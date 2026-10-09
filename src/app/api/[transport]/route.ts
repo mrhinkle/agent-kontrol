@@ -213,45 +213,63 @@ const handler = createMcpHandler(
       }
     );
 
-    server.registerTool(
-      "reply_to_operator",
+    // `reply_to_mark` is the tool's original name. Existing agents are told to call it
+    // in their standing instructions, so it stays registered as a deprecated alias
+    // for the whole 1.x line.
+    const replyTools = [
       {
+        name: "reply_to_operator",
         title: "Reply to the operator",
         description:
           "Send a reply to the operator in Agent Kontrol so it appears in the Fleet conversation drawer. Call after check_inbox when you have an answer, status update, or question. Optionally pass in_reply_to with the inbound message id.",
-        inputSchema: {
-          agent_id: z
-            .string()
-            .describe("This agent's id, e.g. 'hermes-<host>' or 'codex-box'"),
-          body: z.string().describe("Your reply text (1-20 lines)"),
-          in_reply_to: z
-            .number()
-            .int()
-            .optional()
-            .describe("Optional id of the inbound message you are answering"),
-        },
       },
-      async (args) => {
-        if (!isConfigured()) {
-          return { content: [{ type: "text", text: "Demo mode; reply not stored." }] };
+      {
+        name: "reply_to_mark",
+        title: "Reply to the operator (deprecated alias)",
+        description:
+          "Deprecated alias of reply_to_operator, kept so existing agent instructions keep working. Behaves identically; prefer reply_to_operator.",
+      },
+    ];
+    for (const tool of replyTools) {
+      server.registerTool(
+        tool.name,
+        {
+          title: tool.title,
+          description: tool.description,
+          inputSchema: {
+            agent_id: z
+              .string()
+              .describe("This agent's id, e.g. 'hermes-<host>' or 'codex-box'"),
+            body: z.string().describe("Your reply text (1-20 lines)"),
+            in_reply_to: z
+              .number()
+              .int()
+              .optional()
+              .describe("Optional id of the inbound message you are answering"),
+          },
+        },
+        async (args) => {
+          if (!isConfigured()) {
+            return { content: [{ type: "text", text: "Demo mode; reply not stored." }] };
+          }
+          const msg = await replyFromAgent({
+            agent_id: args.agent_id,
+            body: args.body,
+            in_reply_to: args.in_reply_to,
+            created_by: args.agent_id,
+          });
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Reply #${msg.id} delivered to Agent Kontrol` +
+                  (msg.thread_id ? ` (thread ${msg.thread_id}).` : "."),
+              },
+            ],
+          };
         }
-        const msg = await replyFromAgent({
-          agent_id: args.agent_id,
-          body: args.body,
-          in_reply_to: args.in_reply_to,
-          created_by: args.agent_id,
-        });
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Reply #${msg.id} delivered to Agent Kontrol` +
-                (msg.thread_id ? ` (thread ${msg.thread_id}).` : "."),
-            },
-          ],
-        };
-      }
-    );
+      );
+    }
 
     server.registerTool(
       "create_task",

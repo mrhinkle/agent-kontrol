@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `NEXT_PUBLIC_MC_PROGRESS_CONFIG` replaces the progress board's repos from the environment, so a deployment does not need to fork `progress.config.json`.
+- `reply_to_mark` stays registered as a deprecated alias of `reply_to_operator` for the 1.x line, so existing agent instructions keep working.
 - In-app Help menu (`/help`) that renders the project docs.
 - Dashboard: Fleet, Progress, Usage and Costs, Tasks, History, Memory, and Gibson 3D view.
 - Ingest API.
