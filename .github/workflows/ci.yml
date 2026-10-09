@@ -64,3 +64,29 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f supabase/schema.sql
       - name: Store tests on plain Postgres
         run: npm run test:pg
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build image
+        run: docker build -t agent-kontrol:ci .
+      - name: Start container in demo mode (no DATABASE_URL)
+        run: docker run -d --name ak -p 3000:3000 -e MC_TOKEN=ci-token agent-kontrol:ci
+      - name: Wait for /login
+        run: |
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/login || true)
+            if [ "$code" = "200" ]; then echo "login: $code"; exit 0; fi
+            sleep 2
+          done
+          echo "login never returned 200 (last: $code)"; docker logs ak; exit 1
+      - name: Agent endpoint answers with the token
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer ci-token' http://127.0.0.1:3000/api/fleet)
+          echo "fleet: $code"; [ "$code" = "200" ]
+      - name: Container logs
+        if: always()
+        run: docker logs ak

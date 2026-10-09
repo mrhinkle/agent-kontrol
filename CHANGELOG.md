@@ -21,6 +21,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - One-line quickstart.
 - Docker Compose.
 - Deploy to Vercel button.
+- Deploy to Fly.io: `fly.toml` with a release-command schema step, plus a DEPLOY.md walkthrough.
+- CI builds the Docker image and checks that the container serves `/login`.
 - Docs: MCP, API, DATABASE, DEPLOY, AGENTS, ARCHITECTURE.
 
 ### Changed
