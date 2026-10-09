@@ -132,6 +132,22 @@ HOME_XML="$(xml_escape "$HOME")"
 LOG_XML="$(xml_escape "$LOG_FILE")"
 PATH_XML="$(xml_escape "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")"
 
+# The watcher's own optional overrides (path overrides, poll tuning,
+# per-platform agent id/name) only reach the launchd service if they are
+# in its plist — launchd processes don't inherit the installer's shell
+# environment. Carry forward whichever of these were set when install.sh
+# was run.
+EXTRA_ENV_XML=""
+for var in VSCODE_GLOBAL_STORAGE_DIRS CLINE_SHARED_DIR IDLE_AFTER_SECONDS \
+           CLINE_AGENT ROOCODE_AGENT CLINE_AGENT_NAME ROOCODE_AGENT_NAME; do
+  val="${!var:-}"
+  if [[ -n "$val" ]]; then
+    EXTRA_ENV_XML="${EXTRA_ENV_XML}    <key>${var}</key>
+    <string>$(xml_escape "$val")</string>
+"
+  fi
+done
+
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -158,7 +174,7 @@ cat > "$PLIST" <<EOF
     <string>${HOME_XML}</string>
     <key>PATH</key>
     <string>${PATH_XML}</string>
-  </dict>
+${EXTRA_ENV_XML}  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

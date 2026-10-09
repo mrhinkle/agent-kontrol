@@ -32,6 +32,7 @@ Optional:
 
 Run it under launchd/systemd or just `nohup ... &`. Stdlib only.
 """
+import hashlib
 import json
 import os
 import socket
@@ -78,11 +79,19 @@ def default_global_storage_dirs() -> list[Path]:
     return [home / ".config" / e / "User" / "globalStorage" for e in _EDITOR_DIRS]
 
 
-def task_roots() -> list[tuple[str, str, Path]]:
-    """(platform, display_name, tasks_dir) for every candidate that might exist."""
+def fingerprint(tasks_dir: Path) -> str:
+    """Short, stable id for a tasks_dir, so the same task id under two
+    different roots (e.g. Cline's VS Code storage and CLINE_SHARED_DIR)
+    never collides in the server's session id."""
+    return hashlib.sha1(str(tasks_dir).encode()).hexdigest()[:8]
+
+
+def task_roots() -> list[tuple[str, str, str, Path]]:
+    """(platform, display_name, root_fingerprint, tasks_dir) for every
+    candidate that might exist."""
     override = os.environ.get("VSCODE_GLOBAL_STORAGE_DIRS", "")
     storage_dirs = (
-        [Path(p).expanduser() for p in override.split(",") if p.strip()]
+        [Path(p.strip()).expanduser() for p in override.split(",") if p.strip()]
         if override
         else default_global_storage_dirs()
     )
@@ -93,7 +102,7 @@ def task_roots() -> list[tuple[str, str, Path]]:
     ]
     shared = Path(os.environ.get("CLINE_SHARED_DIR", "~/.cline")).expanduser()
     roots.append(("cline", "Cline", shared / "tasks"))
-    return roots
+    return [(platform, name, fingerprint(tasks_dir), tasks_dir) for platform, name, tasks_dir in roots]
 
 
 def post(body: dict) -> None:
@@ -104,12 +113,13 @@ def post(body: dict) -> None:
         method="POST",
     )
     try:
-        urllib.request.urlopen(req, timeout=5)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
     except Exception as e:
         print(f"[mc] post failed: {e}", file=sys.stderr)
 
 
-def report(platform: str, display_name: str, task_id: str, kind: str, title: str) -> None:
+def report(platform: str, display_name: str, root_fp: str, task_id: str, kind: str, title: str) -> None:
     agent_id = AGENT_ID[platform]
     post(
         {
@@ -117,7 +127,7 @@ def report(platform: str, display_name: str, task_id: str, kind: str, title: str
             "platform": platform,
             "machine": HOSTNAME,
             "display_name": os.environ.get(AGENT_NAME_ENV[platform], f"{display_name} ({HOSTNAME})"),
-            "session_id": f"{agent_id}-{task_id}",
+            "session_id": f"{agent_id}-{root_fp}-{task_id}",
             "kind": kind,
             "title": title,
         }
@@ -130,24 +140,24 @@ def main() -> None:
         sys.exit(1)
 
     roots = task_roots()
-    for _, _, tasks_dir in roots:
+    for _, _, _, tasks_dir in roots:
         if not tasks_dir.exists():
             print(f"Watching {tasks_dir} (does not exist yet — will keep checking)")
 
-    seen: dict[str, float] = {}  # "{root-index}:{task-id}" -> last mtime
+    seen: dict[str, float] = {}  # "{root-fingerprint}:{task-id}" -> last mtime
     active: dict[str, tuple[str, str]] = {}  # same key -> (platform, display_name)
     first_scan = True
 
     while True:
         now = time.time()
-        for idx, (platform, name, tasks_dir) in enumerate(roots):
+        for platform, name, root_fp, tasks_dir in roots:
             try:
                 task_dirs = [d for d in tasks_dir.iterdir() if d.is_dir()] if tasks_dir.exists() else []
             except OSError:
                 task_dirs = []
 
             for d in task_dirs:
-                key = f"{idx}:{d.name}"
+                key = f"{root_fp}:{d.name}"
                 try:
                     mtime = max(
                         (f.stat().st_mtime for f in d.iterdir() if f.is_file()),
@@ -161,19 +171,32 @@ def main() -> None:
                     # Seed silently on startup so a daemon restart doesn't
                     # re-announce tasks the server already closed.
                     continue
-                if prev is None and now - mtime < IDLE_AFTER:
+                if prev is None:
+                    # First time this task dir has been seen. Only announce
+                    # it if it looks recent — an old, already-idle task
+                    # shouldn't be reported as freshly started just because
+                    # the daemon restarted.
+                    if now - mtime < IDLE_AFTER:
+                        active[key] = (platform, name)
+                        report(platform, name, root_fp, d.name, "session_start", f"{name} task started ({d.name})")
+                elif mtime > prev:
+                    # A task the daemon already marked done (removed from
+                    # `active` below) getting touched again is a resume, not
+                    # a heartbeat — the server refuses to reopen a closed
+                    # session on anything but an explicit session_start.
+                    was_active = key in active
                     active[key] = (platform, name)
-                    report(platform, name, d.name, "session_start", f"{name} task started ({d.name})")
-                elif prev is not None and mtime > prev:
-                    active[key] = (platform, name)
-                    report(platform, name, d.name, "heartbeat", f"{name} task active")
+                    if was_active:
+                        report(platform, name, root_fp, d.name, "heartbeat", f"{name} task active")
+                    else:
+                        report(platform, name, root_fp, d.name, "session_start", f"{name} task resumed ({d.name})")
         first_scan = False
 
         for key in list(active):
             if now - seen.get(key, 0) > IDLE_AFTER:
                 platform, name = active.pop(key)
-                task_id = key.split(":", 1)[1]
-                report(platform, name, task_id, "session_end", f"{name} task idle — marking done")
+                root_fp, task_id = key.split(":", 1)
+                report(platform, name, root_fp, task_id, "session_end", f"{name} task idle — marking done")
 
         time.sleep(POLL)
 
