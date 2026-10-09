@@ -96,6 +96,27 @@ const STALLED = {
   ],
 };
 
+/** Generic numbers for a configured repo that has no hand-written seed above. */
+export function seedFor(repo: string): Seed {
+  return (
+    SEEDS[repo] ?? {
+      repo,
+      open_issues: 30,
+      open_prs: 2,
+      blocked_issues: null,
+      merged_24h: 3,
+      closed_24h: 4,
+      opened_24h: 5,
+      total_created: 300,
+      total_closed: 270,
+      total_merged: 200,
+      lane_mix: {},
+      review_rounds: 2.0,
+      no_verdict_rate: 0.1,
+    }
+  );
+}
+
 /** Deterministic 0..1 from an integer — keeps demo history stable across polls. */
 function jitter(n: number): number {
   const x = Math.sin(n * 12.9898) * 43758.5453;
@@ -105,8 +126,7 @@ function jitter(n: number): number {
 function demoHistory(days: number, anchor: Date): HistoryPoint[] {
   const points: HistoryPoint[] = [];
   for (const cfg of REPOS) {
-    const s = SEEDS[cfg.repo];
-    if (!s) continue;
+    const s = seedFor(cfg.repo);
     for (let d = days; d >= 0; d--) {
       const day = new Date(anchor.getTime() - d * 86_400_000);
       // Walk the cumulative counters backwards from today at roughly the
@@ -133,7 +153,7 @@ export function demoProgress(window: TimeWindow): ProgressResponse {
   const anchor = new Date("2026-01-15T12:00:00Z");
 
   const repos: RepoProgress[] = REPOS.map((cfg) => {
-    const s = SEEDS[cfg.repo];
+    const s = seedFor(cfg.repo);
     // Scale the window counts off the observed day, damped — a 30-day window
     // is not 30 identical days.
     const scale = days === 1 ? 1 : days * 0.72;

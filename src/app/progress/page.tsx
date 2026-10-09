@@ -329,7 +329,7 @@ export default function ProgressPage() {
 
       {data?.demo && (
         <div className="rounded-lg border border-[#2563eb]/30 bg-[#2563eb]/10 px-4 py-2.5 text-sm text-[#9db9ff]">
-          Demo mode — no database connected. These are the real 2026-09-06 sweep numbers, held still. Set{" "}
+          Demo mode — no database connected. These are synthetic numbers, held still. Set{" "}
           <span className="mono">DATABASE_URL</span> and run <span className="mono">scripts/collect-progress.sh</span> to
           go live.
         </div>

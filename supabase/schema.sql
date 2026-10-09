@@ -62,6 +62,13 @@ create table if not exists messages (
   thread_id text,                         -- root id as text; shared across a conversation
   read_by_dashboard_at timestamptz        -- when the operator opened/read an outbound reply
 );
+-- Additive upgrade path for existing deployments (also in migrations/).
+alter table messages add column if not exists direction text not null default 'inbound';
+alter table messages add column if not exists in_reply_to bigint;
+alter table messages add column if not exists thread_id text;
+alter table messages add column if not exists read_by_dashboard_at timestamptz;
+update messages set thread_id = id::text where thread_id is null;
+
 create index if not exists messages_pending_idx on messages (agent_id, acked_at, created_at);
 create index if not exists messages_pending_inbound_idx
   on messages (agent_id, acked_at, created_at)
@@ -72,12 +79,6 @@ create index if not exists messages_unread_dashboard_idx
 create index if not exists messages_thread_idx
   on messages (agent_id, thread_id, created_at);
 
--- Additive upgrade path for existing deployments (also in migrations/).
-alter table messages add column if not exists direction text not null default 'inbound';
-alter table messages add column if not exists in_reply_to bigint;
-alter table messages add column if not exists thread_id text;
-alter table messages add column if not exists read_by_dashboard_at timestamptz;
-update messages set thread_id = id::text where thread_id is null;
 
 -- v2: the task queue. Mission Control stops being a read-only dashboard and
 -- becomes the harness: you (or an agent) queue work, the dispatcher daemon on

@@ -34,6 +34,13 @@ describe("progress-config", () => {
     assert.ok(LANE_BOT_PREFIX.length > 0);
   });
 
+  it("no label or blockedLabel contains the collector's field separator", () => {
+    for (const r of REPOS) {
+      assert.ok(!r.label.includes("|"), `label has | for ${r.repo}`);
+      assert.ok(r.blockedLabel === null || !r.blockedLabel.includes("|"), `blockedLabel has | for ${r.repo}`);
+    }
+  });
+
   it("every blockedLabel is a string or null", () => {
     for (const r of REPOS) {
       assert.ok(

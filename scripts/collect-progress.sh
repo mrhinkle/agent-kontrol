@@ -30,7 +30,14 @@ set -euo pipefail
 # The blocked label differs per repo and some repos have none, so the field is
 # left empty: the board reports "not tracked" there rather than a false 0%.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_FILE="${MC_PROGRESS_CONFIG:-$(dirname "$SCRIPT_DIR")/progress.config.json}"
+# An installed copy keeps progress.config.json beside the script; a checkout keeps
+# it one level up. MC_PROGRESS_CONFIG overrides both.
+if [[ -f "$SCRIPT_DIR/progress.config.json" ]]; then
+  DEFAULT_CONFIG="$SCRIPT_DIR/progress.config.json"
+else
+  DEFAULT_CONFIG="$(dirname "$SCRIPT_DIR")/progress.config.json"
+fi
+CONFIG_FILE="${MC_PROGRESS_CONFIG:-$DEFAULT_CONFIG}"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   printf 'collect-progress: config file not found: %s\n' "$CONFIG_FILE" >&2

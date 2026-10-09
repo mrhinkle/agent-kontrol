@@ -52,6 +52,9 @@ function validate(raw: typeof config): void {
     if (typeof entry.short !== "string" || entry.short.length === 0) {
       fail(name, "short must be a non-empty string");
     }
+    if (entry.label.includes("|")) {
+      fail(name, 'label must not contain "|" (the collector uses it as a field separator)');
+    }
     if (typeof entry.color !== "string" || !COLOR_RE.test(entry.color)) {
       fail(name, "color must be a #rrggbb hex string");
     }
@@ -60,6 +63,9 @@ function validate(raw: typeof config): void {
       typeof entry.blockedLabel !== "string"
     ) {
       fail(name, "blockedLabel must be a string or null");
+    }
+    if (typeof entry.blockedLabel === "string" && entry.blockedLabel.includes("|")) {
+      fail(name, 'blockedLabel must not contain "|" (the collector uses it as a field separator)');
     }
     if (seenRepos.has(entry.repo)) {
       fail(name, `duplicate repo "${entry.repo}"`);
