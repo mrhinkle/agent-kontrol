@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { FleetAgent, Message } from "@/lib/types";
+import { OPERATOR } from "@/lib/operator";
 import { deliveryStateFor, type DeliveryState } from "@/lib/message-helpers";
 
 /**
@@ -93,7 +94,7 @@ export function ConversationDrawer({ agent }: { agent: FleetAgent }) {
       const res = await fetch("/api/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ agent_id: agent.id, body, created_by: "Operator" }),
+        body: JSON.stringify({ agent_id: agent.id, body, created_by: OPERATOR }),
       });
       const json = await res.json();
       if (res.status === 503 || json.setup_required) {
@@ -174,7 +175,7 @@ export function ConversationDrawer({ agent }: { agent: FleetAgent }) {
                     >
                       <div className="flex items-center justify-between gap-2 mb-0.5">
                         <span className="mono text-[10px] text-gray-500">
-                          {inbound ? m.created_by ?? "Operator" : m.created_by ?? agent.display_name ?? agent.id}
+                          {inbound ? m.created_by ?? OPERATOR : m.created_by ?? agent.display_name ?? agent.id}
                         </span>
                         {inbound && (
                           <span className={`mono text-[10px] ${stateClass(state)}`}>

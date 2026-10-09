@@ -24,15 +24,43 @@ set -euo pipefail
 
 # --------------------------------------------------------------------- config
 
-# repo|display label|blocked label
+# Watched repos come from progress.config.json at the repo root (one level up
+# from scripts/). Each becomes a "repo|display label|blocked label" entry.
 #
 # The blocked label differs per repo and some repos have none, so the field is
 # left empty: the board reports "not tracked" there rather than a false 0%.
-REPOS=(
-  "example-org/app-server|App Server|"
-  "example-org/web-studio|Web Studio|blocked"
-  "example-org/agent-harness|Agent Harness|dependency-blocked"
-)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# An installed copy keeps progress.config.json beside the script; a checkout keeps
+# it one level up. MC_PROGRESS_CONFIG overrides both.
+if [[ -f "$SCRIPT_DIR/progress.config.json" ]]; then
+  DEFAULT_CONFIG="$SCRIPT_DIR/progress.config.json"
+else
+  DEFAULT_CONFIG="$(dirname "$SCRIPT_DIR")/progress.config.json"
+fi
+CONFIG_FILE="${MC_PROGRESS_CONFIG:-$DEFAULT_CONFIG}"
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+  printf 'collect-progress: config file not found: %s\n' "$CONFIG_FILE" >&2
+  exit 1
+fi
+if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
+  printf 'collect-progress: config file is not valid JSON: %s\n' "$CONFIG_FILE" >&2
+  exit 1
+fi
+
+REPOS=()
+repo_lines="$(jq -r '.repos[]? | [.repo, .label, (.blockedLabel // "")] | join("|")' "$CONFIG_FILE")"
+while IFS= read -r line; do
+  if [[ -n "$line" ]]; then REPOS+=("$line"); fi
+done <<<"$repo_lines"
+
+if [[ "${#REPOS[@]}" -eq 0 ]]; then
+  printf 'collect-progress: no repos configured in %s\n' "$CONFIG_FILE" >&2
+  exit 1
+fi
+
+LANE_BOT_PREFIX="$(jq -r '.laneBotPrefix // "agent-lanes-"' "$CONFIG_FILE")"
+SHARED_BOT_PREFIXES_JSON="$(jq -c '.sharedBotPrefixes // []' "$CONFIG_FILE")"
 
 STALLED_HOURS=24
 
@@ -132,11 +160,14 @@ search_page() {
 # recoverable there, and a lane chart that guessed would be worse than one that
 # admits the gap.
 lane_of() {
-  jq -r '
+  jq -r \
+    --arg prefix "$LANE_BOT_PREFIX" \
+    --argjson shared "$SHARED_BOT_PREFIXES_JSON" '
     # An explicit Agent-Vendor trailer wins: it is the only signal that survives
     # a repo where every lane shares one bot identity. Written at commit time by
-    # .githooks/prepare-commit-msg, so it only exists going forward — history
-    # before that stays unattributed, honestly.
+    # a prepare-commit-msg hook that appends an Agent-Vendor trailer (not shipped
+    # in this repo), so it only exists going forward - history before that stays
+    # unattributed, honestly.
     ([ .[] | .commit.message
        | capture("(?im)^Agent-Vendor:[ \\t]+(?<v>[A-Za-z0-9][A-Za-z0-9._-]{0,31})[ \\t]*$")
        | .v | ascii_downcase ]) as $trailers
@@ -144,11 +175,15 @@ lane_of() {
         ($trailers | group_by(.) | max_by(length) | .[0])
       else
         # Otherwise fall back to bot identity, which distinguishes lanes only in
-        # repos that gave each one its own bot.
+        # repos that gave each one its own bot. A bot whose name starts with a
+        # shared prefix commits for several lanes, so it stays unattributed.
         [ .[] | (.author.login // .commit.author.name // "") ]
         | map(select(endswith("[bot]")))
-        | map(sub("\\[bot\\]$"; "") | sub("^agent-lanes-"; ""))
-        | map(if test("^cos-agent-lanes") then "unattributed" else . end)
+        | map(sub("\\[bot\\]$"; ""))
+        | map(. as $login
+              | if any($shared[]; . as $p | $login | startswith($p)) then "unattributed"
+                elif $login | startswith($prefix) then $login[($prefix | length):]
+                else $login end)
         | if length == 0 then "human"
           else (group_by(.) | max_by(length) | .[0])
           end

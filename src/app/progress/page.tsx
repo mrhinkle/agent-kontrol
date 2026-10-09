@@ -6,7 +6,7 @@ import { BacklogChart } from "@/components/BacklogChart";
 import { useFleet } from "@/components/use-fleet";
 import { useProgress } from "@/components/use-progress";
 import { STATUS_STYLES, TimeAgo } from "@/components/ui";
-import { REPOS, THRESHOLDS, WINDOWS, type TimeWindow } from "@/lib/progress-config";
+import { LANE_BOT_PREFIX, REPOS, THRESHOLDS, WINDOWS, type TimeWindow } from "@/lib/progress-config";
 import type { Alert, ProgressResponse, RepoProgress } from "@/lib/progress-types";
 
 /* ------------------------------------------------------------- primitives */
@@ -182,7 +182,7 @@ function Breakdown({ data }: { data: ProgressResponse }) {
           {lanes.length === 0
             ? "—"
             : lanes
-                .map(([k, v]) => `${k.replace(/^agent-lanes-|\[bot\]$/g, "")} ${v}`)
+                .map(([k, v]) => { const key = k.endsWith("[bot]") ? k.slice(0, -5) : k; return `${key.startsWith(LANE_BOT_PREFIX) ? key.slice(LANE_BOT_PREFIX.length) : key} ${v}`; })
                 .join(" · ")}
         </span>
       </div>
@@ -329,7 +329,7 @@ export default function ProgressPage() {
 
       {data?.demo && (
         <div className="rounded-lg border border-[#2563eb]/30 bg-[#2563eb]/10 px-4 py-2.5 text-sm text-[#9db9ff]">
-          Demo mode — no database connected. These are the real 2026-09-06 sweep numbers, held still. Set{" "}
+          Demo mode — no database connected. These are synthetic numbers, held still. Set{" "}
           <span className="mono">DATABASE_URL</span> and run <span className="mono">scripts/collect-progress.sh</span> to
           go live.
         </div>

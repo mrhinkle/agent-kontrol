@@ -38,7 +38,7 @@ const buildAgents = (): FleetAgent[] => [
     current_session: {
       id: "sess-cc-014",
       agent_id: "claude-code-macbook-pro",
-      project: "theaie-net",
+      project: "marketing-site",
       status: "waiting",
       summary: "Newsletter page refactor — waiting on permission to push",
       started_at: minsAgo(65),
@@ -59,9 +59,9 @@ const buildAgents = (): FleetAgent[] => [
     current_session: {
       id: "sess-gpt-007",
       agent_id: "chatgpt-work-main",
-      project: "conference-sponsors",
+      project: "event-sponsors",
       status: "active",
-      summary: "Researching sponsor prospects for All Things AI 2026",
+      summary: "Researching sponsor prospects for the spring event",
       started_at: minsAgo(30),
       ended_at: null,
       updated_at: minsAgo(12),
@@ -98,7 +98,7 @@ const buildEvents = (): Event[] => [
   { id: 8, agent_id: "claude-code-macbook-pro", session_id: "sess-cc-014", kind: "notification", title: "Waiting on permission: git push", detail: null, created_at: minsAgo(3) },
   { id: 7, agent_id: "chatgpt-work-main", session_id: "sess-gpt-007", kind: "status", title: "Compiled 22 sponsor prospects, drafting outreach notes", detail: null, created_at: minsAgo(12) },
   { id: 6, agent_id: "cowork-cloud-1", session_id: "sess-cw-001", kind: "turn_start", title: "Build and create in github", detail: null, created_at: minsAgo(20) },
-  { id: 5, agent_id: "claude-code-macbook-pro", session_id: "sess-cc-014", kind: "session_start", title: "Session started in ~/code/theaie-net", detail: null, created_at: minsAgo(65) },
+  { id: 5, agent_id: "claude-code-macbook-pro", session_id: "sess-cc-014", kind: "session_start", title: "Session started in ~/code/marketing-site", detail: null, created_at: minsAgo(65) },
   { id: 4, agent_id: "hermes-home-server", session_id: "sess-hm-090", kind: "session_end", title: "Inbox triage complete — 4 items flagged", detail: null, created_at: minsAgo(560) },
 ];
 
@@ -115,7 +115,7 @@ export const demoMemory = (): MemoryItem[] => [
   {
     id: 2,
     key: null,
-    content: "ChatGPT Work is researching sponsors — don't duplicate that work in Cowork. Results land in Notion under Conference/Sponsors.",
+    content: "ChatGPT Work is researching sponsors — don't duplicate that work in Cowork. Results land in Notion under Events/Sponsors.",
     tags: ["all-things-ai", "coordination"],
     agent_id: "chatgpt-work-main",
     created_at: minsAgo(25),
@@ -123,9 +123,9 @@ export const demoMemory = (): MemoryItem[] => [
   },
   {
     id: 1,
-    key: "newsletter/tangle-monday",
-    content: "Monday Tangle draft is staged in Notion awaiting review. Beehiiv send scheduled for 6am ET.",
-    tags: ["aie-tangle", "newsletter"],
+    key: "newsletter/weekly-digest",
+    content: "Monday digest draft is staged in Notion awaiting review. Send scheduled for 6am ET.",
+    tags: ["newsletter"],
     agent_id: "hermes-home-server",
     created_at: minsAgo(600),
     updated_at: minsAgo(600),
@@ -161,17 +161,17 @@ const doneDemoTask = (
 });
 
 export const demoTasks = (): Task[] => [
-  // Built history for theaie-net so the demo shows a City of Text monolith.
-  doneDemoTask(105, "Ship newsletter signup flow", "theaie-net", "claude-code", 2600, 1.12),
-  doneDemoTask(104, "Fix OG images on article pages", "theaie-net", "codex", 2100, 0.38),
-  doneDemoTask(103, "Migrate tools directory to CMS", "theaie-net", "claude-code", 1500, 2.4),
-  doneDemoTask(102, "Add sponsor placements page", "theaie-net", "grok", 900, 0.55),
-  doneDemoTask(101, "SEO pass on landing pages", "theaie-net", "codex", 300, 0.61),
+  // Built history for marketing-site so the demo shows a City of Text monolith.
+  doneDemoTask(105, "Ship newsletter signup flow", "marketing-site", "claude-code", 2600, 1.12),
+  doneDemoTask(104, "Fix OG images on article pages", "marketing-site", "codex", 2100, 0.38),
+  doneDemoTask(103, "Migrate tools directory to CMS", "marketing-site", "claude-code", 1500, 2.4),
+  doneDemoTask(102, "Add sponsor placements page", "marketing-site", "grok", 900, 0.55),
+  doneDemoTask(101, "SEO pass on landing pages", "marketing-site", "codex", 300, 0.61),
   {
     id: 4,
-    title: "Fix broken Beehiiv embed on newsletter page",
-    description: "The subscribe embed on /newsletter 404s. Find the current embed id in Beehiiv and update.",
-    project: "theaie-net",
+    title: "Fix broken signup embed on newsletter page",
+    description: "The subscribe embed on /newsletter 404s. Find the current embed id in the email provider and update.",
+    project: "marketing-site",
     platform: "claude-code",
     machine: null,
     priority: 1,
@@ -191,7 +191,7 @@ export const demoTasks = (): Task[] => [
     id: 3,
     title: "Add speaker headshots to conference page",
     description: null,
-    project: "allthingsai-org",
+    project: "event-site",
     platform: "codex",
     machine: null,
     priority: 2,

@@ -52,7 +52,7 @@ function NewTaskForm({ onCreated }: { onCreated: () => void }) {
     <div className="rounded-xl border border-white/10 bg-[#101828] p-4 mb-6">
       <div className="text-sm font-semibold mb-3">Queue a task</div>
       <div className="grid gap-3">
-        <input className={input} placeholder="Title — e.g. Fix the broken subscribe form on theaie.net"
+        <input className={input} placeholder="Title — e.g. Fix the broken subscribe form on example.com"
           value={title} onChange={(e) => setTitle(e.target.value)} />
         <textarea className={`${input} min-h-20`} placeholder="Instructions (becomes the worker's prompt). Be specific: files, acceptance criteria, what done looks like."
           value={description} onChange={(e) => setDescription(e.target.value)} />
