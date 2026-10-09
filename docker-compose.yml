@@ -1,0 +1,32 @@
+# The db port is NOT published (no ports: entry), so the database
+# is reachable only from the app service on the compose network.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mc}
+      POSTGRES_DB: mc
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mc"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${MC_PORT:-3000}:3000"
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-mc}@db:5432/mc
+      MC_TOKEN: ${MC_TOKEN:?set MC_TOKEN in .env}
+      MC_DASHBOARD_PASSWORD: ${MC_DASHBOARD_PASSWORD:?set MC_DASHBOARD_PASSWORD in .env}
+      NEXT_PUBLIC_MC_OPERATOR: ${NEXT_PUBLIC_MC_OPERATOR:-}
+    restart: unless-stopped
+
+volumes:
+  db-data:
