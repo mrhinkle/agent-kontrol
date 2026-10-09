@@ -1,0 +1,20 @@
+{
+  "//": "Merge the 'hooks' block into ~/.claude/settings.json (user-wide) or .claude/settings.json (per project). Set MC_URL and MC_TOKEN in your shell env, or inline them: 'MC_URL=... MC_TOKEN=... python3 ~/.claude/mission_control_hook.py'",
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "python3 ~/.claude/mission_control_hook.py" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "python3 ~/.claude/mission_control_hook.py" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "python3 ~/.claude/mission_control_hook.py" }] }
+    ],
+    "Notification": [
+      { "hooks": [{ "type": "command", "command": "python3 ~/.claude/mission_control_hook.py" }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "python3 ~/.claude/mission_control_hook.py" }] }
+    ]
+  }
+}

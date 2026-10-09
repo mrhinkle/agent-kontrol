@@ -1,0 +1,47 @@
+{
+  "name": "mission-control",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test:ui": "npx --yes tsx@4.23.15 --test tests/ui/*.test.ts",
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "echo 'No ESLint flat config in this repo; run npm run typecheck for TS.' && npm run typecheck",
+    "test:unit:py": "python3 -m unittest discover -s tests/unit -p 'test_*.py' -v",
+    "test:reconcile": "python3 -m unittest tests.integration.test_reconcile_synthetic -v",
+    "test:providers": "npx tsx scripts/run-provider-tests.ts",
+    "test:ingest": "npx tsx scripts/run-ingest-tests.ts",
+    "test": "npm run test:unit:py && npm run test:reconcile && npm run test:providers && npm run test:ingest && npm run test:usage-window && npm run test:messages",
+    "seed:usage": "python3 agents/usage-collector/collect_usage.py --dry-run --roots fixtures/hermes --since 2026-09-28 --until 2026-10-06 --out .data/reconcile-facts.json && npx tsx scripts/seed-usage.ts",
+    "typecheck": "tsc --noEmit",
+    "test:reconcile:real": "python3 -m unittest tests.integration.test_reconcile_real -v",
+    "fixtures:hermes": "python3 scripts/make-fixtures.py",
+    "test:usage-window": "npx tsx scripts/run-usage-window-tests.ts",
+    "test:messages": "npx tsx scripts/run-message-tests.ts"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
+    "@react-three/drei": "^10.7.8",
+    "@react-three/fiber": "^9.7.0",
+    "@react-three/postprocessing": "^3.0.5",
+    "mcp-handler": "^1.0.0",
+    "next": "^15.3.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "three": "^0.185.1",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.0.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/three": "^0.185.4",
+    "tailwindcss": "^4.0.0",
+    "typescript": "5.8.2",
+    "tsx": "^4.19.0",
+    "playwright": "^1.48.0"
+  },
+  "license": "Apache-2.0"
+}

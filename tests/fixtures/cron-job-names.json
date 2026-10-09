@@ -1,0 +1,20 @@
+{
+  "by_profile": {
+    "host/alpha": {
+      "aa11bb22cc33": "synthetic-velocity"
+    },
+    "host/beta": {
+      "bb22cc33dd44": "synthetic-daily"
+    },
+    "host/gamma": {},
+    "neuro/gateway": {
+      "cc33dd44ee55": "gateway-brief"
+    },
+    "neuro/sidecar": {}
+  },
+  "by_id": {
+    "aa11bb22cc33": "synthetic-velocity",
+    "bb22cc33dd44": "synthetic-daily",
+    "cc33dd44ee55": "gateway-brief"
+  }
+}

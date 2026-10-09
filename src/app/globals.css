@@ -1,0 +1,38 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #0a0f1c;
+  --color-panel: #101828;
+  --color-flame: #f44800;
+  --color-electric: #2563eb;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background: #0a0f1c;
+  color: #e5e7eb;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.pulse-dot {
+  animation: pulse-dot 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse-dot { animation: none; }
+}
+
+/* Horizontal scrollers (the phone nav) keep touch/trackpad scrolling without a visible bar. */
+.no-scrollbar { scrollbar-width: none; }
+.no-scrollbar::-webkit-scrollbar { display: none; }

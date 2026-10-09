@@ -1,0 +1,64 @@
+{
+  "activity": [
+    {
+      "date": "2026-09-29",
+      "model": "anthropic/claude-sonnet-5.5",
+      "usage": 8.12,
+      "requests": 40,
+      "prompt_tokens": 1200000,
+      "completion_tokens": 80000
+    },
+    {
+      "date": "2026-09-30",
+      "model": "anthropic/claude-sonnet-5.5",
+      "usage": 6.4,
+      "requests": 30,
+      "prompt_tokens": 900000,
+      "completion_tokens": 60000
+    },
+    {
+      "date": "2026-10-01",
+      "model": "deepseek/deepseek-v4-pro-0813",
+      "usage": 4.25,
+      "requests": 20,
+      "prompt_tokens": 500000,
+      "completion_tokens": 40000
+    },
+    {
+      "date": "2026-10-02",
+      "model": "openai/gpt-5.6-sol",
+      "usage": 3.1,
+      "requests": 15,
+      "prompt_tokens": 200000,
+      "completion_tokens": 30000
+    },
+    {
+      "date": "2026-10-03",
+      "model": "anthropic/claude-sonnet-5.5",
+      "usage": 2.8,
+      "requests": 12,
+      "prompt_tokens": 400000,
+      "completion_tokens": 25000
+    },
+    {
+      "date": "2026-10-04",
+      "model": "deepseek/deepseek-v4-pro-0813",
+      "usage": 1.5,
+      "requests": 8,
+      "prompt_tokens": 100000,
+      "completion_tokens": 20000
+    },
+    {
+      "date": "2026-10-05",
+      "model": "openai/gpt-5-mini",
+      "usage": 0.45,
+      "requests": 5,
+      "prompt_tokens": 50000,
+      "completion_tokens": 10000
+    }
+  ],
+  "credits": {
+    "total_credits": 200.0,
+    "total_usage": 173.38
+  }
+}

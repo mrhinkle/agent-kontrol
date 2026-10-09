@@ -1,0 +1,28 @@
+node_modules/
+.next/
+out/
+.env
+.env.local
+.env*.local
+.vercel
+*.tsbuildinfo
+next-env.d.ts
+__pycache__/
+*.pyc
+.DS_Store
+_xfer/
+
+# Token economics local store / fixtures output
+.data/
+fixtures/hermes-slim.tgz
+
+# Local prototype / agent scratch (do not ship)
+.data/
+token-econ*.patch
+fixtures-hermes.tgz
+fixtures/hermes-slim.tgz
+agents/usage-collector/__pycache__/
+tests/**/__pycache__/
+tests/integration/_harness.ts
+tests/unit/_provider_test.ts
+usage.png
