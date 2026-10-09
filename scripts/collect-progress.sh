@@ -394,7 +394,40 @@ run_backfill() {
   done
 }
 
+# ------------------------------------------------------------ repo list from the dashboard
+
+# Ask the dashboard which repos to sweep, so adding one in Settings needs no edit on
+# this machine. If the dashboard is unreachable, has no saved list yet, or returns
+# something unusable, keep the list read from the local config file above.
+# Set MC_REPOS_FROM_DASHBOARD=0 to ignore the dashboard and use the file only.
+refresh_repos_from_dashboard() {
+  local body lines line
+  if [[ "${MC_REPOS_FROM_DASHBOARD:-1}" == "0" ]]; then
+    log "repos: ${#REPOS[@]} from the local config (dashboard list disabled)"; return 0
+  fi
+  if [[ -z "${MC_URL:-}" || -z "${MC_TOKEN:-}" ]]; then
+    log "repos: ${#REPOS[@]} from the local config (no MC_URL or MC_TOKEN)"; return 0
+  fi
+  if ! body="$(curl -fsS --max-time 15 -H "Authorization: Bearer $MC_TOKEN" "${MC_URL%/}/api/settings/repos" 2>/dev/null)"; then
+    log "repos: dashboard unreachable, using ${#REPOS[@]} from the local config"; return 0
+  fi
+  if [[ "$(jq -r '.source // empty' <<<"$body" 2>/dev/null)" != "database" ]]; then
+    log "repos: no saved list on the dashboard, using ${#REPOS[@]} from the local config"; return 0
+  fi
+  lines="$(jq -r '.repos[]? | [.repo, .label, (.blockedLabel // "")] | join("|")' <<<"$body" 2>/dev/null || true)"
+  if [[ -z "$lines" ]]; then
+    log "repos: dashboard list was empty, using ${#REPOS[@]} from the local config"; return 0
+  fi
+  REPOS=()
+  while IFS= read -r line; do
+    if [[ -n "$line" ]]; then REPOS+=("$line"); fi
+  done <<<"$lines"
+  log "repos: ${#REPOS[@]} from the dashboard"
+}
+
 # ------------------------------------------------------------------- dispatch
+
+refresh_repos_from_dashboard
 
 if [[ "$MODE" == "backfill" ]]; then
   run_backfill "$BACKFILL_DAYS"

@@ -1,5 +1,6 @@
 import { sql } from "./db";
 import { REPOS, THRESHOLDS, windowDays, type TimeWindow } from "./progress-config";
+import { getWatchedRepos } from "./watched-repos";
 import type {
   Alert,
   FleetTotals,
@@ -263,7 +264,7 @@ export function buildAlerts(repos: RepoProgress[], history: HistoryPoint[]): Ale
   // Backlog growing N days running, per repo. Needs N+1 daily points to see
   // N day-over-day changes, so this stays quiet until the history exists.
   const need = THRESHOLDS.backlogGrowingDays;
-  for (const cfg of REPOS) {
+  for (const cfg of repos) {
     const points = history.filter((h) => h.repo === cfg.repo);
     if (points.length < need + 1) continue;
     const tail = points.slice(-(need + 1));
@@ -310,7 +311,8 @@ export async function progress(window: TimeWindow): Promise<Omit<ProgressRespons
   const targetMs = anchor.getTime() - days * 86_400_000;
   const slackMs = Math.max(6 * 3_600_000, days * 86_400_000 * 0.2);
 
-  const repos: RepoProgress[] = REPOS.map((cfg) => {
+  const watched = (await getWatchedRepos(REPOS)).repos;
+  const repos: RepoProgress[] = watched.map((cfg) => {
     const now = latest.get(cfg.repo);
     const then = baseline.get(cfg.repo);
     const thenUsable = then !== undefined && targetMs - new Date(then.collected_at).getTime() <= slackMs;

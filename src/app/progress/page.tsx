@@ -356,7 +356,7 @@ export default function ProgressPage() {
         title="backlog over time"
         right={
           <div className="flex gap-1">
-            {[{ repo: null, label: "all" }, ...REPOS.map((r) => ({ repo: r.repo, label: r.short }))].map((o) => (
+            {[{ repo: null, label: "all" }, ...(data?.repos ?? []).map((r) => ({ repo: r.repo, label: r.short }))].map((o) => (
               <button
                 key={o.label}
                 onClick={() => setChartRepo(o.repo)}

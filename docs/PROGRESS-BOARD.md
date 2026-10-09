@@ -42,6 +42,16 @@ dashboard and the collector; adding a repo is one entry there (then re-run the c
 installer so the scheduled job picks it up). Alert thresholds live in
 [`src/lib/progress-config.ts`](../src/lib/progress-config.ts).
 
+## Choosing which repos to watch
+
+Use **Settings** in the app header. Add a repo as `owner/name`, give it a label, a short name and a color, say which GitHub label marks blocked work (or leave it empty if the repo has none), and save. Reorder with the arrows. The progress board updates immediately, and the collector reads the same list on its next tick (within 15 minutes), so nothing needs redeploying or editing on the collector's machine.
+
+- **Default list.** Until you save one, the board uses `progress.config.json` (or `NEXT_PUBLIC_MC_PROGRESS_CONFIG`). The first save stores your list in the database, and from then on the database wins.
+- **Removing a repo** stops it being shown and collected. Its history stays in the database, and adding it back restores it. You cannot remove the last repo.
+- **New repos need history.** The collector only records the present. Run `collect-progress.sh --backfill 90` once to fill in the past.
+- **Access.** The collector's `gh` login must be able to read each repo, including private ones.
+- **If the dashboard is unreachable,** the collector keeps using its local config file. Set `MC_REPOS_FROM_DASHBOARD=0` to make it ignore the dashboard list entirely.
+
 ## See also
 
 - [DEPLOY.md](DEPLOY.md)

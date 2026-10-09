@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Settings page (`/settings`) to add, edit, reorder and remove the repos the progress board watches, stored in a new `watched_repos` table. The collector reads the list from `GET /api/settings/repos` each tick and falls back to its local file. Design: `docs/design/settings-repos.md`.
 - `NEXT_PUBLIC_MC_PROGRESS_CONFIG` replaces the progress board's repos from the environment, so a deployment does not need to fork `progress.config.json`.
 - `reply_to_mark` stays registered as a deprecated alias of `reply_to_operator` for the 1.x line, so existing agent instructions keep working.
 - In-app Help menu (`/help`) that renders the project docs.

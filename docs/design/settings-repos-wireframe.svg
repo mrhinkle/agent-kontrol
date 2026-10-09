@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 500" role="img" aria-labelledby="t d" font-family="Helvetica, Arial, sans-serif">
+  <title id="t">Settings page wireframe: watched repos</title>
+  <desc id="d">Low-fidelity wireframe of the Settings page. A banner states the repo list source. A table lists each watched repo with label, short name, color and blocked label, with reorder and remove controls. Buttons add a repo, save, or discard. A dashed block marks the later repo picker.</desc>
+  <rect x="0.5" y="0.5" width="759" height="499" rx="6" fill="#ffffff" stroke="#9aa3b2"/>
+  <rect x="0.5" y="0.5" width="759" height="40" rx="6" fill="#eef1f6" stroke="#9aa3b2"/>
+  <text x="16" y="26" font-size="13" font-weight="700" fill="#1f2937">Agent Kontrol</text>
+  <text x="150" y="26" font-size="12" fill="#4b5563">Fleet   Progress   Usage and Costs   Tasks   History   Memory   Gibson</text>
+  <text x="598" y="26" font-size="12" font-weight="700" fill="#1f2937" text-decoration="underline">Settings</text>
+  <text x="664" y="26" font-size="12" fill="#4b5563">Help</text>
+  <text x="24" y="76" font-size="18" font-weight="700" fill="#111827">Settings</text>
+  <text x="24" y="98" font-size="12" fill="#6b7280">Changes apply to the progress board now and to the collector on its next tick (within 15 minutes).</text>
+  <text x="24" y="132" font-size="14" font-weight="700" fill="#111827">Watched repos</text>
+  <rect x="24" y="142" width="712" height="30" rx="4" fill="#e8f0fe" stroke="#9db7f5"/>
+  <text x="36" y="162" font-size="12" fill="#1e3a8a">Using the list stored in the database. 3 repos. The collector reads this list each tick.</text>
+  <rect x="24" y="184" width="712" height="30" fill="#f3f4f6" stroke="#cbd2dc"/>
+  <text x="34" y="204" font-size="11" font-weight="700" fill="#374151">ORDER</text>
+  <text x="96" y="204" font-size="11" font-weight="700" fill="#374151">REPO (OWNER/NAME)</text>
+  <text x="290" y="204" font-size="11" font-weight="700" fill="#374151">LABEL</text>
+  <text x="410" y="204" font-size="11" font-weight="700" fill="#374151">SHORT</text>
+  <text x="480" y="204" font-size="11" font-weight="700" fill="#374151">COLOR</text>
+  <text x="552" y="204" font-size="11" font-weight="700" fill="#374151">BLOCKED LABEL</text>
+  <text x="700" y="204" font-size="11" font-weight="700" fill="#374151">REMOVE</text>
+  <g font-size="12" fill="#111827">
+    <rect x="24" y="214" width="712" height="38" fill="#fff" stroke="#cbd2dc"/>
+    <text x="38" y="238">^  v</text>
+    <rect x="92" y="222" width="188" height="24" rx="3" fill="#fff" stroke="#9aa3b2"/><text x="100" y="238">acme/app-server</text>
+    <rect x="286" y="222" width="116" height="24" rx="3" fill="#fff" stroke="#9aa3b2"/><text x="294" y="238">App Server</text>
+    <rect x="408" y="222" width="62" height="24" rx="3" fill="#fff" stroke="#9aa3b2"/><text x="416" y="238">app</text>
+    <rect x="480" y="222" width="24" height="24" rx="3" fill="#f44800" stroke="#9aa3b2"/><text x="510" y="238" font-size="11" fill="#6b7280">#f44800</text>
+    <rect x="552" y="222" width="136" height="24" rx="3" fill="#fff" stroke="#9aa3b2"/><text x="560" y="238" fill="#9ca3af">none tracked</text>
+    <text x="710" y="238">x</text>
+    <rect x="24" y="252" width="712" height="38" fill="#fff" stroke="#cbd2dc"/>
+    <text x="38" y="276">^  v</text>
+    <rect x="92" y="260" width="188" height="24" rx="3" fill="#fff" stroke="#9aa3b2"/><text x="100" y="276">acme/web-studio</text>
+    <rect x="286" y="260" width="116" height="24" rx="3" fill="#fff" stroke="#9aa3b2"/><text x="294" y="276">Web Studio</text>
+    <rect x="408" y="260" width="62" height="24" rx="3" fill="#fff" stroke="#9aa3b2"/><text x="416" y="276">web</text>
+    <rect x="480" y="260" width="24" height="24" rx="3" fill="#2563eb" stroke="#9aa3b2"/><text x="510" y="276" font-size="11" fill="#6b7280">#2563eb</text>
+    <rect x="552" y="260" width="136" height="24" rx="3" fill="#fff" stroke="#9aa3b2"/><text x="560" y="276">blocked</text>
+    <text x="710" y="276">x</text>
+    <rect x="24" y="290" width="712" height="38" fill="#fff8f5" stroke="#e11d48"/>
+    <text x="38" y="314">^  v</text>
+    <rect x="92" y="298" width="188" height="24" rx="3" fill="#fff" stroke="#e11d48"/><text x="100" y="314">acme app</text>
+    <rect x="286" y="298" width="116" height="24" rx="3" fill="#fff" stroke="#9aa3b2"/><text x="294" y="314">Docs</text>
+    <rect x="408" y="298" width="62" height="24" rx="3" fill="#fff" stroke="#9aa3b2"/><text x="416" y="314">docs</text>
+    <rect x="480" y="298" width="24" height="24" rx="3" fill="#19d2ff" stroke="#9aa3b2"/><text x="510" y="314" font-size="11" fill="#6b7280">#19d2ff</text>
+    <rect x="552" y="298" width="136" height="24" rx="3" fill="#fff" stroke="#9aa3b2"/>
+    <text x="710" y="314">x</text>
+  </g>
+  <text x="96" y="344" font-size="11" fill="#e11d48">Row 3: repo must look like owner/name, for example acme/docs.</text>
+  <rect x="24" y="356" width="104" height="30" rx="4" fill="#fff" stroke="#6b7280"/>
+  <text x="40" y="376" font-size="12" fill="#111827">+ Add repo</text>
+  <rect x="540" y="356" width="90" height="30" rx="4" fill="#fff" stroke="#6b7280"/>
+  <text x="560" y="376" font-size="12" fill="#111827">Discard</text>
+  <rect x="640" y="356" width="96" height="30" rx="4" fill="#1f2937"/>
+  <text x="658" y="376" font-size="12" font-weight="700" fill="#ffffff">Save</text>
+  <rect x="24" y="404" width="712" height="76" rx="6" fill="none" stroke="#9aa3b2" stroke-dasharray="6 4"/>
+  <text x="38" y="426" font-size="12" font-weight="700" fill="#374151">Later: pick from repos the collector can see</text>
+  <rect x="38" y="436" width="300" height="28" rx="3" fill="#fff" stroke="#9aa3b2" stroke-dasharray="3 3"/>
+  <text x="48" y="455" font-size="12" fill="#9ca3af">Choose a repo... (v)</text>
+  <text x="352" y="455" font-size="11" fill="#6b7280">Listed by the collector, so the dashboard never needs a GitHub token.</text>
+</svg>

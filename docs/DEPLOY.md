@@ -98,7 +98,8 @@ With no `DATABASE_URL`, the app runs with sample data and stores nothing.
 | `MC_OAUTH_SECRET` | No | HS256 key for OAuth JWTs. Falls back to `MC_COOKIE_SECRET`, then `MC_TOKEN`. Rotating it revokes all OAuth connections. |
 | `MC_PUBLIC_URL` | No | Canonical origin for OAuth metadata. Otherwise derived from request headers. |
 | `NEXT_PUBLIC_MC_NAME` | No | Header name. Default `Agent Kontrol`. |
-| `NEXT_PUBLIC_MC_PROGRESS_CONFIG` | No | JSON object whose top-level keys replace `progress.config.json`, for example `{"repos":[...]}`. Build-time: set it before the build and redeploy to change it. |
+| `NEXT_PUBLIC_MC_PROGRESS_CONFIG` | No | JSON object whose top-level keys replace `progress.config.json`, for example `{"repos":[...]}`. This is only the starting list: once you save one in Settings, the database list wins. Build-time. |
+| `MC_REPOS_FROM_DASHBOARD` | No | Collector only. Set to `0` to ignore the dashboard's repo list and use the local `progress.config.json`. Default `1`. |
 | `NEXT_PUBLIC_MC_OPERATOR` | No | Your name, shown as the sender of dashboard messages. Default `Operator`. |
 | `NEXT_PUBLIC_HERMES_VITALS_URL` | No | Link shown on the progress board. |
 | `MC_DB_DRIVER` | No | Driver override: `neon` or `pg`. |
@@ -146,7 +147,7 @@ The progress collector and usage collector install as macOS launchd agents. On L
 Use this if you already run the earlier Mission Control code on Vercel and want to move it to this repository. Nothing about your data or domain changes, and agents keep working.
 
 1. In the Vercel project, open Settings, then Git. Disconnect the old repository and connect `mrhinkle/agent-kontrol` (or your fork) with `main` as the production branch. The project, its domains, its environment variables and its database stay as they are.
-2. Add `NEXT_PUBLIC_MC_PROGRESS_CONFIG` with your own repos, for example `{"repos":[{"repo":"your-org/your-repo","label":"Your repo","short":"repo","color":"#2563eb","blockedLabel":"blocked"}]}`. Without it the progress board shows the example repos from `progress.config.json`.
+2. Choose your repos. Either open Settings after the deploy and add them there, or set `NEXT_PUBLIC_MC_PROGRESS_CONFIG` before the build, for example `{"repos":[{"repo":"your-org/your-repo","label":"Your repo","short":"repo","color":"#2563eb","blockedLabel":"blocked"}]}`. Until you do one of these, the progress board shows the example repos from `progress.config.json`.
 3. If you want to keep your old header name, set `NEXT_PUBLIC_MC_NAME`. The "by The AIE" byline and trademark footer appear only under the default name.
 4. Leave `DATABASE_URL`, `MC_TOKEN`, `MC_DASHBOARD_PASSWORD` and any OAuth secrets exactly as they are. Do not rotate them, or agents and MCP connectors will need re-authorizing.
 5. Deploy. The build applies the schema, which only adds what is missing and never drops data. If the build cannot reach the database it fails, and the previous deployment keeps serving.
