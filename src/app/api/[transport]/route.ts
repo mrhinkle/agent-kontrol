@@ -222,7 +222,7 @@ const handler = createMcpHandler(
         inputSchema: {
           agent_id: z
             .string()
-            .describe("This agent's id, e.g. 'hermes-<host>' or 'carmack'"),
+            .describe("This agent's id, e.g. 'hermes-<host>' or 'codex-box'"),
           body: z.string().describe("Your reply text (1-20 lines)"),
           in_reply_to: z
             .number()
