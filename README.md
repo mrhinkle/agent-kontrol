@@ -1,11 +1,13 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="public/logo/agent-kontrol-wordmark-white.svg">
-    <img src="public/logo/agent-kontrol-wordmark-navy.svg" alt="Agent Kontrol" width="520">
+    <source media="(prefers-color-scheme: dark)" srcset="public/logo/agent-kontrol-wordmark-byaie-white.svg">
+    <img src="public/logo/agent-kontrol-wordmark-byaie-navy.svg" alt="Agent Kontrol by the AIE" width="520">
   </picture>
 </p>
 
 # Agent Kontrol
+
+*Agent Kontrol™ by [The AIE Network™](https://theaie.net)*
 
 One dashboard for the AI coding agents you run: Claude Code, Codex, Grok, Hermes and anything that speaks MCP. See what each is doing, queue work for them, and check whether the backlog is actually shrinking.
 
@@ -82,3 +84,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Changes are listed in [CHANGELOG.md](CHA
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE). Copyright 2026 Mark Hinkle.
+
+## Trademarks
+
+Agent Kontrol™ and The AIE Network™ are trademarks of Peripety Labs LLC. The Apache License covers the code and, under its section 6, does not grant permission to use these names or the logo. You may use the name factually, for example to say your deployment runs Agent Kontrol. If you fork or sell a modified version, please give it your own name and logo.

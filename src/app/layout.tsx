@@ -11,6 +11,8 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   const name = process.env.NEXT_PUBLIC_MC_NAME ?? "Agent Kontrol";
+  // The byline and trademark notice belong to the default product name only.
+  const branded = process.env.NEXT_PUBLIC_MC_NAME === undefined;
   return (
     <html lang="en">
       <body className="min-h-screen">
@@ -19,6 +21,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <Link href="/" className="group flex shrink-0 items-center gap-2 py-1 md:py-0">
               <AgentKontrolMark className="h-6 w-6 text-gray-200 transition-colors group-hover:text-white" />
               <span className="font-semibold tracking-wide">{name}</span>
+              {branded && <span className="hidden text-xs text-gray-500 sm:inline">by The AIE</span>}
             </Link>
             <SiteNav />
           </div>
@@ -26,6 +29,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <main className="mx-auto max-w-6xl px-4 py-6">{children}</main>
         <footer className="mx-auto max-w-6xl px-4 py-8 text-xs text-gray-600">
           Agents push, nobody polls. Connect an agent via the MCP server at <span className="mono">/api/mcp</span> or POST to <span className="mono">/api/ingest</span>.
+          {branded && (
+            <p className="mt-2">
+              Agent Kontrol&trade; by <a className="underline" href="https://theaie.net">The AIE Network</a>&trade;. Agent Kontrol and The AIE Network are trademarks of Peripety Labs LLC.
+            </p>
+          )}
         </footer>
       </body>
     </html>

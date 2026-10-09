@@ -25,6 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Branding: the product is Agent Kontrol by The AIE. The byline appears in the app header and footer only under the default app name, so deployments that set `NEXT_PUBLIC_MC_NAME` are not labelled as The AIE's. README, logo files and notices updated; trademark notice names Peripety Labs LLC as owner.
 - Renamed from Mission Control to Agent Kontrol: repository (old URLs redirect), package, app name, docs and logo. Internal names are unchanged so existing installs keep working: the `MC_` environment prefix, `~/.mission-control`, `~/.claude/mission-control.env`, and the `com.missioncontrol.*` launchd labels.
 - New logo and wordmark in `public/logo/`; the wordmark letters are outlined from Montserrat ExtraBold (SIL Open Font License).
 - Operator name is configurable (`NEXT_PUBLIC_MC_OPERATOR`).
