@@ -282,3 +282,31 @@ create table if not exists watched_repos (
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
+
+-- Traces: OpenTelemetry-style spans from agents. A trace is the tree of spans that
+-- share a trace_id (a session, its turns, the tool and model calls inside them).
+-- Spans are upserted by (trace_id, span_id) so an open span can be closed later.
+-- Old rows are pruned after MC_TRACE_RETENTION_DAYS (default 30).
+create table if not exists spans (
+  trace_id text not null,
+  span_id text not null,
+  parent_span_id text,
+  agent_id text not null,
+  session_id text,
+  name text not null,
+  kind text not null default 'other',     -- session | turn | tool | model | other
+  status text not null default 'unset',   -- ok | error | unset
+  status_message text,
+  started_at timestamptz not null,
+  ended_at timestamptz,                   -- null while the span is open
+  attributes jsonb not null default '{}'::jsonb,
+  model text,
+  input_tokens bigint,
+  output_tokens bigint,
+  cost_usd numeric,
+  created_at timestamptz default now(),
+  primary key (trace_id, span_id)
+);
+create index if not exists spans_started_idx on spans (started_at desc);
+create index if not exists spans_agent_idx on spans (agent_id, started_at desc);
+create index if not exists spans_session_idx on spans (session_id);

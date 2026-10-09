@@ -52,6 +52,6 @@ describe("main nav", () => {
     assert.deepEqual(active("/login"), []);
   });
   it("keeps the agreed link set and order", () => {
-    assert.deepEqual(NAV_LINKS.map((l) => l.label), ["Fleet", "Progress", "Usage and Costs", "Tasks", "History", "Memory", "Gibson", "Settings", "Help"]);
+    assert.deepEqual(NAV_LINKS.map((l) => l.label), ["Fleet", "Progress", "Usage and Costs", "Tasks", "History", "Traces", "Memory", "Gibson", "Settings", "Help"]);
   });
 });
