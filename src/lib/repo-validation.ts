@@ -29,6 +29,11 @@ const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
 const SHORT_RE = /^[\w-]+$/;
 const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 const SEPARATOR_MESSAGE = 'Do not use "|". The collector uses it as a field separator.';
+// Control characters (a newline would split the collector's one-line-per-repo format).
+const CONTROL_RE = /[\u0000-\u001f\u007f]/;
+const CONTROL_MESSAGE = "Do not use line breaks or control characters.";
+// The blocked label is placed inside a quoted GitHub search qualifier.
+const QUOTE_MESSAGE = 'Do not use " or \\ in the blocked label. It is used in a GitHub search.';
 
 export type RepoValidation = { ok: true; repos: RepoInput[] } | { ok: false; errors: RepoError[] };
 
@@ -68,6 +73,8 @@ export function validateRepoList(input: unknown): RepoValidation {
     const label = str(e.label);
     if (label.length < 1 || label.length > 40) {
       errors.push({ index, field: "label", message: "Label must be 1 to 40 characters." });
+    } else if (CONTROL_RE.test(label)) {
+      errors.push({ index, field: "label", message: CONTROL_MESSAGE });
     } else if (label.includes("|")) {
       errors.push({ index, field: "label", message: SEPARATOR_MESSAGE });
     }
@@ -93,8 +100,12 @@ export function validateRepoList(input: unknown): RepoValidation {
         const b = e.blockedLabel.trim();
         if (b.length > 50) {
           errors.push({ index, field: "blockedLabel", message: "Blocked label must be 50 characters or fewer." });
+        } else if (CONTROL_RE.test(b)) {
+          errors.push({ index, field: "blockedLabel", message: CONTROL_MESSAGE });
         } else if (b.includes("|")) {
           errors.push({ index, field: "blockedLabel", message: SEPARATOR_MESSAGE });
+        } else if (b.includes('"') || b.includes("\\")) {
+          errors.push({ index, field: "blockedLabel", message: QUOTE_MESSAGE });
         } else {
           blockedLabel = b === "" ? null : b;
         }

@@ -82,4 +82,13 @@ describe("validateRepoList", () => {
     assert.ok(errorsOf([42]).some((x) => x.index === 0));
     assert.ok(errorsOf([[]]).some((x) => x.index === 0));
   });
+
+  it("rejects control characters and, in the blocked label, quotes and backslashes", () => {
+    assert.ok(errorsOf([ok({ label: "a\nb" })]).some((x) => x.field === "label"));
+    assert.ok(errorsOf([ok({ blockedLabel: "a\nb" })]).some((x) => x.field === "blockedLabel"));
+    assert.ok(errorsOf([ok({ blockedLabel: 'x" repo:other/private is:issue "' })]).some((x) => x.field === "blockedLabel"));
+    assert.ok(errorsOf([ok({ blockedLabel: "a\\b" })]).some((x) => x.field === "blockedLabel"));
+    const fine = validateRepoList([ok({ blockedLabel: "needs: design" })]);
+    assert.equal(fine.ok, true);
+  });
 });
