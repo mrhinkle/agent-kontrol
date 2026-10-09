@@ -8,6 +8,7 @@ interface Loaded {
   source: "database" | "file";
   writable: boolean;
   max: number;
+  version?: string;
   repos: RepoInput[];
 }
 
@@ -27,6 +28,7 @@ export function RepoSettings() {
   const [attempted, setAttempted] = useState(false);
   const [serverErrors, setServerErrors] = useState<RepoError[]>([]);
   const [saving, setSaving] = useState(false);
+  const [stale, setStale] = useState(false);
   const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
 
   const apply = useCallback((data: Loaded) => {
@@ -35,6 +37,7 @@ export function RepoSettings() {
     setRows(fromRepos(data.repos));
     setAttempted(false);
     setServerErrors([]);
+    setStale(false);
   }, []);
 
   const load = useCallback(async () => {
@@ -64,10 +67,28 @@ export function RepoSettings() {
     return () => window.removeEventListener("beforeunload", warn);
   }, [dirty]);
 
+  // beforeunload does not fire for in-app navigation, so also confirm before following a link away.
+  useEffect(() => {
+    if (!dirty) return;
+    const guard = (e: MouseEvent) => {
+      const a = (e.target as HTMLElement | null)?.closest?.("a[href]") as HTMLAnchorElement | null;
+      if (!a || a.target === "_blank" || e.defaultPrevented || e.metaKey || e.ctrlKey || e.shiftKey) return;
+      const url = new URL(a.href, window.location.href);
+      if (url.origin !== window.location.origin || url.pathname === window.location.pathname) return;
+      if (!window.confirm("You have unsaved changes. Leave this page and lose them?")) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+    document.addEventListener("click", guard, true);
+    return () => document.removeEventListener("click", guard, true);
+  }, [dirty]);
+
   const clientCheck = useMemo(() => validateRepoList(toPayload(rows)), [rows]);
   const errors = attempted ? (clientCheck.ok ? serverErrors : clientCheck.errors) : serverErrors;
   const grouped = useMemo(() => groupErrors(errors), [errors]);
   const writable = loaded?.writable ?? false;
+  const disabled = !writable || saving;
   const max = loaded?.max ?? MAX_REPOS;
 
   function edit(id: string, patch: Partial<RepoInput>) {
@@ -84,13 +105,16 @@ export function RepoSettings() {
   async function save() {
     setAttempted(true);
     setMessage(null);
-    if (!validateRepoList(toPayload(rows)).ok) return;
+    if (!validateRepoList(toPayload(rows)).ok) {
+      requestAnimationFrame(() => document.querySelector<HTMLElement>("[data-repo-settings] [aria-invalid='true']")?.focus());
+      return;
+    }
     setSaving(true);
     try {
       const res = await fetch("/api/settings/repos", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repos: toPayload(rows) }),
+        body: JSON.stringify({ repos: toPayload(rows), version: loaded?.version }),
       });
       const body = (await res.json().catch(() => ({}))) as Partial<Loaded> & { errors?: RepoError[]; error?: string };
       if (res.ok) {
@@ -98,6 +122,9 @@ export function RepoSettings() {
         setMessage({ kind: "ok", text: "Saved. The collector picks this up within 15 minutes." });
       } else if (res.status === 400 && body.errors) {
         setServerErrors(body.errors);
+      } else if (res.status === 409 && (body as { code?: string }).code === "stale") {
+        setMessage({ kind: "error", text: body.error ?? "The list changed elsewhere. Reload and try again." });
+        setStale(true);
       } else {
         setMessage({ kind: "error", text: body.error ?? `Save failed (${res.status}).` });
       }
@@ -130,7 +157,7 @@ export function RepoSettings() {
     <div className="space-y-4">
       <div className="rounded-lg border border-[#2563eb]/40 bg-[#2563eb]/10 px-3 py-2 text-sm text-blue-100">{banner}</div>
 
-      <div className="rounded-xl border border-white/10 bg-[#101828] p-4 md:p-6">
+      <div data-repo-settings className="rounded-xl border border-white/10 bg-[#101828] p-4 md:p-6">
         <div className={`hidden ${GRID} mb-2 text-[11px] uppercase tracking-wider text-gray-500`}>
           <span>Order</span>
           <span>Repo (owner/name)</span>
@@ -148,27 +175,27 @@ export function RepoSettings() {
             return (
               <li key={r.id} className={`rounded-lg border border-white/10 p-3 md:border-0 md:p-0 ${GRID}`}>
                 <div className="mb-2 flex gap-1 md:mb-0">
-                  <button className={iconBtn} onClick={() => reorder(i, i - 1)} disabled={!writable || i === 0} aria-label={`Move ${name} up`}>
+                  <button className={iconBtn} onClick={() => reorder(i, i - 1)} disabled={disabled || i === 0} aria-label={`Move ${name} up`}>
                     ↑
                   </button>
-                  <button className={iconBtn} onClick={() => reorder(i, i + 1)} disabled={!writable || i === rows.length - 1} aria-label={`Move ${name} down`}>
+                  <button className={iconBtn} onClick={() => reorder(i, i + 1)} disabled={disabled || i === rows.length - 1} aria-label={`Move ${name} down`}>
                     ↓
                   </button>
                 </div>
                 <label className="mb-2 block md:mb-0">
                   <span className="mb-1 block text-xs text-gray-400 md:sr-only">Repo (owner/name)</span>
-                  <input className={input} value={r.repo} disabled={!writable} placeholder="acme/app" onChange={(ev) => edit(r.id, { repo: ev.target.value })} aria-label={`Repo for row ${i + 1}`} aria-invalid={!!e.repo} />
-                  {e.repo && <span className="mt-1 block text-xs text-red-400">{e.repo}</span>}
+                  <input className={input} value={r.repo} disabled={disabled} placeholder="acme/app" onChange={(ev) => edit(r.id, { repo: ev.target.value })} aria-label={`Repo for row ${i + 1}`} aria-invalid={!!e.repo} aria-describedby={e.repo ? `${r.id}-repo-err` : undefined} />
+                  {e.repo && <span id={`${r.id}-repo-err`} className="mt-1 block text-xs text-red-400">{e.repo}</span>}
                 </label>
                 <label className="mb-2 block md:mb-0">
                   <span className="mb-1 block text-xs text-gray-400 md:sr-only">Label</span>
-                  <input className={input} value={r.label} disabled={!writable} placeholder="App" onChange={(ev) => edit(r.id, { label: ev.target.value })} aria-label={`Label for ${name}`} aria-invalid={!!e.label} />
-                  {e.label && <span className="mt-1 block text-xs text-red-400">{e.label}</span>}
+                  <input className={input} value={r.label} disabled={disabled} placeholder="App" onChange={(ev) => edit(r.id, { label: ev.target.value })} aria-label={`Label for ${name}`} aria-invalid={!!e.label} aria-describedby={e.label ? `${r.id}-label-err` : undefined} />
+                  {e.label && <span id={`${r.id}-label-err`} className="mt-1 block text-xs text-red-400">{e.label}</span>}
                 </label>
                 <label className="mb-2 block md:mb-0">
                   <span className="mb-1 block text-xs text-gray-400 md:sr-only">Short</span>
-                  <input className={input} value={r.short} disabled={!writable} placeholder="app" onChange={(ev) => edit(r.id, { short: ev.target.value })} aria-label={`Short name for ${name}`} aria-invalid={!!e.short} />
-                  {e.short && <span className="mt-1 block text-xs text-red-400">{e.short}</span>}
+                  <input className={input} value={r.short} disabled={disabled} placeholder="app" onChange={(ev) => edit(r.id, { short: ev.target.value })} aria-label={`Short name for ${name}`} aria-invalid={!!e.short} aria-describedby={e.short ? `${r.id}-short-err` : undefined} />
+                  {e.short && <span id={`${r.id}-short-err`} className="mt-1 block text-xs text-red-400">{e.short}</span>}
                 </label>
                 <label className="mb-2 block md:mb-0">
                   <span className="mb-1 block text-xs text-gray-400 md:sr-only">Color</span>
@@ -176,7 +203,7 @@ export function RepoSettings() {
                     <input
                       type="color"
                       value={/^#[0-9a-fA-F]{6}$/.test(r.color) ? r.color : "#2563eb"}
-                      disabled={!writable}
+                      disabled={disabled}
                       onChange={(ev) => edit(r.id, { color: ev.target.value })}
                       className="h-9 w-10 cursor-pointer rounded-md border border-white/10 bg-transparent p-0.5 disabled:opacity-60"
                       aria-label={`Color for ${name}`}
@@ -190,18 +217,19 @@ export function RepoSettings() {
                   <input
                     className={input}
                     value={r.blockedLabel ?? ""}
-                    disabled={!writable}
+                    disabled={disabled}
                     placeholder="none tracked"
                     onChange={(ev) => edit(r.id, { blockedLabel: ev.target.value === "" ? null : ev.target.value })}
                     aria-label={`Blocked label for ${name}`}
                     aria-invalid={!!e.blockedLabel}
+                    aria-describedby={e.blockedLabel ? `${r.id}-blocked-err` : undefined}
                   />
-                  {e.blockedLabel && <span className="mt-1 block text-xs text-red-400">{e.blockedLabel}</span>}
+                  {e.blockedLabel && <span id={`${r.id}-blocked-err`} className="mt-1 block text-xs text-red-400">{e.blockedLabel}</span>}
                 </label>
                 <div>
                   <button
                     className={iconBtn}
-                    disabled={!writable}
+                    disabled={disabled}
                     aria-label={`Remove ${name}`}
                     onClick={() => {
                       setRows((rs) => rs.filter((x) => x.id !== r.id));
@@ -218,6 +246,12 @@ export function RepoSettings() {
 
         {rows.length === 0 && <p className="text-sm text-gray-400">No repos yet. Add one to start.</p>}
 
+        {attempted && errors.length > 0 && (
+          <p role="alert" className="mt-3 text-sm text-red-400">
+            {errors.length} {errors.length === 1 ? "problem" : "problems"} to fix before saving.
+          </p>
+        )}
+
         {grouped.list.length > 0 && (
           <ul className="mt-3 space-y-1" role="alert">
             {grouped.list.map((m) => (
@@ -229,7 +263,7 @@ export function RepoSettings() {
         )}
 
         <div className="mt-4 flex flex-wrap items-center gap-2">
-          <button className={secondary} disabled={!writable || rows.length >= max} onClick={() => setRows((rs) => [...rs, newRow(rs.length)])}>
+          <button className={secondary} disabled={disabled || rows.length >= max} onClick={() => setRows((rs) => [...rs, newRow(rs.length)])}>
             + Add repo
           </button>
           <span className="text-xs text-gray-500">
@@ -243,6 +277,12 @@ export function RepoSettings() {
             {saving ? "Saving…" : "Save"}
           </button>
         </div>
+
+        {stale && (
+          <button className={`${secondary} mt-3`} onClick={() => void load()}>
+            Reload the latest list
+          </button>
+        )}
 
         {message && (
           <p role="status" className={`mt-3 text-sm ${message.kind === "ok" ? "text-emerald-400" : "text-red-400"}`}>

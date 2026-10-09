@@ -62,6 +62,12 @@ async function main() {
   await replaceWatchedRepos([{ ...c, short: a.short }, { ...a, short: c.short }]);
   got = await getWatchedRepos(fallback);
   assert.deepEqual(got.repos.map((r) => r.short), [a.short, c.short], "short names can be swapped");
+  // A save that fails part-way must leave the previous list exactly as it was.
+  await replaceWatchedRepos([a, b]);
+  await assert.rejects(replaceWatchedRepos([c, { ...c, label: "dup" }]), "a duplicate repo in one save is rejected by the database");
+  got = await getWatchedRepos(fallback);
+  assert.deepEqual(got.repos.map((r) => r.repo), [a.repo, b.repo], "a failed save changes nothing");
+  assert.equal(got.repos[1].blockedLabel, "blocked");
   await sql()`delete from watched_repos`;
   assert.equal((await getWatchedRepos(fallback)).source, "file");
 

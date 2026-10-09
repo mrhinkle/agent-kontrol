@@ -153,8 +153,8 @@ Each entry in `repos`:
 
 ### Settings
 
-- `GET /api/settings/repos` returns `{ "source": "database" | "file", "writable": true, "max": 25, "repos": [{ "repo", "label", "short", "color", "blockedLabel" }] }`. `source` is `file` when no list has been saved yet, or when there is no database; `repos` is then the default from `progress.config.json`. The collector calls this on every tick.
-- `PUT /api/settings/repos` with `{ "repos": [...] }` replaces the whole list, in order, and returns the stored list in the same shape. It answers `400 { "errors": [{ "index", "field", "message" }] }` when invalid (`index` is `-1` for an error about the whole list), and `409` when no database is connected. A list needs 1 to 25 repos, each `owner/name`, with a unique short name and a `#rrggbb` color.
+- `GET /api/settings/repos` returns `{ "source": "database" | "file", "writable": true, "max": 25, "version": "...", "repos": [{ "repo", "label", "short", "color", "blockedLabel" }] }`. `source` is `file` when no list has been saved yet, or when there is no database; `repos` is then the default from `progress.config.json`. The collector calls this on every tick.
+- `PUT /api/settings/repos` with `{ "repos": [...], "version": "..." }` replaces the whole list, in order, and returns the stored list in the same shape. `version` is optional; send the one from your last GET and the save is refused with `409 { "code": "stale" }` if someone changed the list since, so two open tabs cannot overwrite each other. The replace is a single SQL statement, so a failed save leaves the old list intact. It answers `400 { "errors": [{ "index", "field", "message" }] }` when invalid (`index` is `-1` for an error about the whole list), and `409` when no database is connected. A list needs 1 to 25 repos, each `owner/name`, with a unique short name and a `#rrggbb` color.
 
 Anyone with a dashboard session or `MC_TOKEN` can change this list, which matches the rest of the trust model (see [SECURITY.md](../SECURITY.md)).
 

@@ -57,14 +57,14 @@ Both routes sit behind the existing gate: dashboard session cookie or `Authoriza
 `GET /api/settings/repos`
 
 ```json
-{ "source": "database", "writable": true, "max": 25,
+{ "source": "database", "writable": true, "max": 25, "version": "1ded4c88e21150a4",
   "repos": [{ "repo": "acme/app-server", "label": "App Server", "short": "app",
               "color": "#f44800", "blockedLabel": null }] }
 ```
 
 `source` is `"file"` when the table is empty or there is no database. `writable` is false in demo mode.
 
-`PUT /api/settings/repos` with `{ "repos": [...] }` replaces the whole list in order. Returns the stored list, or `400 { "errors": [{ "index": 2, "field": "repo", "message": "..." }] }`. Returns `409` when there is no database. Rows are upserted first and missing ones deleted after, so a failure part-way never leaves the list empty.
+`PUT /api/settings/repos` with `{ "repos": [...], "version": "..." }` replaces the whole list in order. `version` is a fingerprint returned by GET; when sent and the list has changed since, the save is refused with `409 { "code": "stale" }`. Returns the stored list, or `400 { "errors": [{ "index": 2, "field": "repo", "message": "..." }] }`. Returns `409` when there is no database. The replace is a single SQL statement (upserts and the delete of removed rows together), so a failure part-way leaves the old list intact.
 
 ## Screens
 
@@ -82,7 +82,7 @@ The collector already has GitHub access. Once a day it posts the repos it can se
 
 - Dashboard down: the collector uses its local file.
 - Bad PUT: nothing changes, and the page shows what to fix.
-- Two people save at once: last write wins, which is acceptable for a one-operator tool.
+- Two tabs: the second save is refused as stale and the page offers a reload. Truly simultaneous API writers can still interleave; that is accepted for a one-operator tool.
 - Removing every repo: not allowed. Validation asks for at least one, because an empty table would fall back to the file list.
 
 ## Tests

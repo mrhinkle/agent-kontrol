@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { isConfigured, sql } from "./db";
 import type { RepoConfig } from "./progress-config";
 import type { RepoInput } from "./repo-validation";
@@ -37,17 +38,33 @@ export async function getWatchedRepos(fallback: RepoConfig[]): Promise<{ source:
   }
 }
 
+/** A short fingerprint of a list, so a client can tell whether it changed since it loaded it. */
+export function listVersion(repos: RepoConfig[]): string {
+  const canonical = JSON.stringify(repos.map((r) => [r.repo, r.label, r.short, r.color, r.blockedLabel]));
+  return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
+}
+
 /**
- * Replaces the list. Rows are upserted first and the ones no longer listed are
- * deleted after, so a failure part-way never leaves the table empty. Snapshots
- * of a removed repo stay in `repo_snapshots`; adding it back restores its history.
+ * Replaces the list in ONE statement, so a failure part-way or a concurrent
+ * read never sees a half-old, half-new list: the upserts and the delete of rows
+ * no longer listed all run against the same snapshot. Snapshots of a removed
+ * repo stay in `repo_snapshots`; adding it back restores its history.
  */
 export async function replaceWatchedRepos(repos: RepoInput[]): Promise<void> {
-  const db = sql();
-  for (const [position, r] of repos.entries()) {
-    await db`
+  await sql()`
+    with incoming as (
+      select * from unnest(
+        ${repos.map((r) => r.repo)}::text[],
+        ${repos.map((r) => r.label)}::text[],
+        ${repos.map((r) => r.short)}::text[],
+        ${repos.map((r) => r.color)}::text[],
+        ${repos.map((r) => r.blockedLabel)}::text[],
+        ${repos.map((_, i) => i)}::int[]
+      ) as t(repo, label, short, color, blocked_label, position)
+    ),
+    upserted as (
       insert into watched_repos (repo, label, short, color, blocked_label, position, updated_at)
-      values (${r.repo}, ${r.label}, ${r.short}, ${r.color}, ${r.blockedLabel}, ${position}, now())
+      select repo, label, short, color, blocked_label, position, now() from incoming
       on conflict (repo) do update set
         label = excluded.label,
         short = excluded.short,
@@ -55,8 +72,9 @@ export async function replaceWatchedRepos(repos: RepoInput[]): Promise<void> {
         blocked_label = excluded.blocked_label,
         position = excluded.position,
         updated_at = now()
-    `;
-  }
-  const names = repos.map((r) => r.repo);
-  await db`delete from watched_repos where repo <> all(${names}::text[])`;
+      returning repo
+    )
+    delete from watched_repos w
+    where not exists (select 1 from incoming i where i.repo = w.repo)
+  `;
 }
