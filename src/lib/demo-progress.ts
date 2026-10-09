@@ -3,13 +3,12 @@ import { buildAlerts } from "./progress-store";
 import type { HistoryPoint, ProgressResponse, RepoProgress } from "./progress-types";
 
 /**
- * Demo mode for the progress board — what /progress renders with no
- * DATABASE_URL, so the page can be built and reviewed without touching the
- * live Neon.
+ * Demo mode for the progress board - what /progress renders with no
+ * DATABASE_URL, so the page can be built and reviewed without a database.
  *
- * The current-tick numbers are from the real 2026-09-06 sweep that motivated the
- * board, with the repos renamed (a 28-merge day where all three backlogs still grew). History is
- * synthesised from them, deterministically, so it doesn't jitter on every poll.
+ * All numbers are synthetic. They are shaped to show the board's point: a busy
+ * day of merges on which some backlogs still grew. History is synthesised from
+ * them, deterministically, so it doesn't jitter on every poll.
  */
 
 interface Seed {
@@ -31,66 +30,66 @@ interface Seed {
 const SEEDS: Record<string, Seed> = {
   "example-org/app-server": {
     repo: "example-org/app-server",
-    open_issues: 47,
-    open_prs: 1,
+    open_issues: 40,
+    open_prs: 2,
     blocked_issues: null,
-    merged_24h: 21,
-    closed_24h: 25,
-    opened_24h: 29,
-    total_created: 1841,
-    total_closed: 1794,
-    total_merged: 1502,
-    lane_mix: { unattributed: 21 },
-    review_rounds: 2.1,
-    no_verdict_rate: 0.09,
+    merged_24h: 12,
+    closed_24h: 14,
+    opened_24h: 18,
+    total_created: 1200,
+    total_closed: 1160,
+    total_merged: 900,
+    lane_mix: { unattributed: 12 },
+    review_rounds: 2.0,
+    no_verdict_rate: 0.1,
   },
   "example-org/web-studio": {
     repo: "example-org/web-studio",
-    open_issues: 126,
-    open_prs: 7,
-    blocked_issues: 39,
-    merged_24h: 0,
-    closed_24h: 0,
-    opened_24h: 2,
-    total_created: 662,
-    total_closed: 536,
-    total_merged: 441,
+    open_issues: 100,
+    open_prs: 6,
+    blocked_issues: 30,
+    merged_24h: 1,
+    closed_24h: 2,
+    opened_24h: 4,
+    total_created: 500,
+    total_closed: 400,
+    total_merged: 300,
     lane_mix: {},
-    review_rounds: 2.4,
-    no_verdict_rate: 0.12,
+    review_rounds: 2.5,
+    no_verdict_rate: 0.1,
   },
   "example-org/agent-harness": {
     repo: "example-org/agent-harness",
-    open_issues: 77,
+    open_issues: 60,
     open_prs: 4,
-    blocked_issues: 40,
-    merged_24h: 7,
-    closed_24h: 8,
-    opened_24h: 12,
-    total_created: 613,
-    total_closed: 536,
-    total_merged: 498,
-    lane_mix: { "agent-lanes-grok[bot]": 5, "agent-lanes-mini[bot]": 2 },
-    review_rounds: 2.6,
-    no_verdict_rate: 0.11,
+    blocked_issues: 24,
+    merged_24h: 6,
+    closed_24h: 7,
+    opened_24h: 10,
+    total_created: 400,
+    total_closed: 340,
+    total_merged: 320,
+    lane_mix: { "agent-lanes-grok[bot]": 4, "agent-lanes-codex[bot]": 2 },
+    review_rounds: 2.5,
+    no_verdict_rate: 0.1,
   },
 };
 
 const STALLED = {
   "example-org/web-studio": [
     {
-      number: 546,
-      title: "harden template deploy path for first-run customers",
-      url: "https://github.com/example-org/web-studio/pull/546",
-      idle_hours: 312,
+      number: 101,
+      title: "harden the deploy path for first-run users",
+      url: "https://github.com/example-org/web-studio/pull/101",
+      idle_hours: 120,
       green: true,
       draft: false,
     },
     {
-      number: 544,
-      title: "conversation memory: prune stale threads",
-      url: "https://github.com/example-org/web-studio/pull/544",
-      idle_hours: 316,
+      number: 102,
+      title: "prune stale conversation threads",
+      url: "https://github.com/example-org/web-studio/pull/102",
+      idle_hours: 130,
       green: false,
       draft: true,
     },
@@ -131,7 +130,7 @@ function demoHistory(days: number, anchor: Date): HistoryPoint[] {
 
 export function demoProgress(window: TimeWindow): ProgressResponse {
   const days = windowDays(window);
-  const anchor = new Date("2026-09-06T20:22:00Z");
+  const anchor = new Date("2026-01-15T12:00:00Z");
 
   const repos: RepoProgress[] = REPOS.map((cfg) => {
     const s = SEEDS[cfg.repo];

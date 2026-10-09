@@ -1,11 +1,13 @@
 /**
- * The progress board's configuration: which repos it watches and where the
- * alert thresholds sit.
+ * Progress board configuration.
  *
- * Repo-agnostic by design — adding a fourth repo is one entry here plus one
- * line in scripts/collect-progress.sh's REPOS array. Nothing else changes.
+ * Adding a repo is ONE entry in progress.config.json - no code changes here.
+ * The JSON is validated at module load so a bad entry fails loudly at import
+ * time, not silently at render time.
  */
+import config from "../../progress.config.json";
 
+/** One repo's entry on the progress board. */
 export interface RepoConfig {
   /** owner/name as GitHub knows it */
   repo: string;
@@ -15,28 +17,86 @@ export interface RepoConfig {
   short: string;
   /** accent used for this repo's line on the history graph */
   color: string;
-  /**
-   * The label this repo uses for "scoped but waiting on something". Each repo
-   * spells it differently, and some repos have none — null means
-   * blocked work is not tracked there, which the board says out loud rather
-   * than reporting a comforting 0%.
-   */
+  /** the label this repo uses for 'scoped but waiting on something'; null
+   *  means blocked work is not tracked there, which the board says out loud
+   *  rather than reporting a comforting 0% */
   blockedLabel: string | null;
 }
 
-export const REPOS: RepoConfig[] = [
-  { repo: "example-org/app-server", label: "App Server", short: "app", color: "#f44800", blockedLabel: null },
-  { repo: "example-org/web-studio", label: "Web Studio", short: "web", color: "#2563eb", blockedLabel: "blocked" },
-  { repo: "example-org/agent-harness", label: "Agent Harness", short: "harness", color: "#19d2ff", blockedLabel: "dependency-blocked" },
-];
+const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
+const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 
+function fail(entry: unknown, problem: string): never {
+  throw new Error(
+    `progress.config.json: ${problem}${
+      entry === undefined ? "" : ` (entry: ${JSON.stringify(entry)})`
+    }`,
+  );
+}
+
+function validate(raw: typeof config): void {
+  if (!Array.isArray(raw.repos) || raw.repos.length === 0) {
+    fail(undefined, "repos must be a non-empty array");
+  }
+  const seenRepos = new Set<string>();
+  const seenShorts = new Set<string>();
+  for (const entry of raw.repos) {
+    const name =
+      typeof entry?.repo === "string" ? entry.repo : JSON.stringify(entry);
+    if (typeof entry.repo !== "string" || !REPO_RE.test(entry.repo)) {
+      fail(name, "repo must be owner/name (letters, digits, ., -, _)");
+    }
+    if (typeof entry.label !== "string" || entry.label.length === 0) {
+      fail(name, "label must be a non-empty string");
+    }
+    if (typeof entry.short !== "string" || entry.short.length === 0) {
+      fail(name, "short must be a non-empty string");
+    }
+    if (typeof entry.color !== "string" || !COLOR_RE.test(entry.color)) {
+      fail(name, "color must be a #rrggbb hex string");
+    }
+    if (
+      entry.blockedLabel !== null &&
+      typeof entry.blockedLabel !== "string"
+    ) {
+      fail(name, "blockedLabel must be a string or null");
+    }
+    if (seenRepos.has(entry.repo)) {
+      fail(name, `duplicate repo "${entry.repo}"`);
+    }
+    if (seenShorts.has(entry.short)) {
+      fail(name, `duplicate short "${entry.short}"`);
+    }
+    seenRepos.add(entry.repo);
+    seenShorts.add(entry.short);
+  }
+  if (typeof raw.laneBotPrefix !== "string") {
+    fail(undefined, "laneBotPrefix must be a string");
+  }
+}
+
+validate(config);
+
+/** The repos the board tracks, in board order. */
+export const REPOS: RepoConfig[] = config.repos.map((entry) => ({
+  repo: entry.repo,
+  label: entry.label,
+  short: entry.short,
+  color: entry.color,
+  blockedLabel: entry.blockedLabel,
+}));
+
+/** Look up one repo's config by its owner/name. */
 export function repoConfig(repo: string): RepoConfig | undefined {
   return REPOS.find((r) => r.repo === repo);
 }
 
+/** Prefix for bot-authored lane branches, from progress.config.json. */
+export const LANE_BOT_PREFIX: string = config.laneBotPrefix;
+
 /**
  * Thresholds. Each one is the line past which the board says something out
- * loud in "Needs you" — every number here is a claim you can argue with, which
+ * loud in "Needs you" - every number here is a claim you can argue with, which
  * is the point of keeping them in one place.
  */
 export const THRESHOLDS = {

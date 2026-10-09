@@ -6,7 +6,7 @@ import { BacklogChart } from "@/components/BacklogChart";
 import { useFleet } from "@/components/use-fleet";
 import { useProgress } from "@/components/use-progress";
 import { STATUS_STYLES, TimeAgo } from "@/components/ui";
-import { REPOS, THRESHOLDS, WINDOWS, type TimeWindow } from "@/lib/progress-config";
+import { LANE_BOT_PREFIX, REPOS, THRESHOLDS, WINDOWS, type TimeWindow } from "@/lib/progress-config";
 import type { Alert, ProgressResponse, RepoProgress } from "@/lib/progress-types";
 
 /* ------------------------------------------------------------- primitives */
@@ -182,7 +182,7 @@ function Breakdown({ data }: { data: ProgressResponse }) {
           {lanes.length === 0
             ? "—"
             : lanes
-                .map(([k, v]) => `${k.replace(/^agent-lanes-|\[bot\]$/g, "")} ${v}`)
+                .map(([k, v]) => { const key = k.endsWith("[bot]") ? k.slice(0, -5) : k; return `${key.startsWith(LANE_BOT_PREFIX) ? key.slice(LANE_BOT_PREFIX.length) : key} ${v}`; })
                 .join(" · ")}
         </span>
       </div>

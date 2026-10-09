@@ -124,8 +124,8 @@ psql "$DATABASE_URL" -f supabase/schema.sql
   "machine": "macbook-pro",
   "session_id": "abc123",
   "kind": "session_start",
-  "title": "Session started in ~/code/theaie-net",
-  "project": "theaie-net"
+  "title": "Session started in ~/code/marketing-site",
+  "project": "marketing-site"
 }
 ```
 
@@ -135,7 +135,7 @@ Agents that go quiet for 15 minutes show as offline.
 
 MCP tools at `/api/mcp`:
 
-- `report_status` — semantic status ("researching sponsors for ATA 2026")
+- `report_status` — semantic status ("researching sponsors for the spring event")
 - `get_fleet_status` — what is everyone doing right now
 - `remember` / `recall` — shared memory with keys + tags for coordination
 - `check_inbox` — pull messages you queued from the dashboard
@@ -188,8 +188,10 @@ Notes that matter when reading the numbers:
   work is labelled `unattributed`. Commits carrying an `Agent-Vendor:` trailer
   (a `prepare-commit-msg` hook that appends an `Agent-Vendor:` trailer) attribute exactly.
 
-Repos and thresholds live in [`src/lib/progress-config.ts`](src/lib/progress-config.ts);
-adding a fourth repo is one entry there plus one line in the collector.
+The watched repos live in [`progress.config.json`](progress.config.json), read by both the
+dashboard and the collector; adding a repo is one entry there (then re-run the collector
+installer so the scheduled job picks it up). Alert thresholds live in
+[`src/lib/progress-config.ts`](src/lib/progress-config.ts).
 
 ## Design notes
 

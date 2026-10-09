@@ -5,6 +5,7 @@ import { isConfigured } from "@/lib/db";
 import { claimNextTask, createTask, fetchMessages, fleet, listTasks, recall, remember, replyFromAgent, report, updateTask } from "@/lib/store";
 import { progress } from "@/lib/progress-store";
 import { formatDigest } from "@/lib/progress-digest";
+import { OPERATOR } from "@/lib/operator";
 import { demoProgress } from "@/lib/demo-progress";
 
 export const maxDuration = 60;
@@ -199,14 +200,14 @@ const handler = createMcpHandler(
         const text = msgs
           .map(
             (m) =>
-              `- #${m.id} [${m.created_at}] from ${m.created_by ?? "Operator"}` +
+              `- #${m.id} [${m.created_at}] from ${m.created_by ?? OPERATOR}` +
               (m.thread_id ? ` (thread ${m.thread_id})` : "") +
               `: ${m.body}`
           )
           .join("\n");
         return {
           content: [
-            { type: "text", text: `You have ${msgs.length} message(s) from the operator:\n${text}` },
+            { type: "text", text: `You have ${msgs.length} message(s) from ${OPERATOR}:\n${text}` },
           ],
         };
       }

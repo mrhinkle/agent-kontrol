@@ -23,6 +23,7 @@ LABEL="com.missioncontrol.progress-collector"
 PLIST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 INSTALL_DIR="${HOME}/.mission-control"
 INSTALLED_SH="${INSTALL_DIR}/collect-progress.sh"
+INSTALLED_CONFIG="${INSTALL_DIR}/progress.config.json"
 ENV_FILE="${HOME}/.claude/mission-control.env"
 LOG_FILE="${HOME}/Library/Logs/mc-progress-collector.log"
 DOMAIN="gui/$(id -u)"
@@ -80,6 +81,10 @@ gh auth status >/dev/null 2>&1 || {
   exit 1
 }
 
+[[ -f "${REPO_ROOT}/progress.config.json" ]] || {
+  echo "progress.config.json not found under ${REPO_ROOT}" >&2; exit 1
+}
+
 [[ -f "${REPO_ROOT}/scripts/collect-progress.sh" ]] || {
   echo "scripts/collect-progress.sh not found under ${REPO_ROOT}" >&2; exit 1
 }
@@ -87,6 +92,9 @@ gh auth status >/dev/null 2>&1 || {
 mkdir -p "$INSTALL_DIR" "${HOME}/Library/LaunchAgents" "${HOME}/Library/Logs" "$(dirname "$ENV_FILE")"
 cp "${REPO_ROOT}/scripts/collect-progress.sh" "$INSTALLED_SH"
 chmod 755 "$INSTALLED_SH"
+# The installed script runs outside the repo, so it gets its own copy of the
+# watched-repo list. Edit progress.config.json in the repo, then re-run this installer.
+cp "${REPO_ROOT}/progress.config.json" "$INSTALLED_CONFIG"
 
 # The script reads this file itself, so credentials never enter the plist.
 {
@@ -124,6 +132,8 @@ cat > "$PLIST" <<EOF
     <string>${HOME_XML}</string>
     <key>PATH</key>
     <string>${PATH_XML}</string>
+    <key>MC_PROGRESS_CONFIG</key>
+    <string>$(xml_escape "$INSTALLED_CONFIG")</string>
   </dict>
   <key>StartInterval</key>
   <integer>${INTERVAL_SECONDS}</integer>

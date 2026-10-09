@@ -1,0 +1,9 @@
+{
+  "repos": [
+    { "repo": "example-org/app-server", "label": "App Server", "short": "app", "color": "#f44800", "blockedLabel": null },
+    { "repo": "example-org/web-studio", "label": "Web Studio", "short": "web", "color": "#2563eb", "blockedLabel": "blocked" },
+    { "repo": "example-org/agent-harness", "label": "Agent Harness", "short": "harness", "color": "#19d2ff", "blockedLabel": "dependency-blocked" }
+  ],
+  "laneBotPrefix": "agent-lanes-",
+  "sharedBotPrefixes": ["shared-agent-lanes"]
+}
