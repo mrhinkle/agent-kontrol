@@ -26,7 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - Renamed from Mission Control to Agent Kontrol: repository (old URLs redirect), package, app name, docs and logo. Internal names are unchanged so existing installs keep working: the `MC_` environment prefix, `~/.mission-control`, `~/.claude/mission-control.env`, and the `com.missioncontrol.*` launchd labels.
-- New logo and wordmark in `public/logo/`; the wordmark letters are outlined from Montserrat ExtraBold (SIL Open Font License) and are a placeholder for custom lettering.
+- New logo and wordmark in `public/logo/`; the wordmark letters are outlined from Montserrat ExtraBold (SIL Open Font License).
 - Operator name is configurable (`NEXT_PUBLIC_MC_OPERATOR`).
 - MCP tool renamed to `reply_to_operator`.
 
