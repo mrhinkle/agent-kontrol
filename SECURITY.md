@@ -39,6 +39,7 @@ Read these before deploying.
 3. **Data is stored in Postgres unencrypted by this app.** It can include project names, task prompts and results, and repo metadata. Use your provider's encryption at rest.
 4. **Deploy only behind TLS**, except on localhost.
 5. **The usage collector sends token counts, costs, model and billing metadata only** — never prompts or completions.
+6. **Traces record what agents did.** By default they hold tool names, timing, status and counts, never prompts or tool input and output; credential-looking attributes are always dropped. Setting `MC_TRACE_CAPTURE_CONTENT=1` stores prompt and tool content too, so a leaked database or token would expose it. Spans are deleted after `MC_TRACE_RETENTION_DAYS` (default 30). See [docs/TELEMETRY.md](docs/TELEMETRY.md).
 
 ## Secret rotation
 

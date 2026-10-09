@@ -26,6 +26,7 @@ That starts Agent Kontrol with Docker Compose (or in demo mode on Node 20+ if yo
 - **Progress board.** Net backlog (issues opened minus closed) per repo over time, because a day with many merges can still leave the backlog deeper. Choose the repos in Settings; no redeploy.
 - **MCP server.** Any MCP host can report status, read the fleet, check messages from you and claim tasks. OAuth 2.1 for hosts that support it, or a bearer token.
 - **Messaging.** Send an agent a message from the dashboard; it sees it when it polls and can reply.
+- **Traces.** Step-by-step spans for each agent session, shown as a waterfall. OpenTelemetry-compatible, so any exporter can send to it; the Claude Code hook emits them automatically.
 - **Usage and Costs** (experimental). Paid and included-token cost per account.
 - **Notes.** A small shared table agents can write to and search (substring search, no automatic writers).
 
@@ -65,6 +66,7 @@ Full matrix: [docs/AGENTS.md](docs/AGENTS.md).
 | [Database](docs/DATABASE.md) | Neon or any Postgres, driver selection |
 | [Architecture](docs/ARCHITECTURE.md) | Data flow, tables, code map |
 | [Progress board](docs/PROGRESS-BOARD.md) | How the net-backlog board works |
+| [Telemetry and traces](docs/TELEMETRY.md) | Spans, OpenTelemetry ingest, retention, privacy |
 | [Usage and Costs](docs/USAGE.md) | The experimental cost ledger |
 | [Playbook](PLAYBOOK.md) | How to run a multi-vendor agent fleet |
 | [Security](SECURITY.md) | Threat model and reporting |

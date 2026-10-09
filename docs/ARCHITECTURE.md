@@ -46,6 +46,7 @@ Every ingest path writes Postgres. The dashboard pages read through the REST API
 - `tasks` — queue: platform routing, priority, status `queued`|`claimed`|`running`|`review`|`done`|`failed`|`cancelled`, result, cost
 - `oauth_clients`, `oauth_codes` — OAuth 2.1 server for MCP clients; access tokens are stateless signed JWTs
 - `repo_snapshots` — one append-only row per repo per collector tick; re-running the same instant updates in place
+- `spans` — agent traces: one row per (trace_id, span_id), upserted so an open span can be closed later; pruned after `MC_TRACE_RETENTION_DAYS`
 - `model_prices`, `usage_accounts`, `usage_facts`, `account_snapshots` — usage ledger
 
 ## Status derivation

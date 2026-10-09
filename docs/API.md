@@ -14,7 +14,7 @@ Secrets in query strings (`?key=`) are not supported. Send tokens in the `Author
 | Route group | Accepted credentials |
 | --- | --- |
 | Dashboard UI and data routes (default) | Session cookie `mc_auth`, or `Authorization: Bearer <MC_TOKEN>` |
-| Ingest routes: `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, `POST /api/usage/ingest` | `Authorization: Bearer <MC_TOKEN>` only |
+| Ingest routes: `POST /api/v1/traces`, `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, `POST /api/usage/ingest` | `Authorization: Bearer <MC_TOKEN>` only |
 | MCP transport: `/api/mcp` | `Authorization: Bearer <MC_TOKEN>`, or an OAuth access token (JWT) issued by this server |
 | Login, OAuth, and discovery: `/login`, `/api/login`, `/oauth/*`, `/.well-known/*` | No cookie gate; these routes enforce their own auth |
 
@@ -44,6 +44,9 @@ If `MC_DASHBOARD_PASSWORD` is unset, the gate is open in local development and o
 | POST | `/api/tasks` | Cookie or bearer | Create a task |
 | POST | `/api/tasks/claim` | Cookie or bearer | Atomically claim the next queued task |
 | PATCH | `/api/tasks/:id` | Cookie or bearer | Dispatchers report progress and completion; the dashboard cancels or requeues |
+| POST | `/api/v1/traces` | Bearer | OTLP/HTTP JSON trace export |
+| GET | `/api/traces` | Cookie or bearer | Trace summaries, newest first |
+| GET | `/api/traces/:traceId` | Cookie or bearer | The spans of one trace |
 | GET | `/api/usage` | Cookie or bearer | Usage ledger |
 | POST | `/api/usage/ingest` | Bearer | Ingest usage facts |
 | POST | `/api/login` | Own (rate-limited) | Dashboard password login |
@@ -164,6 +167,14 @@ Usage and Costs is experimental.
 
 - `GET /api/usage?window=24h|7d|30d`, or `?since=ISO&until=ISO` — the usage ledger. The default window is a rolling 7 days.
 - `POST /api/usage/ingest` — bearer `MC_TOKEN` — body `{collected_at?, kind?, facts: UsageFact[], snapshot?}`. This route is separate from `POST /api/ingest`, which is liveness only.
+
+### Traces
+
+See [Telemetry and traces](TELEMETRY.md) for the full contract.
+
+- `POST /api/v1/traces` — bearer `MC_TOKEN` — an OTLP/HTTP JSON export. Answers `200 { partialSuccess: { rejectedSpans?, errorMessage? } }`. `415` for protobuf, `413` over 2 MB, `401` for a bad token.
+- `GET /api/traces?agent=&errors=1&before=&limit=` — `{ demo, traces: TraceSummary[] }`.
+- `GET /api/traces/:traceId` — `{ demo, spans: Span[] }`; `404` when the trace is unknown or pruned.
 
 ### Login
 
