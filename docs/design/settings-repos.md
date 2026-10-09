@@ -31,7 +31,7 @@ The repos on the progress board live in `progress.config.json`, optionally repla
 | How does the collector learn the list? | It calls `GET /api/settings/repos` with its token each tick, and falls back to its local file if that fails. | No edits on the machine, and it still runs when the dashboard is unreachable. |
 | How does the progress page get repos? | From the `/api/progress` response, which already carries label, short and color per repo. | Removes the build-time dependency in the browser. |
 | What happens to a removed repo's history? | Snapshots stay in the database. The repo is just no longer shown or collected. Adding it back restores the history. | No data loss from a mis-click. |
-| Limits | At most 25 repos, `owner/name` format, unique repo and short name, color `#rrggbb`. | The collector spends the GitHub search budget per repo each tick. |
+| Limits | At least 1 and at most 25 repos, `owner/name` format, unique repo and short name (ignoring case), color `#rrggbb`. | The collector spends the GitHub search budget per repo each tick. An empty list would silently fall back to the file, so the last repo cannot be removed. |
 
 ## Data
 
@@ -46,10 +46,9 @@ create table if not exists watched_repos (
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
-create unique index if not exists watched_repos_short_idx on watched_repos (short);
 ```
 
-Additive and idempotent, so the usual schema step applies it.
+Additive and idempotent, so the usual schema step applies it. There is no unique index on `short`: validation enforces it, so rows can be reordered or have names swapped one upsert at a time.
 
 ## API
 
@@ -84,7 +83,7 @@ The collector already has GitHub access. Once a day it posts the repos it can se
 - Dashboard down: the collector uses its local file.
 - Bad PUT: nothing changes, and the page shows what to fix.
 - Two people save at once: last write wins, which is acceptable for a one-operator tool.
-- All repos removed: the board shows an empty state that links to Settings.
+- Removing every repo: not allowed. Validation asks for at least one, because an empty table would fall back to the file list.
 
 ## Tests
 

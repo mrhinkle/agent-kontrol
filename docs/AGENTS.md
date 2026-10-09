@@ -32,7 +32,7 @@ NousResearch hermes-agent (MIT, model-agnostic). Add the MCP server URL with an 
 
 ## progress-collector
 
-`install.sh` installs `scripts/collect-progress.sh` as a launchd job that runs every 15 minutes; set `MC_PROGRESS_INTERVAL` seconds to change that. It needs `gh` (authenticated), `jq` and `curl`, and it reads `progress.config.json`. Install it on a machine that stays awake: missed ticks are permanent gaps.
+`install.sh` installs `scripts/collect-progress.sh` as a launchd job that runs every 15 minutes; set `MC_PROGRESS_INTERVAL` seconds to change that. It needs `gh` (authenticated), `jq` and `curl`. It takes its repo list from the dashboard's Settings page on each tick and falls back to `progress.config.json` if the dashboard is unreachable or has no saved list. Install it on a machine that stays awake: missed ticks are permanent gaps.
 
 ## usage-collector
 

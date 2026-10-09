@@ -23,7 +23,7 @@ That starts Agent Kontrol with Docker Compose (or in demo mode on Node 20+ if yo
 
 - **Fleet view.** Live status and history for every agent, from deterministic hooks and watchers, not from the agents remembering to report.
 - **Task queue.** Queue work for any platform; a per-machine dispatcher runs it headless and reports result and cost. Optional cross-vendor review by a second platform.
-- **Progress board.** Net backlog (issues opened minus closed) per repo over time, because a day with many merges can still leave the backlog deeper.
+- **Progress board.** Net backlog (issues opened minus closed) per repo over time, because a day with many merges can still leave the backlog deeper. Choose the repos in Settings; no redeploy.
 - **MCP server.** Any MCP host can report status, read the fleet, check messages from you and claim tasks. OAuth 2.1 for hosts that support it, or a bearer token.
 - **Messaging.** Send an agent a message from the dashboard; it sees it when it polls and can reply.
 - **Usage and Costs** (experimental). Paid and included-token cost per account.

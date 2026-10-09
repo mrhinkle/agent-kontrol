@@ -268,3 +268,17 @@ on conflict (version, model) do update set
   output_per_mtok = excluded.output_per_mtok,
   cache_read_per_mtok = excluded.cache_read_per_mtok,
   notes = excluded.notes;
+
+-- Settings: the repos the progress board watches. Edited from the Settings page;
+-- with no rows the app falls back to progress.config.json. Uniqueness of the short
+-- name is enforced by validation, not an index, so rows can be reordered freely.
+create table if not exists watched_repos (
+  repo text primary key,                  -- owner/name
+  label text not null,
+  short text not null,
+  color text not null default '#2563eb',
+  blocked_label text,                     -- null means blocked work is not tracked
+  position integer not null default 0,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);

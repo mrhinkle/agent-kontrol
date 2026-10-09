@@ -38,6 +38,8 @@ If `MC_DASHBOARD_PASSWORD` is unset, the gate is open in local development and o
 | GET | `/api/progress` | Cookie or bearer | Everything the progress board needs |
 | GET | `/api/progress/digest` | Cookie or bearer | The board as plain text, for schedulers and terminals |
 | POST | `/api/progress/ingest` | Bearer | One collection tick from `scripts/collect-progress.sh` |
+| GET | `/api/settings/repos` | Cookie or bearer | The repos the progress board watches |
+| PUT | `/api/settings/repos` | Cookie or bearer | Replace the watched repos |
 | GET | `/api/tasks` | Cookie or bearer | List tasks |
 | POST | `/api/tasks` | Cookie or bearer | Create a task |
 | POST | `/api/tasks/claim` | Cookie or bearer | Atomically claim the next queued task |
@@ -148,6 +150,13 @@ Each entry in `repos`:
 | `review_rounds` | number | no | Review rounds. |
 | `no_verdict_rate` | number | no | No-verdict rate. |
 | `detail` | object | no | `{lane_mix?, stalled_prs?, notes?}`. |
+
+### Settings
+
+- `GET /api/settings/repos` returns `{ "source": "database" | "file", "writable": true, "max": 25, "repos": [{ "repo", "label", "short", "color", "blockedLabel" }] }`. `source` is `file` when no list has been saved yet, or when there is no database; `repos` is then the default from `progress.config.json`. The collector calls this on every tick.
+- `PUT /api/settings/repos` with `{ "repos": [...] }` replaces the whole list, in order, and returns the stored list in the same shape. It answers `400 { "errors": [{ "index", "field", "message" }] }` when invalid (`index` is `-1` for an error about the whole list), and `409` when no database is connected. A list needs 1 to 25 repos, each `owner/name`, with a unique short name and a `#rrggbb` color.
+
+Anyone with a dashboard session or `MC_TOKEN` can change this list, which matches the rest of the trust model (see [SECURITY.md](../SECURITY.md)).
 
 ### Usage
 
