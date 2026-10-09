@@ -35,6 +35,18 @@ describe("isAuthorized", () => {
     assert.equal(await isAuthorized(reqWith("http://localhost/x")), false);
   });
 
+  it("unset NODE_ENV + no token => false (fail closed)", async () => {
+    delete env.MC_TOKEN;
+    delete env.NODE_ENV;
+    assert.equal(await isAuthorized(reqWith("http://localhost/x")), false);
+  });
+
+  it("test NODE_ENV + no token => true", async () => {
+    delete env.MC_TOKEN;
+    env.NODE_ENV = "test";
+    assert.equal(await isAuthorized(reqWith("http://localhost/x")), true);
+  });
+
   it("correct bearer => true", async () => {
     env.MC_TOKEN = "sekret";
     env.NODE_ENV = "production";

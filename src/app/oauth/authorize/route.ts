@@ -1,4 +1,6 @@
 import { authCookieValue, randomToken, secretsMatch } from "@/lib/authcrypto";
+import { clientIp } from "@/lib/rate-limit";
+import { loginLimiter } from "@/lib/login-limiter";
 import { escapeHtml, isAllowedRedirectUri, resource as mcpResource } from "@/lib/oauth";
 import { isConfigured, sql } from "@/lib/db";
 
@@ -290,7 +292,28 @@ export async function POST(req: Request) {
   // POST. Either way, approval is an explicit user action (the Approve click).
   const hasSession = await hasValidDashboardSession(req);
   const submitted = form.get("password") ?? "";
-  const passwordOk = submitted.length > 0 && (await secretsMatch(submitted, password));
+
+  // A password guess without a valid session draws from the same per-client
+  // budget as the dashboard login. A request with a session never touches it.
+  const ip = clientIp(req);
+  let passwordOk = false;
+  if (submitted.length > 0) {
+    const throttled = !hasSession;
+    if (throttled) {
+      const { allowed, retryAfterSec } = loginLimiter.check(ip);
+      if (!allowed) {
+        return consentPage(params, client.client_name || client.client_id, {
+          authenticated: false,
+          error: `Too many attempts. Try again in ${retryAfterSec} seconds.`,
+        });
+      }
+      // Reserve the attempt synchronously, before the await below, so a
+      // concurrent burst cannot pass the check.
+      loginLimiter.fail(ip);
+    }
+    passwordOk = await secretsMatch(submitted, password);
+    if (throttled && passwordOk) loginLimiter.reset(ip);
+  }
 
   if (!hasSession && !passwordOk) {
     return consentPage(params, client.client_name || client.client_id, {

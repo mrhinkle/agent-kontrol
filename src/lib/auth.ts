@@ -11,8 +11,8 @@ import { secretsMatch } from "./authcrypto";
  * putting a secret in a query parameter is opt-in and discouraged.
  *
  * If MC_TOKEN is unset:
- *   - outside production (local dev / demo mode): everything is allowed.
- *   - in production: everything is denied (fail closed).
+ *   - in development or test (local dev / demo mode): everything is allowed.
+ *   - anywhere else, including an unset NODE_ENV: everything is denied (fail closed).
  */
 export async function isAuthorized(
   req: Request,
@@ -20,7 +20,7 @@ export async function isAuthorized(
 ): Promise<boolean> {
   const token = process.env.MC_TOKEN;
   if (!token) {
-    return process.env.NODE_ENV !== "production";
+    return process.env.NODE_ENV === "development" || process.env.NODE_ENV === "test";
   }
   const header = req.headers.get("authorization");
   if (header?.startsWith("Bearer ") && (await secretsMatch(header.slice(7), token))) {

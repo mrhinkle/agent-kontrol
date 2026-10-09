@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
 import { authCookieValue, secretsMatch } from "@/lib/authcrypto";
-import { clientIp, createLimiter } from "@/lib/rate-limit";
-
-const limiter = createLimiter({ max: 5, windowMs: 10 * 60 * 1000 });
+import { clientIp } from "@/lib/rate-limit";
+import { loginLimiter } from "@/lib/login-limiter";
 
 export async function POST(req: Request) {
   const password = process.env.MC_DASHBOARD_PASSWORD;
@@ -11,13 +10,14 @@ export async function POST(req: Request) {
   }
 
   const ip = clientIp(req);
-  const { allowed, retryAfterSec } = limiter.check(ip);
+  const { allowed, retryAfterSec } = loginLimiter.check(ip);
   if (!allowed) {
-    return NextResponse.json(
-      { error: "too many attempts" },
-      { status: 429, headers: { "Retry-After": String(retryAfterSec) } },
-    );
+    return NextResponse.json({ error: "too many attempts" }, { status: 429, headers: { "Retry-After": String(retryAfterSec) } });
   }
+
+  // Reserve the attempt synchronously (no await between check and fail) so a
+  // concurrent burst cannot pass the check before the attempt is recorded.
+  loginLimiter.fail(ip);
 
   let submitted = "";
   try {
@@ -28,11 +28,11 @@ export async function POST(req: Request) {
   }
 
   if (!(await secretsMatch(submitted, password))) {
-    limiter.fail(ip);
     return NextResponse.json({ error: "wrong password" }, { status: 401 });
   }
 
-  limiter.reset(ip);
+  // Correct password: release the reservation.
+  loginLimiter.reset(ip);
 
   const res = NextResponse.json({ ok: true });
   res.cookies.set("mc_auth", await authCookieValue(password), {
