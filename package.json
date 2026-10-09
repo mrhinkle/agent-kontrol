@@ -27,7 +27,7 @@
     "@react-three/drei": "^10.7.8",
     "@react-three/fiber": "^9.7.0",
     "@react-three/postprocessing": "^3.0.5",
-    "mcp-handler": "^1.0.0",
+    "mcp-handler": "^2.2.0",
     "next": "^15.3.0",
     "pg": "^8.23.1",
     "react": "^19.0.0",
