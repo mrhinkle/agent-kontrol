@@ -50,7 +50,7 @@ Use **Settings** in the app header. Add a repo as `owner/name`, give it a label,
 - **Removing a repo** stops it being shown and collected. Its history stays in the database, and adding it back restores it. You cannot remove the last repo.
 - **New repos need history.** The collector only records the present. Run `collect-progress.sh --backfill 90` once to fill in the past.
 - **Access.** The collector's `gh` login must be able to read each repo, including private ones.
-- **If the dashboard is unreachable,** the collector keeps using its local config file. Set `MC_REPOS_FROM_DASHBOARD=0` to make it ignore the dashboard list entirely.
+- **The collector trusts the dashboard.** Whenever it can reach the dashboard it uses the dashboard's list, whether that is one you saved or the default, so a reinstalled collector never sweeps stale example repos. **If the dashboard is unreachable,** it keeps using its local config file. Set `MC_REPOS_FROM_DASHBOARD=0` to make it ignore the dashboard list entirely.
 
 ## See also
 

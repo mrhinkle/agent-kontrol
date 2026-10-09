@@ -12,8 +12,8 @@ describe("collector repo discovery", () => {
     assert.ok(/Authorization: Bearer \$MC_TOKEN/.test(sh));
   });
 
-  it("only trusts a saved database list and otherwise keeps the local file", () => {
-    assert.ok(sh.includes('!= "database"'));
+  it("uses the dashboard's list whenever it answers, and otherwise keeps the local file", () => {
+    assert.ok(!sh.includes('!= "database"'), "must not require a saved list: the dashboard default beats a local example file");
     assert.ok(sh.includes("from the local config"));
     assert.ok(sh.includes("MC_REPOS_FROM_DASHBOARD"));
   });

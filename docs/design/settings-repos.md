@@ -28,7 +28,7 @@ The repos on the progress board live in `progress.config.json`, optionally repla
 | Where is the list stored? | A `watched_repos` table. | Changes apply immediately and survive redeploys. |
 | What if the table is empty? | Fall back to `progress.config.json` (or the build-time variable). | Fresh installs and demo mode work unchanged. |
 | Which wins? | Rows in the database. | The page is the place people change it. |
-| How does the collector learn the list? | It calls `GET /api/settings/repos` with its token each tick, and falls back to its local file if that fails. | No edits on the machine, and it still runs when the dashboard is unreachable. |
+| How does the collector learn the list? | It calls `GET /api/settings/repos` with its token each tick and trusts whatever list comes back, falling back to its local file only if the call fails. | No edits on the machine, and it still runs when the dashboard is unreachable. |
 | How does the progress page get repos? | From the `/api/progress` response, which already carries label, short and color per repo. | Removes the build-time dependency in the browser. |
 | What happens to a removed repo's history? | Snapshots stay in the database. The repo is just no longer shown or collected. Adding it back restores the history. | No data loss from a mis-click. |
 | Limits | At least 1 and at most 25 repos, `owner/name` format, unique repo and short name (ignoring case), color `#rrggbb`. | The collector spends the GitHub search budget per repo each tick. An empty list would silently fall back to the file, so the last repo cannot be removed. |
@@ -72,7 +72,7 @@ See the wireframe. One row per repo with inline fields. Reorder with the arrows,
 
 ## Collector
 
-On each tick, before reading its local file, `scripts/collect-progress.sh` asks the dashboard for the list. If the answer is `source: "database"` with at least one repo, it uses that. Otherwise it uses the file, as today. It logs which one it used. A new repo still needs `--backfill` once to fill history.
+On each tick, before reading its local file, `scripts/collect-progress.sh` asks the dashboard for the list. If the dashboard answers with at least one repo it uses that list, whether it is saved in Settings (`source: "database"`) or the dashboard's own default (`source: "file"`), because either beats the example repos in a local copy of the config. If the dashboard is unreachable or returns something unusable, it uses its local file. It logs which one it used. A new repo still needs `--backfill` once to fill history.
 
 ## Second step: the picker
 
