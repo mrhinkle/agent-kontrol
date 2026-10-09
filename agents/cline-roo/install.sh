@@ -87,6 +87,7 @@ case "$MC_URL" in
     exit 1
     ;;
 esac
+MC_POLL_SECONDS="${MC_POLL_SECONDS:-30}"
 
 PYTHON="$(command -v python3 || true)"
 if [[ -z "$PYTHON" && -x /usr/bin/python3 ]]; then
@@ -131,6 +132,7 @@ SCRIPT_XML="$(xml_escape "$INSTALLED_PY")"
 HOME_XML="$(xml_escape "$HOME")"
 LOG_XML="$(xml_escape "$LOG_FILE")"
 PATH_XML="$(xml_escape "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")"
+MC_POLL_SECONDS_XML="$(xml_escape "$MC_POLL_SECONDS")"
 
 # The watcher's own optional overrides (path overrides, poll tuning,
 # per-platform agent id/name) only reach the launchd service if they are
@@ -169,7 +171,7 @@ cat > "$PLIST" <<EOF
     <key>MC_TOKEN</key>
     <string>${MC_TOKEN_XML}</string>
     <key>MC_POLL_SECONDS</key>
-    <string>30</string>
+    <string>${MC_POLL_SECONDS_XML}</string>
     <key>HOME</key>
     <string>${HOME_XML}</string>
     <key>PATH</key>
