@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  resolveConfig,
   REPOS,
   repoConfig,
   LANE_BOT_PREFIX,
@@ -48,5 +49,24 @@ describe("progress-config", () => {
         `bad blockedLabel for ${r.repo}`,
       );
     }
+  });
+
+  it("an override replaces the repos and keeps the other settings", () => {
+    const c = resolveConfig(
+      JSON.stringify({ repos: [{ repo: "acme/api", label: "API", short: "api", color: "#112233", blockedLabel: null }] }),
+    );
+    assert.equal(c.repos.length, 1);
+    assert.equal(c.repos[0].repo, "acme/api");
+    assert.ok(c.laneBotPrefix.length > 0);
+  });
+
+  it("rejects an override that is not JSON, not an object, or has a bad repo", () => {
+    assert.throws(() => resolveConfig("{nope"), /not valid JSON/);
+    assert.throws(() => resolveConfig("[1,2]"), /must be a JSON object/);
+    assert.throws(() => resolveConfig(JSON.stringify({ repos: [{ repo: "bad", label: "x", short: "x", color: "#000000", blockedLabel: null }] })), /owner\/name/);
+  });
+
+  it("an empty override falls back to the file", () => {
+    assert.equal(resolveConfig("").repos.length, resolveConfig(undefined).repos.length);
   });
 });

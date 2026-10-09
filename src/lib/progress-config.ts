@@ -5,7 +5,9 @@
  * The JSON is validated at module load so a bad entry fails loudly at import
  * time, not silently at render time.
  */
-import config from "../../progress.config.json";
+import fileConfig from "../../progress.config.json";
+
+type ProgressConfig = typeof fileConfig;
 
 /** One repo's entry on the progress board. */
 export interface RepoConfig {
@@ -34,7 +36,7 @@ function fail(entry: unknown, problem: string): never {
   );
 }
 
-function validate(raw: typeof config): void {
+function validate(raw: ProgressConfig): void {
   if (!Array.isArray(raw.repos) || raw.repos.length === 0) {
     fail(undefined, "repos must be a non-empty array");
   }
@@ -81,7 +83,33 @@ function validate(raw: typeof config): void {
   }
 }
 
-validate(config);
+/**
+ * The config the board runs on: progress.config.json, with any top-level keys
+ * in the override JSON replacing the file's (so `{"repos":[...]}` alone is
+ * enough). The override comes from NEXT_PUBLIC_MC_PROGRESS_CONFIG, a build-time
+ * variable, because the progress page is a client component. It lets a
+ * deployment point the board at its own repos without forking this file.
+ */
+export function resolveConfig(override: string | undefined): ProgressConfig {
+  if (!override || !override.trim()) {
+    validate(fileConfig);
+    return fileConfig;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(override);
+  } catch {
+    throw new Error("NEXT_PUBLIC_MC_PROGRESS_CONFIG is not valid JSON");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("NEXT_PUBLIC_MC_PROGRESS_CONFIG must be a JSON object");
+  }
+  const merged = { ...fileConfig, ...(parsed as object) } as ProgressConfig;
+  validate(merged);
+  return merged;
+}
+
+const config = resolveConfig(process.env.NEXT_PUBLIC_MC_PROGRESS_CONFIG);
 
 /** The repos the board tracks, in board order. */
 export const REPOS: RepoConfig[] = config.repos.map((entry) => ({

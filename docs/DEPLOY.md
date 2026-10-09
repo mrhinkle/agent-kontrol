@@ -98,6 +98,7 @@ With no `DATABASE_URL`, the app runs with sample data and stores nothing.
 | `MC_OAUTH_SECRET` | No | HS256 key for OAuth JWTs. Falls back to `MC_COOKIE_SECRET`, then `MC_TOKEN`. Rotating it revokes all OAuth connections. |
 | `MC_PUBLIC_URL` | No | Canonical origin for OAuth metadata. Otherwise derived from request headers. |
 | `NEXT_PUBLIC_MC_NAME` | No | Header name. Default `Agent Kontrol`. |
+| `NEXT_PUBLIC_MC_PROGRESS_CONFIG` | No | JSON object whose top-level keys replace `progress.config.json`, for example `{"repos":[...]}`. Build-time: set it before the build and redeploy to change it. |
 | `NEXT_PUBLIC_MC_OPERATOR` | No | Your name, shown as the sender of dashboard messages. Default `Operator`. |
 | `NEXT_PUBLIC_HERMES_VITALS_URL` | No | Link shown on the progress board. |
 | `MC_DB_DRIVER` | No | Driver override: `neon` or `pg`. |
@@ -139,6 +140,21 @@ Change the env var, redeploy, then update every agent and collector with the new
 ### Collectors on Linux
 
 The progress collector and usage collector install as macOS launchd agents. On Linux, run `scripts/collect-progress.sh` and `agents/usage-collector/collect_usage.py` from cron or a systemd timer yourself; no installer is provided.
+
+## Moving an existing Mission Control deployment
+
+Use this if you already run the earlier Mission Control code on Vercel and want to move it to this repository. Nothing about your data or domain changes, and agents keep working.
+
+1. In the Vercel project, open Settings, then Git. Disconnect the old repository and connect `mrhinkle/agent-kontrol` (or your fork) with `main` as the production branch. The project, its domains, its environment variables and its database stay as they are.
+2. Add `NEXT_PUBLIC_MC_PROGRESS_CONFIG` with your own repos, for example `{"repos":[{"repo":"your-org/your-repo","label":"Your repo","short":"repo","color":"#2563eb","blockedLabel":"blocked"}]}`. Without it the progress board shows the example repos from `progress.config.json`.
+3. If you want to keep your old header name, set `NEXT_PUBLIC_MC_NAME`. The "by The AIE" byline and trademark footer appear only under the default name.
+4. Leave `DATABASE_URL`, `MC_TOKEN`, `MC_DASHBOARD_PASSWORD` and any OAuth secrets exactly as they are. Do not rotate them, or agents and MCP connectors will need re-authorizing.
+5. Deploy. The build applies the schema, which only adds what is missing and never drops data. If the build cannot reach the database it fails, and the previous deployment keeps serving.
+6. Check `/login`, then the Fleet page, the Progress board, and an MCP call.
+
+If something is wrong, promote the previous deployment in Vercel (Deployments, then Promote). That switches traffic back immediately.
+
+Agents need no changes. The `reply_to_mark` tool still works as an alias of `reply_to_operator`. Collectors you installed earlier keep posting. To get the shared repo list, reinstall them from this repository.
 
 ## Vercel Deployment Protection
 

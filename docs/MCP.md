@@ -131,6 +131,8 @@ When to call: at the start of a session and periodically while working.
 
 ### reply_to_operator
 
+`reply_to_mark` is the tool's original name. It is still registered as a deprecated alias with identical behavior, and stays through 1.x, so agents whose standing instructions still say `reply_to_mark` keep working. New instructions should use `reply_to_operator`.
+
 Reply to the operator. Replies appear in the Fleet conversation drawer.
 
 | Parameter | Type | Required | Description |
