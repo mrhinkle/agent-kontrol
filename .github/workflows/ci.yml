@@ -31,3 +31,36 @@ jobs:
       - run: npm run test:ui
       - run: npm test
       - run: npm run build
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: mc
+          POSTGRES_DB: mc
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:mc@localhost:5432/mc
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Apply schema (twice, to prove it is idempotent)
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f supabase/schema.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f supabase/schema.sql
+      - name: Store tests on plain Postgres
+        run: npm run test:pg

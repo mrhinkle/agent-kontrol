@@ -1,0 +1,48 @@
+name: Bug report
+description: Report something that is broken or behaves incorrectly.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. If this is a security vulnerability, do not use this form — use GitHub's private vulnerability reporting instead (Security tab, "Report a vulnerability").
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: A clear and specific description of the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What you did, in order.
+      placeholder: |
+        1. ...
+        2. ...
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: The release version or commit you are running.
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment target
+      options:
+        - Vercel + Neon
+        - Vercel + other Postgres
+        - Docker Compose
+        - Node host
+        - Local
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant log output. Remove any secrets (tokens, passwords, connection strings) before pasting.
+      render: shell

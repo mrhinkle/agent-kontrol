@@ -98,6 +98,33 @@ function renderBlock(b: Block, key: number): ReactNode {
       );
     case "hr":
       return <hr key={key} className="border-white/10" />;
+    case "table":
+      return (
+        <div key={key} className="overflow-x-auto rounded-md border border-white/10">
+          <table className="w-full border-collapse text-left text-[13px]">
+            <thead className="bg-white/5 text-gray-300">
+              <tr>
+                {b.head.map((h, i) => (
+                  <th key={i} className="border-b border-white/10 px-3 py-1.5 font-semibold">
+                    {renderInlines(h)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {b.rows.map((r, i) => (
+                <tr key={i} className="border-b border-white/5 last:border-0 align-top">
+                  {r.map((c, j) => (
+                    <td key={j} className="px-3 py-1.5">
+                      {renderInlines(c)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
     case "list": {
       const items = b.items.map((it, i) => (
         <li key={i} className={it.checked === null ? undefined : "flex list-none items-start gap-2 -ml-5"}>
