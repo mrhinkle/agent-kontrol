@@ -18,6 +18,15 @@ export default function LoginPage() {
     });
     if (res.ok) {
       window.location.href = "/";
+    } else if (res.status === 429) {
+      const header = res.headers.get("Retry-After");
+      const seconds = header !== null ? Number(header) : Number.NaN;
+      setError(
+        Number.isFinite(seconds) && seconds > 0
+          ? `Too many attempts. Try again in ${seconds} seconds.`
+          : "Too many attempts. Try again in a few minutes."
+      );
+      setBusy(false);
     } else {
       setError("Wrong password.");
       setBusy(false);
