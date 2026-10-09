@@ -10,7 +10,7 @@ Use GitHub's private vulnerability reporting on this repository (Security tab, "
 
 ## Security model
 
-Mission Control is designed for one operator running one deployment. It is not multi-tenant. There are no per-user accounts or roles.
+Agent Kontrol is designed for one operator running one deployment. It is not multi-tenant. There are no per-user accounts or roles.
 
 Credentials:
 

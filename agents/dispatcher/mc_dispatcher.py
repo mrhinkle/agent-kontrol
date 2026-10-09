@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Mission Control dispatcher — the harness daemon.
+Agent Kontrol dispatcher — the harness daemon.
 
-Runs on any machine with agent CLIs installed. Polls Mission Control for
+Runs on any machine with agent CLIs installed. Polls Agent Kontrol for
 queued tasks routed to the platforms available on this machine, runs each
 one headless, and reports status + result + cost back. This is what turns
-Mission Control from a dashboard into a working agent harness:
+Agent Kontrol from a dashboard into a working agent harness:
 
   Tasks page / create_task (MCP)
         │
@@ -21,7 +21,7 @@ Mission Control from a dashboard into a working agent harness:
   PATCH /api/tasks/<id>  status=done|failed, result, cost_usd
 
 Config via environment (or ~/.claude/mission-control.env):
-  MC_URL                 e.g. https://mission-control-xyz.vercel.app   (required)
+  MC_URL                 e.g. https://your-deploy.vercel.app   (required)
   MC_TOKEN               shared secret                                  (required)
   MC_WORKDIR             where projects live (default ~/Code)
   MC_PLATFORMS           comma list to serve (default: auto-detect from PATH)
@@ -124,7 +124,7 @@ def ingest(kind: str, title: str, agent_id: str, platform: str, detail: dict | N
 
 def build_prompt(task: dict) -> str:
     lines = [
-        f"You are running as an autonomous worker dispatched by Mission Control (task #{task['id']}).",
+        f"You are running as an autonomous worker dispatched by Agent Kontrol (task #{task['id']}).",
         f"Task: {task['title']}",
     ]
     if task.get("description"):

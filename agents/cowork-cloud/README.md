@@ -1,7 +1,7 @@
 # Connecting Claude Cowork (cloud sessions)
 
 Cloud Cowork sessions can't run filesystem hooks, so they report in through
-the Mission Control MCP server — the semantic layer.
+the Agent Kontrol MCP server — the semantic layer.
 
 ## 1. Add the MCP server as a connector
 
@@ -17,9 +17,9 @@ In the Claude app: Settings → Connectors → Add custom connector
 Append this to your global Cowork instructions (CLAUDE.md):
 
 ```
-## Mission Control
-You are part of a multi-agent fleet tracked at Mission Control.
-- At the start of any substantive task, call the mission-control `report_status`
+## Agent Kontrol
+You are part of a multi-agent fleet tracked at Agent Kontrol.
+- At the start of any substantive task, call the agent-kontrol `report_status`
   tool (agent_id: "cowork-cloud", platform: "cowork-cloud") with a one-line summary.
 - Report again at major milestones, when blocked, and when done
   (status: "done" or "failed").

@@ -62,11 +62,11 @@ load_existing_env
 
 if [[ -z "${MC_URL:-}" ]]; then
   [[ -t 0 ]] || { echo "Set MC_URL (or run interactively)." >&2; exit 1; }
-  read -r -p "Mission Control URL (e.g. https://your-deploy.vercel.app): " MC_URL
+  read -r -p "Agent Kontrol URL (e.g. https://your-deploy.vercel.app): " MC_URL
 fi
 if [[ -z "${MC_TOKEN:-}" ]]; then
   [[ -t 0 ]] || { echo "Set MC_TOKEN (or run interactively)." >&2; exit 1; }
-  read -r -s -p "Mission Control token: " MC_TOKEN; echo >&2
+  read -r -s -p "Agent Kontrol token: " MC_TOKEN; echo >&2
 fi
 
 MC_URL="${MC_URL%/}"

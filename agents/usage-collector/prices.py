@@ -1,6 +1,6 @@
 """Versioned model price table for Usage and Costs.
 
-Matches Mission Control issue #12 seed version 2026-10-05.
+Matches Agent Kontrol issue #12 seed version 2026-10-05.
 Amounts are USD per 1,000,000 tokens.
 """
 from __future__ import annotations

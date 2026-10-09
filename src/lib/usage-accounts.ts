@@ -1,7 +1,7 @@
 /**
  * Non-secret account registry for Usage and Costs.
  * Secret values live only in env vars named by `secret_env`.
- * See Mission Control issue #12.
+ * See Agent Kontrol issue #12.
  */
 
 export type BillingType = "api" | "subscription" | "credits" | "agent_logged";

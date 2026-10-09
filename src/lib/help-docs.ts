@@ -27,7 +27,7 @@ export const HELP_DOCS: HelpDoc[] = [
   { slug: "changelog", title: "Changelog", file: "CHANGELOG.md", blurb: "What changed in each release." },
 ];
 
-export const REPO_BLOB = "https://github.com/mrhinkle/mission-control/blob/main/";
+export const REPO_BLOB = "https://github.com/mrhinkle/agent-kontrol/blob/main/";
 
 export function findDoc(slug: string): HelpDoc | undefined {
   return HELP_DOCS.find((d) => d.slug === slug);

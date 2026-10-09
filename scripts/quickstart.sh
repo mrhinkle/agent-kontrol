@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MC_REPO="https://github.com/mrhinkle/mission-control.git"
-MC_DIR="./mission-control"
+MC_REPO="https://github.com/mrhinkle/agent-kontrol.git"
+MC_DIR="./agent-kontrol"
 MC_MODE=""
 MC_START=1
 MC_STEP="init"
@@ -24,14 +24,14 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-echo "mission-control quickstart"
+echo "agent-kontrol quickstart"
 echo "  dir:   $MC_DIR"
 echo "  mode:  ${MC_MODE:-auto (Docker if available)}"
 echo ""
 
 # Detect if we are already inside a clone.
 in_clone() {
-  [ -f package.json ] && grep -q '"name": *"mission-control"' package.json 2>/dev/null
+  [ -f package.json ] && grep -Eq '"name": *"(agent-kontrol|mission-control)"' package.json 2>/dev/null
 }
 
 set_step "prerequisites"
@@ -62,7 +62,7 @@ if in_clone; then
   MC_DIR="."
   echo "already inside a clone; using current directory"
 else
-  if [ -d "$MC_DIR" ] && [ -f "$MC_DIR/package.json" ] && grep -q '"name": *"mission-control"' "$MC_DIR/package.json" 2>/dev/null; then
+  if [ -d "$MC_DIR" ] && [ -f "$MC_DIR/package.json" ] && grep -Eq '"name": *"(agent-kontrol|mission-control)"' "$MC_DIR/package.json" 2>/dev/null; then
     echo "reusing existing clone at $MC_DIR"
     (cd "$MC_DIR" && git pull --ff-only >/dev/null 2>&1) || echo "  (git pull failed; continuing with current checkout)"
   else
@@ -119,7 +119,7 @@ if [ "$MC_MODE" = "docker" ]; then
   fi
 
   echo ""
-  echo "mission-control is up: $MC_URL"
+  echo "agent-kontrol is up: $MC_URL"
   echo "Your dashboard password and agent token are in $MC_DIR/.env"
   echo "Install the agent hook with:"
   echo "  MC_URL=http://localhost:${MC_PORT} MC_TOKEN=\$(grep '^MC_TOKEN=' $MC_DIR/.env | cut -d= -f2) ./agents/claude-code/install.sh"

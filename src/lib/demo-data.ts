@@ -17,9 +17,9 @@ const buildAgents = (): FleetAgent[] => [
     current_session: {
       id: "sess-cw-001",
       agent_id: "cowork-cloud-1",
-      project: "mission-control",
+      project: "agent-kontrol",
       status: "active",
-      summary: "Building the Mission Control dashboard and MCP server",
+      summary: "Building the Agent Kontrol dashboard and MCP server",
       started_at: minsAgo(42),
       ended_at: null,
       updated_at: minsAgo(1),
@@ -105,9 +105,9 @@ const buildEvents = (): Event[] => [
 export const demoMemory = (): MemoryItem[] => [
   {
     id: 3,
-    key: "mission-control/decisions",
+    key: "agent-kontrol/decisions",
     content: "Stack: Next.js on Vercel + Neon. Agents push status; nobody polls vendors. MCP server is both telemetry ingest and shared memory.",
-    tags: ["mission-control", "architecture"],
+    tags: ["agent-kontrol", "architecture"],
     agent_id: "cowork-cloud-1",
     created_at: minsAgo(40),
     updated_at: minsAgo(40),

@@ -1,14 +1,21 @@
-# Mission Control
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="public/logo/agent-kontrol-wordmark-white.svg">
+    <img src="public/logo/agent-kontrol-wordmark-navy.svg" alt="Agent Kontrol" width="520">
+  </picture>
+</p>
+
+# Agent Kontrol
 
 One dashboard for the AI coding agents you run: Claude Code, Codex, Grok, Hermes and anything that speaks MCP. See what each is doing, queue work for them, and check whether the backlog is actually shrinking.
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fmrhinkle%2Fmission-control&project-name=mission-control&repository-name=mission-control&env=MC_TOKEN%2CMC_DASHBOARD_PASSWORD&envDescription=MC_TOKEN%20is%20the%20shared%20secret%20agents%20use.%20MC_DASHBOARD_PASSWORD%20protects%20the%20dashboard.%20Generate%20each%20with%20openssl%20rand%20-hex%2024.&envLink=https%3A%2F%2Fgithub.com%2Fmrhinkle%2Fmission-control%2Fblob%2Fmain%2Fdocs%2FDEPLOY.md&stores=%5B%7B%22type%22%3A%22integration%22%2C%22integrationSlug%22%3A%22neon%22%2C%22productSlug%22%3A%22neon%22%2C%22protocol%22%3A%22storage%22%7D%5D)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fmrhinkle%2Fagent-kontrol&project-name=agent-kontrol&repository-name=agent-kontrol&env=MC_TOKEN%2CMC_DASHBOARD_PASSWORD&envDescription=MC_TOKEN%20is%20the%20shared%20secret%20agents%20use.%20MC_DASHBOARD_PASSWORD%20protects%20the%20dashboard.%20Generate%20each%20with%20openssl%20rand%20-hex%2024.&envLink=https%3A%2F%2Fgithub.com%2Fmrhinkle%2Fagent-kontrol%2Fblob%2Fmain%2Fdocs%2FDEPLOY.md&stores=%5B%7B%22type%22%3A%22integration%22%2C%22integrationSlug%22%3A%22neon%22%2C%22productSlug%22%3A%22neon%22%2C%22protocol%22%3A%22storage%22%7D%5D)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mrhinkle/mission-control/main/scripts/quickstart.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mrhinkle/agent-kontrol/main/scripts/quickstart.sh | bash
 ```
 
-That starts Mission Control with Docker Compose (or in demo mode on Node 20+ if you have no Docker). Other targets: Vercel with Neon or any Postgres, any Node host. See [docs/DEPLOY.md](docs/DEPLOY.md).
+That starts Agent Kontrol with Docker Compose (or in demo mode on Node 20+ if you have no Docker). Other targets: Vercel with Neon or any Postgres, any Node host. See [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## What it does
 

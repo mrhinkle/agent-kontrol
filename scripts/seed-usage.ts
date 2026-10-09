@@ -1,5 +1,5 @@
 /**
- * Seed helper: POSTs collector dry-run facts to a running Mission Control
+ * Seed helper: POSTs collector dry-run facts to a running Agent Kontrol
  * (requires DATABASE_URL + MC_TOKEN on the server).
  *
  *   python3 agents/usage-collector/collect_usage.py --dry-run --roots fixtures/hermes \

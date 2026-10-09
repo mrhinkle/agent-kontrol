@@ -1,6 +1,6 @@
 # Agent adapters
 
-This document describes the adapters that connect coding agents to Mission Control: what each one watches, how to install it, and what it can do. All adapters live in `agents/<name>/` in the repository.
+This document describes the adapters that connect coding agents to Agent Kontrol: what each one watches, how to install it, and what it can do. All adapters live in `agents/<name>/` in the repository.
 
 ## claude-code
 

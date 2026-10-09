@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""collect_usage.py — Hermes → Mission Control Usage and Costs collector.
+"""collect_usage.py — Hermes → Agent Kontrol Usage and Costs collector.
 
 Read-only walk of Hermes state.db files (host profiles + Neuro container),
 price/classify each session_model_usage row, POST to /api/usage/ingest.

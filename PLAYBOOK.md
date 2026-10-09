@@ -1,13 +1,13 @@
 # The Fleet Playbook
 
 How to actually run a multi-platform agent harness — Claude (Code + Cowork),
-Codex, Grok, and Hermes — for maximum output. Mission Control is the
+Codex, Grok, and Hermes — for maximum output. Agent Kontrol is the
 infrastructure; this is the doctrine. Researched July 2026; sources at the
 bottom.
 
 ## 1. The operating model
 
-**Mission Control is the queen; the platforms are workers.** The most useful
+**Agent Kontrol is the queen; the platforms are workers.** The most useful
 idea in the swarm-orchestration world (ruvnet's claude-flow/Ruflo lineage) is
 the hierarchical queen/worker topology: one coordinator that owns state and
 routing, many specialist workers that execute [1][2]. You don't need Raft

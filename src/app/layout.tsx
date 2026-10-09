@@ -1,23 +1,23 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { MCLogoConsole } from "@/components/MCLogo";
+import { AgentKontrolMark } from "@/components/AgentKontrolMark";
 import { SiteNav } from "@/components/SiteNav";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Mission Control",
-  description: "One dashboard for every agent in the fleet — status, history, and shared memory.",
+  title: "Agent Kontrol",
+  description: "One control room for every AI coding agent you run: status, history, tasks, and a net-backlog progress board.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
-  const name = process.env.NEXT_PUBLIC_MC_NAME ?? "Mission Control";
+  const name = process.env.NEXT_PUBLIC_MC_NAME ?? "Agent Kontrol";
   return (
     <html lang="en">
       <body className="min-h-screen">
         <header className="border-b border-white/10 sticky top-0 z-10 backdrop-blur bg-[#0a0f1c]/80">
           <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-x-6 gap-y-1 px-4 py-2 md:flex-nowrap md:py-3">
             <Link href="/" className="group flex shrink-0 items-center gap-2 py-1 md:py-0">
-              <MCLogoConsole className="h-6 w-6 text-gray-200 transition-colors group-hover:text-white" />
+              <AgentKontrolMark className="h-6 w-6 text-gray-200 transition-colors group-hover:text-white" />
               <span className="font-semibold tracking-wide">{name}</span>
             </Link>
             <SiteNav />

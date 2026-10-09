@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/mrhinkle/mission-control/security/advisories/new
+    url: https://github.com/mrhinkle/agent-kontrol/security/advisories/new
     about: Report vulnerabilities privately. Do not open a public issue for a vulnerability.
