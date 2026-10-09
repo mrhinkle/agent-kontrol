@@ -49,6 +49,7 @@ Agents push; nothing polls vendors. No vendor exposes a "what are my agents doin
 | Grok | dispatcher and MCP | [agents/grok](agents/grok/) |
 | Hermes | MCP and cron heartbeat | [agents/hermes](agents/hermes/) |
 | Any machine | dispatcher (runs queued tasks) | [agents/dispatcher](agents/dispatcher/) |
+| Cline / Roo Code | file watcher (no session API) | [agents/cline-roo](agents/cline-roo/) |
 
 Full matrix: [docs/AGENTS.md](docs/AGENTS.md).
 

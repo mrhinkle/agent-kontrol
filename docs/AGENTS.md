@@ -30,6 +30,10 @@ The xAI Grok Build CLI is early beta (`grok -p`). There are two ways to connect 
 
 NousResearch hermes-agent (MIT, model-agnostic). Add the MCP server URL with an `Authorization: Bearer YOUR_MC_TOKEN` header, add a persona instruction, and optionally a cron heartbeat.
 
+## cline-roo
+
+`cline_roo_watcher.py` is a daemon covering two VS Code extensions that have no session API: Cline and Roo Code (a Cline fork). It watches their on-disk task folders under VS Code's (or a VS Code fork's) `globalStorage` directory and reports `session_start`/`heartbeat`/`session_end` off file mtimes, the same way `codex_watcher.py` does. One process reports both as separate platforms (`cline`, `roo-code`). Paths are per each project's public docs, not verified against a live install; `install.sh` sets up a launchd agent on macOS. `VSCODE_GLOBAL_STORAGE_DIRS` overrides the scanned directories.
+
 ## progress-collector
 
 `install.sh` installs `scripts/collect-progress.sh` as a launchd job that runs every 15 minutes; set `MC_PROGRESS_INTERVAL` seconds to change that. It needs `gh` (authenticated), `jq` and `curl`, and it reads `progress.config.json`. Install it on a machine that stays awake: missed ticks are permanent gaps.
@@ -49,6 +53,7 @@ Read-only. It reads Hermes session usage and posts token counts, costs, model an
 | cowork-cloud | MCP connector | yes (report_status) | yes (check_inbox, reply_to_operator) | claim_task via MCP |
 | grok | dispatcher + MCP | yes | via MCP | yes via dispatcher |
 | hermes | MCP + cron | yes (report_status) | yes (check_inbox, reply_to_operator) | claim_task via MCP |
+| cline-roo | file watcher | yes (coarse) | no | no |
 
 ## Message delivery
 

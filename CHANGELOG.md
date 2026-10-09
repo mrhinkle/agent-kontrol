@@ -21,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - One-line quickstart.
 - Docker Compose.
 - Deploy to Vercel button.
+- Cline / Roo Code watcher: a file-based adapter for both VS Code extensions, covering coding agents outside the four-platform fleet.
 - Docs: MCP, API, DATABASE, DEPLOY, AGENTS, ARCHITECTURE.
 
 ### Changed
