@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { MCLogoConsole } from "@/components/MCLogo";
+import { MCMark } from "@/components/MCLogo";
 import { SiteNav } from "@/components/SiteNav";
 import "./globals.css";
 
@@ -17,7 +17,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <header className="border-b border-white/10 sticky top-0 z-10 backdrop-blur bg-[#0a0f1c]/80">
           <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-x-6 gap-y-1 px-4 py-2 md:flex-nowrap md:py-3">
             <Link href="/" className="group flex shrink-0 items-center gap-2 py-1 md:py-0">
-              <MCLogoConsole className="h-6 w-6 text-gray-200 transition-colors group-hover:text-white" />
+              <MCMark className="h-7 w-7 text-gray-200 transition-colors group-hover:text-white" />
               <span className="font-semibold tracking-wide">{name}</span>
             </Link>
             <SiteNav />

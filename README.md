@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/mission-control-wordmark-dark.svg">
+    <img alt="Mission Control" src="assets/brand/mission-control-wordmark.svg" width="480">
+  </picture>
+</p>
+
 # Mission Control
 
 Command center for the whole agent fleet — Claude Code, Claude Cowork (cloud +
