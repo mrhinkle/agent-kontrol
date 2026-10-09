@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- In-app Help menu (`/help`) that renders the project docs.
 - Dashboard: Fleet, Progress, Usage and Costs, Tasks, History, Memory, and Gibson 3D view.
 - Ingest API.
 - MCP server with 11 tools and OAuth 2.1.

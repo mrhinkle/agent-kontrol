@@ -140,6 +140,10 @@ Change the env var, redeploy, then update every agent and collector with the new
 
 The progress collector and usage collector install as macOS launchd agents. On Linux, run `scripts/collect-progress.sh` and `agents/usage-collector/collect_usage.py` from cron or a systemd timer yourself; no installer is provided.
 
+## Vercel Deployment Protection
+
+If Vercel Deployment Protection is on for the project, external MCP hosts cannot reach `/api/mcp`, `/.well-known/*`, or `/oauth/*`, so discovery and the OAuth sign-in fail. Turn protection off for the production deployment, or bypass those paths. Agents using `Authorization: Bearer <MC_TOKEN>` are also blocked by protection, because the request never reaches the app.
+
 ## Troubleshooting
 
 | Symptom | Cause |

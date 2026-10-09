@@ -8,7 +8,7 @@
  *
  * Supported: ATX headings, paragraphs, hard line breaks, bullet / numbered /
  * task lists (one level), fenced and indented code, blockquotes, horizontal
- * rules, inline code, bold, italic, strikethrough, links, and bare URLs.
+ * rules, pipe tables, inline code, bold, italic, strikethrough, links, and bare URLs.
  * Anything else renders as text.
  */
 
@@ -29,6 +29,7 @@ export type Block =
   | { t: "list"; ordered: boolean; start: number; items: ListItem[] }
   /** Source past the parse cap, shown as plain text so nothing is lost. */
   | { t: "text"; v: string }
+  | { t: "table"; head: Inline[][]; rows: Inline[][][] }
   | { t: "hr" };
 
 export interface ListItem {
@@ -175,6 +176,19 @@ function parseBlocks(lines: string[], depth: number): Block[] {
       blocks.push({ t: "quote", c: parseBlocks(body, depth + 1) });
       continue;
     }
+    if (para.length === 0 && line.includes("|") && i + 1 < lines.length && TABLE_DELIM.test(lines[i + 1])) {
+      const head = splitRow(line);
+      const cols = head.length;
+      i += 2;
+      const rows: Inline[][][] = [];
+      while (i < lines.length && lines[i].trim() && lines[i].includes("|")) {
+        const cells = splitRow(lines[i]);
+        rows.push(Array.from({ length: cols }, (_, c) => parseInline(cells[c] ?? "")));
+        i++;
+      }
+      blocks.push({ t: "table", head: head.map((h) => parseInline(h)), rows });
+      continue;
+    }
     const bullet = BULLET.exec(line);
     const ordered = ORDERED.exec(line);
     if (bullet || ordered) {
@@ -215,6 +229,36 @@ function parseBlocks(lines: string[], depth: number): Block[] {
   }
   flush();
   return blocks;
+}
+
+/** A pipe-table delimiter row: | --- | :---: | ---: | */
+const TABLE_DELIM = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$/;
+
+/** Splits one table row on unescaped pipes that are not inside inline code. */
+export function splitRow(line: string): string[] {
+  let s = line.trim();
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|") && !s.endsWith("\\|")) s = s.slice(0, -1);
+  const cells: string[] = [];
+  let cur = "";
+  let inCode = false;
+  for (let k = 0; k < s.length; k++) {
+    const ch = s[k];
+    if (ch === "\\" && s[k + 1] === "|") {
+      cur += "|";
+      k++;
+      continue;
+    }
+    if (ch === "`") inCode = !inCode;
+    if (ch === "|" && !inCode) {
+      cells.push(cur.trim());
+      cur = "";
+      continue;
+    }
+    cur += ch;
+  }
+  cells.push(cur.trim());
+  return cells;
 }
 
 function indentOf(line: string): number {
