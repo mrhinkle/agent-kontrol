@@ -3,7 +3,7 @@ import { HELP_DOCS } from "@/lib/help-docs";
 
 export const dynamic = "force-static";
 
-export const metadata = { title: "Help · Mission Control" };
+export const metadata = { title: "Help · Agent Kontrol" };
 
 export default function HelpIndex() {
   return (
@@ -12,7 +12,7 @@ export default function HelpIndex() {
         <h1 className="text-xl font-semibold">Help</h1>
         <p className="mt-1 text-sm text-gray-400">
           The project documentation, inside the app. The same files live in the{" "}
-          <a className="underline" href="https://github.com/mrhinkle/mission-control/tree/main/docs">
+          <a className="underline" href="https://github.com/mrhinkle/agent-kontrol/tree/main/docs">
             repository
           </a>
           .

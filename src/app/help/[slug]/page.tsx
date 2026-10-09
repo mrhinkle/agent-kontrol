@@ -40,7 +40,7 @@ export default async function HelpDocPage({ params }: { params: Promise<{ slug: 
         <Markdown source={source} className="text-sm text-gray-300" />
         <p className="mt-6 text-xs text-gray-500">
           Source:{" "}
-          <a className="underline" href={`https://github.com/mrhinkle/mission-control/blob/main/${doc.file}`}>
+          <a className="underline" href={`https://github.com/mrhinkle/agent-kontrol/blob/main/${doc.file}`}>
             {doc.file}
           </a>
         </p>

@@ -5,7 +5,7 @@ MCP servers + hooks via `~/.grok/config.toml`, AGENTS.md support, subagents.
 Auth via SuperGrok / X Premium+ subscription or `XAI_API_KEY`. Docs:
 https://docs.x.ai/build/overview
 
-Two ways to wire it into Mission Control — use both:
+Two ways to wire it into Agent Kontrol — use both:
 
 ## 1. Dispatcher (recommended — deterministic)
 
@@ -19,7 +19,7 @@ opinions on another agent's plan, fast large-context summarization.
 
 ## 2. MCP connector (semantic — lets Grok report in and use shared memory)
 
-Add Mission Control to `~/.grok/config.toml` as an MCP server:
+Add Agent Kontrol to `~/.grok/config.toml` as an MCP server:
 
 ```toml
 [mcp_servers.mission-control]
@@ -33,7 +33,7 @@ moves fast.)
 Then add to your global `AGENTS.md` so interactive Grok sessions participate:
 
 ```
-You are part of the operator's agent fleet, tracked at Mission Control.
+You are part of the operator's agent fleet, tracked at Agent Kontrol.
 - At session start: call check_inbox (agent_id "grok-<hostname>") and
   get_fleet_status before starting work another agent might already own.
   If there are messages, act on them and reply_to_operator.

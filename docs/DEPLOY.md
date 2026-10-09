@@ -1,18 +1,18 @@
 # Deploy
 
-This document explains how to install and run Mission Control: the one-line quickstart, the deployment targets, the environment variables, and day-to-day operations.
+This document explains how to install and run Agent Kontrol: the one-line quickstart, the deployment targets, the environment variables, and day-to-day operations.
 
 ## Quickstart
 
 One-line install (Docker if Docker Compose is available, otherwise local demo mode on Node >= 20):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mrhinkle/mission-control/main/scripts/quickstart.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mrhinkle/agent-kontrol/main/scripts/quickstart.sh | bash
 ```
 
 The script:
 
-- Clones the repo to `./mission-control`, or reuses a clone that is already there.
+- Clones the repo to `./agent-kontrol`, or reuses a clone that is already there.
 - Creates `.env` with a random `MC_TOKEN` and `MC_DASHBOARD_PASSWORD` (mode 600, never overwritten).
 - In Docker mode, runs `docker compose up -d --build`, waits for http://localhost:3000/login, and tells you the password and token are in `.env`.
 
@@ -25,14 +25,14 @@ Flags:
 The same thing without piping to a shell:
 
 ```bash
-git clone https://github.com/mrhinkle/mission-control.git
-cd mission-control
+git clone https://github.com/mrhinkle/agent-kontrol.git
+cd agent-kontrol
 ./scripts/quickstart.sh
 ```
 
 ## Deploy to Vercel
 
-[![Deploy to Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fmrhinkle%2Fmission-control&project-name=mission-control&repository-name=mission-control&env=MC_TOKEN%2CMC_DASHBOARD_PASSWORD&envDescription=MC_TOKEN%20is%20the%20shared%20secret%20agents%20use.%20MC_DASHBOARD_PASSWORD%20protects%20the%20dashboard.%20Generate%20each%20with%20openssl%20rand%20-hex%2024.&envLink=https%3A%2F%2Fgithub.com%2Fmrhinkle%2Fmission-control%2Fblob%2Fmain%2Fdocs%2FDEPLOY.md&stores=%5B%7B%22type%22%3A%22integration%22%2C%22integrationSlug%22%3A%22neon%22%2C%22productSlug%22%3A%22neon%22%2C%22protocol%22%3A%22storage%22%7D%5D)
+[![Deploy to Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fmrhinkle%2Fagent-kontrol&project-name=agent-kontrol&repository-name=agent-kontrol&env=MC_TOKEN%2CMC_DASHBOARD_PASSWORD&envDescription=MC_TOKEN%20is%20the%20shared%20secret%20agents%20use.%20MC_DASHBOARD_PASSWORD%20protects%20the%20dashboard.%20Generate%20each%20with%20openssl%20rand%20-hex%2024.&envLink=https%3A%2F%2Fgithub.com%2Fmrhinkle%2Fagent-kontrol%2Fblob%2Fmain%2Fdocs%2FDEPLOY.md&stores=%5B%7B%22type%22%3A%22integration%22%2C%22integrationSlug%22%3A%22neon%22%2C%22productSlug%22%3A%22neon%22%2C%22protocol%22%3A%22storage%22%7D%5D)
 
 The Neon integration injects `DATABASE_URL`. `npm run build` applies the schema automatically when `DATABASE_URL` is present (script `scripts/apply-schema.mjs`; idempotent), so a new deploy works on first load. This is the path the author runs in production.
 
@@ -97,7 +97,7 @@ With no `DATABASE_URL`, the app runs with sample data and stores nothing.
 | `MC_COOKIE_SECRET` | No | HMAC key for the dashboard cookie. Falls back to `MC_TOKEN`. Rotating it signs everyone out. |
 | `MC_OAUTH_SECRET` | No | HS256 key for OAuth JWTs. Falls back to `MC_COOKIE_SECRET`, then `MC_TOKEN`. Rotating it revokes all OAuth connections. |
 | `MC_PUBLIC_URL` | No | Canonical origin for OAuth metadata. Otherwise derived from request headers. |
-| `NEXT_PUBLIC_MC_NAME` | No | Header name. Default `Mission Control`. |
+| `NEXT_PUBLIC_MC_NAME` | No | Header name. Default `Agent Kontrol`. |
 | `NEXT_PUBLIC_MC_OPERATOR` | No | Your name, shown as the sender of dashboard messages. Default `Operator`. |
 | `NEXT_PUBLIC_HERMES_VITALS_URL` | No | Link shown on the progress board. |
 | `MC_DB_DRIVER` | No | Driver override: `neon` or `pg`. |

@@ -1,4 +1,4 @@
--- Mission Control schema (targets Neon / plain Postgres).
+-- Agent Kontrol schema (targets Neon / plain Postgres).
 -- Apply with: psql "$DATABASE_URL" -f supabase/schema.sql
 -- (Path kept under supabase/ for historical reasons; no Supabase-specific features.)
 
@@ -80,7 +80,7 @@ create index if not exists messages_thread_idx
   on messages (agent_id, thread_id, created_at);
 
 
--- v2: the task queue. Mission Control stops being a read-only dashboard and
+-- v2: the task queue. Agent Kontrol stops being a read-only dashboard and
 -- becomes the harness: you (or an agent) queue work, the dispatcher daemon on
 -- each machine claims tasks for its installed CLIs (claude / codex / grok),
 -- runs them headless, and reports results + cost back.

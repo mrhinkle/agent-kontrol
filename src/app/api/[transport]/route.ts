@@ -11,7 +11,7 @@ import { demoProgress } from "@/lib/demo-progress";
 export const maxDuration = 60;
 
 /**
- * Mission Control MCP server — /api/mcp
+ * Agent Kontrol MCP server — /api/mcp
  * The semantic layer: any connected agent (Claude, ChatGPT Work, Hermes)
  * can report what it's doing, see what the rest of the fleet is doing,
  * and read/write shared memory.
@@ -23,7 +23,7 @@ const handler = createMcpHandler(
       {
         title: "Report status",
         description:
-          "Report what you are currently working on to Mission Control. Call this at the start of a task, at major milestones, and when you finish or get blocked.",
+          "Report what you are currently working on to Agent Kontrol. Call this at the start of a task, at major milestones, and when you finish or get blocked.",
         inputSchema: {
           agent_id: z
             .string()
@@ -42,7 +42,7 @@ const handler = createMcpHandler(
       },
       async (args) => {
         if (!isConfigured()) {
-          return { content: [{ type: "text", text: "Mission Control is in demo mode (no database configured); status not stored." }] };
+          return { content: [{ type: "text", text: "Agent Kontrol is in demo mode (no database configured); status not stored." }] };
         }
         await report({
           agent_id: args.agent_id,
@@ -56,7 +56,7 @@ const handler = createMcpHandler(
           project: args.project,
           summary: args.summary ?? args.title,
         });
-        return { content: [{ type: "text", text: "Status reported to Mission Control." }] };
+        return { content: [{ type: "text", text: "Status reported to Agent Kontrol." }] };
       }
     );
 
@@ -70,7 +70,7 @@ const handler = createMcpHandler(
       },
       async () => {
         if (!isConfigured()) {
-          return { content: [{ type: "text", text: "Mission Control is in demo mode (no database configured)." }] };
+          return { content: [{ type: "text", text: "Agent Kontrol is in demo mode (no database configured)." }] };
         }
         const { agents, events } = await fleet();
         const lines: string[] = [];
@@ -125,11 +125,11 @@ const handler = createMcpHandler(
       {
         title: "Remember",
         description:
-          "Write a note to Mission Control shared memory so other agents (and future sessions) can see it. Use for decisions, handoffs, and 'don't duplicate this' coordination notes.",
+          "Write a note to Agent Kontrol shared memory so other agents (and future sessions) can see it. Use for decisions, handoffs, and 'don't duplicate this' coordination notes.",
         inputSchema: {
           content: z.string().describe("The note to store"),
           key: z.string().optional().describe("Optional stable key; writing the same key overwrites (good for living docs like 'project-x/status')"),
-          tags: z.array(z.string()).optional().describe("Tags for filtering, e.g. ['mission-control','decision']"),
+          tags: z.array(z.string()).optional().describe("Tags for filtering, e.g. ['agent-kontrol','decision']"),
           agent_id: z.string().optional().describe("Who is writing this note"),
         },
       },
@@ -147,7 +147,7 @@ const handler = createMcpHandler(
       {
         title: "Recall",
         description:
-          "Search Mission Control shared memory. Filter by free-text query, exact key, and/or tags. Returns the most recently updated notes first.",
+          "Search Agent Kontrol shared memory. Filter by free-text query, exact key, and/or tags. Returns the most recently updated notes first.",
         inputSchema: {
           query: z.string().optional().describe("Free-text search over note content"),
           key: z.string().optional().describe("Exact key lookup"),
@@ -178,7 +178,7 @@ const handler = createMcpHandler(
       {
         title: "Check inbox",
         description:
-          "Check Mission Control for messages the operator has sent to this agent. Call at the start of a task and periodically while working. Returns pending messages and marks them read.",
+          "Check Agent Kontrol for messages the operator has sent to this agent. Call at the start of a task and periodically while working. Returns pending messages and marks them read.",
         inputSchema: {
           agent_id: z
             .string()
@@ -218,7 +218,7 @@ const handler = createMcpHandler(
       {
         title: "Reply to the operator",
         description:
-          "Send a reply to the operator in Mission Control so it appears in the Fleet conversation drawer. Call after check_inbox when you have an answer, status update, or question. Optionally pass in_reply_to with the inbound message id.",
+          "Send a reply to the operator in Agent Kontrol so it appears in the Fleet conversation drawer. Call after check_inbox when you have an answer, status update, or question. Optionally pass in_reply_to with the inbound message id.",
         inputSchema: {
           agent_id: z
             .string()
@@ -245,7 +245,7 @@ const handler = createMcpHandler(
           content: [
             {
               type: "text",
-              text: `Reply #${msg.id} delivered to Mission Control` +
+              text: `Reply #${msg.id} delivered to Agent Kontrol` +
                 (msg.thread_id ? ` (thread ${msg.thread_id}).` : "."),
             },
           ],

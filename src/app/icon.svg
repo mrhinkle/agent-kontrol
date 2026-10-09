@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-labelledby="t">
+  <title id="t">Agent Kontrol</title>
+  <rect width="120" height="120" rx="26" fill="#0b1f4b"/>
+  <circle cx="60.00" cy="60.00" r="31.00" fill="none" stroke="#ffffff" stroke-width="8.00"/>
+  <line x1="60.00" y1="37.68" x2="60.00" y2="19.70" stroke="#ffffff" stroke-width="8.00"/>
+  <line x1="60.00" y1="82.32" x2="60.00" y2="100.30" stroke="#ffffff" stroke-width="8.00"/>
+  <line x1="37.68" y1="60.00" x2="19.70" y2="60.00" stroke="#ffffff" stroke-width="8.00"/>
+  <line x1="82.32" y1="60.00" x2="100.30" y2="60.00" stroke="#ffffff" stroke-width="8.00"/>
+  <polygon points="60.00,40.47 74.51,71.53 45.49,71.53" fill="#ff6d00" stroke="#ff6d00" stroke-width="2.80" stroke-linejoin="round"/>
+</svg>

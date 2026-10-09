@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# collect-progress.sh — one collection tick for the Mission Control progress board.
+# collect-progress.sh — one collection tick for the Agent Kontrol progress board.
 #
 # Sweeps each configured repo with the GitHub API, then POSTs a single snapshot
 # per repo to /api/progress/ingest. The dashboard never calls GitHub itself; this

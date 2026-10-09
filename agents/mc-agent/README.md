@@ -1,7 +1,7 @@
 # mc-agent — unified discovery daemon
 
 One launchd process per Mac. On start it probes for Claude Code, Codex, Grok,
-and Hermes state directories, POSTs a `heartbeat` to Mission Control for each
+and Hermes state directories, POSTs a `heartbeat` to Agent Kontrol for each
 platform it finds, then tails session (or log) files and reports
 `session_start` / `status` / `session_end` the same way
 [`codex_watcher.py`](../codex/codex_watcher.py) does.
@@ -91,23 +91,23 @@ passing `MC_URL` / `MC_TOKEN` on the SSH command so you are not prompted over a
 remote TTY:
 
 ```bash
-# from the mission-control checkout on this Mac
-ssh user@second-mac.local 'mkdir -p ~/Code/mission-control/agents/mc-agent'
+# from the agent-kontrol checkout on this Mac
+ssh user@second-mac.local 'mkdir -p ~/Code/agent-kontrol/agents/mc-agent'
 
 scp agents/mc-agent/mc_agent.py agents/mc-agent/install.sh agents/mc-agent/README.md \
-  user@second-mac.local:~/Code/mission-control/agents/mc-agent/
+  user@second-mac.local:~/Code/agent-kontrol/agents/mc-agent/
 
 scp ~/.claude/mission-control.env user@second-mac.local:~/.claude/
 ssh user@second-mac.local \
   'set -a; source ~/.claude/mission-control.env; set +a; \
-   bash ~/Code/mission-control/agents/mc-agent/install.sh'
+   bash ~/Code/agent-kontrol/agents/mc-agent/install.sh'
 ```
 
 To prompt on the remote machine instead, allocate a TTY:
 
 ```bash
 ssh -t user@second-mac.local \
-  'bash ~/Code/mission-control/agents/mc-agent/install.sh'
+  'bash ~/Code/agent-kontrol/agents/mc-agent/install.sh'
 ```
 
 Each machine reports as `<platform>-<hostname>`, so each machine
@@ -140,7 +140,7 @@ server already closed.
 
 | Variable | Default | Role |
 | --- | --- | --- |
-| `MC_URL` | (required) | Mission Control origin, no trailing slash needed |
+| `MC_URL` | (required) | Agent Kontrol origin, no trailing slash needed |
 | `MC_TOKEN` | (required) | Bearer token for `/api/ingest` |
 | `MC_POLL_SECONDS` | `30` | Directory poll interval |
 | `IDLE_AFTER_SECONDS` | `900` | Idle → `session_end` |

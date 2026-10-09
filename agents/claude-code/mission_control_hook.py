@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Mission Control hook for Claude Code / Cowork (local).
+Agent Kontrol hook for Claude Code / Cowork (local).
 
 Reads the hook event JSON from stdin and POSTs a normalized event to the
-Mission Control ingest API. Deterministic ground truth: this fires whether
+Agent Kontrol ingest API. Deterministic ground truth: this fires whether
 or not the model remembers to report in.
 
 Config via environment (put these in ~/.zshenv or the hook command):
-  MC_URL    e.g. https://mission-control-xyz.vercel.app
+  MC_URL    e.g. https://your-deploy.vercel.app
   MC_TOKEN  shared secret (matches the Vercel env var)
   MC_AGENT  optional agent id override (default: claude-code-<hostname>)
 
@@ -123,7 +123,7 @@ def main() -> None:
                 out = {
                     "hookSpecificOutput": {
                         "hookEventName": event_name,
-                        "additionalContext": "\U0001F4EC Messages from the operator via Mission Control:\n" + lines,
+                        "additionalContext": "\U0001F4EC Messages from the operator via Agent Kontrol:\n" + lines,
                     }
                 }
                 print(json.dumps(out))

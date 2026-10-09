@@ -1,6 +1,6 @@
 # Dispatcher — the harness daemon
 
-One process per machine. It polls Mission Control for queued tasks, runs them
+One process per machine. It polls Agent Kontrol for queued tasks, runs them
 headless on whichever agent CLIs the machine has (`claude`, `codex`, `grok`),
 and reports results + cost back. Queue a task on the Tasks page (or via the
 `create_task` MCP tool from any agent) and it gets picked up within
@@ -43,7 +43,7 @@ Save as `~/Library/LaunchAgents/com.mission-control.dispatcher.plist`, then
   <key>Label</key><string>com.mission-control.dispatcher</string>
   <key>ProgramArguments</key><array>
     <string>/usr/bin/python3</string>
-    <string>/Users/YOU/Code/mission-control/agents/dispatcher/mc_dispatcher.py</string>
+    <string>/Users/YOU/Code/agent-kontrol/agents/dispatcher/mc_dispatcher.py</string>
   </array>
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>

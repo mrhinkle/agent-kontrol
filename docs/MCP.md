@@ -1,6 +1,6 @@
-# Mission Control MCP Server
+# Agent Kontrol MCP Server
 
-Mission Control exposes fleet coordination to AI coding agents over the Model Context Protocol. This document covers how to connect, the 11 tools, how shared memory works, and a block of standing instructions you can paste into an agent.
+Agent Kontrol exposes fleet coordination to AI coding agents over the Model Context Protocol. This document covers how to connect, the 11 tools, how shared memory works, and a block of standing instructions you can paste into an agent.
 
 ## Connecting
 
@@ -58,7 +58,7 @@ Tool names are part of the public API and will not change within 1.x.
 
 ### report_status
 
-Report what you are currently working on to Mission Control.
+Report what you are currently working on to Agent Kontrol.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |

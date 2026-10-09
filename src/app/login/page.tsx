@@ -38,7 +38,7 @@ export default function LoginPage() {
       <form onSubmit={submit} className="w-full max-w-sm rounded-xl border border-white/10 bg-[#101828] p-6">
         <div className="flex items-center gap-2 mb-4">
           <span className="inline-block h-2.5 w-2.5 rounded-full bg-[#f44800] pulse-dot" />
-          <span className="font-semibold">Mission Control</span>
+          <span className="font-semibold">Agent Kontrol</span>
         </div>
         <label className="block text-sm text-gray-400 mb-2" htmlFor="password">
           Password

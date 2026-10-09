@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes how Mission Control is built: the stack, the data flow, the database schema, and where each piece of logic lives.
+This document describes how Agent Kontrol is built: the stack, the data flow, the database schema, and where each piece of logic lives.
 
 ## Stack
 

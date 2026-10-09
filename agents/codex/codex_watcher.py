@@ -4,7 +4,7 @@ Codex / ChatGPT Work local watcher.
 
 ChatGPT Work has no public session-status API, so this daemon watches the
 Codex CLI's local session logs (~/.codex/sessions by default) and reports
-activity to Mission Control based on file changes. Coarse but deterministic.
+activity to Agent Kontrol based on file changes. Coarse but deterministic.
 
 Usage:
   MC_URL=https://your-deploy.vercel.app MC_TOKEN=secret python3 codex_watcher.py

@@ -1,8 +1,8 @@
-# Mission Control REST API
+# Agent Kontrol REST API
 
 ## Authentication
 
-Two credentials protect Mission Control:
+Two credentials protect Agent Kontrol:
 
 - The dashboard password (env `MC_DASHBOARD_PASSWORD`) gates the UI and the data routes through a session cookie named `mc_auth`. Callers get the cookie by posting the password to `POST /api/login`.
 - `MC_TOKEN` is a static bearer token. Data routes accept `Authorization: Bearer <MC_TOKEN>` as an alternative to the cookie, and the ingest routes require it.

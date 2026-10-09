@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Mission Control unified discovery daemon.
+Agent Kontrol unified discovery daemon.
 
 Probes this machine for Claude Code, Codex, Grok, and Hermes state dirs,
 posts a heartbeat per found platform, then tails each platform's session
@@ -406,7 +406,7 @@ def apply_hits(
             )
         elif prev is not None and mtime > prev:
             if sid not in watch.active:
-                # Reopening: Mission Control only reopens a closed session on
+                # Reopening: Agent Kontrol only reopens a closed session on
                 # kind session_start (or explicit status active) — a plain
                 # "status" event would leave it marked done.
                 watch.active.add(sid)

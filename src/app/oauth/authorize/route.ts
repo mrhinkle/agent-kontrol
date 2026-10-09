@@ -88,7 +88,7 @@ function consentPage(
 <body>
   <div class="card">
     <h1>Authorize MCP client</h1>
-    <p><strong>${escapeHtml(clientName)}</strong> wants access to Mission Control MCP
+    <p><strong>${escapeHtml(clientName)}</strong> wants access to Agent Kontrol MCP
     with scope <code>${escapeHtml(params.scope || "mcp")}</code>.</p>
     ${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
     <form method="post" action="/oauth/authorize">

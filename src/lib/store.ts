@@ -512,7 +512,7 @@ export async function markConversationRead(input: {
 }
 
 // ---------------------------------------------------------------------------
-// Tasks — the work queue that turns Mission Control into a harness.
+// Tasks — the work queue that turns Agent Kontrol into a harness.
 // ---------------------------------------------------------------------------
 
 export async function createTask(input: {

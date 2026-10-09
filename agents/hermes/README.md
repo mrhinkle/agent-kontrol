@@ -14,7 +14,7 @@ Follow hermes-agent's MCP integration docs
 - URL: `https://YOUR-DEPLOY.vercel.app/api/mcp`
 - Auth: `Authorization: Bearer YOUR_MC_TOKEN`
 
-Use Hermes's MCP tool filtering to expose all Mission Control tools:
+Use Hermes's MCP tool filtering to expose all Agent Kontrol tools:
 `report_status`, `get_fleet_status`, `remember`, `recall`, `check_inbox`, `reply_to_operator`,
 `create_task`, `get_task_queue`, `claim_task`, `update_task`.
 
@@ -23,7 +23,7 @@ Use Hermes's MCP tool filtering to expose all Mission Control tools:
 Add to Hermes's SOUL.md / MEMORY.md persona files:
 
 ```
-You are part of the operator's agent fleet, tracked at Mission Control.
+You are part of the operator's agent fleet, tracked at Agent Kontrol.
 - At session start (and on heartbeat/cron): call check_inbox
   (agent_id: "hermes-<host>"). If there are messages, act on them and
   reply_to_operator. Also read get_fleet_status before starting work another
@@ -52,4 +52,4 @@ curl -s -X POST "$MC_URL/api/ingest" \
 
 Also worth a cron job: a morning `get_task_queue` + `get_fleet_status` digest
 sent to you on your messaging platform of choice — Hermes as the fleet's
-voice, Mission Control as its source of truth.
+voice, Agent Kontrol as its source of truth.

@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "Usage and Costs · Mission Control",
+  title: "Usage and Costs · Agent Kontrol",
   description: "Fleet paid vs Codex shadow usage ledger for Hermes and OpenRouter.",
 };
 

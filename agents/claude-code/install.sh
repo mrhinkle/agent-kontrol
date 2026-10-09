@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Install the Mission Control hook for Claude Code on this machine.
+# Install the Agent Kontrol hook for Claude Code on this machine.
 # Usage: MC_URL=https://your-deploy.vercel.app MC_TOKEN=yourtoken ./install.sh
 set -euo pipefail
 
 if [[ -z "${MC_URL:-}" || -z "${MC_TOKEN:-}" ]]; then
   echo "Set MC_URL and MC_TOKEN first, e.g.:"
-  echo "  MC_URL=https://mission-control.vercel.app MC_TOKEN=secret ./install.sh"
+  echo "  MC_URL=https://your-deploy.vercel.app MC_TOKEN=secret ./install.sh"
   exit 1
 fi
 

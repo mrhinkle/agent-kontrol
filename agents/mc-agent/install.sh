@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the Mission Control unified discovery daemon (mc_agent.py) as a
+# Install the Agent Kontrol unified discovery daemon (mc_agent.py) as a
 # launchd agent on this Mac. Idempotent: re-running unloads, rewrites, reloads.
 #
 # Usage:
@@ -80,10 +80,10 @@ prompt_secret() {
 load_existing_env
 
 if [[ -z "${MC_URL:-}" ]]; then
-  MC_URL="$(prompt_secret MC_URL "Mission Control URL (e.g. https://your-deploy.vercel.app): ")"
+  MC_URL="$(prompt_secret MC_URL "Agent Kontrol URL (e.g. https://your-deploy.vercel.app): ")"
 fi
 if [[ -z "${MC_TOKEN:-}" ]]; then
-  MC_TOKEN="$(prompt_secret MC_TOKEN "Mission Control token: ")"
+  MC_TOKEN="$(prompt_secret MC_TOKEN "Agent Kontrol token: ")"
 fi
 
 MC_URL="${MC_URL%/}"
