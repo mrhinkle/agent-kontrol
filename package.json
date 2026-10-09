@@ -1,6 +1,6 @@
 {
   "name": "agent-kontrol",
-  "version": "0.1.0",
+  "version": "1.0.0-beta.1",
   "private": true,
   "scripts": {
     "test:ui": "npx --yes tsx@4.23.15 --test tests/ui/*.test.ts",
