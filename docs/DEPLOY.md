@@ -43,7 +43,7 @@ The Neon integration injects `DATABASE_URL`. `npm run build` applies the schema 
 | Vercel + Neon | Neon Postgres | One click | Used in the author's production |
 | Vercel + another Postgres | Any Postgres 13+ | Set `DATABASE_URL` | Supported |
 | Docker Compose (self-hosted) | Postgres 16, included | Two env vars in `.env` | Same code, less exercised |
-| Fly.io | Fly Postgres or Neon | `fly launch` + three secrets | Same image as Compose; CI builds and smoke-tests it |
+| Fly.io | Fly Managed Postgres or Neon | `fly launch` + three secrets | Same image as Compose; CI builds and smoke-tests it |
 | Any Node host | Any Postgres | `npm ci && npm run build && npm start` | Same code, less exercised |
 | Local demo | None | `npm ci && npm run dev` | Sample data, nothing stored |
 
@@ -84,7 +84,7 @@ fly launch --copy-config --no-deploy --name <your-app> --region <region>
 
 Database, one of:
 
-- **Fly Postgres**: `fly postgres create --name <your-app>-db --region <region>` then `fly postgres attach <your-app>-db --app <your-app>`. Attach sets `DATABASE_URL` as a secret; the app detects the `pg` driver from the hostname.
+- **Fly Managed Postgres**: `fly mpg create --name <your-app>-db --region <region> --plan Basic` then `fly mpg attach <cluster-id> -a <your-app>` (the cluster id is in `fly mpg list`). Attach sets `DATABASE_URL` as a secret using the pooled PgBouncer URL and restarts the app; the hostname is not Neon's, so the app uses the `pg` driver. The older unmanaged `fly postgres` commands still run but Fly no longer maintains or supports them.
 - **Neon**: create a project at neon.tech and set `DATABASE_URL` yourself (next step). Neon's HTTP driver is detected automatically.
 
 Secrets:
@@ -94,7 +94,7 @@ fly secrets set --app <your-app> \
   MC_TOKEN="$(openssl rand -hex 24)" \
   MC_DASHBOARD_PASSWORD="$(openssl rand -hex 24)" \
   MC_PUBLIC_URL="https://<your-app>.fly.dev"
-# plus DATABASE_URL if you are not using `fly postgres attach`
+# plus DATABASE_URL if you are not using `fly mpg attach`
 ```
 
 `MC_PUBLIC_URL` pins the OAuth issuer to your public hostname. Fly's proxy also sends `X-Forwarded-Proto`, so the app derives the right origin without it, but setting it avoids surprises when you add a custom domain later.
@@ -109,8 +109,8 @@ fly logs              # `migrate: schema applied` appears in the release command
 
 Notes:
 
-- The release command runs `scripts/apply-schema.mjs` on a temporary machine before the new version takes traffic. `MC_SKIP_MIGRATE=1` in `fly.toml` turns off the duplicate run that the container does at start for Compose.
-- `min_machines_running = 1` and `auto_stop_machines = "off"` keep the MCP endpoint and task queue reachable at all times. Drop them if you only want the dashboard and can tolerate cold starts.
+- The release command runs `scripts/apply-schema.mjs` on a temporary machine before the new version takes traffic. The release machine inherits `[env]`, so the command sets `MC_SKIP_MIGRATE=0` for itself; the `MC_SKIP_MIGRATE=1` in `[env]` only turns off the duplicate run the container does at start for Compose.
+- `auto_stop_machines = "off"` keeps the MCP endpoint and task queue reachable at all times. Set it to `"stop"` or `"suspend"` (and then `min_machines_running = 0`) if you only want the dashboard and can tolerate cold starts.
 - `NEXT_PUBLIC_*` values are baked in at build time and the Dockerfile declares no build args, so Fly deploys use the defaults (header name `Agent Kontrol`, sender `Operator`). To change them, add `ARG`/`ENV` lines for those names to the build stage of the Dockerfile and set them under `[build.args]` in `fly.toml`.
 - Custom domain: `fly certs add <domain>`, point DNS at the app, then update `MC_PUBLIC_URL`.
 - Upgrade: `git pull && fly deploy`. Rollback: `fly releases` then `fly deploy --image <previous image>`.
