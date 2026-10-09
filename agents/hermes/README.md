@@ -12,7 +12,7 @@ Follow hermes-agent's MCP integration docs
 (https://hermes-agent.nousresearch.com/docs/ → MCP) and add:
 
 - URL: `https://YOUR-DEPLOY.vercel.app/api/mcp`
-- Auth: `Authorization: Bearer YOUR_MC_TOKEN` (or the `?key=` URL form)
+- Auth: `Authorization: Bearer YOUR_MC_TOKEN`
 
 Use Hermes's MCP tool filtering to expose all Mission Control tools:
 `report_status`, `get_fleet_status`, `remember`, `recall`, `check_inbox`, `reply_to_operator`,

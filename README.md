@@ -78,8 +78,9 @@ clients are unaffected by the password gate.
 ### 4. Point any MCP-speaking agent at the server
 
 - URL: `https://YOUR-DEPLOY.vercel.app/api/mcp`
-- Auth: `Authorization: Bearer <MC_TOKEN>` — or `/api/mcp?key=<MC_TOKEN>` for
-  clients that can't set headers (treat that URL as a secret).
+- Auth: `Authorization: Bearer <MC_TOKEN>`, or OAuth (next section) for clients
+  that can't set headers. Secrets in URLs are not supported: they leak into
+  logs and browser history.
 
 ### Connecting via OAuth
 

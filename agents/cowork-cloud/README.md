@@ -7,9 +7,10 @@ the Mission Control MCP server — the semantic layer.
 
 In the Claude app: Settings → Connectors → Add custom connector
 
-- URL: `https://YOUR-DEPLOY.vercel.app/api/mcp?key=YOUR_MC_TOKEN`
-- (The `?key=` form exists because some connector UIs can't set an
-  Authorization header. Treat the URL as a secret.)
+- URL: `https://YOUR-DEPLOY.vercel.app/api/mcp`
+- Leave the token fields empty. The connector signs in through OAuth: approve
+  the consent screen with your dashboard password. (See "Connecting via OAuth"
+  in the top-level README.)
 
 ## 2. Add a standing instruction
 
