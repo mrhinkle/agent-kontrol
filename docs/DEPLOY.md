@@ -109,7 +109,7 @@ fly logs              # `migrate: schema applied` appears in the release command
 
 Notes:
 
-- The release command runs `scripts/apply-schema.mjs` on a temporary machine before the new version takes traffic. The release machine inherits `[env]`, so the command sets `MC_SKIP_MIGRATE=0` for itself; the `MC_SKIP_MIGRATE=1` in `[env]` only turns off the duplicate run the container does at start for Compose.
+- The release command runs `scripts/apply-schema.mjs` on a temporary machine before the new version takes traffic. The release machine inherits `[env]`, so the command sets `MC_SKIP_MIGRATE=0` for itself; the `MC_SKIP_MIGRATE=1` in `[env]` only turns off the duplicate run the container does at start (the run Docker Compose relies on; redundant on Fly).
 - `auto_stop_machines = "off"` keeps the MCP endpoint and task queue reachable at all times. Set it to `"stop"` or `"suspend"` (and then `min_machines_running = 0`) if you only want the dashboard and can tolerate cold starts.
 - `NEXT_PUBLIC_*` values are baked in at build time and the Dockerfile declares no build args, so Fly deploys use the defaults (header name `Agent Kontrol`, sender `Operator`). To change them, add `ARG`/`ENV` lines for those names to the build stage of the Dockerfile and set them under `[build.args]` in `fly.toml`.
 - Custom domain: `fly certs add <domain>`, point DNS at the app, then update `MC_PUBLIC_URL`.

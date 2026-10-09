@@ -23,7 +23,8 @@ primary_region = "iad"
   PORT = "3000"
   NEXT_TELEMETRY_DISABLED = "1"
   # The release command above already applied the schema; skip the
-  # per-container run that the Dockerfile does for Docker Compose.
+  # duplicate run the Dockerfile CMD does at container start (that run is
+  # what Docker Compose relies on; on Fly it is redundant).
   MC_SKIP_MIGRATE = "1"
 
 [http_service]
