@@ -20,7 +20,7 @@ The Claude Code hook already installed for the Fleet view now emits traces too. 
 | `turn N` | each prompt, to the next `Stop` |
 | the tool name, for example `Bash` | `PreToolUse` to `PostToolUse` |
 
-A tool call whose response reports an error is marked as an error. The hook keeps a tiny state file per session under `~/.claude/mission-control-trace/` to pair a tool's start with its end, and deletes it when the session ends (leftovers older than 7 days are cleaned up). Tool hooks add one short HTTP call per tool use, with a 2 second timeout, and never block the agent. Set `MC_TRACES=0` to turn tracing off while keeping the Fleet events.
+A tool call whose response reports an error is marked as an error. The hook keeps a tiny state file per session under `~/.claude/mission-control-trace/` to pair a tool's start with its end, and deletes it when the session ends (leftovers older than 7 days are cleaned up). Tool traces are sent from a detached child process, so the agent never waits on the network (on Windows, where fork is unavailable, the send is synchronous with a short timeout). After a failed send the hook skips tracing for 30 seconds, so a down server cannot slow every tool call. Set `MC_TRACES=0` to turn tracing off while keeping the Fleet events.
 
 ## Any other agent or tool: send OTLP
 
@@ -46,6 +46,8 @@ Rules:
 - **Format.** JSON only. Protobuf is answered with 415. gzip request bodies are accepted. Requests over 2 MB, or with more than 500 spans, are cut off; spans past the limit are reported as rejected.
 - **Agent id.** The `agent.id` resource attribute, falling back to `service.name`. A span with neither is rejected.
 - **Ids.** `traceId` is 32 hex characters and `spanId` 16, as OpenTelemetry defines them. Zero ids are rejected.
+- **Numbers.** Token counts must be non-negative integers and cost a finite amount under a trillion. A value that is not is dropped from that span, and the span is still stored.
+- **Updates are monotonic.** Sending a span again merges it: the earliest start and latest end win, a span that has failed stays failed, and attributes combine with the newer value winning. A retry of an older update cannot shorten a span or erase an error.
 - **Open spans.** A span sent without an end time is shown as running. Send it again later with the same ids and an end time, and it is updated in place. Earliest start, latest end and combined attributes win.
 - **Response.** `200 { "partialSuccess": { "rejectedSpans": N, "errorMessage": "..." } }`, as OTLP specifies. A bad token is 401.
 
@@ -68,6 +70,7 @@ Prompts and tool payloads are the most sensitive data an agent touches, so they 
 
 - Attributes whose names look like credentials (`secret`, `token`, `password`, `authorization`, `api_key`, `cookie`, `credential`, `private_key`) are dropped. This always applies.
 - Prompt, completion, and tool input and output attributes (`gen_ai.prompt`, `gen_ai.completion`, `tool.input`, `tool.output`, and similar) are dropped unless you set `MC_TRACE_CAPTURE_CONTENT=1` on the server. The Claude Code hook also needs `MC_TRACE_CAPTURE_CONTENT=1` before it sends them, and truncates to 300 characters.
+- Obvious credentials inside values, span names and status messages (API keys, bearer tokens, JWTs, GitHub and Slack tokens) are replaced with `[redacted]`. This is a best-effort filter, not a guarantee; the real protection is that content is not stored.
 - Only strings, numbers and booleans are kept. Values are cut to 500 characters, names to 64, and a span keeps at most 40 attributes.
 - Everything stored is plain Postgres data, unencrypted by this app, like the rest of your data. Use your provider's encryption at rest.
 

@@ -101,6 +101,13 @@ async function main() {
   assert.equal(summary.output_tokens, 5);
   assert.equal((await listTraces({ agent: `${tag}-agent`, errorsOnly: true })).length, 1);
   assert.equal((await listTraces({ agent: `${tag}-agent`, before: "2026-10-09T11:00:00.000Z" })).length, 0, "before filters by start time");
+  // Out-of-order and retried updates are monotonic: the later end and a failure survive a stale "ok".
+  await upsertSpans([mk("00000000000000a2", "00000000000000a1", { status: "ok", ended_at: "2026-10-09T12:00:01.000Z", attributes: { c: "late" } })]);
+  const afterStale = (await getTrace(traceId)).find((s) => s.span_id === "00000000000000a2")!;
+  assert.equal(afterStale.status, "error", "a stale ok cannot erase an error");
+  assert.equal(afterStale.status_message, "bad");
+  assert.equal(afterStale.ended_at, "2026-10-09T12:00:02.000Z", "a stale end cannot shorten a span");
+  assert.equal(afterStale.attributes.c, "late", "attributes still merge");
   const oldTrace = traceId.slice(0, 31) + "f";
   await upsertSpans([mk("00000000000000b1", null, { trace_id: oldTrace, started_at: "2020-01-01T00:00:00.000Z" })]);
   await pruneSpans();

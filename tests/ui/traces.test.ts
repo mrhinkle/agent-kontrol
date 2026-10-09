@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildWaterfall, dedupeSpans, formatDuration, nanoToIso, parseOtlp, sanitizeAttributes, type SpanRow } from "../../src/lib/traces";
+import { buildWaterfall, dedupeSpans, formatDuration, mergeStatus, nanoToIso, parseOtlp, redactText, sanitizeAttributes, type SpanRow } from "../../src/lib/traces";
 
 const TRACE = "0123456789abcdef0123456789abcdef";
 const ns = (iso: string) => String(BigInt(Date.parse(iso)) * 1_000_000n);
@@ -192,5 +192,67 @@ describe("formatDuration", () => {
     assert.equal(formatDuration(250), "250ms");
     assert.equal(formatDuration(1500), "1.50s");
     assert.equal(formatDuration(75_000), "1m 15s");
+  });
+});
+
+describe("sanitizer hardening", () => {
+  it("drops indexed prompt and tool-content keys by default", () => {
+    const out = sanitizeAttributes({
+      "gen_ai.prompt.0.content": "Use sk-abcdefghijklmnopqrstuv",
+      "gen_ai.completion.0.content": "x",
+      "gen_ai.input.messages": "[]",
+      "tool.input.command": "cat ~/.ssh/id_rsa",
+      "gen_ai.usage.input_tokens": 5,
+      "tool.name": "Bash",
+    });
+    // Token counts are filtered too (the name contains "token") but live in their own columns.
+    assert.deepEqual(out, { "tool.name": "Bash" });
+  });
+
+  it("classifies a long key before truncating it", () => {
+    const key = "a".repeat(70) + ".password";
+    assert.deepEqual(sanitizeAttributes({ [key]: "hunter2" }), {});
+  });
+
+  it("scrubs obvious credentials inside values, names and status messages", () => {
+    assert.equal(redactText("token sk-abcdefghijklmnopqrstuv end"), "token [redacted] end");
+    assert.equal(redactText("Authorization: Bearer abcdefghijklmnop1234"), "Authorization: [redacted]");
+    assert.equal(redactText("ghp_abcdefghijklmnopqrstuvwxyz0123"), "[redacted]");
+    const r = parseOtlp(otlp([span({ name: "call sk-abcdefghijklmnopqrstuv", status: { code: 2, message: "failed with ghp_abcdefghijklmnopqrstuvwxyz0123" } })]));
+    assert.equal(r.spans[0].name, "call [redacted]");
+    assert.equal(r.spans[0].status_message, "failed with [redacted]");
+  });
+});
+
+describe("numeric validation", () => {
+  it("drops token and cost values that would not fit the database, keeping the span", () => {
+    const attrs = (k: string, v: object) => ({ key: k, value: v });
+    const r = parseOtlp(
+      otlp([
+        span({ attributes: [attrs("gen_ai.usage.input_tokens", { doubleValue: 1e21 }), attrs("gen_ai.usage.output_tokens", { doubleValue: 2.5 }), attrs("agentkontrol.cost_usd", { doubleValue: 1e15 })] }),
+        span({ spanId: "00000000000000b2", attributes: [attrs("gen_ai.usage.input_tokens", { intValue: "9007199254740991" }), attrs("agentkontrol.cost_usd", { doubleValue: 1e-7 })] }),
+      ]),
+    );
+    assert.equal(r.spans.length, 2);
+    assert.deepEqual([r.spans[0].input_tokens, r.spans[0].output_tokens, r.spans[0].cost_usd], [null, null, null]);
+    assert.deepEqual([r.spans[1].input_tokens, r.spans[1].cost_usd], [9007199254740991, 1e-7]);
+  });
+});
+
+describe("monotonic merge", () => {
+  it("an error is never overwritten by ok, in either arrival order", () => {
+    assert.equal(mergeStatus("error", "ok"), "error");
+    assert.equal(mergeStatus("ok", "error"), "error");
+    assert.equal(mergeStatus("unset", "ok"), "ok");
+    assert.equal(mergeStatus("ok", "unset"), "ok");
+  });
+
+  it("keeps the later end and the failure when updates arrive out of order", () => {
+    const closed = parseOtlp(otlp([span({ status: { code: 2, message: "boom" }, endTimeUnixNano: ns("2026-10-09T12:00:05.000Z") })])).spans[0];
+    const staleOk = parseOtlp(otlp([span({ status: { code: 1 }, endTimeUnixNano: ns("2026-10-09T12:00:01.000Z") })])).spans[0];
+    const m = dedupeSpans([closed, staleOk]);
+    assert.equal(m[0].status, "error");
+    assert.equal(m[0].status_message, "boom");
+    assert.equal(m[0].ended_at, "2026-10-09T12:00:05.000Z");
   });
 });

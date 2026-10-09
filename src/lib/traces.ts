@@ -64,7 +64,17 @@ const ZERO16 = "0".repeat(16);
 /** Attribute names that look like credentials are never stored. */
 const SECRET_KEY = /(secret|token|password|passwd|authorization|api[._-]?key|cookie|credential|private[._-]?key)/i;
 /** Prompt, completion and tool payloads. Stored only when the operator opts in. */
-const CONTENT_KEY = /^(gen_ai\.(prompt|completion|input\.messages|output\.messages|system_instructions)|tool\.(input|output)|content|prompt|completion|input|output)$/i;
+const CONTENT_KEY = /^(gen_ai\.(prompt|completion|input|output|system_instructions)|tool\.(input|output)|content|prompt|completion|input|output)(\.|$)/i;
+
+/**
+ * Best-effort scrub of obvious credentials that appear inside free-text values
+ * (a span name, a status message, an attribute). It cannot catch everything;
+ * the real protection is that prompts and tool content are not stored at all.
+ */
+const SECRET_VALUE = /\b(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|Bearer\s+[A-Za-z0-9._~+\/=-]{16,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,})/g;
+export function redactText(text: string, max: number = MAX_VALUE): string {
+  return text.replace(SECRET_VALUE, "[redacted]").slice(0, max);
+}
 
 export function isTraceId(s: unknown): s is string {
   return typeof s === "string" && HEX32.test(s) && s !== ZERO32;
@@ -81,10 +91,11 @@ export function sanitizeAttributes(
   const out: Record<string, AttrValue> = {};
   for (const [rawKey, value] of Object.entries(attrs)) {
     if (Object.keys(out).length >= MAX_ATTRS) break;
+    // Classify the full key before truncating it, so a long key cannot hide its last words.
+    if (!rawKey || SECRET_KEY.test(rawKey)) continue;
+    if (!opts.captureContent && CONTENT_KEY.test(rawKey)) continue;
     const key = rawKey.slice(0, MAX_KEY);
-    if (!key || SECRET_KEY.test(key)) continue;
-    if (!opts.captureContent && CONTENT_KEY.test(key)) continue;
-    if (typeof value === "string") out[key] = value.slice(0, MAX_VALUE);
+    if (typeof value === "string") out[key] = redactText(value);
     else if (typeof value === "number" && Number.isFinite(value)) out[key] = value;
     else if (typeof value === "boolean") out[key] = value;
   }
@@ -143,9 +154,16 @@ export function nanoToIso(v: unknown): string | null {
   }
 }
 
-function asNumber(v: unknown): number | null {
-  const n = typeof v === "string" ? Number(v) : v;
-  return typeof n === "number" && Number.isFinite(n) && n >= 0 ? n : null;
+/** A token count: a non-negative safe integer, so it always fits a Postgres bigint. Anything else is dropped. */
+function asCount(v: unknown): number | null {
+  const n = typeof v === "string" && v.trim() !== "" ? Number(v) : v;
+  return typeof n === "number" && Number.isSafeInteger(n) && n >= 0 ? n : null;
+}
+
+/** A dollar amount: finite, non-negative and under a trillion. Anything else is dropped. */
+function asCost(v: unknown): number | null {
+  const n = typeof v === "string" && v.trim() !== "" ? Number(v) : v;
+  return typeof n === "number" && Number.isFinite(n) && n >= 0 && n < 1e12 ? n : null;
 }
 
 function pickKind(attrs: Record<string, unknown>, parentless: boolean): SpanKind {
@@ -228,23 +246,35 @@ export function parseOtlp(
           span_id: spanId,
           parent_span_id: parent,
           agent_id: agent,
-          session_id: typeof sessionRaw === "string" ? sessionRaw.slice(0, 200) : null,
-          name: String(s.name ?? "span").slice(0, MAX_NAME) || "span",
+          session_id: typeof sessionRaw === "string" ? redactText(sessionRaw, 200) : null,
+          name: redactText(String(s.name ?? "span"), MAX_NAME) || "span",
           kind: pickKind(rawAttrs, parent === null),
           status: spanStatus,
-          status_message: typeof status.message === "string" && status.message ? status.message.slice(0, MAX_VALUE) : null,
+          status_message: typeof status.message === "string" && status.message ? redactText(status.message) : null,
           started_at: started,
           ended_at: nanoToIso(s.endTimeUnixNano),
           attributes: attrs,
-          model: typeof model === "string" ? model.slice(0, 120) : null,
-          input_tokens: asNumber(rawAttrs["gen_ai.usage.input_tokens"] ?? rawAttrs["gen_ai.usage.prompt_tokens"]),
-          output_tokens: asNumber(rawAttrs["gen_ai.usage.output_tokens"] ?? rawAttrs["gen_ai.usage.completion_tokens"]),
-          cost_usd: asNumber(rawAttrs["agentkontrol.cost_usd"]),
+          model: typeof model === "string" ? redactText(model, 120) : null,
+          input_tokens: asCount(rawAttrs["gen_ai.usage.input_tokens"] ?? rawAttrs["gen_ai.usage.prompt_tokens"]),
+          output_tokens: asCount(rawAttrs["gen_ai.usage.output_tokens"] ?? rawAttrs["gen_ai.usage.completion_tokens"]),
+          cost_usd: asCost(rawAttrs["agentkontrol.cost_usd"]),
         });
       }
     }
   }
   return result;
+}
+
+function laterIso(a: string | null, b: string | null): string | null {
+  if (!a) return b;
+  if (!b) return a;
+  return Date.parse(a) >= Date.parse(b) ? a : b;
+}
+
+/** Once a span has failed it stays failed, whatever order its updates arrive in. */
+export function mergeStatus(prev: SpanStatus, next: SpanStatus): SpanStatus {
+  if (prev === "error" || next === "error") return "error";
+  return next === "unset" ? prev : next;
 }
 
 /**
@@ -264,9 +294,9 @@ export function dedupeSpans(spans: SpanInput[]): SpanInput[] {
       ...prev,
       ...s,
       parent_span_id: s.parent_span_id ?? prev.parent_span_id,
-      ended_at: s.ended_at ?? prev.ended_at,
-      status: s.status === "unset" ? prev.status : s.status,
-      status_message: s.status_message ?? prev.status_message,
+      ended_at: laterIso(prev.ended_at, s.ended_at),
+      status: mergeStatus(prev.status, s.status),
+      status_message: prev.status === "error" ? (prev.status_message ?? s.status_message) : (s.status_message ?? prev.status_message),
       started_at: prev.started_at < s.started_at ? prev.started_at : s.started_at,
       attributes: { ...prev.attributes, ...s.attributes },
       model: s.model ?? prev.model,

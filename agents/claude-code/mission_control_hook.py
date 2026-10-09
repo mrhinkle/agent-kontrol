@@ -223,16 +223,64 @@ def send_traces(url: str, agent_id: str, event_name: str, payload: dict) -> None
         save_state(session_id, state)
     if not spans:
         return
+    if trace_backoff_active():
+        return
     req = urllib.request.Request(
         f"{url}/api/v1/traces",
         data=json.dumps(otlp_request(agent_id, session_id, spans)).encode(),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {os.environ.get('MC_TOKEN', '')}"},
         method="POST",
     )
+    post_detached(req)
+
+
+def _backoff_path() -> Path:
+    return Path("~/.claude/mission-control-trace/.down").expanduser()
+
+
+def trace_backoff_active(window: float = 30.0) -> bool:
+    """After a failed send, skip tracing for a while so a dead server cannot slow every tool call."""
     try:
-        urllib.request.urlopen(req, timeout=2)
+        return time.time() - _backoff_path().stat().st_mtime < window
     except Exception:
-        pass
+        return False
+
+
+def _send_now(req) -> None:
+    try:
+        urllib.request.urlopen(req, timeout=3)
+        try:
+            _backoff_path().unlink()
+        except FileNotFoundError:
+            pass
+    except Exception:
+        try:
+            _backoff_path().parent.mkdir(parents=True, exist_ok=True)
+            _backoff_path().touch()
+        except Exception:
+            pass
+
+
+def post_detached(req) -> None:
+    """Send in a forked child so the agent never waits on the network (POSIX).
+    Where fork is unavailable the send is synchronous, bounded by its timeout."""
+    if not hasattr(os, "fork"):
+        _send_now(req)
+        return
+    try:
+        pid = os.fork()
+    except Exception:
+        _send_now(req)
+        return
+    if pid != 0:
+        return  # parent: return to the agent immediately
+    try:
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+        _send_now(req)
+    finally:
+        os._exit(0)
 
 
 def main() -> None:

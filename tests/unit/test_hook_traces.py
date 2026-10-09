@@ -2,6 +2,9 @@
 """Trace span construction in the Claude Code hook (pure functions, no network)."""
 import importlib.util
 import os
+import socket
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -91,6 +94,51 @@ class HookTraceTests(unittest.TestCase):
         req = hook.otlp_request("cc-mac", SID, [])
         attrs = {a["key"]: a["value"]["stringValue"] for a in req["resourceSpans"][0]["resource"]["attributes"]}
         self.assertEqual(attrs["agent.id"], "cc-mac")
+
+
+class HookResilienceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_home = os.environ.get("HOME")
+        os.environ["HOME"] = self.tmp.name
+
+    def tearDown(self):
+        if self.old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self.old_home
+        self.tmp.cleanup()
+
+    def test_a_server_that_never_answers_does_not_delay_the_agent(self):
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(5)
+        url = f"http://127.0.0.1:{srv.getsockname()[1]}"
+        payload = {"session_id": "slow", "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "t", "tool_response": {}}
+        os.environ["MC_TOKEN"] = "x"
+        start = time.time()
+        hook.send_traces(url, "agent", "PostToolUse", payload)
+        elapsed = time.time() - start
+        srv.close()
+        self.assertLess(elapsed, 0.5, f"tool hook blocked for {elapsed:.2f}s on an unresponsive server")
+
+    def test_backoff_skips_tracing_after_a_failure_then_expires(self):
+        marker = hook._backoff_path()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        self.assertFalse(hook.trace_backoff_active())
+        marker.touch()
+        self.assertTrue(hook.trace_backoff_active())
+        old = time.time() - 120
+        os.utime(marker, (old, old))
+        self.assertFalse(hook.trace_backoff_active())
+
+    def test_failed_send_creates_the_backoff_marker(self):
+        class Req:  # urlopen on an unreachable port fails fast
+            pass
+        import urllib.request
+        req = urllib.request.Request("http://127.0.0.1:9/api/v1/traces", data=b"{}", method="POST")
+        hook._send_now(req)
+        self.assertTrue(hook.trace_backoff_active())
 
 
 if __name__ == "__main__":

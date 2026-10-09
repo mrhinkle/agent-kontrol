@@ -8,6 +8,25 @@ import { captureContentEnabled, dedupeSpans, MAX_BODY_BYTES, parseOtlp } from "@
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
 
+/** Read a request body, giving up (null) as soon as it passes `max` bytes. */
+async function readCapped(req: Request, max: number): Promise<Buffer | null> {
+  if (!req.body) return Buffer.alloc(0);
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks);
+}
+
 /**
  * POST /api/v1/traces
  * OTLP/HTTP JSON trace export (the OpenTelemetry wire format), so any
@@ -32,8 +51,13 @@ export async function POST(req: Request) {
 
   let text: string;
   try {
-    let buf = Buffer.from(await req.arrayBuffer());
-    if (buf.length > MAX_BODY_BYTES) return NextResponse.json({ error: "request too large" }, { status: 413 });
+    // Refuse early on a declared size, then read the stream with a hard cap so an
+    // oversized body is never fully buffered.
+    const declared = Number(req.headers.get("content-length") ?? 0);
+    if (declared > MAX_BODY_BYTES) return NextResponse.json({ error: "request too large" }, { status: 413 });
+    const raw = await readCapped(req, MAX_BODY_BYTES);
+    if (raw === null) return NextResponse.json({ error: "request too large" }, { status: 413 });
+    let buf = raw;
     if ((req.headers.get("content-encoding") ?? "").toLowerCase() === "gzip") {
       buf = gunzipSync(buf, { maxOutputLength: MAX_BODY_BYTES });
     }

@@ -49,10 +49,20 @@ export async function upsertSpans(spans: SpanInput[]): Promise<void> {
       parent_span_id = coalesce(excluded.parent_span_id, spans.parent_span_id),
       name = excluded.name,
       kind = excluded.kind,
-      status = case when excluded.status = 'unset' then spans.status else excluded.status end,
-      status_message = coalesce(excluded.status_message, spans.status_message),
+      -- Monotonic: a span that failed stays failed, and a retry of an older
+      -- update can never shorten a span or erase its end.
+      status = case
+        when spans.status = 'error' or excluded.status = 'error' then 'error'
+        when excluded.status = 'unset' then spans.status
+        else excluded.status end,
+      status_message = case
+        when spans.status = 'error' then coalesce(spans.status_message, excluded.status_message)
+        else coalesce(excluded.status_message, spans.status_message) end,
       started_at = least(spans.started_at, excluded.started_at),
-      ended_at = coalesce(excluded.ended_at, spans.ended_at),
+      ended_at = case
+        when spans.ended_at is null then excluded.ended_at
+        when excluded.ended_at is null then spans.ended_at
+        else greatest(spans.ended_at, excluded.ended_at) end,
       attributes = spans.attributes || excluded.attributes,
       model = coalesce(excluded.model, spans.model),
       input_tokens = coalesce(excluded.input_tokens, spans.input_tokens),
