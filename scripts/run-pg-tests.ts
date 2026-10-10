@@ -10,6 +10,7 @@ import { report, remember, recall, createTask, claimNextTask, listTasks } from "
 import { getWatchedRepos, replaceWatchedRepos } from "../src/lib/watched-repos";
 import type { RepoConfig } from "../src/lib/progress-config";
 import { getTrace, listTraces, pruneSpans, upsertSpans } from "../src/lib/trace-store";
+import { pruneAutomaticNotes, upsertAutomaticNote } from "../src/lib/session-memory";
 import type { SpanInput } from "../src/lib/traces";
 
 async function main() {
@@ -134,8 +135,35 @@ async function main() {
   assert.match(note.content, /WB Agent \[codex\] on Demo App/);
   assert.match(note.content, /Tools: Bash×2 \(1 failed\)/);
   assert.match(note.content, /errors: 1/);
-  assert.match(note.content, /Migrated the schema/);
+  assert.match(note.content, /Milestones reported: 1\./);
+  assert.doesNotMatch(note.content, /Migrated the schema/, "reported text stays out by default");
   assert.doesNotMatch(note.content, /rotate the production keys/, "prompt text stays out by default");
+  const noteRow = (await sql()`select source, facts_at from memory where key = ${`session/${sid}`}`)[0];
+  assert.equal(noteRow.source, "automatic-session");
+  assert.ok(noteRow.facts_at, "the note records how fresh its facts were");
+  process.env.MC_MEMORY_WRITEBACK_TEXT = "1";
+  await report({ agent_id: wbAgent, session_id: sid, kind: "session_end", title: "Session ended" } as never);
+  const withText = (await recall({ key: `session/${sid}` }))[0];
+  assert.match(withText.content, /Migrated the schema/, "text appears with the opt-in");
+  assert.doesNotMatch(withText.content, /rotate the production keys/, "prompt-derived text still needs its own opt-in");
+  delete process.env.MC_MEMORY_WRITEBACK_TEXT;
+
+  // A stale snapshot can never replace a newer note, and a note an agent wrote itself is never overwritten.
+  const keyed = { key: `session/${tag}-race`, content: "NEW", tags: ["session-summary"] };
+  await upsertAutomaticNote(keyed, wbAgent, "2026-10-09T12:00:10.000Z");
+  await upsertAutomaticNote({ ...keyed, content: "STALE" }, wbAgent, "2026-10-09T12:00:05.000Z");
+  assert.equal((await recall({ key: keyed.key }))[0].content, "NEW", "an older snapshot loses");
+  await upsertAutomaticNote({ ...keyed, content: "NEWER" }, wbAgent, "2026-10-09T12:00:10.000Z");
+  assert.equal((await recall({ key: keyed.key }))[0].content, "NEWER", "an equal or newer snapshot wins");
+  await remember({ content: "written by an agent", key: `session/${tag}-own`, tags: ["session-summary"], agent_id: wbAgent });
+  await upsertAutomaticNote({ key: `session/${tag}-own`, content: "AUTO", tags: ["session-summary"] }, wbAgent, "2026-10-09T12:00:10.000Z");
+  assert.equal((await recall({ key: `session/${tag}-own` }))[0].content, "written by an agent", "agent-written notes are not overwritten");
+
+  // Cleanup removes only expired AUTOMATIC notes, even when an agent used the same tag.
+  await sql()`update memory set updated_at = now() - interval '90 days' where key in (${`session/${tag}-race`}, ${`session/${tag}-own`})`;
+  await pruneAutomaticNotes();
+  assert.equal((await recall({ key: `session/${tag}-race` })).length, 0, "an expired automatic note is removed");
+  assert.equal((await recall({ key: `session/${tag}-own` })).length, 1, "an old note an agent wrote survives, even with the same tag");
   await report({ agent_id: wbAgent, session_id: sid, kind: "session_end", title: "Session ended" } as never);
   assert.equal((await recall({ tags: ["session-summary"], query: "WB Agent" })).filter((n) => n.key === `session/${sid}`).length, 1, "ending twice keeps one note");
 

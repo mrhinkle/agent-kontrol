@@ -155,13 +155,13 @@ export async function report(input: ReportInput): Promise<void> {
   }
 
   // Any platform that ends a session (hook, watcher, or an MCP report with status
-  // done or failed) leaves a short note in shared memory. Best effort: never fails the report.
+  // done or failed) leaves a short note in shared memory. Best effort and bounded:
+  // it never fails the report, and ingest waits at most a couple of seconds for it.
   if (input.session_id && (input.kind === "session_end" || input.status === "done" || input.status === "failed")) {
-    try {
-      await writeSessionNote(input.session_id);
-    } catch (e) {
-      console.error("[memory] session note failed", e);
-    }
+    const work = writeSessionNote(input.session_id).catch((e) => console.error("[memory] session note failed", e));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([work, new Promise<void>((resolve) => (timer = setTimeout(resolve, 2500)))]);
+    clearTimeout(timer);
   }
 }
 
@@ -277,7 +277,9 @@ export async function remember(input: {
           content = excluded.content,
           tags = excluded.tags,
           agent_id = excluded.agent_id,
-          updated_at = excluded.updated_at
+          updated_at = excluded.updated_at,
+          source = null,
+          facts_at = null
         returning *
       `;
       if (!rows[0]) throw new Error("memory upsert returned no row");

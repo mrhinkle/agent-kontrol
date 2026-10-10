@@ -15,25 +15,25 @@ Details of the two tools are in [MCP tools](MCP.md).
 
 When a session ends, Agent Kontrol writes one short note to memory on its own. This happens on the server, so it covers every platform: the Claude Code hook, the file watchers, `mc-agent`, and any agent that calls `report_status` with status `done` or `failed`.
 
-The note has the key `session/<session id>` and the tags `session-summary`, the platform and the project. It says who worked, on what, for how long, whether it finished or failed, the event and error counts, which tools ran and how many failed (when the agent sends traces), and the last few milestones the agent reported on purpose. For example:
+The note has the key `session/<session id>` and the tags `session-summary`, the platform and the project. By default it holds **structured facts only**: who worked, on what, for how long, whether it finished or failed, the event and error counts, which tools ran and how many failed (when the agent sends traces), and how many milestones the agent reported. For example:
 
 ```
 Session summary (automatic): Claude Code (mbp) [claude-code] on api-server.
 Outcome: done. Ran 72m 0s. Ended 2026-10-09T13:12:00.000Z.
 Events: 31, errors: 2.
 Tools: Bash×12 (2 failed), Read×9, Edit×4.
-Reported:
-- Migrated the users table
-- Tests green
+Milestones reported: 2.
 ```
 
 An agent can find these with `recall` using the tag `session-summary` plus the project name.
 
-- **Built from facts, not a transcript.** No model is called and nothing is summarized from what was said. The note is only as informative as what the adapter and the agent reported. An agent that calls `remember` itself writes a better handoff.
-- **Prompt text stays out by default.** Any agent that can `recall` can read every note, so the first prompt of a session is not copied in. Set `MC_MEMORY_WRITEBACK_PROMPTS=1` to include it.
-- **Thin sessions are skipped.** A session under two minutes with no tool calls and no milestones leaves no note.
-- **One note per session.** Ending a session twice updates the same note.
-- **Cleanup.** Automatic notes older than `MC_MEMORY_WRITEBACK_DAYS` (default 30) are deleted. Notes an agent wrote with `remember` are never touched.
+- **Free text is opt-in.** Every agent that can `recall` can read every note, and titles and summaries are text an agent or adapter wrote freely, which can contain anything. Set `MC_MEMORY_WRITEBACK_TEXT=1` to also include the last few reported milestones and the last summary. They are passed through a filter that masks obvious credentials, which is best effort, not a guarantee. Text that came from a prompt is left out even then; add `MC_MEMORY_WRITEBACK_PROMPTS=1` to include it.
+- **Built from facts, not a transcript.** No model is called. The note is only as informative as what the adapter and the agent reported. An agent that calls `remember` itself writes a better handoff.
+- **Thin sessions are skipped.** A session under two minutes with no tool calls and nothing reported leaves no note.
+- **One note per session.** Ending a session twice updates the same note, and a slower, older update can never replace a newer one.
+- **Yours are safe.** The server marks the notes it writes. If an agent writes a note with the same key using `remember`, the agent's note wins and the server leaves it alone. Cleanup only ever deletes the server's own notes, even if an agent used the same tag.
+- **Cleanup.** Automatic notes older than `MC_MEMORY_WRITEBACK_DAYS` (default 30) are deleted a few at a time as new ones are written.
+- **Cost on ingest.** The note is written while the session-end request is handled, with a two-second cap on how long that request waits, and it never fails the request. On a platform that freezes the function after it responds, a slow write can be cut short, and the next session end retries it.
 - **Off switch.** Set `MC_MEMORY_WRITEBACK=0` to stop writing them.
 
 ## How to use it well

@@ -1,12 +1,48 @@
 import { sql } from "./db";
-import { buildSessionNote, includePrompts, writebackDays, writebackEnabled, type SessionFacts } from "./session-note";
+import { buildSessionNote, includePrompts, includeText, writebackDays, writebackEnabled, type SessionFacts, type SessionNote } from "./session-note";
+
+/** The `source` value that marks a memory row the server wrote itself. */
+export const AUTOMATIC_SOURCE = "automatic-session";
+
+/**
+ * Store a note, but only if it was built from facts at least as new as the stored
+ * one. Two session-end reports can race; the staler snapshot must not win. A row
+ * with another source (an agent wrote the key itself) is never overwritten.
+ */
+export async function upsertAutomaticNote(note: SessionNote, agentId: string, factsAt: string): Promise<void> {
+  await sql()`
+    insert into memory (key, content, tags, agent_id, updated_at, source, facts_at)
+    values (${note.key}, ${note.content}, ${note.tags}, ${agentId}, ${new Date().toISOString()}, ${AUTOMATIC_SOURCE}, ${factsAt}::timestamptz)
+    on conflict (key) do update set
+      content = excluded.content,
+      tags = excluded.tags,
+      agent_id = excluded.agent_id,
+      updated_at = excluded.updated_at,
+      facts_at = excluded.facts_at
+    where memory.source = ${AUTOMATIC_SOURCE}
+      and (memory.facts_at is null or memory.facts_at <= excluded.facts_at)
+  `;
+}
+
+/** Delete a bounded batch of expired automatic notes. Runs on every write, so growth stays bounded. */
+export async function pruneAutomaticNotes(): Promise<void> {
+  const days = writebackDays();
+  await sql()`
+    delete from memory where id in (
+      select id from memory
+      where source = ${AUTOMATIC_SOURCE} and updated_at < now() - (${days}::int * interval '1 day')
+      order by updated_at asc limit 25
+    )
+  `;
+}
 
 /**
  * Write (or refresh) the automatic memory note for a session that has ended.
  * Called by `report()` for every platform, so any adapter that ends a session
  * (hook, watcher, MCP `report_status` with status done) gets the same behavior.
  * Idempotent: the note's key is the session id. Failures are the caller's to log;
- * this must never make an ingest fail.
+ * this must never make an ingest fail. Queries are aggregates and small limits,
+ * backed by indexes on (session_id, created_at) and (session_id, kind).
  */
 export async function writeSessionNote(sessionId: string): Promise<void> {
   if (!writebackEnabled()) return;
@@ -21,8 +57,21 @@ export async function writeSessionNote(sessionId: string): Promise<void> {
   const s = rows[0];
   if (!s) return;
 
-  const events = await db`
-    select kind, title from events where session_id = ${sessionId} order by created_at asc limit 2000
+  const withText = includeText();
+  const [counts] = await db`
+    select count(*)::int as n,
+           (count(*) filter (where kind = 'error'))::int as errors,
+           max(created_at) as newest,
+           (count(*) filter (where kind in ('milestone', 'status')))::int as reported
+    from events where session_id = ${sessionId}
+  `;
+  // The last few reported titles. Without the free-text opt-in they only feed a count and are never stored.
+  const titles = await db`
+    select title from (
+      select title, created_at from events
+      where session_id = ${sessionId} and kind in ('milestone', 'status') and title is not null
+      order by created_at desc limit 20
+    ) t order by created_at asc
   `;
 
   let tools: { name: string; count: number; failed: number }[] = [];
@@ -47,29 +96,16 @@ export async function writeSessionNote(sessionId: string): Promise<void> {
     status: String(s.status),
     started_at: iso(s.started_at),
     ended_at: iso(s.ended_at) ?? iso(s.updated_at),
-    event_count: events.length,
-    error_count: events.filter((e) => e.kind === "error").length,
+    event_count: Number(counts?.n ?? 0),
+    error_count: Number(counts?.errors ?? 0),
     tools,
-    milestones: events.filter((e) => e.kind === "milestone" || e.kind === "status").map((e) => String(e.title ?? "")),
+    milestones: titles.map((e) => String(e.title ?? "")),
     summary: s.summary ?? null,
   };
 
-  const note = buildSessionNote(facts, { includePrompts: includePrompts() });
+  const note = buildSessionNote(facts, { includeText: withText, includePrompts: includePrompts() });
   if (!note) return;
 
-  await db`
-    insert into memory (key, content, tags, agent_id, updated_at)
-    values (${note.key}, ${note.content}, ${note.tags}, ${facts.agent_id}, ${new Date().toISOString()})
-    on conflict (key) do update set
-      content = excluded.content,
-      tags = excluded.tags,
-      agent_id = excluded.agent_id,
-      updated_at = excluded.updated_at
-  `;
-
-  // Housekeeping on roughly 1 in 25 writes so automatic notes do not pile up forever.
-  if (Math.random() < 0.04) {
-    const days = writebackDays();
-    await db`delete from memory where 'session-summary' = any(tags) and updated_at < now() - (${days}::int * interval '1 day')`;
-  }
+  await upsertAutomaticNote(note, facts.agent_id, iso(counts?.newest) ?? new Date().toISOString());
+  await pruneAutomaticNotes();
 }
