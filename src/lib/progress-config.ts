@@ -134,7 +134,7 @@ export const LANE_BOT_PREFIX: string = config.laneBotPrefix;
  * is the point of keeping them in one place.
  */
 export const THRESHOLDS = {
-  /** open issues labelled dependency-blocked, as a share of open issues */
+  /** open issues carrying the repo's blocked label, as a share of open issues */
   blockedRatio: 0.4,
   /** consecutive daily snapshots with net_backlog > 0 before it's an alert */
   backlogGrowingDays: 3,

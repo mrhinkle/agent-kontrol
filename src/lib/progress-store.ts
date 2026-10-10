@@ -218,10 +218,12 @@ export function buildAlerts(repos: RepoProgress[], history: HistoryPoint[]): Ale
         level: "bad",
         repo: r.repo,
         rule: "blockedRatio",
-        message: `${r.label} is ${Math.round(r.blocked_ratio * 100)}% dependency-blocked (over ${Math.round(
+        message: `${r.label}: ${Math.round(r.blocked_ratio * 100)}% of open issues are labeled "${r.blocked_label ?? "blocked"}" (over ${Math.round(
           THRESHOLDS.blockedRatio * 100
         )}%) — clear blockers before decomposing more`,
-        url: `https://github.com/${r.repo}/issues?q=is%3Aissue+is%3Aopen+label%3Adependency-blocked`,
+        url: `https://github.com/${r.repo}/issues?q=${encodeURIComponent(
+          `is:issue is:open label:"${r.blocked_label ?? "blocked"}"`
+        )}`,
       });
     }
 
@@ -357,6 +359,7 @@ export async function progress(window: TimeWindow): Promise<Omit<ProgressRespons
       open_issues: openIssues,
       open_prs: now?.open_prs ?? 0,
       blocked_issues: blocked,
+      blocked_label: cfg.blockedLabel,
       blocked_ratio: blocked !== null && openIssues > 0 ? blocked / openIssues : null,
       merged_prs: merged,
       issues_closed: closed,

@@ -55,6 +55,10 @@ Agents push; nothing polls vendors. No vendor exposes a "what are my agents doin
 
 Full matrix: [docs/AGENTS.md](docs/AGENTS.md).
 
+## Status
+
+Agent Kontrol is in **1.0 beta** ([release notes](https://github.com/mrhinkle/agent-kontrol/releases)). The API, MCP tool surface and schema are meant to stay stable through 1.0; please report anything that breaks them. Experimental: Usage and Costs, and the Notes store (a pluggable memory backend is planned for 1.1). Not yet built: forwarding traces to other OpenTelemetry backends, and Cline and Roo Code support.
+
 ## Documentation
 
 | | |

@@ -10,6 +10,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Traces: step-by-step spans for agent sessions. `POST /api/v1/traces` accepts OTLP/HTTP JSON from any OpenTelemetry exporter, `/traces` shows a waterfall, and the Claude Code hook emits session, turn and tool spans (register the new `PreToolUse` and `PostToolUse` hooks). Prompt and tool content is not stored unless `MC_TRACE_CAPTURE_CONTENT=1`; spans are pruned after `MC_TRACE_RETENTION_DAYS` (default 30). Docs: `docs/TELEMETRY.md`.
 
+### Changed
+
+- The progress board's blocked alert now names the repo's own blocked label and links to a search for it. It always said "dependency-blocked" and linked to that label, whatever the repo used.
+
+### Documentation
+
+- What "blocked" means (a label you choose, not something detected), the release-branch workflow on Vercel, an adapter capability table, a Status section in the README, and release and dependency policy in CONTRIBUTING.
+
 ## [1.0.0-beta.1] - 2026-10-09
 
 First public beta. Feature-complete for 1.0; the API, MCP tool surface and schema are stable unless beta feedback shows a defect. Please report issues on GitHub.
