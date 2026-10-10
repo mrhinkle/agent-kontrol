@@ -10,6 +10,7 @@ import { report, remember, recall, createTask, claimNextTask, listTasks } from "
 import { getWatchedRepos, replaceWatchedRepos } from "../src/lib/watched-repos";
 import type { RepoConfig } from "../src/lib/progress-config";
 import { getTrace, listTraces, pruneSpans, upsertSpans } from "../src/lib/trace-store";
+import { pruneAutomaticNotes, upsertAutomaticNote } from "../src/lib/session-memory";
 import type { SpanInput } from "../src/lib/traces";
 
 async function main() {
@@ -114,6 +115,76 @@ async function main() {
   assert.equal((await getTrace(oldTrace)).length, 0, "spans older than the retention window are pruned");
   assert.equal((await getTrace(traceId)).length, 2, "recent spans are kept");
   await sql()`delete from spans where trace_id = ${traceId}`;
+
+  // Session writeback: any platform that ends a session leaves one note in shared memory.
+  const sid = `${tag}-sess`;
+  const wbAgent = `${tag}-wb`;
+  const at = (min: number) => new Date(Date.now() - min * 60_000).toISOString();
+  await report({ agent_id: wbAgent, platform: "codex", display_name: "WB Agent", session_id: sid, kind: "session_start", project: "Demo App" } as never);
+  await sql()`update sessions set started_at = ${at(30)} where id = ${sid}`;
+  await report({ agent_id: wbAgent, session_id: sid, kind: "milestone", title: "Migrated the schema" } as never);
+  await report({ agent_id: wbAgent, session_id: sid, kind: "turn_start", title: "New instruction: rotate the production keys" } as never);
+  await report({ agent_id: wbAgent, session_id: sid, kind: "error", title: "build failed" } as never);
+  await sql()`insert into spans (trace_id, span_id, agent_id, session_id, name, kind, status, started_at, ended_at)
+              values (${randomUUID().replace(/-/g, "")}, '00000000000000d1', ${wbAgent}, ${sid}, 'Bash', 'tool', 'error', now(), now()),
+                     (${randomUUID().replace(/-/g, "")}, '00000000000000d2', ${wbAgent}, ${sid}, 'Bash', 'tool', 'ok', now(), now())`;
+  await report({ agent_id: wbAgent, session_id: sid, kind: "session_end", title: "Session ended" } as never);
+  const note = (await recall({ key: `session/${sid}` }))[0];
+  assert.ok(note, "an ended session leaves a note");
+  assert.ok(note.tags.includes("session-summary") && note.tags.includes("codex") && note.tags.includes("demo-app"));
+  assert.match(note.content, /WB Agent \[codex\] on Demo App/);
+  assert.match(note.content, /Tools: Bash×2 \(1 failed\)/);
+  assert.match(note.content, /errors: 1/);
+  assert.match(note.content, /Milestones reported: 1\./);
+  assert.doesNotMatch(note.content, /Migrated the schema/, "reported text stays out by default");
+  assert.doesNotMatch(note.content, /rotate the production keys/, "prompt text stays out by default");
+  const noteRow = (await sql()`select source, facts_at from memory where key = ${`session/${sid}`}`)[0];
+  assert.equal(noteRow.source, "automatic-session");
+  assert.ok(noteRow.facts_at, "the note records how fresh its facts were");
+  process.env.MC_MEMORY_WRITEBACK_TEXT = "1";
+  await report({ agent_id: wbAgent, session_id: sid, kind: "session_end", title: "Session ended" } as never);
+  const withText = (await recall({ key: `session/${sid}` }))[0];
+  assert.match(withText.content, /Migrated the schema/, "text appears with the opt-in");
+  assert.doesNotMatch(withText.content, /rotate the production keys/, "prompt-derived text still needs its own opt-in");
+  delete process.env.MC_MEMORY_WRITEBACK_TEXT;
+
+  // A stale snapshot can never replace a newer note, and a note an agent wrote itself is never overwritten.
+  const keyed = { key: `session/${tag}-race`, content: "NEW", tags: ["session-summary"] };
+  await upsertAutomaticNote(keyed, wbAgent, "2026-10-09T12:00:10.000Z");
+  await upsertAutomaticNote({ ...keyed, content: "STALE" }, wbAgent, "2026-10-09T12:00:05.000Z");
+  assert.equal((await recall({ key: keyed.key }))[0].content, "NEW", "an older snapshot loses");
+  await upsertAutomaticNote({ ...keyed, content: "NEWER" }, wbAgent, "2026-10-09T12:00:10.000Z");
+  assert.equal((await recall({ key: keyed.key }))[0].content, "NEWER", "an equal or newer snapshot wins");
+  await remember({ content: "written by an agent", key: `session/${tag}-own`, tags: ["session-summary"], agent_id: wbAgent });
+  await upsertAutomaticNote({ key: `session/${tag}-own`, content: "AUTO", tags: ["session-summary"] }, wbAgent, "2026-10-09T12:00:10.000Z");
+  assert.equal((await recall({ key: `session/${tag}-own` }))[0].content, "written by an agent", "agent-written notes are not overwritten");
+
+  // Cleanup removes only expired AUTOMATIC notes, even when an agent used the same tag.
+  await sql()`update memory set updated_at = now() - interval '90 days' where key in (${`session/${tag}-race`}, ${`session/${tag}-own`})`;
+  await pruneAutomaticNotes();
+  assert.equal((await recall({ key: `session/${tag}-race` })).length, 0, "an expired automatic note is removed");
+  assert.equal((await recall({ key: `session/${tag}-own` })).length, 1, "an old note an agent wrote survives, even with the same tag");
+  await report({ agent_id: wbAgent, session_id: sid, kind: "session_end", title: "Session ended" } as never);
+  assert.equal((await recall({ tags: ["session-summary"], query: "WB Agent" })).filter((n) => n.key === `session/${sid}`).length, 1, "ending twice keeps one note");
+
+  // An MCP agent that reports status done also gets a note; a thin session does not.
+  const sid2 = `${tag}-mcp`;
+  await report({ agent_id: `${tag}-mcp-agent`, session_id: sid2, kind: "milestone", title: "Opened the PR", project: "Demo App" } as never);
+  await report({ agent_id: `${tag}-mcp-agent`, session_id: sid2, kind: "status", status: "done", title: "Finished" } as never);
+  assert.ok((await recall({ key: `session/${sid2}` }))[0], "status done via the MCP path writes a note");
+  const sid3 = `${tag}-thin`;
+  await report({ agent_id: `${tag}-thin-agent`, session_id: sid3, kind: "session_start" } as never);
+  await report({ agent_id: `${tag}-thin-agent`, session_id: sid3, kind: "session_end" } as never);
+  assert.equal((await recall({ key: `session/${sid3}` })).length, 0, "a thin session leaves no note");
+
+  process.env.MC_MEMORY_WRITEBACK = "0";
+  const sid4 = `${tag}-off`;
+  await report({ agent_id: `${tag}-off-agent`, session_id: sid4, kind: "milestone", title: "Did a thing" } as never);
+  await report({ agent_id: `${tag}-off-agent`, session_id: sid4, kind: "session_end" } as never);
+  assert.equal((await recall({ key: `session/${sid4}` })).length, 0, "MC_MEMORY_WRITEBACK=0 turns it off");
+  delete process.env.MC_MEMORY_WRITEBACK;
+  await sql()`delete from memory where key like ${"session/" + tag + "%"}`;
+  await sql()`delete from spans where session_id like ${tag + "%"}`;
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
 }

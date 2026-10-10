@@ -16,7 +16,7 @@ This document describes the adapters that connect coding agents to Agent Kontrol
 | usage-collector | No | No | No | No | Yes |
 | progress-collector | No (feeds the Progress board) | No | No | No | No |
 
-"Via MCP" means the agent has to call the tool; it is not automatic. Any agent or SDK that can export OpenTelemetry can send traces to `/api/v1/traces` (see [Telemetry and traces](TELEMETRY.md)). A Cline and Roo Code adapter was proposed but is not included: its file locations have not been verified against a real install.
+"Via MCP" means the agent has to call the tool; it is not automatic. Every adapter that ends a session, or reports status `done` or `failed`, also gets an automatic note in shared memory (see [Memory (Notes)](MEMORY.md)). Any agent or SDK that can export OpenTelemetry can send traces to `/api/v1/traces` (see [Telemetry and traces](TELEMETRY.md)). A Cline and Roo Code adapter was proposed but is not included: its file locations have not been verified against a real install.
 
 ## claude-code
 

@@ -198,7 +198,7 @@ When to call: whenever the status of a claimed task changes, and when it finishe
 
 ## Memory
 
-See [Memory (Notes)](MEMORY.md) for what this store is and is not. Shared memory is one Postgres table, `memory`, with a unique optional `key`, `content`, a `tags` text array, an `agent_id`, and timestamps. Nothing writes to it automatically; only agents that call `remember` do. Search is substring matching (ILIKE), not semantic: `recall` finds notes whose content contains the query string, case-insensitively, and returns the most recently updated notes first.
+See [Memory (Notes)](MEMORY.md) for what this store is and is not, including the automatic session notes. Shared memory is one Postgres table, `memory`, with a unique optional `key`, `content`, a `tags` text array, an `agent_id`, and timestamps. Apart from the automatic note written when a session ends (see [Memory (Notes)](MEMORY.md)), nothing writes to it; only agents that call `remember` do. Search is substring matching (ILIKE), not semantic: `recall` finds notes whose content contains the query string, case-insensitively, and returns the most recently updated notes first.
 
 ## Recommended agent instructions
 

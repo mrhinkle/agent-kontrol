@@ -310,3 +310,12 @@ create table if not exists spans (
 create index if not exists spans_started_idx on spans (started_at desc);
 create index if not exists spans_agent_idx on spans (agent_id, started_at desc);
 create index if not exists spans_session_idx on spans (session_id);
+
+-- Automatic session notes: `source` marks rows the server wrote itself so cleanup never
+-- touches notes an agent wrote; `facts_at` is the newest event the note was built from, so
+-- a slower, staler write can never replace a newer note.
+alter table memory add column if not exists source text;
+alter table memory add column if not exists facts_at timestamptz;
+create index if not exists memory_auto_idx on memory (updated_at) where source = 'automatic-session';
+create index if not exists events_session_idx on events (session_id, created_at);
+create index if not exists spans_session_kind_idx on spans (session_id, kind);
