@@ -109,7 +109,8 @@ async function main() {
   assert.equal(afterStale.status_message, "bad");
   assert.equal(afterStale.ended_at, "2026-10-09T12:00:02.000Z", "a stale end cannot shorten a span");
   assert.equal(afterStale.attributes.c, "late", "attributes still merge");
-  const oldTrace = traceId.slice(0, 31) + "f";
+  // Always a different id from traceId: flip the last hex digit, so the test cannot collide with itself.
+  const oldTrace = traceId.slice(0, 31) + (traceId.endsWith("0") ? "1" : "0");
   await upsertSpans([mk("00000000000000b1", null, { trace_id: oldTrace, started_at: "2020-01-01T00:00:00.000Z" })]);
   await pruneSpans();
   assert.equal((await getTrace(oldTrace)).length, 0, "spans older than the retention window are pruned");
