@@ -143,7 +143,8 @@ function kvToObject(list: unknown): Record<string, unknown> {
 
 /** Unix nanoseconds (string or number, as OTLP JSON sends them) to an ISO string. */
 export function nanoToIso(v: unknown): string | null {
-  if (v === undefined || v === null || v === "" || v === "0" || v === 0) return null;
+  if (typeof v !== "string" && typeof v !== "number" && typeof v !== "bigint") return null;
+  if (v === "" || v === "0" || v === 0) return null;
   try {
     const ns = typeof v === "bigint" ? v : BigInt(typeof v === "number" ? Math.trunc(v) : String(v));
     const ms = Number(ns / 1_000_000n);
@@ -376,6 +377,23 @@ export function buildWaterfall(spans: SpanRow[], nowMs: number = Date.now()): Wa
     }
   };
   walk(null, 0);
+  // Spans in a parent cycle (a to b to a) are reachable from no root. Show them anyway,
+  // each cycle starting from its earliest span, so no span silently disappears.
+  for (const s of [...spans].sort((a, b) => Date.parse(a.started_at) - Date.parse(b.started_at))) {
+    if (seen.has(s.span_id)) continue;
+    seen.add(s.span_id);
+    const a = Date.parse(s.started_at);
+    const b = endOf(s);
+    rows.push({
+      span: s,
+      depth: 0,
+      offsetPct: ((a - startMs) / totalMs) * 100,
+      widthPct: Math.max(0.4, ((Math.max(a, b) - a) / totalMs) * 100),
+      durationMs: durationMs(s),
+      open: s.ended_at === null,
+    });
+    walk(s.span_id, 1);
+  }
   return { rows, startMs, endMs, totalMs };
 }
 
