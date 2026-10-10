@@ -89,6 +89,9 @@ export function sanitizeAttributes(
   opts: { captureContent?: boolean } = {},
 ): Record<string, AttrValue> {
   const out: Record<string, AttrValue> = {};
+  // OTLP attributes should be an object, but an exporter can send anything;
+  // treat non-objects (arrays included) as "no attributes" instead of throwing.
+  if (typeof attrs !== "object" || attrs === null || Array.isArray(attrs)) return out;
   for (const [rawKey, value] of Object.entries(attrs)) {
     if (Object.keys(out).length >= MAX_ATTRS) break;
     // Classify the full key before truncating it, so a long key cannot hide its last words.
@@ -108,10 +111,23 @@ export function captureContentEnabled(): boolean {
   return v === "1" || v === "true" || v === "yes";
 }
 
-/** Days to keep spans. 0 or unset-to-invalid falls back to 30. */
+/**
+ * Strictly parse a whole-number day count from an environment variable: one to
+ * six ASCII digits with a value of at least 1. Anything else — empty, decimals,
+ * signs, scientific or hex notation, trailing units — returns `fallback`.
+ * `Number()` would silently accept "1e3", "0x10" and "1.5"; days must be whole.
+ */
+export function parseWholeDays(raw: string | undefined, fallback: number): number {
+  if (raw === undefined) return fallback;
+  const digits = raw.trim();
+  if (!/^\d{1,6}$/.test(digits)) return fallback;
+  const n = Number(digits);
+  return n >= 1 ? n : fallback;
+}
+
+/** Days to keep spans. Unset or not a whole number of days falls back to 30. */
 export function retentionDays(): number {
-  const n = Number(process.env.MC_TRACE_RETENTION_DAYS);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 30;
+  return parseWholeDays(process.env.MC_TRACE_RETENTION_DAYS, 30);
 }
 
 // ---------------------------------------------------------------- OTLP JSON
@@ -272,6 +288,19 @@ function laterIso(a: string | null, b: string | null): string | null {
   return Date.parse(a) >= Date.parse(b) ? a : b;
 }
 
+/**
+ * The earlier of two ISO strings, comparing instants: equal wall-clock strings
+ * with different UTC offsets can sort backwards as text. An unparseable value
+ * loses to the other, so one bad string does not erase a good timestamp.
+ */
+function earlierIso(a: string, b: string): string {
+  const pa = Date.parse(a);
+  const pb = Date.parse(b);
+  if (Number.isNaN(pa)) return b;
+  if (Number.isNaN(pb)) return a;
+  return pa < pb ? a : b;
+}
+
 /** Once a span has failed it stays failed, whatever order its updates arrive in. */
 export function mergeStatus(prev: SpanStatus, next: SpanStatus): SpanStatus {
   if (prev === "error" || next === "error") return "error";
@@ -298,7 +327,7 @@ export function dedupeSpans(spans: SpanInput[]): SpanInput[] {
       ended_at: laterIso(prev.ended_at, s.ended_at),
       status: mergeStatus(prev.status, s.status),
       status_message: prev.status === "error" ? (prev.status_message ?? s.status_message) : (s.status_message ?? prev.status_message),
-      started_at: prev.started_at < s.started_at ? prev.started_at : s.started_at,
+      started_at: earlierIso(prev.started_at, s.started_at),
       attributes: { ...prev.attributes, ...s.attributes },
       model: s.model ?? prev.model,
       input_tokens: s.input_tokens ?? prev.input_tokens,
@@ -331,74 +360,112 @@ export interface Waterfall {
 
 export function durationMs(s: Pick<SpanRow, "started_at" | "ended_at">): number | null {
   if (!s.ended_at) return null;
-  return Math.max(0, Date.parse(s.ended_at) - Date.parse(s.started_at));
+  const end = Date.parse(s.ended_at);
+  // An end that cannot be parsed, or that precedes the start, clamps to the start.
+  if (Number.isNaN(end)) return 0;
+  return Math.max(0, end - Date.parse(s.started_at));
 }
 
 /**
  * Order spans depth-first (children under their parent, by start time) and
  * compute each bar's position. A span whose parent is missing is treated as a
- * root, so a partial trace still renders. Open spans extend to `nowMs`.
+ * root, so a partial trace still renders; a span whose start cannot be parsed
+ * is skipped, since it cannot be drawn. Open spans extend to `nowMs`. The walk
+ * uses an explicit stack because parent chains can be tens of thousands of
+ * spans deep, which would overflow the call stack if walked recursively.
  */
 export function buildWaterfall(spans: SpanRow[], nowMs: number = Date.now()): Waterfall {
-  if (spans.length === 0) return { rows: [], startMs: 0, endMs: 0, totalMs: 0 };
+  const empty: Waterfall = { rows: [], startMs: 0, endMs: 0, totalMs: 0 };
+  if (!Array.isArray(spans)) return empty;
+  // A span with an unparseable start, or an element that is not a span at all, has no place on the timeline.
+  const timed = spans.filter((s) => typeof s === "object" && s !== null && !Number.isNaN(Date.parse(s.started_at)));
+  if (timed.length === 0) return empty;
 
-  const ids = new Set(spans.map((s) => s.span_id));
+  const ids = new Set(timed.map((s) => s.span_id));
   const children = new Map<string | null, SpanRow[]>();
-  for (const s of spans) {
+  for (const s of timed) {
+    // Roots are decided by structure alone: no parent, a parent outside the
+    // input, or a self-parent. Never by start time, so a child whose clock is
+    // ahead of its parent's still nests under that parent.
     const parent = s.parent_span_id && ids.has(s.parent_span_id) && s.parent_span_id !== s.span_id ? s.parent_span_id : null;
     const list = children.get(parent) ?? [];
     list.push(s);
     children.set(parent, list);
   }
-  for (const list of children.values()) list.sort((a, b) => Date.parse(a.started_at) - Date.parse(b.started_at));
+  // Siblings sort by start time, then span id, so equal starts still lay out stably.
+  const byStartThenId = (a: SpanRow, b: SpanRow): number => {
+    const d = Date.parse(a.started_at) - Date.parse(b.started_at);
+    if (d !== 0) return d;
+    return a.span_id < b.span_id ? -1 : a.span_id > b.span_id ? 1 : 0;
+  };
+  for (const list of children.values()) list.sort(byStartThenId);
 
-  const startMs = Math.min(...spans.map((s) => Date.parse(s.started_at)));
-  const endOf = (s: SpanRow) => (s.ended_at ? Date.parse(s.ended_at) : nowMs);
-  const endMs = Math.max(startMs, ...spans.map(endOf));
+  // An open span extends to nowMs; an end that is unparseable or precedes the
+  // start clamps to the start, so a bar never gets a negative width.
+  const endOf = (s: SpanRow, start: number): number => {
+    if (s.ended_at === null) return nowMs;
+    const end = Date.parse(s.ended_at);
+    return Number.isNaN(end) || end < start ? start : end;
+  };
+
+  let startMs = Infinity;
+  let maxEnd = -Infinity;
+  for (const s of timed) {
+    const a = Date.parse(s.started_at);
+    if (a < startMs) startMs = a;
+    const b = endOf(s, a);
+    if (b > maxEnd) maxEnd = b;
+  }
+  const endMs = Math.max(startMs, maxEnd);
   const totalMs = Math.max(1, endMs - startMs);
 
   const rows: WaterfallRow[] = [];
   const seen = new Set<string>();
-  const walk = (parent: string | null, depth: number) => {
-    for (const s of children.get(parent) ?? []) {
-      if (seen.has(s.span_id)) continue; // guards against cycles
+  const stack: { span: SpanRow; depth: number }[] = [];
+  // Pushed in reverse so the earliest sibling is popped (and drawn) first.
+  const pushChildren = (parent: string | null, depth: number): void => {
+    const list = children.get(parent);
+    if (!list) return;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const child = list[i];
+      if (child !== undefined) stack.push({ span: child, depth });
+    }
+  };
+  const drain = (): void => {
+    while (stack.length > 0) {
+      const frame = stack.pop();
+      if (!frame) return; // unreachable after the length check, but keeps TS happy
+      const { span: s, depth } = frame;
+      if (seen.has(s.span_id)) continue; // a cycle led back to an emitted span
       seen.add(s.span_id);
       const a = Date.parse(s.started_at);
-      const b = endOf(s);
+      const b = endOf(s, a);
       rows.push({
         span: s,
         depth,
         offsetPct: ((a - startMs) / totalMs) * 100,
-        widthPct: Math.max(0.4, ((Math.max(a, b) - a) / totalMs) * 100),
+        widthPct: Math.max(0.4, ((b - a) / totalMs) * 100),
         durationMs: durationMs(s),
         open: s.ended_at === null,
       });
-      walk(s.span_id, depth + 1);
+      pushChildren(s.span_id, depth + 1);
     }
   };
-  walk(null, 0);
+  pushChildren(null, 0);
+  drain();
   // Spans in a parent cycle (a to b to a) are reachable from no root. Show them anyway,
-  // each cycle starting from its earliest span, so no span silently disappears.
-  for (const s of [...spans].sort((a, b) => Date.parse(a.started_at) - Date.parse(b.started_at))) {
+  // each cycle entered at its earliest span, so no span silently disappears.
+  for (const s of [...timed].sort(byStartThenId)) {
     if (seen.has(s.span_id)) continue;
-    seen.add(s.span_id);
-    const a = Date.parse(s.started_at);
-    const b = endOf(s);
-    rows.push({
-      span: s,
-      depth: 0,
-      offsetPct: ((a - startMs) / totalMs) * 100,
-      widthPct: Math.max(0.4, ((Math.max(a, b) - a) / totalMs) * 100),
-      durationMs: durationMs(s),
-      open: s.ended_at === null,
-    });
-    walk(s.span_id, 1);
+    stack.push({ span: s, depth: 0 });
+    drain();
   }
   return { rows, startMs, endMs, totalMs };
 }
 
 export function formatDuration(ms: number | null): string {
-  if (ms === null) return "running";
+  // NaN and the infinities mean the duration is unknown, same as null.
+  if (ms === null || !Number.isFinite(ms)) return "running";
   if (ms < 1) return "<1ms";
   if (ms < 1000) return `${Math.round(ms)}ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)}s`;

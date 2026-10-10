@@ -12,7 +12,7 @@
  * agent that can `recall` can read these notes, so the default is conservative.
  */
 import { createHash } from "node:crypto";
-import { formatDuration, redactText } from "./traces";
+import { formatDuration, parseWholeDays, redactText } from "./traces";
 
 export interface SessionFacts {
   session_id: string;
@@ -57,8 +57,7 @@ export function includePrompts(): boolean {
 
 /** Days to keep automatic notes. Default 30. */
 export function writebackDays(): number {
-  const n = Number(process.env.MC_MEMORY_WRITEBACK_DAYS);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 30;
+  return parseWholeDays(process.env.MC_MEMORY_WRITEBACK_DAYS, 30);
 }
 
 const PROMPT_TITLE = /^New instruction\b/i;
@@ -88,6 +87,16 @@ export function sessionKey(sessionId: string): string {
 }
 
 /**
+ * Counts come from aggregates over possibly partial data, so a negative,
+ * fractional, NaN or infinite value is a recording artifact, not a fact. Clamp
+ * to a non-negative whole number before it can reach the note or the
+ * thin-session check (a fractional total must not make an empty session look busy).
+ */
+function wholeCount(v: number): number {
+  return Number.isFinite(v) ? Math.max(0, Math.trunc(v)) : 0;
+}
+
+/**
  * Build the note, or null when the session was too thin to be worth remembering
  * (under two minutes with no tool calls and nothing reported).
  */
@@ -102,7 +111,7 @@ export function buildSessionNote(
   const durationMs = Number.isFinite(startMs) && Number.isFinite(endMs) ? Math.max(0, endMs - startMs) : null;
 
   const milestones = f.milestones.filter((m) => isUsefulTitle(m, withPrompts));
-  const toolTotal = f.tools.reduce((n, t) => n + t.count, 0);
+  const toolTotal = f.tools.reduce((n, t) => n + wholeCount(t.count), 0);
   if (toolTotal === 0 && milestones.length === 0 && (durationMs === null || durationMs < 120_000)) return null;
 
   const who = redactText(f.display_name?.trim() || f.agent_id, 80);
@@ -112,11 +121,15 @@ export function buildSessionNote(
   );
   const outcome = f.status === "failed" ? "failed" : "done";
   lines.push(`Outcome: ${outcome}.${durationMs !== null ? ` Ran ${formatDuration(durationMs)}.` : ""}${f.ended_at ? ` Ended ${f.ended_at}.` : ""}`);
-  lines.push(`Events: ${f.event_count}, errors: ${f.error_count}.`);
+  lines.push(`Events: ${wholeCount(f.event_count)}, errors: ${wholeCount(f.error_count)}.`);
   if (f.tools.length > 0) {
     const parts = f.tools
       .slice(0, 8)
-      .map((t) => `${redactText(t.name, 40)}×${t.count}${t.failed > 0 ? ` (${t.failed} failed)` : ""}`)
+      .map((t) => {
+        const count = wholeCount(t.count);
+        const failed = wholeCount(t.failed);
+        return `${redactText(t.name, 40)}×${count}${failed > 0 ? ` (${failed} failed)` : ""}`;
+      })
       .join(", ");
     lines.push(`Tools: ${parts}.`);
   }
