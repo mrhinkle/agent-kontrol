@@ -17,7 +17,7 @@ One dashboard for the AI coding agents you run: Claude Code, Codex, Grok, Hermes
 curl -fsSL https://raw.githubusercontent.com/mrhinkle/agent-kontrol/main/scripts/quickstart.sh | bash
 ```
 
-That starts Agent Kontrol with Docker Compose (or in demo mode on Node 20+ if you have no Docker). Other targets: Vercel with Neon or any Postgres, any Node host. See [docs/DEPLOY.md](docs/DEPLOY.md).
+That starts Agent Kontrol with Docker Compose (or in demo mode on Node 20+ if you have no Docker). Other targets: Vercel with Neon or any Postgres, Fly.io, any Node host. See [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## What it does
 

@@ -43,10 +43,11 @@ The Neon integration injects `DATABASE_URL`. `npm run build` applies the schema 
 | Vercel + Neon | Neon Postgres | One click | Used in the author's production |
 | Vercel + another Postgres | Any Postgres 13+ | Set `DATABASE_URL` | Supported |
 | Docker Compose (self-hosted) | Postgres 16, included | Two env vars in `.env` | Same code, less exercised |
+| Fly.io | Fly Managed Postgres or Neon | `fly launch` + three secrets | Same image as Compose; CI builds and smoke-tests it |
 | Any Node host | Any Postgres | `npm ci && npm run build && npm start` | Same code, less exercised |
 | Local demo | None | `npm ci && npm run dev` | Sample data, nothing stored |
 
-Only Vercel + Neon is used in the author's production. CI runs the data layer tests against Postgres 16 (schema applied twice). The Docker and generic-Node paths follow the same code but are less exercised. Not supported: serverless platforms that cannot run Node 22, and plain HTTP without TLS for anything but localhost.
+Only Vercel + Neon is used in the author's production. CI runs the data layer tests against Postgres 16 (schema applied twice). The Docker, Fly.io and generic-Node paths follow the same code but are less exercised; CI does build the Docker image and check that it serves `/login`. Not supported: serverless platforms that cannot run Node 22, and plain HTTP without TLS for anything but localhost.
 
 ### Vercel + Neon
 
@@ -69,7 +70,52 @@ Files:
 - `Dockerfile` — node:22-slim, multi-stage, runs as the non-root `node` user, healthcheck on `/login`, applies the schema on every container start.
 - `docker-compose.yml` — db and app; the db port is not published; data lives in the named volume `db-data`; the app listens on `${MC_PORT:-3000}`; `POSTGRES_PASSWORD` defaults to `mc` and should be changed for anything beyond local use.
 
-### Any Node host (VM, Fly, Railway, Render, etc.)
+### Fly.io
+
+Fly runs the same `Dockerfile` that Docker Compose uses. `fly.toml` in the repo root sets the port, a health check on `/login`, one always-on machine, and a release command that applies the schema once per deploy.
+
+Requirements: [flyctl](https://fly.io/docs/flyctl/install/) and a Fly account.
+
+```bash
+fly launch --copy-config --no-deploy --name <your-app> --region <region>
+```
+
+`--copy-config` keeps the repo's `fly.toml`; `--no-deploy` stops before the first deploy so you can set secrets. Pick a region close to your database.
+
+Database, one of:
+
+- **Fly Managed Postgres**: `fly mpg create --name <your-app>-db --region <region> --plan Basic` then `fly mpg attach <cluster-id> -a <your-app>` (the cluster id is in `fly mpg list`). Attach sets `DATABASE_URL` as a secret using the pooled PgBouncer URL and restarts the app; the hostname is not Neon's, so the app uses the `pg` driver. The older unmanaged `fly postgres` commands still run but Fly no longer maintains or supports them.
+- **Neon**: create a project at neon.tech and set `DATABASE_URL` yourself (next step). Neon's HTTP driver is detected automatically.
+
+Secrets:
+
+```bash
+fly secrets set --app <your-app> \
+  MC_TOKEN="$(openssl rand -hex 24)" \
+  MC_DASHBOARD_PASSWORD="$(openssl rand -hex 24)" \
+  MC_PUBLIC_URL="https://<your-app>.fly.dev"
+# plus DATABASE_URL if you are not using `fly mpg attach`
+```
+
+`MC_PUBLIC_URL` pins the OAuth issuer to your public hostname. Fly's proxy also sends `X-Forwarded-Proto`, so the app derives the right origin without it, but setting it avoids surprises when you add a custom domain later.
+
+Deploy:
+
+```bash
+fly deploy
+fly secrets list      # confirm the four names are present
+fly logs              # `migrate: schema applied` appears in the release command output
+```
+
+Notes:
+
+- The release command runs `scripts/apply-schema.mjs` on a temporary machine before the new version takes traffic. The release machine inherits `[env]`, so the command sets `MC_SKIP_MIGRATE=0` for itself; the `MC_SKIP_MIGRATE=1` in `[env]` only turns off the duplicate run the container does at start (the run Docker Compose relies on; redundant on Fly).
+- `auto_stop_machines = "off"` keeps the MCP endpoint and task queue reachable at all times. Set it to `"stop"` or `"suspend"` (and then `min_machines_running = 0`) if you only want the dashboard and can tolerate cold starts.
+- `NEXT_PUBLIC_*` values are baked in at build time and the Dockerfile declares no build args, so Fly deploys use the defaults (header name `Agent Kontrol`, sender `Operator`). To change them, add `ARG`/`ENV` lines for those names to the build stage of the Dockerfile and set them under `[build.args]` in `fly.toml`.
+- Custom domain: `fly certs add <domain>`, point DNS at the app, then update `MC_PUBLIC_URL`.
+- Upgrade: `git pull && fly deploy`. Rollback: `fly releases` then `fly deploy --image <previous image>`.
+
+### Any Node host (VM, Railway, Render, etc.)
 
 Requirements: Node 22 and a Postgres.
 
@@ -118,7 +164,7 @@ openssl rand -hex 24
 
 ### Upgrade
 
-Pull and redeploy on Vercel, or:
+Pull and redeploy on Vercel, run `fly deploy` on Fly.io, or:
 
 ```bash
 git pull && docker compose up -d --build
