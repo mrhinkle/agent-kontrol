@@ -151,12 +151,12 @@ With no `DATABASE_URL`, the app runs with sample data and stores nothing.
 | `MC_DB_DRIVER` | No | Driver override: `neon` or `pg`. |
 | `MC_DB_POOL_MAX` | No | pg pool size. Default 5. |
 | `MC_SKIP_MIGRATE` | No | Set to 1 to skip the automatic schema step. Set it on the Vercel Preview environment so preview builds never touch the production database. |
-| `MC_TRACE_RETENTION_DAYS` | No | Days to keep trace spans before they are deleted. Default 30. |
+| `MC_TRACE_RETENTION_DAYS` | No | Days to keep trace spans before they are deleted. A whole number of days from 1 to 999999; anything else (such as `1.5` or `14d`) is ignored and the default 30 is used. |
 | `MC_TRACE_CAPTURE_CONTENT` | No | Set to `1` to also store prompt and tool input and output in spans. Off by default; see [Telemetry and traces](TELEMETRY.md). |
 | `MC_MEMORY_WRITEBACK` | No | Set to `0` to stop writing an automatic note to memory when a session ends. On by default. |
 | `MC_MEMORY_WRITEBACK_TEXT` | No | Set to `1` to add the last reported milestones and summary (redacted) to those notes. Off by default; notes then hold structured facts only. |
 | `MC_MEMORY_WRITEBACK_PROMPTS` | No | With the text option on, also keep text that came from a prompt. Off by default. |
-| `MC_MEMORY_WRITEBACK_DAYS` | No | Days to keep automatic notes. Default 30. |
+| `MC_MEMORY_WRITEBACK_DAYS` | No | Days to keep automatic notes. Same rule: a whole number from 1 to 999999, otherwise 30. |
 | `MC_PROGRESS_INTERVAL` | No | Collector only: seconds between ticks. Default 900. |
 | `MC_PROGRESS_CONFIG` | No | Path to `progress.config.json` for the collector. |
 | `MC_OPENROUTER_MANAGEMENT_KEY` | No | Key for the usage ledger. |
