@@ -32,7 +32,7 @@ Notes that matter when reading the numbers:
 - **Blocked work is per-repo.** Each repo spells the label differently and
   a repo with none reads `not tracked` rather than `0%`.
 
-### What "blocked" means
+## What "blocked" means
 
 Agent Kontrol does not detect that work is stuck. **Blocked is a GitHub label you choose per repo in Settings.** The board counts the open issues that carry it and divides by all open issues in that repo, so 26% means about a quarter of the open issues have the label. The alert fires when that share passes the threshold, and its link opens the matching issue search.
 

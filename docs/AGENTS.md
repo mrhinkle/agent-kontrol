@@ -12,7 +12,7 @@ This document describes the adapters that connect coding agents to Agent Kontrol
 | dispatcher | Task results | No | Yes: claims and runs them | No | Cost per task |
 | cowork-cloud (MCP) | Only if the agent calls `report_status` | Yes, via `check_inbox` | Yes, via MCP tools | No | No |
 | grok | Dispatcher plus MCP | Via MCP | Via the dispatcher | No | No |
-| hermes | Via MCP | Via MCP | No | Any OpenTelemetry exporter | With the usage collector |
+| hermes | Via MCP | Via MCP | Via MCP (`claim_task`) | Any OpenTelemetry exporter | With the usage collector |
 | usage-collector | No | No | No | No | Yes |
 | progress-collector | No (feeds the Progress board) | No | No | No | No |
 

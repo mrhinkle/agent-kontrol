@@ -184,7 +184,7 @@ By default Vercel treats `main` as production, so every merge goes live. To ship
 1. Create the branch once: `git branch release main && git push origin release`.
 2. In Vercel, open Settings, then Environments, then Production, and set Branch Tracking to `release`. (Older dashboards: Settings, then Git, then Production Branch.)
 3. Merges to `main` now build previews only. To ship, open a pull request with base `release` and compare `main`, and merge it. Production deploys from that merge.
-4. To redeploy a commit without a new merge, use Redeploy on the deployment in Vercel, or promote a preview to production. A promoted preview keeps the environment variables it was built with, so redeploying (which rebuilds with production variables) is the safer choice.
+4. To redeploy a commit without a new merge, use Redeploy on the deployment in Vercel, or promote a preview to production. Prefer a redeploy that targets production, which builds with the Production environment variables; check which variables a promoted preview ends up with before relying on it.
 
 Set `MC_SKIP_MIGRATE=1` on the Preview environment. Otherwise each preview build runs the schema step against whatever `DATABASE_URL` Preview has, which is usually your production database.
 

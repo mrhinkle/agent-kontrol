@@ -212,17 +212,18 @@ export function buildAlerts(repos: RepoProgress[], history: HistoryPoint[]): Ale
   const alerts: Alert[] = [];
 
   for (const r of repos) {
-    if (r.blocked_ratio !== null && r.blocked_ratio > THRESHOLDS.blockedRatio) {
+    // A repo with no blocked label has nothing to alert on, even if an earlier tick stored a count.
+    if (r.blocked_label !== null && r.blocked_ratio !== null && r.blocked_ratio > THRESHOLDS.blockedRatio) {
       alerts.push({
         id: `blocked:${r.repo}`,
         level: "bad",
         repo: r.repo,
         rule: "blockedRatio",
-        message: `${r.label}: ${Math.round(r.blocked_ratio * 100)}% of open issues are labeled "${r.blocked_label ?? "blocked"}" (over ${Math.round(
+        message: `${r.label}: ${Math.round(r.blocked_ratio * 100)}% of open issues are labeled "${r.blocked_label}" (over ${Math.round(
           THRESHOLDS.blockedRatio * 100
         )}%) — clear blockers before decomposing more`,
         url: `https://github.com/${r.repo}/issues?q=${encodeURIComponent(
-          `is:issue is:open label:"${r.blocked_label ?? "blocked"}"`
+          `is:issue is:open label:"${r.blocked_label}"`
         )}`,
       });
     }
