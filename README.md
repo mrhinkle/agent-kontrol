@@ -71,6 +71,7 @@ Agent Kontrol is in **1.0 beta** ([release notes](https://github.com/mrhinkle/ag
 | [Architecture](docs/ARCHITECTURE.md) | Data flow, tables, code map |
 | [Progress board](docs/PROGRESS-BOARD.md) | How the net-backlog board works |
 | [Telemetry and traces](docs/TELEMETRY.md) | Spans, OpenTelemetry ingest, retention, privacy |
+| [Memory (Notes)](docs/MEMORY.md) | What the notes store does and does not do |
 | [Usage and Costs](docs/USAGE.md) | The experimental cost ledger |
 | [Playbook](PLAYBOOK.md) | How to run a multi-vendor agent fleet |
 | [Security](SECURITY.md) | Threat model and reporting |
