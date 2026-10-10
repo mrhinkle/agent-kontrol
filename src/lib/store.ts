@@ -1,3 +1,4 @@
+import { writeSessionNote } from "./session-memory";
 import { sql } from "./db";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
 
@@ -151,6 +152,16 @@ export async function report(input: ReportInput): Promise<void> {
     `;
   } catch (e) {
     throw new Error(`events insert: ${errMsg(e)}`);
+  }
+
+  // Any platform that ends a session (hook, watcher, or an MCP report with status
+  // done or failed) leaves a short note in shared memory. Best effort: never fails the report.
+  if (input.session_id && (input.kind === "session_end" || input.status === "done" || input.status === "failed")) {
+    try {
+      await writeSessionNote(input.session_id);
+    } catch (e) {
+      console.error("[memory] session note failed", e);
+    }
   }
 }
 

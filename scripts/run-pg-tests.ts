@@ -115,6 +115,49 @@ async function main() {
   assert.equal((await getTrace(traceId)).length, 2, "recent spans are kept");
   await sql()`delete from spans where trace_id = ${traceId}`;
 
+  // Session writeback: any platform that ends a session leaves one note in shared memory.
+  const sid = `${tag}-sess`;
+  const wbAgent = `${tag}-wb`;
+  const at = (min: number) => new Date(Date.now() - min * 60_000).toISOString();
+  await report({ agent_id: wbAgent, platform: "codex", display_name: "WB Agent", session_id: sid, kind: "session_start", project: "Demo App" } as never);
+  await sql()`update sessions set started_at = ${at(30)} where id = ${sid}`;
+  await report({ agent_id: wbAgent, session_id: sid, kind: "milestone", title: "Migrated the schema" } as never);
+  await report({ agent_id: wbAgent, session_id: sid, kind: "turn_start", title: "New instruction: rotate the production keys" } as never);
+  await report({ agent_id: wbAgent, session_id: sid, kind: "error", title: "build failed" } as never);
+  await sql()`insert into spans (trace_id, span_id, agent_id, session_id, name, kind, status, started_at, ended_at)
+              values (${randomUUID().replace(/-/g, "")}, '00000000000000d1', ${wbAgent}, ${sid}, 'Bash', 'tool', 'error', now(), now()),
+                     (${randomUUID().replace(/-/g, "")}, '00000000000000d2', ${wbAgent}, ${sid}, 'Bash', 'tool', 'ok', now(), now())`;
+  await report({ agent_id: wbAgent, session_id: sid, kind: "session_end", title: "Session ended" } as never);
+  const note = (await recall({ key: `session/${sid}` }))[0];
+  assert.ok(note, "an ended session leaves a note");
+  assert.ok(note.tags.includes("session-summary") && note.tags.includes("codex") && note.tags.includes("demo-app"));
+  assert.match(note.content, /WB Agent \[codex\] on Demo App/);
+  assert.match(note.content, /Tools: Bash×2 \(1 failed\)/);
+  assert.match(note.content, /errors: 1/);
+  assert.match(note.content, /Migrated the schema/);
+  assert.doesNotMatch(note.content, /rotate the production keys/, "prompt text stays out by default");
+  await report({ agent_id: wbAgent, session_id: sid, kind: "session_end", title: "Session ended" } as never);
+  assert.equal((await recall({ tags: ["session-summary"], query: "WB Agent" })).filter((n) => n.key === `session/${sid}`).length, 1, "ending twice keeps one note");
+
+  // An MCP agent that reports status done also gets a note; a thin session does not.
+  const sid2 = `${tag}-mcp`;
+  await report({ agent_id: `${tag}-mcp-agent`, session_id: sid2, kind: "milestone", title: "Opened the PR", project: "Demo App" } as never);
+  await report({ agent_id: `${tag}-mcp-agent`, session_id: sid2, kind: "status", status: "done", title: "Finished" } as never);
+  assert.ok((await recall({ key: `session/${sid2}` }))[0], "status done via the MCP path writes a note");
+  const sid3 = `${tag}-thin`;
+  await report({ agent_id: `${tag}-thin-agent`, session_id: sid3, kind: "session_start" } as never);
+  await report({ agent_id: `${tag}-thin-agent`, session_id: sid3, kind: "session_end" } as never);
+  assert.equal((await recall({ key: `session/${sid3}` })).length, 0, "a thin session leaves no note");
+
+  process.env.MC_MEMORY_WRITEBACK = "0";
+  const sid4 = `${tag}-off`;
+  await report({ agent_id: `${tag}-off-agent`, session_id: sid4, kind: "milestone", title: "Did a thing" } as never);
+  await report({ agent_id: `${tag}-off-agent`, session_id: sid4, kind: "session_end" } as never);
+  assert.equal((await recall({ key: `session/${sid4}` })).length, 0, "MC_MEMORY_WRITEBACK=0 turns it off");
+  delete process.env.MC_MEMORY_WRITEBACK;
+  await sql()`delete from memory where key like ${"session/" + tag + "%"}`;
+  await sql()`delete from spans where session_id like ${tag + "%"}`;
+
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
 }
 
