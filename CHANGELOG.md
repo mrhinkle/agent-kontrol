@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- When a session ends, or an agent reports status done or failed, the server writes one short note to shared memory (key `session/<id>`, tag `session-summary`), for every platform. Built from recorded facts only; prompt text is excluded unless `MC_MEMORY_WRITEBACK_PROMPTS=1`; `MC_MEMORY_WRITEBACK=0` turns it off; notes expire after `MC_MEMORY_WRITEBACK_DAYS` (default 30).
 - The progress board's blocked alert now names the repo's own blocked label and links to a search for it. It always said "dependency-blocked" and linked to that label, whatever the repo used.
 
 ### Documentation

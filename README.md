@@ -28,7 +28,7 @@ That starts Agent Kontrol with Docker Compose (or in demo mode on Node 20+ if yo
 - **Messaging.** Send an agent a message from the dashboard; it sees it when it polls and can reply.
 - **Traces.** Step-by-step spans for each agent session, shown as a waterfall. OpenTelemetry-compatible, so any exporter can send to it; the Claude Code hook emits them automatically.
 - **Usage and Costs** (experimental). Paid and included-token cost per account.
-- **Notes.** A small shared table agents can write to and search (substring search, no automatic writers).
+- **Notes.** A small shared table agents can write to and search (substring search). A short note is written automatically when any agent's session ends, so the next agent can see who worked where.
 
 ```
 Claude Code hooks ──┐
