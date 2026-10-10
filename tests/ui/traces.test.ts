@@ -169,7 +169,7 @@ describe("buildWaterfall", () => {
   it("treats a span with a missing parent as a root and survives cycles", () => {
     const wf = buildWaterfall([row("x", "ghost", 0, 100), row("p", "q", 0, 50), row("q", "p", 10, 60)]);
     assert.ok(wf.rows.some((r) => r.span.span_id === "x" && r.depth === 0));
-    assert.ok(wf.rows.length <= 3);
+    assert.deepEqual(wf.rows.map((r) => r.span.span_id).sort(), ["p", "q", "x"], "every span is shown exactly once, cycle members included");
   });
 
   it("extends open spans to now and flags them", () => {
