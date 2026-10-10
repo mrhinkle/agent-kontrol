@@ -67,6 +67,8 @@ export interface RepoProgress {
   open_prs: number;
   /** null when the repo has no blocked label — not tracked, not zero */
   blocked_issues: number | null;
+  /** the GitHub label that marks blocked work in this repo; null when not tracked */
+  blocked_label: string | null;
   /** blocked_issues / open_issues; null when blocked work isn't tracked */
   blocked_ratio: number | null;
 

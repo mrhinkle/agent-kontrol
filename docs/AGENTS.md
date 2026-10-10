@@ -2,9 +2,25 @@
 
 This document describes the adapters that connect coding agents to Agent Kontrol: what each one watches, how to install it, and what it can do. All adapters live in `agents/<name>/` in the repository.
 
+## What each adapter can do
+
+| Adapter | Status | Messages to the agent | Tasks | Traces | Usage |
+| --- | --- | --- | --- | --- | --- |
+| claude-code (hook) | Yes, from lifecycle hooks | Yes, pulled at checkpoints | Via the dispatcher | Yes: session, turn and tool spans | No |
+| codex (watcher) | Coarse, from session files | No | Via the dispatcher | No | No |
+| mc-agent | Heartbeats and file tails | No | No | No | No |
+| dispatcher | Task results | No | Yes: claims and runs them | No | Cost per task |
+| cowork-cloud (MCP) | Only if the agent calls `report_status` | Yes, via `check_inbox` | Yes, via MCP tools | No | No |
+| grok | Dispatcher plus MCP | Via MCP | Via the dispatcher | No | No |
+| hermes | Via MCP | Via MCP | Via MCP (`claim_task`) | Any OpenTelemetry exporter | With the usage collector |
+| usage-collector | No | No | No | No | Yes |
+| progress-collector | No (feeds the Progress board) | No | No | No | No |
+
+"Via MCP" means the agent has to call the tool; it is not automatic. Any agent or SDK that can export OpenTelemetry can send traces to `/api/v1/traces` (see [Telemetry and traces](TELEMETRY.md)). A Cline and Roo Code adapter was proposed but is not included: its file locations have not been verified against a real install.
+
 ## claude-code
 
-A Python hook (`mission_control_hook.py`) that POSTs Claude Code and Cowork-local lifecycle events to `/api/ingest`. It fires whether or not the model remembers to report, and it fails open: it exits 0 and never blocks a session. `install.sh` installs the hook using `MC_URL` and `MC_TOKEN`. `MC_AGENT` optionally sets the agent id; the default is `claude-code-<hostname>`. At natural checkpoints the hook also pulls messages the operator has queued and hands them to the model.
+A Python hook (`mission_control_hook.py`) that POSTs Claude Code and Cowork-local lifecycle events to `/api/ingest`. It fires whether or not the model remembers to report, and it fails open: it exits 0 and never blocks a session. `install.sh` installs the hook using `MC_URL` and `MC_TOKEN`. `MC_AGENT` optionally sets the agent id; the default is `claude-code-<hostname>`. At natural checkpoints the hook also pulls messages the operator has queued and hands them to the model. With the `PreToolUse` and `PostToolUse` hooks registered (see `settings-fragment.json`) it also emits traces: a session span, a turn span per prompt and a span per tool call. Set `MC_TRACES=0` to turn that off. Details are in [Telemetry and traces](TELEMETRY.md).
 
 ## codex
 

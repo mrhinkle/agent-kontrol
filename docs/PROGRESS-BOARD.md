@@ -31,6 +31,14 @@ Notes that matter when reading the numbers:
   instead of quietly reporting a short window as a full one.
 - **Blocked work is per-repo.** Each repo spells the label differently and
   a repo with none reads `not tracked` rather than `0%`.
+
+## What "blocked" means
+
+Agent Kontrol does not detect that work is stuck. **Blocked is a GitHub label you choose per repo in Settings.** The board counts the open issues that carry it and divides by all open issues in that repo, so 26% means about a quarter of the open issues have the label. The alert fires when that share passes the threshold, and its link opens the matching issue search.
+
+- Pull requests are not counted, only issues.
+- An issue stays counted until the label is removed, so a stale label overstates blocking and unlabeled stuck work is invisible. Keeping the label current is part of the practice.
+- Use one label for one meaning (for example "waiting on a dependency or a decision"), and leave the field empty for repos that do not use one.
 - **Lane attribution is counted, never guessed.** These repos squash-merge, so
   `main` credits every commit to the PR owner; the collector reads the PR's own
   branch commits instead. Where a repo shares one bot identity across lanes the

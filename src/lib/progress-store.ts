@@ -212,16 +212,19 @@ export function buildAlerts(repos: RepoProgress[], history: HistoryPoint[]): Ale
   const alerts: Alert[] = [];
 
   for (const r of repos) {
-    if (r.blocked_ratio !== null && r.blocked_ratio > THRESHOLDS.blockedRatio) {
+    // A repo with no blocked label has nothing to alert on, even if an earlier tick stored a count.
+    if (r.blocked_label !== null && r.blocked_ratio !== null && r.blocked_ratio > THRESHOLDS.blockedRatio) {
       alerts.push({
         id: `blocked:${r.repo}`,
         level: "bad",
         repo: r.repo,
         rule: "blockedRatio",
-        message: `${r.label} is ${Math.round(r.blocked_ratio * 100)}% dependency-blocked (over ${Math.round(
+        message: `${r.label}: ${Math.round(r.blocked_ratio * 100)}% of open issues are labeled "${r.blocked_label}" (over ${Math.round(
           THRESHOLDS.blockedRatio * 100
         )}%) — clear blockers before decomposing more`,
-        url: `https://github.com/${r.repo}/issues?q=is%3Aissue+is%3Aopen+label%3Adependency-blocked`,
+        url: `https://github.com/${r.repo}/issues?q=${encodeURIComponent(
+          `is:issue is:open label:"${r.blocked_label}"`
+        )}`,
       });
     }
 
@@ -357,6 +360,7 @@ export async function progress(window: TimeWindow): Promise<Omit<ProgressRespons
       open_issues: openIssues,
       open_prs: now?.open_prs ?? 0,
       blocked_issues: blocked,
+      blocked_label: cfg.blockedLabel,
       blocked_ratio: blocked !== null && openIssues > 0 ? blocked / openIssues : null,
       merged_prs: merged,
       issues_closed: closed,

@@ -150,7 +150,10 @@ With no `DATABASE_URL`, the app runs with sample data and stores nothing.
 | `NEXT_PUBLIC_HERMES_VITALS_URL` | No | Link shown on the progress board. |
 | `MC_DB_DRIVER` | No | Driver override: `neon` or `pg`. |
 | `MC_DB_POOL_MAX` | No | pg pool size. Default 5. |
-| `MC_SKIP_MIGRATE` | No | Set to 1 to skip the automatic schema step. |
+| `MC_SKIP_MIGRATE` | No | Set to 1 to skip the automatic schema step. Set it on the Vercel Preview environment so preview builds never touch the production database. |
+| `MC_TRACE_RETENTION_DAYS` | No | Days to keep trace spans before they are deleted. Default 30. |
+| `MC_TRACE_CAPTURE_CONTENT` | No | Set to `1` to also store prompt and tool input and output in spans. Off by default; see [Telemetry and traces](TELEMETRY.md). |
+| `MC_PROGRESS_INTERVAL` | No | Collector only: seconds between ticks. Default 900. |
 | `MC_PROGRESS_CONFIG` | No | Path to `progress.config.json` for the collector. |
 | `MC_OPENROUTER_MANAGEMENT_KEY` | No | Key for the usage ledger. |
 
@@ -172,6 +175,19 @@ git pull && docker compose up -d --build
 
 The schema step runs again and is safe to repeat.
 
+When a release changes agent adapters, re-run the adapter's `install.sh` on each machine, and when it changes hook settings (for example traces need the `PreToolUse` and `PostToolUse` hooks), re-merge `agents/claude-code/settings-fragment.json` into your Claude Code settings. The CHANGELOG says when this is needed.
+
+### Releasing on Vercel without shipping every merge
+
+By default Vercel treats `main` as production, so every merge goes live. To ship deliberately, use a `release` branch:
+
+1. Create the branch once: `git branch release main && git push origin release`.
+2. In Vercel, open Settings, then Environments, then Production, and set Branch Tracking to `release`. (Older dashboards: Settings, then Git, then Production Branch.)
+3. Merges to `main` now build previews only. To ship, open a pull request with base `release` and compare `main`, and merge it. Production deploys from that merge.
+4. To redeploy a commit without a new merge, use Redeploy on the deployment in Vercel, or promote a preview to production. Prefer a redeploy that targets production, which builds with the Production environment variables; check which variables a promoted preview ends up with before relying on it.
+
+Set `MC_SKIP_MIGRATE=1` on the Preview environment. Otherwise each preview build runs the schema step against whatever `DATABASE_URL` Preview has, which is usually your production database.
+
 ### Backups
 
 Use your database provider (Neon branches/PITR), or:
@@ -192,7 +208,7 @@ The progress collector and usage collector install as macOS launchd agents. On L
 
 Use this if you already run the earlier Mission Control code on Vercel and want to move it to this repository. Nothing about your data or domain changes, and agents keep working.
 
-1. In the Vercel project, open Settings, then Git. Disconnect the old repository and connect `mrhinkle/agent-kontrol` (or your fork) with `main` as the production branch. The project, its domains, its environment variables and its database stay as they are.
+1. In the Vercel project, open Settings, then Git. Disconnect the old repository and connect `mrhinkle/agent-kontrol` (or your fork) with `main` (or `release`, see above) as the production branch. The project, its domains, its environment variables and its database stay as they are.
 2. Choose your repos. Either open Settings after the deploy and add them there, or set `NEXT_PUBLIC_MC_PROGRESS_CONFIG` before the build, for example `{"repos":[{"repo":"your-org/your-repo","label":"Your repo","short":"repo","color":"#2563eb","blockedLabel":"blocked"}]}`. Until you do one of these, the progress board shows the example repos from `progress.config.json`.
 3. If you want to keep your old header name, set `NEXT_PUBLIC_MC_NAME`. The "by The AIE" byline and trademark footer appear only under the default name.
 4. Leave `DATABASE_URL`, `MC_TOKEN`, `MC_DASHBOARD_PASSWORD` and any OAuth secrets exactly as they are. Do not rotate them, or agents and MCP connectors will need re-authorizing.

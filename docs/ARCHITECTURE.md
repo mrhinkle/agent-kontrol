@@ -69,6 +69,9 @@ See [API.md](API.md). Demo mode: no `DATABASE_URL` means sample data and nothing
 - `src/app` — routes and pages
 - `src/lib/store.ts` — agents, memory, messages, tasks
 - `src/lib/progress-store.ts`
+- `src/lib/traces.ts` — OTLP parsing, sanitizing and the waterfall layout (pure)
+- `src/lib/trace-store.ts` — span upsert, trace list, prune
+- `src/app/api/v1/traces` — OTLP/HTTP JSON ingest; `src/app/traces` — the viewer
 - `src/lib/usage-store.ts`
 - `src/lib/db.ts` — driver selection
 - `src/lib/auth.ts` and `src/middleware.ts` — auth

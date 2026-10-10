@@ -22,6 +22,7 @@ export const HELP_DOCS: HelpDoc[] = [
   { slug: "architecture", title: "Architecture", file: "docs/ARCHITECTURE.md", blurb: "Data flow, tables, and a map of the code." },
   { slug: "progress-board", title: "Progress board", file: "docs/PROGRESS-BOARD.md", blurb: "How net backlog is measured and configured." },
   { slug: "telemetry", title: "Telemetry and traces", file: "docs/TELEMETRY.md", blurb: "Spans, OpenTelemetry ingest, privacy and retention." },
+  { slug: "memory", title: "Memory (Notes)", file: "docs/MEMORY.md", blurb: "What the shared notes store does, what it does not, and where it is going." },
   { slug: "usage", title: "Usage and Costs", file: "docs/USAGE.md", blurb: "The experimental cost ledger." },
   { slug: "security", title: "Security", file: "SECURITY.md", blurb: "Threat model, risks, and how to report a problem." },
   { slug: "playbook", title: "Fleet playbook", file: "PLAYBOOK.md", blurb: "How to run a multi-vendor agent fleet." },

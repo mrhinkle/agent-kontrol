@@ -171,6 +171,7 @@ export function demoProgress(window: TimeWindow): ProgressResponse {
       open_issues: s.open_issues,
       open_prs: s.open_prs,
       blocked_issues: s.blocked_issues,
+      blocked_label: cfg.blockedLabel,
       blocked_ratio: s.blocked_issues === null ? null : s.blocked_issues / s.open_issues,
       merged_prs: merged,
       issues_closed: closed,
