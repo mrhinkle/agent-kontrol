@@ -26,6 +26,14 @@ describe("pure functions tolerate hostile input", () => {
 });
 
 describe("buildWaterfall layout", () => {
+  it("treats an empty or missing end time as open, like durationMs does", () => {
+    const now = Date.parse("2026-10-09T12:00:30.000Z");
+    for (const missing of ["", undefined]) {
+      const wf = buildWaterfall([row(id(1), null, 0, null, { ended_at: missing as never })], now);
+      assert.equal(wf.rows[0].open, true);
+      assert.equal(wf.totalMs, 30000);
+    }
+  });
   it("ignores array elements that are not spans", () => {
     const wf = buildWaterfall([null, 5, "x", {}, row(id(1), null, 0, 10)] as never);
     assert.deepEqual(wf.rows.map((r) => r.span.span_id), [id(1)]);

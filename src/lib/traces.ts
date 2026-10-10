@@ -403,7 +403,7 @@ export function buildWaterfall(spans: SpanRow[], nowMs: number = Date.now()): Wa
   // An open span extends to nowMs; an end that is unparseable or precedes the
   // start clamps to the start, so a bar never gets a negative width.
   const endOf = (s: SpanRow, start: number): number => {
-    if (s.ended_at === null) return nowMs;
+    if (!s.ended_at) return nowMs;
     const end = Date.parse(s.ended_at);
     return Number.isNaN(end) || end < start ? start : end;
   };
@@ -446,7 +446,7 @@ export function buildWaterfall(spans: SpanRow[], nowMs: number = Date.now()): Wa
         offsetPct: ((a - startMs) / totalMs) * 100,
         widthPct: Math.max(0.4, ((b - a) / totalMs) * 100),
         durationMs: durationMs(s),
-        open: s.ended_at === null,
+        open: !s.ended_at,
       });
       pushChildren(s.span_id, depth + 1);
     }
