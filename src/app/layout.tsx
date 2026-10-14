@@ -31,7 +31,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           Agents push, nobody polls. Connect an agent via the MCP server at <span className="mono">/api/mcp</span> or POST to <span className="mono">/api/ingest</span>.
           {branded && (
             <p className="mt-2">
-              Agent Kontrol&trade; by <a className="underline" href="https://theaie.net">The AIE Network</a>&trade;. Agent Kontrol and The AIE Network are trademarks of Peripety Labs LLC.
+              Agent Kontrol&trade; by <a className="underline" href="https://theaie.net">The AIE Network</a>&trade;. &copy; 2026 Mark Hinkle and The AIE Network. Agent Kontrol is a trademark of Mark Hinkle. The AIE Network is a trademark of Peripety Labs LLC.
             </p>
           )}
         </footer>

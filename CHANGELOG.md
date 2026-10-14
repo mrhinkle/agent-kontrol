@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Notices: copyright is Mark Hinkle and The AIE Network; Agent Kontrol™ is a trademark of Mark Hinkle (The AIE Network™ stays with Peripety Labs LLC). Added an Apache `NOTICE` file and `author` in package.json.
+
 ### Added
 
 - Traces: step-by-step spans for agent sessions. `POST /api/v1/traces` accepts OTLP/HTTP JSON from any OpenTelemetry exporter, `/traces` shows a waterfall, and the Claude Code hook emits session, turn and tool spans (register the new `PreToolUse` and `PostToolUse` hooks). Prompt and tool content is not stored unless `MC_TRACE_CAPTURE_CONTENT=1`; spans are pruned after `MC_TRACE_RETENTION_DAYS` (default 30). Docs: `docs/TELEMETRY.md`.

@@ -90,8 +90,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Changes are listed in [CHANGELOG.md](CHA
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE). Copyright 2026 Mark Hinkle.
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Copyright 2026 Mark Hinkle and The AIE Network.
 
 ## Trademarks
 
-Agent Kontrol™ and The AIE Network™ are trademarks of Peripety Labs LLC. The Apache License covers the code and, under its section 6, does not grant permission to use these names or the logo. You may use the name factually, for example to say your deployment runs Agent Kontrol. If you fork or sell a modified version, please give it your own name and logo.
+Agent Kontrol™ is a trademark of Mark Hinkle. The AIE Network™ is a trademark of Peripety Labs LLC. The Apache License covers the code and, under its section 6, does not grant permission to use these names or the logo. You may use the name factually, for example to say your deployment runs Agent Kontrol. If you fork or sell a modified version, please give it your own name and logo.
