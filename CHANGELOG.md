@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Documentation
+
+- README: a 90-second narrated demo (Fleet, History, Progress and the Gibson 3D view) in `docs/demo/`, with captions.
+
 ### Added
 
 - Traces: step-by-step spans for agent sessions. `POST /api/v1/traces` accepts OTLP/HTTP JSON from any OpenTelemetry exporter, `/traces` shows a waterfall, and the Claude Code hook emits session, turn and tool spans (register the new `PreToolUse` and `PostToolUse` hooks). Prompt and tool content is not stored unless `MC_TRACE_CAPTURE_CONTENT=1`; spans are pruned after `MC_TRACE_RETENTION_DAYS` (default 30). Docs: `docs/TELEMETRY.md`.

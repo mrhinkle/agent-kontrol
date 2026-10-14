@@ -11,6 +11,10 @@
 
 One dashboard for the AI coding agents you run: Claude Code, Codex, Grok, Hermes and anything that speaks MCP. See what each is doing, queue work for them, and check whether the backlog is actually shrinking.
 
+[![Agent Kontrol demo: the Fleet view, then the Gibson 3D view](docs/demo/agent-kontrol-demo-poster.jpg)](docs/demo/agent-kontrol-demo.mp4)
+
+*90-second demo with AI narration. Captions: [agent-kontrol-demo.srt](docs/demo/agent-kontrol-demo.srt).*
+
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fmrhinkle%2Fagent-kontrol&project-name=agent-kontrol&repository-name=agent-kontrol&env=MC_TOKEN%2CMC_DASHBOARD_PASSWORD&envDescription=MC_TOKEN%20is%20the%20shared%20secret%20agents%20use.%20MC_DASHBOARD_PASSWORD%20protects%20the%20dashboard.%20Generate%20each%20with%20openssl%20rand%20-hex%2024.&envLink=https%3A%2F%2Fgithub.com%2Fmrhinkle%2Fagent-kontrol%2Fblob%2Fmain%2Fdocs%2FDEPLOY.md&stores=%5B%7B%22type%22%3A%22integration%22%2C%22integrationSlug%22%3A%22neon%22%2C%22productSlug%22%3A%22neon%22%2C%22protocol%22%3A%22storage%22%7D%5D)
 
 ```bash

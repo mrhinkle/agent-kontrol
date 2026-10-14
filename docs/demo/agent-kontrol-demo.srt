@@ -1,0 +1,56 @@
+1
+00:00:00,001 --> 00:00:10,966
+This is Agent Kontrol. It's one screen for every AI agent
+I run. Claude Code, Cowork, ChatGPT, and Hermes. Who's
+working, who's stuck, and who needs me.
+
+2
+00:00:10,966 --> 00:00:19,603
+Right now, Claude Code on my MacBook is waiting on
+permission to push. That's the one I need to look at.
+
+3
+00:00:19,603 --> 00:00:24,373
+Below the cards, live activity shows every milestone as it
+happens.
+
+4
+00:00:24,373 --> 00:00:32,241
+History keeps every session and every event, so I can see
+what each agent did while I was away.
+
+5
+00:00:32,241 --> 00:00:39,335
+Progress answers a harder question. Is the backlog
+actually shrinking? Merged pull requests alone won't tell
+you.
+
+6
+00:00:39,335 --> 00:00:50,689
+And this is the Gibson. The same fleet, in 3D. Agents
+stand on the outer ring, grouped by machine. Towers are
+projects, and every floor is a task.
+
+7
+00:00:50,689 --> 00:00:54,047
+Drag to orbit around the whole fleet.
+
+8
+00:00:57,524 --> 00:01:06,293
+Or let it rotate on its own, like a status board on the
+wall.
+
+9
+00:01:08,290 --> 00:01:14,940
+Zoom in, and the dashed lines show which agent is working
+on which project.
+
+10
+00:01:14,940 --> 00:01:21,293
+Click an agent to see its details. That orange beacon
+means it's waiting on me.
+
+11
+00:01:21,816 --> 00:01:28,927
+Agent Kontrol is open source and self-hosted, on Neon or
+any Postgres. Narration is an AI voice.
