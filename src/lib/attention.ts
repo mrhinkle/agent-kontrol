@@ -34,7 +34,12 @@ export function deriveAttention({ agents, tasks, progressAlerts, now = Date.now(
   const items: AttentionItem[] = [];
   const failedAgents = agents.filter((a) => a.derived_status === "failed").length;
   const waiting = agents.filter((a) => a.derived_status === "waiting").length;
-  const failedTasks = tasks.filter((t) => t.status === "failed" && now - Date.parse(t.updated_at) < FAILED_TASK_WINDOW_MS).length;
+  // A failed task with an unreadable timestamp stays visible rather than vanishing.
+  const recent = (t: Pick<Task, "updated_at">) => {
+    const age = now - Date.parse(t.updated_at);
+    return Number.isNaN(age) || age < FAILED_TASK_WINDOW_MS;
+  };
+  const failedTasks = tasks.filter((t) => t.status === "failed" && recent(t)).length;
   const review = tasks.filter((t) => t.status === "review").length;
 
   if (failedAgents > 0) {

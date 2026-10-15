@@ -47,6 +47,11 @@ describe("attention strip derivation", () => {
     });
     assert.deepEqual(items, []);
   });
+
+  it("keeps a failed task whose timestamp cannot be parsed", () => {
+    const items = deriveAttention({ agents: [], tasks: [{ status: "failed", updated_at: "not a date" }], progressAlerts: null, now: NOW });
+    assert.deepEqual(items.map((i) => [i.key, i.count]), [["failed-tasks", 1]]);
+  });
 });
 
 describe("fleet urgency order", () => {

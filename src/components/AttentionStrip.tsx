@@ -69,9 +69,12 @@ function useAttention(): Snapshot | null {
           fetch("/api/tasks?status=all&limit=200", { cache: "no-store", signal: abort.signal }),
           loadProgress(abort.signal),
         ]);
+        // Either feed failing keeps the last good snapshot. An empty task list in
+        // place of a failed request would read as "clear" while work is failing.
         if (!fleetRes.ok) throw new Error(`fleet API ${fleetRes.status}`);
+        if (!tasksRes.ok) throw new Error(`tasks API ${tasksRes.status}`);
         const fleet = (await fleetRes.json()) as FleetResponse;
-        const tasks = tasksRes.ok ? ((await tasksRes.json()) as { tasks?: Task[] }).tasks ?? [] : [];
+        const tasks = ((await tasksRes.json()) as { tasks?: Task[] }).tasks ?? [];
         if (alive) setSnap({ demo: fleet.demo, items: deriveAttention({ agents: fleet.agents, tasks, progressAlerts }) });
       } catch {
         // Keep the last good strip; the page body reports its own errors.
