@@ -1,12 +1,11 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { DemoBanner, TimeAgo } from "@/components/ui";
+import { TimeAgo } from "@/components/ui";
 import type { MemoryItem } from "@/lib/types";
 
 export default function MemoryPage() {
   const [items, setItems] = useState<MemoryItem[]>([]);
-  const [demo, setDemo] = useState(false);
   const [query, setQuery] = useState("");
   const [loaded, setLoaded] = useState(false);
 
@@ -21,7 +20,6 @@ export default function MemoryPage() {
         const json = await res.json();
         if (controller.signal.aborted) return; // stale response — ignore
         setItems(json.items ?? []);
-        setDemo(Boolean(json.demo));
         setLoaded(true);
       } catch {
         // aborted or network error — keep current results
@@ -35,7 +33,6 @@ export default function MemoryPage() {
 
   return (
     <div>
-      {demo && <DemoBanner />}
       <div className="flex items-center gap-4 mb-5">
         <h1 className="text-lg font-semibold">Shared memory</h1>
         <input
