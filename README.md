@@ -27,6 +27,7 @@ That starts Agent Kontrol with Docker Compose (or in demo mode on Node 20+ if yo
 - **MCP server.** Any MCP host can report status, read the fleet, check messages from you and claim tasks. OAuth 2.1 for hosts that support it, or a bearer token.
 - **Messaging.** Send an agent a message from the dashboard; it sees it when it polls and can reply.
 - **Traces.** Step-by-step spans for each agent session, shown as a waterfall. OpenTelemetry-compatible, so any exporter can send to it; the Claude Code hook emits them automatically.
+- **Langfuse (optional).** When `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set, task queue actions, MCP tool calls, and ingest requests are traced to Langfuse. Off otherwise. Settings shows whether it is connected.
 - **Usage and Costs** (experimental). Paid and included-token cost per account.
 - **Notes.** A small shared table agents can write to and search (substring search). A short structured note (who, where, how long, outcome, tool counts) is written automatically when any agent's session ends, so the next agent can see who worked where.
 
@@ -57,7 +58,7 @@ Full matrix: [docs/AGENTS.md](docs/AGENTS.md).
 
 ## Status
 
-Agent Kontrol is in **1.0 beta** ([release notes](https://github.com/mrhinkle/agent-kontrol/releases)). The API, MCP tool surface and schema are meant to stay stable through 1.0; please report anything that breaks them. Experimental: Usage and Costs, and the Notes store (a pluggable memory backend is planned for 1.1). Not yet built: forwarding traces to other OpenTelemetry backends, and Cline and Roo Code support.
+Agent Kontrol is in **1.0 beta** ([release notes](https://github.com/mrhinkle/agent-kontrol/releases)). The API, MCP tool surface and schema are meant to stay stable through 1.0; please report anything that breaks them. Experimental: Usage and Costs, and the Notes store (a pluggable memory backend is planned for 1.1). Optional: [Langfuse](#langfuse) export of task, MCP, and ingest events. Not yet built: forwarding stored traces to Grafana or Honeycomb, and Cline and Roo Code support.
 
 ## Documentation
 
@@ -77,6 +78,32 @@ Agent Kontrol is in **1.0 beta** ([release notes](https://github.com/mrhinkle/ag
 | [Security](SECURITY.md) | Threat model and reporting |
 
 The same docs are available inside the app under **Help**.
+
+## Langfuse
+
+Agent Kontrol can export its own activity to [Langfuse](https://langfuse.com), Cloud or self-hosted. Tracing stays off until both `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set. With those unset, the app builds and runs as before and sends nothing to Langfuse.
+
+```bash
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+# Optional host. LANGFUSE_HOST and LANGFUSE_BASE_URL are also accepted.
+# Precedence: LANGFUSE_BASEURL, then LANGFUSE_HOST, then LANGFUSE_BASE_URL.
+# Default: https://cloud.langfuse.com
+# LANGFUSE_BASEURL=https://us.cloud.langfuse.com
+```
+
+Create the keys in the Langfuse project settings. Redeploy, then open **Settings → Integrations**. The card shows **Connected** or **Not configured**, the same steps, and a link to the project once the keys are accepted.
+
+| Span | When |
+| --- | --- |
+| `task.create`, `task.claim`, `task.update` | Task queue API |
+| `mcp.<tool>` | Each MCP tool call, for example `mcp.claim_task` |
+| `ingest.event` | `POST /api/ingest` |
+| `ingest.usage` | `POST /api/usage/ingest` |
+| `ingest.progress` | `POST /api/progress/ingest` |
+| `ingest.traces` | `POST /api/v1/traces` |
+
+Spans carry ids, status, platform, and counts. Prompts, message bodies, tool payloads, and secrets are left out.
 
 ## Develop
 

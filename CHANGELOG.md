@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Optional Langfuse export. Set `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` to trace task queue actions (`task.create`, `task.claim`, `task.update`), each MCP tool call (`mcp.<tool>`), and ingest (`ingest.event`, `ingest.usage`, `ingest.progress`, `ingest.traces`). `LANGFUSE_BASEURL` or `LANGFUSE_HOST` selects the host (default `https://cloud.langfuse.com`). Off when the keys are unset. Settings → Integrations shows Connected or Not configured and links to the project. Prompts, message bodies, and secrets are not sent.
 - Traces: step-by-step spans for agent sessions. `POST /api/v1/traces` accepts OTLP/HTTP JSON from any OpenTelemetry exporter, `/traces` shows a waterfall, and the Claude Code hook emits session, turn and tool spans (register the new `PreToolUse` and `PostToolUse` hooks). Prompt and tool content is not stored unless `MC_TRACE_CAPTURE_CONTENT=1`; spans are pruned after `MC_TRACE_RETENTION_DAYS` (default 30). Docs: `docs/TELEMETRY.md`.
 
 ### Changed

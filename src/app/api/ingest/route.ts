@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { isAuthorized } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
+import { ingestEventMeta } from "@/lib/langfuse-config";
+import { traceAgentEvent } from "@/lib/langfuse";
 import { report, type ReportInput } from "@/lib/store";
 
 export const maxDuration = 30;
@@ -29,7 +31,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
   if (!isConfigured()) {
-    return NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; event dropped" });
+    return traceAgentEvent("ingest.event", { demo: true }, async () =>
+      NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; event dropped" }),
+    );
   }
 
   let body: ReportInput;
@@ -42,10 +46,12 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "agent_id and kind are required" }, { status: 400 });
   }
 
-  try {
-    await report(body);
-    return NextResponse.json({ ok: true });
-  } catch (e) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
-  }
+  return traceAgentEvent("ingest.event", ingestEventMeta(body), async () => {
+    try {
+      await report(body);
+      return NextResponse.json({ ok: true });
+    } catch (e) {
+      return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    }
+  });
 }

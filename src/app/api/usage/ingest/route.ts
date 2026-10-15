@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { isAuthorized } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
+import { traceAgentEvent } from "@/lib/langfuse";
 import { isUndefinedTableError, USAGE_SETUP_MESSAGE } from "@/lib/usage-errors";
 import { ingestAccountSnapshot, ingestUsageFacts } from "@/lib/usage-store";
 import type { UsageIngestInput } from "@/lib/usage-types";
@@ -17,11 +18,13 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
   if (!isConfigured()) {
-    return NextResponse.json({
-      ok: true,
-      demo: true,
-      note: "DATABASE_URL not set; usage facts dropped",
-    });
+    return traceAgentEvent("ingest.usage", { demo: true }, async () =>
+      NextResponse.json({
+        ok: true,
+        demo: true,
+        note: "DATABASE_URL not set; usage facts dropped",
+      }),
+    );
   }
 
   let body: UsageIngestInput & {
@@ -46,25 +49,35 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "collected_at must be ISO 8601" }, { status: 400 });
   }
 
-  try {
-    const written = await ingestUsageFacts(body);
-    if (body.snapshot?.account_id) {
-      await ingestAccountSnapshot(body.snapshot);
-    }
-    return NextResponse.json({ ok: true, written });
-  } catch (e) {
-    if (isUndefinedTableError(e)) {
-      return NextResponse.json(
-        {
-          error: USAGE_SETUP_MESSAGE,
-          setup_required: true,
-          message: USAGE_SETUP_MESSAGE,
-        },
-        { status: 503 },
-      );
-    }
-    const msg = (e as Error).message || "ingest failed";
-    const status = msg.startsWith("privacy:") ? 400 : 500;
-    return NextResponse.json({ error: msg }, { status });
-  }
+  return traceAgentEvent(
+    "ingest.usage",
+    {
+      fact_count: body.facts.length,
+      kind: body.kind,
+      has_snapshot: Boolean(body.snapshot?.account_id),
+    },
+    async () => {
+      try {
+        const written = await ingestUsageFacts(body);
+        if (body.snapshot?.account_id) {
+          await ingestAccountSnapshot(body.snapshot);
+        }
+        return NextResponse.json({ ok: true, written });
+      } catch (e) {
+        if (isUndefinedTableError(e)) {
+          return NextResponse.json(
+            {
+              error: USAGE_SETUP_MESSAGE,
+              setup_required: true,
+              message: USAGE_SETUP_MESSAGE,
+            },
+            { status: 503 },
+          );
+        }
+        const msg = (e as Error).message || "ingest failed";
+        const status = msg.startsWith("privacy:") ? 400 : 500;
+        return NextResponse.json({ error: msg }, { status });
+      }
+    },
+  );
 }
