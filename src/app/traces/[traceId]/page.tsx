@@ -2,7 +2,6 @@
 
 import { use, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { DemoBanner } from "@/components/ui";
 import { buildWaterfall, formatDuration, type SpanRow } from "@/lib/traces";
 
 const KIND_COLOR: Record<string, string> = {
@@ -16,7 +15,6 @@ const KIND_COLOR: Record<string, string> = {
 export default function TraceDetail({ params }: { params: Promise<{ traceId: string }> }) {
   const { traceId } = use(params);
   const [spans, setSpans] = useState<SpanRow[] | null>(null);
-  const [demo, setDemo] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
 
@@ -29,7 +27,6 @@ export default function TraceDetail({ params }: { params: Promise<{ traceId: str
         const body = await res.json();
         if (!live) return;
         setSpans(body.spans);
-        setDemo(Boolean(body.demo));
         setError(null);
       } catch (e) {
         if (live) setError((e as Error).message);
@@ -49,7 +46,6 @@ export default function TraceDetail({ params }: { params: Promise<{ traceId: str
 
   return (
     <div>
-      {demo && <DemoBanner />}
       <div className="mb-4 text-sm">
         <Link href="/traces" className="text-gray-400 hover:text-gray-200">
           ← Traces

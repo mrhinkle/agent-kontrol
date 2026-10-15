@@ -52,20 +52,46 @@ export function StatusChip({ status }: { status: string }) {
   );
 }
 
-export function PlatformBadge({ platform }: { platform: string }) {
-  const labels: Record<string, string> = {
-    "claude-code": "Claude Code",
-    "cowork-cloud": "Cowork · Cloud",
-    "cowork-local": "Cowork · Local",
-    "chatgpt-work": "ChatGPT Work",
-    codex: "Codex",
-    grok: "Grok",
-    hermes: "Hermes",
-    any: "Any platform",
-  };
+/**
+ * Platform marks: a tinted tile with a two-letter glyph, so a card reads at a
+ * glance without reproducing any vendor's logo. Unknown platforms get a neutral
+ * tile with the first two letters of their id.
+ */
+export const PLATFORM_META: Record<string, { label: string; glyph: string; color: string }> = {
+  "claude-code": { label: "Claude Code", glyph: "CL", color: "#d97757" },
+  "cowork-cloud": { label: "Cowork · Cloud", glyph: "CW", color: "#d97757" },
+  "cowork-local": { label: "Cowork · Local", glyph: "CW", color: "#d97757" },
+  "chatgpt-work": { label: "ChatGPT Work", glyph: "GP", color: "#10a37f" },
+  codex: { label: "Codex", glyph: "CX", color: "#10a37f" },
+  grok: { label: "Grok", glyph: "GK", color: "#c9d1e3" },
+  hermes: { label: "Hermes", glyph: "HE", color: "#a78bfa" },
+  "cline-roo": { label: "Cline / Roo", glyph: "CR", color: "#5ec8ff" },
+  any: { label: "Any platform", glyph: "\u2217", color: "#8b9bc0" },
+};
+
+export function platformMeta(platform: string): { label: string; glyph: string; color: string } {
+  return PLATFORM_META[platform] ?? { label: platform, glyph: platform.replace(/[^a-z0-9]/gi, "").slice(0, 2).toUpperCase() || "?", color: "#8b9bc0" };
+}
+
+export function PlatformMark({ platform, size = 16 }: { platform: string; size?: number }) {
+  const m = platformMeta(platform);
   return (
-    <span className="text-[11px] uppercase tracking-wider text-gray-500 mono">
-      {labels[platform] ?? platform}
+    <span
+      aria-hidden
+      className="mono inline-flex shrink-0 items-center justify-center rounded-[4px] font-bold leading-none"
+      style={{ width: size, height: size, fontSize: Math.round(size * 0.5), color: m.color, backgroundColor: `${m.color}1f`, boxShadow: `inset 0 0 0 1px ${m.color}55` }}
+    >
+      {m.glyph}
+    </span>
+  );
+}
+
+export function PlatformBadge({ platform }: { platform: string }) {
+  const m = platformMeta(platform);
+  return (
+    <span className="inline-flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-gray-500 mono" title={platform}>
+      <PlatformMark platform={platform} size={14} />
+      {m.label}
     </span>
   );
 }
@@ -86,11 +112,17 @@ export function TimeAgo({ iso }: { iso: string | null }) {
   return <span title={iso}>{label}</span>;
 }
 
-export function DemoBanner() {
+/**
+ * Demo mode lives in the header as a pill, not a banner on every page. The
+ * tooltip holds the instructions; the Help pages have the long version.
+ */
+export function DemoPill() {
   return (
-    <div className="mb-4 rounded-lg border border-[#2563eb]/30 bg-[#2563eb]/10 px-4 py-2.5 text-sm text-[#9db9ff]">
-      Demo mode — no database connected yet. Set <span className="mono">DATABASE_URL</span> and{" "}
-      <span className="mono">MC_TOKEN</span> to go live.
-    </div>
+    <span
+      className="mono whitespace-nowrap rounded-full bg-[#2563eb]/15 px-2.5 py-1 text-[10.5px] font-semibold uppercase tracking-wider text-[#9db9ff] ring-1 ring-inset ring-[#2563eb]/50"
+      title="Demo mode: simulated data, no database connected. Set DATABASE_URL and MC_TOKEN to go live."
+    >
+      demo · simulated
+    </span>
   );
 }
