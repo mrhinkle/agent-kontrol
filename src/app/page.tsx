@@ -163,8 +163,9 @@ export default function FleetPage() {
   const [showBackground, setShowBackground] = useState(false);
 
   // Urgent first: failed, needs you, active, done, offline. Within a tier the
-  // server's order (most recently seen first) holds, so a card only moves when
-  // an agent's status changes, not under the cursor on an ordinary poll.
+  // server's order (most recently seen first) holds. A card moves when its
+  // status changes or when the server reorders a tier, which it does only when
+  // last-seen order changes; neither happens on an ordinary poll.
   const agents = useMemo(() => sortAgentsByUrgency(data?.agents ?? []), [data]);
   const feed = useMemo(() => buildFeed(data?.events ?? [], { showBackground, limit: FEED_LIMIT }), [data, showBackground]);
 

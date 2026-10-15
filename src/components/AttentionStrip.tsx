@@ -7,6 +7,8 @@ import { DemoPill } from "@/components/ui";
 import type { FleetResponse, Task } from "@/lib/types";
 
 const POLL_MS = 15_000;
+/** A poll that has not answered by then is abandoned so the next tick can run. */
+const POLL_TIMEOUT_MS = 10_000;
 const PROGRESS_POLL_MS = 60_000;
 const PROGRESS_TIMEOUT_MS = 5_000;
 
@@ -32,12 +34,16 @@ function useAttention(): Snapshot | null {
   useEffect(() => {
     let alive = true;
     let inFlight = false;
+    // The in-flight poll's controller: aborted on timeout (so a hung request can
+    // never pin inFlight and freeze the strip) and on unmount.
+    let current: AbortController | null = null;
 
-    async function loadProgress(): Promise<number | null> {
+    async function loadProgress(parent: AbortSignal): Promise<number | null> {
       const cached = progressRef.current;
       if (cached.at && Date.now() - cached.at < PROGRESS_POLL_MS) return cached.count;
       const abort = new AbortController();
       const timer = setTimeout(() => abort.abort(), PROGRESS_TIMEOUT_MS);
+      parent.addEventListener("abort", () => abort.abort(), { once: true });
       try {
         const res = await fetch("/api/progress?window=24h", { cache: "no-store", signal: abort.signal });
         if (!res.ok) throw new Error(String(res.status));
@@ -54,11 +60,14 @@ function useAttention(): Snapshot | null {
     async function load() {
       if (inFlight) return;
       inFlight = true;
+      const abort = new AbortController();
+      current = abort;
+      const timer = setTimeout(() => abort.abort(), POLL_TIMEOUT_MS);
       try {
         const [fleetRes, tasksRes, progressAlerts] = await Promise.all([
-          fetch("/api/fleet", { cache: "no-store" }),
-          fetch("/api/tasks?status=all&limit=200", { cache: "no-store" }),
-          loadProgress(),
+          fetch("/api/fleet", { cache: "no-store", signal: abort.signal }),
+          fetch("/api/tasks?status=all&limit=200", { cache: "no-store", signal: abort.signal }),
+          loadProgress(abort.signal),
         ]);
         if (!fleetRes.ok) throw new Error(`fleet API ${fleetRes.status}`);
         const fleet = (await fleetRes.json()) as FleetResponse;
@@ -67,6 +76,8 @@ function useAttention(): Snapshot | null {
       } catch {
         // Keep the last good strip; the page body reports its own errors.
       } finally {
+        clearTimeout(timer);
+        if (current === abort) current = null;
         inFlight = false;
       }
     }
@@ -76,6 +87,7 @@ function useAttention(): Snapshot | null {
     return () => {
       alive = false;
       clearInterval(t);
+      current?.abort();
     };
   }, []);
 
@@ -85,8 +97,14 @@ function useAttention(): Snapshot | null {
 export function AttentionStrip() {
   const snap = useAttention();
   if (!snap) return null;
+  // The live region is a hidden one-line summary; announcing the links themselves
+  // would re-read the whole strip every time a count changed.
+  const summary = snap.items.length === 0 ? "Nothing needs you" : snap.items.map((i) => i.label).join(", ");
   return (
-    <div className="no-scrollbar flex min-w-0 items-center gap-1.5 overflow-x-auto sm:justify-end" role="status" aria-live="polite" aria-label="Attention">
+    <div className="no-scrollbar flex min-w-0 items-center gap-1.5 overflow-x-auto sm:justify-end" aria-label="Attention">
+      <span className="sr-only" role="status" aria-live="polite">
+        {summary}
+      </span>
       {snap.items.map((item) => {
         const t = TONE[item.tone];
         return (
