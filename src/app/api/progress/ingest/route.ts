@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { isAuthorized } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
+import { traceAgentEvent } from "@/lib/langfuse";
+import { progressIngestMeta } from "@/lib/langfuse-config";
 import { ingestSnapshots, type IngestInput } from "@/lib/progress-store";
 
 export const maxDuration = 30;
@@ -29,7 +31,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
   if (!isConfigured()) {
-    return NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; snapshot dropped" });
+    return traceAgentEvent("ingest.progress", { demo: true }, async () =>
+      NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; snapshot dropped" }),
+    );
   }
 
   let body: IngestInput;
@@ -45,10 +49,16 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "collected_at must be ISO 8601" }, { status: 400 });
   }
 
-  try {
-    const written = await ingestSnapshots(body);
-    return NextResponse.json({ ok: true, written });
-  } catch (e) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
-  }
+  return traceAgentEvent(
+    "ingest.progress",
+    () => progressIngestMeta(body),
+    async () => {
+      try {
+        const written = await ingestSnapshots(body);
+        return NextResponse.json({ ok: true, written });
+      } catch (e) {
+        return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+      }
+    },
+  );
 }

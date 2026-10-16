@@ -85,7 +85,11 @@ Spans older than `MC_TRACE_RETENTION_DAYS` (default 30) are deleted. Pruning run
 - `GET /api/traces?agent=<id>&errors=1&before=<ISO>&limit=<1-100>` returns summaries.
 - `GET /api/traces/<traceId>` returns the spans.
 
-Both accept the dashboard cookie or the bearer token. Forwarding traces on to Grafana, Honeycomb or another OpenTelemetry backend is not built yet; for now you can send the same spans to both places by configuring two exporters.
+Both accept the dashboard cookie or the bearer token. The spans stored here are not forwarded to Grafana, Honeycomb, or another OpenTelemetry backend; send the same spans to a second backend by configuring a second exporter in the agent.
+
+Separately, Agent Kontrol can export its own task queue, MCP tool, and ingest events to Langfuse when `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set. That export does not replay the spans stored here, and it does not include prompts or secrets. With the keys unset, nothing is sent. The host is the first of `LANGFUSE_BASEURL`, `LANGFUSE_HOST`, and `LANGFUSE_BASE_URL` that is set (default `https://cloud.langfuse.com`). It must be https, except `http://localhost` and `http://127.0.0.1`. Settings shows whether the project is connected.
+
+Those spans are batched (up to 512, about every 5 seconds) and flushed on process shutdown. They are not flushed inside each request. On a long-running Node process that is reliable. On serverless, a warm instance still exports on the interval; an instance frozen or discarded before then can delay or drop the last batch.
 
 ## Known limits
 

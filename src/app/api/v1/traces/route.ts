@@ -2,6 +2,7 @@ import { gunzipSync } from "node:zlib";
 import { NextResponse } from "next/server";
 import { isAuthorized } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
+import { traceAgentEvent } from "@/lib/langfuse";
 import { pruneSpans, upsertSpans } from "@/lib/trace-store";
 import { captureContentEnabled, dedupeSpans, MAX_BODY_BYTES, parseOtlp } from "@/lib/traces";
 
@@ -79,15 +80,26 @@ export async function POST(req: Request) {
   }
   const partialSuccess = rejected > 0 ? { rejectedSpans: rejected, errorMessage: errors.join("; ") } : {};
 
-  if (!isConfigured()) return NextResponse.json({ partialSuccess, demo: true });
+  return traceAgentEvent(
+    "ingest.traces",
+    {
+      span_count: spans.length,
+      rejected,
+      agent_count: new Set(spans.map((span) => span.agent_id)).size,
+      demo: !isConfigured(),
+    },
+    async () => {
+      if (!isConfigured()) return NextResponse.json({ partialSuccess, demo: true });
 
-  try {
-    await upsertSpans(dedupeSpans(spans));
-    // Housekeeping on roughly 1 in 50 writes, so no scheduler is needed.
-    if (Math.random() < 0.02) pruneSpans().catch((e) => console.error("[traces] prune failed", e));
-    return NextResponse.json({ partialSuccess });
-  } catch (e) {
-    console.error("[traces] write failed", e);
-    return NextResponse.json({ error: "could not store spans" }, { status: 500 });
-  }
+      try {
+        await upsertSpans(dedupeSpans(spans));
+        // Housekeeping on roughly 1 in 50 writes, so no scheduler is needed.
+        if (Math.random() < 0.02) pruneSpans().catch((e) => console.error("[traces] prune failed", e));
+        return NextResponse.json({ partialSuccess });
+      } catch (e) {
+        console.error("[traces] write failed", e);
+        return NextResponse.json({ error: "could not store spans" }, { status: 500 });
+      }
+    },
+  );
 }

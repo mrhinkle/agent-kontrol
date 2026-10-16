@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { isConfigured } from "@/lib/db";
+import { traceAgentEvent } from "@/lib/langfuse";
 import { updateTask, report } from "@/lib/store";
 import type { TaskStatus } from "@/lib/types";
 
@@ -13,7 +14,7 @@ export const maxDuration = 30;
  */
 export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }> }) {
   if (!isConfigured()) {
-    return NextResponse.json({ ok: true, demo: true });
+    return traceAgentEvent("task.update", { demo: true }, async () => NextResponse.json({ ok: true, demo: true }));
   }
   const { id } = await ctx.params;
   const taskId = Number(id);
@@ -33,18 +34,31 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
   } catch {
     return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
   }
-  try {
-    const task = await updateTask({ id: taskId, ...body });
-    if (body.status && body.agent_id) {
-      await report({
-        agent_id: body.agent_id,
-        kind: body.status === "failed" ? "error" : "status",
-        title: `Task #${task.id} → ${body.status}: ${task.title}`,
-        detail: { task_id: task.id, cost_usd: body.cost_usd },
-      });
-    }
-    return NextResponse.json({ ok: true, task });
-  } catch (e) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
-  }
+  return traceAgentEvent(
+    "task.update",
+    {
+      id: taskId,
+      status: body.status,
+      agent_id: body.agent_id,
+      assigned_agent: body.assigned_agent,
+      cost_usd: body.cost_usd,
+      has_result: typeof body.result === "string" && body.result.length > 0,
+    },
+    async () => {
+      try {
+        const task = await updateTask({ id: taskId, ...body });
+        if (body.status && body.agent_id) {
+          await report({
+            agent_id: body.agent_id,
+            kind: body.status === "failed" ? "error" : "status",
+            title: `Task #${task.id} → ${body.status}: ${task.title}`,
+            detail: { task_id: task.id, cost_usd: body.cost_usd },
+          });
+        }
+        return NextResponse.json({ ok: true, task });
+      } catch (e) {
+        return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+      }
+    },
+  );
 }

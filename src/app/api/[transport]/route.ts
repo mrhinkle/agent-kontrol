@@ -2,6 +2,8 @@ import { createMcpHandler, withMcpAuth } from "mcp-handler";
 import { z } from "zod";
 import { secretsMatch, verifyAccessToken } from "@/lib/authcrypto";
 import { isConfigured } from "@/lib/db";
+import { traceAgentEvent } from "@/lib/langfuse";
+import { mcpToolMeta } from "@/lib/langfuse-config";
 import { claimNextTask, createTask, fetchMessages, fleet, listTasks, recall, remember, replyFromAgent, report, updateTask } from "@/lib/store";
 import { progress } from "@/lib/progress-store";
 import { formatDigest } from "@/lib/progress-digest";
@@ -18,6 +20,16 @@ export const maxDuration = 60;
  */
 const handler = createMcpHandler(
   (server) => {
+    const registerTool = server.registerTool.bind(server);
+    // One span per tool call. The handler itself is unchanged; only enums, fingerprints, and sizes are recorded.
+    server.registerTool = ((name: string, config: object, cb: (args: never, extra?: unknown) => unknown) =>
+      registerTool(
+        name,
+        config as never,
+        (async (args: never, extra?: unknown) =>
+          traceAgentEvent(`mcp.${name}`, () => ({ tool: name, ...mcpToolMeta(args) }), () => Promise.resolve(cb(args, extra)))) as never,
+      )) as typeof server.registerTool;
+
     server.registerTool(
       "report_status",
       {

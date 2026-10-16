@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { isConfigured } from "@/lib/db";
+import { traceAgentEvent } from "@/lib/langfuse";
 import { claimNextTask, report } from "@/lib/store";
 
 export const dynamic = "force-dynamic";
@@ -13,7 +14,7 @@ export const maxDuration = 30;
  */
 export async function POST(req: Request) {
   if (!isConfigured()) {
-    return NextResponse.json({ task: null, demo: true });
+    return traceAgentEvent("task.claim", { demo: true }, async () => NextResponse.json({ task: null, demo: true }));
   }
   let body: { platform?: string; machine?: string; agent_id?: string };
   try {
@@ -24,24 +25,33 @@ export async function POST(req: Request) {
   if (!body.platform || !body.agent_id) {
     return NextResponse.json({ error: "platform and agent_id are required" }, { status: 400 });
   }
-  try {
-    const task = await claimNextTask({
-      platform: body.platform,
-      machine: body.machine,
-      agent_id: body.agent_id,
-    });
-    if (task) {
-      await report({
-        agent_id: body.agent_id,
-        platform: body.platform,
-        machine: body.machine,
-        kind: "status",
-        title: `Claimed task #${task.id}: ${task.title}`,
-        detail: { task_id: task.id },
-      });
-    }
-    return NextResponse.json({ task });
-  } catch (e) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
-  }
+  const platform = body.platform;
+  const agentId = body.agent_id;
+  const machine = body.machine;
+  return traceAgentEvent(
+    "task.claim",
+    { platform, machine, agent_id: agentId },
+    async () => {
+      try {
+        const task = await claimNextTask({
+          platform,
+          machine,
+          agent_id: agentId,
+        });
+        if (task) {
+          await report({
+            agent_id: agentId,
+            platform,
+            machine,
+            kind: "status",
+            title: `Claimed task #${task.id}: ${task.title}`,
+            detail: { task_id: task.id },
+          });
+        }
+        return NextResponse.json({ task });
+      } catch (e) {
+        return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+      }
+    },
+  );
 }

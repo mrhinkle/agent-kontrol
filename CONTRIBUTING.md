@@ -2,7 +2,7 @@
 
 ## Development setup
 
-- Node 22
+- Node 22.3 or newer
 - `npm ci`
 - `npm run dev` — runs in demo mode when `DATABASE_URL` is unset.
 

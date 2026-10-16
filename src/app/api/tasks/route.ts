@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { isConfigured } from "@/lib/db";
+import { traceAgentEvent } from "@/lib/langfuse";
 import { createTask, listTasks } from "@/lib/store";
 import { demoTasks } from "@/lib/demo-data";
 
@@ -32,7 +33,9 @@ export async function GET(req: Request) {
 
 export async function POST(req: Request) {
   if (!isConfigured()) {
-    return NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; task dropped" });
+    return traceAgentEvent("task.create", { demo: true }, async () =>
+      NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; task dropped" }),
+    );
   }
   let body: {
     title?: string;
@@ -52,10 +55,25 @@ export async function POST(req: Request) {
   if (!body.title) {
     return NextResponse.json({ error: "title is required" }, { status: 400 });
   }
-  try {
-    const task = await createTask({ ...body, title: body.title });
-    return NextResponse.json({ ok: true, task });
-  } catch (e) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
-  }
+  const title = body.title;
+  return traceAgentEvent(
+    "task.create",
+    {
+      platform: body.platform,
+      machine: body.machine,
+      project: body.project,
+      priority: body.priority,
+      reviewer_platform: body.reviewer_platform,
+      created_by: body.created_by,
+      title_chars: title.length,
+    },
+    async () => {
+      try {
+        const task = await createTask({ ...body, title });
+        return NextResponse.json({ ok: true, task });
+      } catch (e) {
+        return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+      }
+    },
+  );
 }

@@ -2,8 +2,11 @@
   "name": "agent-kontrol",
   "version": "1.0.0-beta.1",
   "private": true,
+  "engines": {
+    "node": ">=22.3.0"
+  },
   "scripts": {
-    "test:ui": "npx --yes tsx@4.23.15 --test tests/ui/*.test.ts",
+    "test:ui": "NODE_OPTIONS='--require ./scripts/stub-server-only.cjs' npx --yes tsx@4.23.15 --test tests/ui/*.test.ts",
     "dev": "next dev",
     "build": "node scripts/apply-schema.mjs && next build",
     "start": "next start",
@@ -23,7 +26,10 @@
     "migrate": "node scripts/apply-schema.mjs"
   },
   "dependencies": {
+    "@langfuse/otel": "^6.0.0",
+    "@langfuse/tracing": "^6.0.0",
     "@neondatabase/serverless": "^1.1.0",
+    "@opentelemetry/sdk-trace-node": "^2.12.0",
     "@react-three/drei": "^10.7.8",
     "@react-three/fiber": "^9.7.0",
     "@react-three/postprocessing": "^3.0.5",
@@ -32,6 +38,7 @@
     "pg": "^8.23.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "server-only": "^0.0.1",
     "three": "^0.186.1",
     "zod": "^3.24.0"
   },

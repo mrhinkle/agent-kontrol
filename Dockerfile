@@ -1,4 +1,5 @@
 # syntax=docker/dockerfile:1
+# Engines require Node >=22.3.0 (process.getBuiltinModule). The 22-slim tag tracks the current Node 22 release.
 
 FROM node:22-slim AS deps
 WORKDIR /app
