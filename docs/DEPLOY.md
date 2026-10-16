@@ -47,7 +47,7 @@ The Neon integration injects `DATABASE_URL`. `npm run build` applies the schema 
 | Any Node host | Any Postgres | `npm ci && npm run build && npm start` | Same code, less exercised |
 | Local demo | None | `npm ci && npm run dev` | Sample data, nothing stored |
 
-Only Vercel + Neon is used in the author's production. CI runs the data layer tests against Postgres 16 (schema applied twice). The Docker, Fly.io and generic-Node paths follow the same code but are less exercised; CI does build the Docker image and check that it serves `/login`. Not supported: serverless platforms that cannot run Node 22, and plain HTTP without TLS for anything but localhost.
+Only Vercel + Neon is used in the author's production. CI runs the data layer tests against Postgres 16 (schema applied twice). The Docker, Fly.io and generic-Node paths follow the same code but are less exercised; CI does build the Docker image and check that it serves `/login`. Not supported: serverless platforms that cannot run Node 22.3, and plain HTTP without TLS for anything but localhost.
 
 ### Vercel + Neon
 
@@ -67,7 +67,7 @@ docker compose up -d --build
 
 Files:
 
-- `Dockerfile` — node:22-slim, multi-stage, runs as the non-root `node` user, healthcheck on `/login`, applies the schema on every container start.
+- `Dockerfile` — node:22-slim (current Node 22, which is past the 22.3.0 floor), multi-stage, runs as the non-root `node` user, healthcheck on `/login`, applies the schema on every container start.
 - `docker-compose.yml` — db and app; the db port is not published; data lives in the named volume `db-data`; the app listens on `${MC_PORT:-3000}`; `POSTGRES_PASSWORD` defaults to `mc` and should be changed for anything beyond local use.
 
 ### Fly.io
@@ -117,7 +117,7 @@ Notes:
 
 ### Any Node host (VM, Railway, Render, etc.)
 
-Requirements: Node 22 and a Postgres.
+Requirements: Node 22.3 or newer and a Postgres.
 
 ```bash
 npm ci && npm run build && npm start

@@ -46,7 +46,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "agent_id and kind are required" }, { status: 400 });
   }
 
-  return traceAgentEvent("ingest.event", ingestEventMeta(body), async () => {
+  return traceAgentEvent("ingest.event", () => ingestEventMeta(body), async () => {
     try {
       await report(body);
       return NextResponse.json({ ok: true });

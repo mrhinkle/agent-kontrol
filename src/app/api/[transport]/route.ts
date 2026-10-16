@@ -21,13 +21,13 @@ export const maxDuration = 60;
 const handler = createMcpHandler(
   (server) => {
     const registerTool = server.registerTool.bind(server);
-    // One span per tool call. The handler itself is unchanged; only ids and sizes are recorded.
+    // One span per tool call. The handler itself is unchanged; only enums, fingerprints, and sizes are recorded.
     server.registerTool = ((name: string, config: object, cb: (args: never, extra?: unknown) => unknown) =>
       registerTool(
         name,
         config as never,
         (async (args: never, extra?: unknown) =>
-          traceAgentEvent(`mcp.${name}`, { tool: name, ...mcpToolMeta(args) }, () => Promise.resolve(cb(args, extra)))) as never,
+          traceAgentEvent(`mcp.${name}`, () => ({ tool: name, ...mcpToolMeta(args) }), () => Promise.resolve(cb(args, extra)))) as never,
       )) as typeof server.registerTool;
 
     server.registerTool(

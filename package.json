@@ -3,7 +3,7 @@
   "version": "1.0.0-beta.1",
   "private": true,
   "engines": {
-    "node": ">=22"
+    "node": ">=22.3.0"
   },
   "scripts": {
     "test:ui": "NODE_OPTIONS='--require ./scripts/stub-server-only.cjs' npx --yes tsx@4.23.15 --test tests/ui/*.test.ts",

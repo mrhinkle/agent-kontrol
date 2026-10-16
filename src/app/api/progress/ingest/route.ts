@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { isAuthorized } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import { traceAgentEvent } from "@/lib/langfuse";
+import { progressIngestMeta } from "@/lib/langfuse-config";
 import { ingestSnapshots, type IngestInput } from "@/lib/progress-store";
 
 export const maxDuration = 30;
@@ -50,11 +51,7 @@ export async function POST(req: Request) {
 
   return traceAgentEvent(
     "ingest.progress",
-    {
-      kind: body.kind,
-      repo_count: body.repos.length,
-      repos: body.repos.map((repo) => repo.repo).slice(0, 12).join(","),
-    },
+    () => progressIngestMeta(body),
     async () => {
       try {
         const written = await ingestSnapshots(body);

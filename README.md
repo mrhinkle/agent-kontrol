@@ -17,7 +17,7 @@ One dashboard for the AI coding agents you run: Claude Code, Codex, Grok, Hermes
 curl -fsSL https://raw.githubusercontent.com/mrhinkle/agent-kontrol/main/scripts/quickstart.sh | bash
 ```
 
-That starts Agent Kontrol with Docker Compose (or in demo mode on Node 22+ if you have no Docker). Other targets: Vercel with Neon or any Postgres, Fly.io, any Node host. See [docs/DEPLOY.md](docs/DEPLOY.md).
+That starts Agent Kontrol with Docker Compose (or in demo mode on Node 22.3+ if you have no Docker). Other targets: Vercel with Neon or any Postgres, Fly.io, any Node host. See [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## What it does
 
@@ -103,7 +103,7 @@ Create the keys in the Langfuse project settings. Redeploy, then open **Settings
 | `ingest.progress` | `POST /api/progress/ingest` |
 | `ingest.traces` | `POST /api/v1/traces` |
 
-Spans carry ids, status, platform, and counts. Prompts, message bodies, tool payloads, and secrets are left out.
+Spans carry closed enums, counts, and keyed fingerprints of ids (`session_ref`, `agent_ref`, and the same for other ids). A failure adds `error_kind` and `error_ref` only. Prompts, message bodies, tool payloads, repo names, exception text, and secrets are left out. A span name outside the closed set above is recorded as `unknown`.
 
 The host is read from `LANGFUSE_BASEURL`, then `LANGFUSE_HOST`, then `LANGFUSE_BASE_URL`. It must be `https`, except `http://localhost` and `http://127.0.0.1` for a Langfuse server on the same machine.
 
