@@ -1,12 +1,22 @@
 /**
  * Send one Langfuse observation per agent event. With the keys unset this is
  * a direct call to `fn` and the SDK is never loaded.
+ *
+ * Spans are batched by the OpenTelemetry processor (default: up to 512 spans,
+ * about every 5 seconds). This module does not flush on each request: a flush
+ * there would add a network round trip to every ingest and MCP call. The batch
+ * is flushed on process shutdown (`beforeExit`, `SIGTERM`, `SIGINT`), which
+ * Docker and Fly send. On serverless there is often no shutdown between
+ * requests. A warm instance still exports on that interval. An instance frozen
+ * or discarded first can delay the last batch until it wakes, or drop it if
+ * the instance is thrown away. That lag is the cost of keeping those requests
+ * off the Langfuse network path.
  */
-import { after } from "next/server";
+import "server-only";
 import { redactText } from "@/lib/traces";
-import { isLangfuseEnabled, readLangfuseConfig, sanitizeLangfuseMeta } from "@/lib/langfuse-config";
+import { formatLangfuseSetupError, isLangfuseEnabled, readLangfuseConfig, sanitizeLangfuseMeta } from "@/lib/langfuse-config";
 
-interface Flusher {
+interface LangfuseProcessor {
   forceFlush(): Promise<void>;
 }
 
@@ -18,9 +28,10 @@ export interface LangfuseTraceRecord {
 
 type LangfuseEmitter = (event: LangfuseTraceRecord) => Promise<void> | void;
 
-let processor: Flusher | null = null;
-let starting: Promise<Flusher | null> | null = null;
+let processor: LangfuseProcessor | null = null;
+let starting: Promise<LangfuseProcessor | null> | null = null;
 let testEmitter: LangfuseEmitter | null = null;
+let shutdownHooked = false;
 
 /** Unit tests record events here instead of opening a tracer. */
 export function setLangfuseEmitterForTests(emitter: LangfuseEmitter | null): void {
@@ -31,28 +42,27 @@ function responseStatus(result: unknown): number | undefined {
   return result instanceof Response ? result.status : undefined;
 }
 
-function scheduleFlush(current: Flusher): void {
-  const run = () =>
-    current.forceFlush().catch(() => {
-      console.error("[langfuse] flush failed");
+function hookShutdown(current: LangfuseProcessor): void {
+  if (shutdownHooked) return;
+  shutdownHooked = true;
+  const flush = () => {
+    void current.forceFlush().catch(() => {
+      console.error("[langfuse] shutdown flush failed");
     });
-  try {
-    after(() => {
-      void run();
-    });
-  } catch {
-    void run();
-  }
+  };
+  process.once("beforeExit", flush);
+  process.on("SIGTERM", flush);
+  process.on("SIGINT", flush);
 }
 
-export async function ensureLangfuse(): Promise<Flusher | null> {
+export async function ensureLangfuse(): Promise<LangfuseProcessor | null> {
   if (!isLangfuseEnabled()) return null;
   if (processor) return processor;
   if (!starting) starting = startLangfuse();
   return starting;
 }
 
-async function startLangfuse(): Promise<Flusher | null> {
+async function startLangfuse(): Promise<LangfuseProcessor | null> {
   const cfg = readLangfuseConfig();
   if (!cfg.enabled || !cfg.publicKey || !cfg.secretKey) return null;
   try {
@@ -66,17 +76,17 @@ async function startLangfuse(): Promise<Flusher | null> {
       secretKey: cfg.secretKey,
       baseUrl: cfg.baseUrl,
       exportMode: "batched",
-      flushAt: 1,
       mediaUploadEnabled: false,
       mask: ({ data }) => (typeof data === "string" ? redactText(data, 500) : data),
     });
     // Isolated provider so the rest of the process keeps its own tracer.
     const provider = new NodeTracerProvider({ spanProcessors: [created] });
     setLangfuseTracerProvider(provider);
+    hookShutdown(created);
     processor = created;
     return created;
-  } catch {
-    console.error("[langfuse] tracing disabled: setup failed");
+  } catch (err) {
+    console.error(`[langfuse] tracing disabled: setup failed (${formatLangfuseSetupError(err)})`);
     return null;
   }
 }
@@ -110,14 +120,13 @@ async function traceWithEmitter<T>(name: string, metadata: Record<string, unknow
 
 async function traceWithSdk<T>(name: string, metadata: Record<string, unknown> | undefined, fn: () => Promise<T>): Promise<T> {
   const safe = sanitizeLangfuseMeta(metadata);
-  let current: Flusher | null = null;
   try {
-    current = await ensureLangfuse();
+    const ready = await ensureLangfuse();
+    if (!ready) return fn();
   } catch {
     console.error("[langfuse] tracing skipped");
     return fn();
   }
-  if (!current) return fn();
 
   let result!: T;
   let failure: unknown;
@@ -167,8 +176,6 @@ async function traceWithSdk<T>(name: string, metadata: Record<string, unknown> |
     );
   } catch {
     console.error("[langfuse] tracing skipped");
-  } finally {
-    scheduleFlush(current);
   }
   if (!ran) return fn();
   if (failure) throw failure;

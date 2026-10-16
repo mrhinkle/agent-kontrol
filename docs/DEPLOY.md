@@ -162,7 +162,7 @@ With no `DATABASE_URL`, the app runs with sample data and stores nothing.
 | `MC_OPENROUTER_MANAGEMENT_KEY` | No | Key for the usage ledger. |
 | `LANGFUSE_PUBLIC_KEY` | No | Langfuse public key. Task, MCP, and ingest tracing stays off until this and `LANGFUSE_SECRET_KEY` are both set. |
 | `LANGFUSE_SECRET_KEY` | No | Langfuse secret key. It is not written to logs, traces, or the Settings page. |
-| `LANGFUSE_BASEURL` | No | Langfuse host. `LANGFUSE_HOST` and `LANGFUSE_BASE_URL` are also accepted, in that order after `LANGFUSE_BASEURL`. Default `https://cloud.langfuse.com`. |
+| `LANGFUSE_BASEURL` | No | Langfuse host. `LANGFUSE_HOST` and `LANGFUSE_BASE_URL` are also accepted, in that order after `LANGFUSE_BASEURL`. Default `https://cloud.langfuse.com`. https is required; http is only accepted for localhost and 127.0.0.1. |
 
 `NEXT_PUBLIC_*` values are baked in at build time. Generate secrets with:
 

@@ -4,7 +4,9 @@
  *
  * The host is LANGFUSE_BASEURL, then LANGFUSE_HOST, then LANGFUSE_BASE_URL
  * (the name current Langfuse docs use). The default is Langfuse Cloud (EU).
+ * https is required. http is accepted only for localhost and 127.0.0.1.
  */
+import "server-only";
 import { redactText, sanitizeAttributes } from "@/lib/traces";
 
 export const LANGFUSE_DEFAULT_BASE_URL = "https://cloud.langfuse.com";
@@ -76,7 +78,9 @@ function nonempty(value: string | undefined): string | null {
   return trimmed ? trimmed : null;
 }
 
-/** Accept an http(s) origin or path prefix. Reject credentials, queries and hashes. */
+const LOCAL_HTTP_HOSTS = new Set(["localhost", "127.0.0.1"]);
+
+/** https origin or path prefix. http only for localhost and 127.0.0.1. No credentials, queries, or hashes. */
 export function parseLangfuseBaseUrl(raw: string): string | null {
   let url: URL;
   try {
@@ -84,11 +88,21 @@ export function parseLangfuseBaseUrl(raw: string): string | null {
   } catch {
     return null;
   }
-  if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+  const httpLocal = url.protocol === "http:" && LOCAL_HTTP_HOSTS.has(url.hostname);
+  if (url.protocol !== "https:" && !httpLocal) return null;
   if (url.username || url.password) return null;
   if (url.search || url.hash) return null;
   const path = url.pathname.replace(/\/+$/, "");
   return `${url.origin}${path === "/" ? "" : path}`;
+}
+
+/** name and code only. Error messages can carry URLs and secrets, so they stay out of the log. */
+export function formatLangfuseSetupError(err: unknown): string {
+  const name = err instanceof Error && /^[A-Za-z][A-Za-z0-9_]*$/.test(err.name) ? err.name : "Error";
+  if (!err || typeof err !== "object" || !("code" in err)) return name;
+  const raw = (err as { code?: unknown }).code;
+  if ((typeof raw !== "string" && typeof raw !== "number") || !/^[A-Za-z0-9_.-]{1,32}$/.test(String(raw))) return name;
+  return `${name} ${raw}`;
 }
 
 export function readLangfuseConfig(env: EnvLike = process.env): LangfuseConfig {
@@ -103,7 +117,7 @@ export function readLangfuseConfig(env: EnvLike = process.env): LangfuseConfig {
     if (!raw) continue;
     const parsed = parseLangfuseBaseUrl(raw);
     if (!parsed) {
-      baseUrlError = `${name} is not a usable http(s) URL, so Langfuse tracing stays off.`;
+      baseUrlError = `${name} must be an https URL (http is only allowed for localhost), so Langfuse tracing stays off.`;
       break;
     }
     baseUrl = parsed;
@@ -199,6 +213,27 @@ function missingKeyMessage(env: EnvLike): string | null {
   return null;
 }
 
+/** Settings reloads within this window reuse the last Langfuse probe. */
+const STATUS_CACHE_MS = 30_000;
+
+interface StatusCacheEntry {
+  key: string;
+  expires: number;
+  status: LangfuseStatus;
+}
+
+let statusCache: StatusCacheEntry | null = null;
+let statusInflight: { key: string; promise: Promise<LangfuseStatus> } | null = null;
+
+export function clearLangfuseStatusCacheForTests(): void {
+  statusCache = null;
+  statusInflight = null;
+}
+
+function statusCacheKey(cfg: LangfuseConfig): string {
+  return `${cfg.publicKey ?? ""}\n${cfg.baseUrl}`;
+}
+
 function statusBase(cfg: LangfuseConfig, extra: Partial<LangfuseStatus>): LangfuseStatus {
   return {
     state: "not_configured",
@@ -211,24 +246,7 @@ function statusBase(cfg: LangfuseConfig, extra: Partial<LangfuseStatus>): Langfu
   };
 }
 
-/**
- * Ask Langfuse which project these keys belong to. The secret never leaves
- * this function. A failure here does not affect tracing; the Settings page
- * just shows that the host could not be reached.
- */
-export async function getLangfuseStatus(
-  env: EnvLike = process.env,
-  fetchImpl: typeof fetch = fetch,
-): Promise<LangfuseStatus> {
-  const cfg = readLangfuseConfig(env);
-  if (!cfg.enabled || !cfg.publicKey || !cfg.secretKey) {
-    return statusBase(cfg, {
-      state: "not_configured",
-      configured: false,
-      message: cfg.baseUrlError ?? missingKeyMessage(env),
-    });
-  }
-
+async function probeLangfuse(cfg: LangfuseConfig, fetchImpl: typeof fetch): Promise<LangfuseStatus> {
   const fallback: LangfuseStatus = statusBase(cfg, {
     state: "unreachable",
     configured: true,
@@ -264,4 +282,42 @@ export async function getLangfuseStatus(
   } catch {
     return fallback;
   }
+}
+
+/**
+ * Ask Langfuse which project these keys belong to. The secret never leaves
+ * this function. A failure here does not affect tracing; the Settings page
+ * just shows that the host could not be reached.
+ *
+ * The Settings page calls this with no arguments. That path caches the probe
+ * for 30 seconds so a reload does not wait on the 3 second timeout again.
+ * Callers that pass their own fetch (tests) are not cached.
+ */
+export async function getLangfuseStatus(env: EnvLike = process.env, fetchImpl?: typeof fetch): Promise<LangfuseStatus> {
+  const cfg = readLangfuseConfig(env);
+  if (!cfg.enabled || !cfg.publicKey || !cfg.secretKey) {
+    return statusBase(cfg, {
+      state: "not_configured",
+      configured: false,
+      message: cfg.baseUrlError ?? missingKeyMessage(env),
+    });
+  }
+
+  const doFetch = fetchImpl ?? globalThis.fetch;
+  if (fetchImpl !== undefined) return probeLangfuse(cfg, doFetch);
+
+  const key = statusCacheKey(cfg);
+  if (statusCache && statusCache.key === key && statusCache.expires > Date.now()) return statusCache.status;
+  if (statusInflight && statusInflight.key === key) return statusInflight.promise;
+
+  const promise = probeLangfuse(cfg, doFetch)
+    .then((status) => {
+      statusCache = { key, expires: Date.now() + STATUS_CACHE_MS, status };
+      return status;
+    })
+    .finally(() => {
+      if (statusInflight?.promise === promise) statusInflight = null;
+    });
+  statusInflight = { key, promise };
+  return promise;
 }

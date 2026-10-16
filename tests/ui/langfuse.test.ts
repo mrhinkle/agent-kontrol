@@ -4,6 +4,8 @@ import fs from "node:fs";
 import { NextResponse } from "next/server";
 import {
   LANGFUSE_DEFAULT_BASE_URL,
+  clearLangfuseStatusCacheForTests,
+  formatLangfuseSetupError,
   getLangfuseStatus,
   ingestEventMeta,
   isLangfuseEnabled,
@@ -88,6 +90,9 @@ describe("Langfuse config", () => {
     assert.equal(parseLangfuseBaseUrl("ftp://files.example"), null);
     assert.equal(parseLangfuseBaseUrl("https://user:secret@cloud.langfuse.com"), null);
     assert.equal(parseLangfuseBaseUrl("https://cloud.langfuse.com/path?token=abc"), null);
+    assert.equal(parseLangfuseBaseUrl("http://langfuse.example"), null);
+    assert.equal(parseLangfuseBaseUrl("http://127.0.0.1:3000"), "http://127.0.0.1:3000");
+    assert.equal(parseLangfuseBaseUrl("http://localhost:3001/langfuse/"), "http://localhost:3001/langfuse");
     const cfg = readLangfuseConfig({
       LANGFUSE_PUBLIC_KEY: "pk",
       LANGFUSE_SECRET_KEY: "sk",
@@ -95,6 +100,25 @@ describe("Langfuse config", () => {
     });
     assert.equal(cfg.enabled, false);
     assert.match(cfg.baseUrlError ?? "", /LANGFUSE_BASEURL/);
+    const remoteHttp = readLangfuseConfig({
+      LANGFUSE_PUBLIC_KEY: "pk",
+      LANGFUSE_SECRET_KEY: "sk",
+      LANGFUSE_HOST: "http://10.0.0.8:3000",
+    });
+    assert.equal(remoteHttp.enabled, false);
+    assert.match(remoteHttp.baseUrlError ?? "", /https/);
+  });
+
+  it("logs setup failures by name and code, not the message", () => {
+    const err = new Error("secret sk-lf-abcdefghijklmnopqrstuvwxyz at https://user:pw@host");
+    err.name = "TypeError";
+    (err as { code?: string }).code = "ERR_INVALID_URL";
+    assert.equal(formatLangfuseSetupError(err), "TypeError ERR_INVALID_URL");
+    assert.equal(formatLangfuseSetupError(err).includes("sk-lf"), false);
+    const noisy = new Error("nope");
+    noisy.name = "sk-lf-leaked";
+    (noisy as { code?: string }).code = "secret sk-lf-value";
+    assert.equal(formatLangfuseSetupError(noisy), "Error");
   });
 });
 
@@ -243,6 +267,32 @@ describe("Langfuse status", () => {
     assert.match(status.message ?? "", /Could not reach/);
     assert.equal((status.message ?? "").includes("ECONNREFUSED"), false);
   });
+
+  it("reuses a Settings probe for a short time", async () => {
+    clearLangfuseStatusCacheForTests();
+    clearEnv();
+    process.env.LANGFUSE_PUBLIC_KEY = "pk-cache";
+    process.env.LANGFUSE_SECRET_KEY = "sk-cache";
+    process.env.LANGFUSE_BASEURL = "https://cache.example";
+    const original = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ data: [{ id: "proj_cache", name: "Cached" }] }), { status: 200 });
+    }) as typeof fetch;
+    try {
+      const first = await getLangfuseStatus();
+      const second = await getLangfuseStatus();
+      assert.equal(calls, 1);
+      assert.equal(first.state, "connected");
+      assert.equal(second.projectName, "Cached");
+      assert.equal(second.projectUrl, "https://cache.example/project/proj_cache");
+    } finally {
+      globalThis.fetch = original;
+      clearLangfuseStatusCacheForTests();
+      clearEnv();
+    }
+  });
 });
 
 describe("traceAgentEvent", () => {
@@ -314,6 +364,14 @@ describe("Langfuse wiring", () => {
     assert.match(src, /isLangfuseEnabled/);
     assert.doesNotMatch(src, /@langfuse\/otel/);
     assert.match(fs.readFileSync("next.config.ts", "utf8"), /@langfuse\/otel/);
+    const runtime = fs.readFileSync("src/lib/langfuse.ts", "utf8");
+    assert.doesNotMatch(runtime, /flushAt/);
+    assert.doesNotMatch(runtime, /from "next\/server"/);
+    assert.match(runtime, /beforeExit/);
+    assert.match(runtime, /SIGTERM/);
+    assert.match(runtime, /import "server-only"/);
+    assert.match(fs.readFileSync("src/lib/langfuse-config.ts", "utf8"), /import "server-only"/);
+    assert.match(fs.readFileSync("package.json", "utf8"), /"node": ">=22"/);
   });
 
   it("traces task queue actions, MCP tools, and ingest endpoints", () => {
