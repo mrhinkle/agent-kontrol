@@ -23,13 +23,35 @@ It auto-detects which CLIs are installed. Override with
 2. Run: headless CLI in `MC_WORKDIR/<project>` (default `~/Code/<project>`):
    - `claude -p "<prompt>" --output-format json --permission-mode acceptEdits`
      (cost captured from `total_cost_usd`)
-   - `codex exec --full-auto "<prompt>"`
-   - `grok -p "<prompt>"`
+   - `codex exec --sandbox workspace-write --json "<prompt>"`
+   - `grok -p "<prompt>" --output-format json`
 3. Review (optional): if the task has `reviewer_platform`, the reviewer runs
    **read-only** with a skeptical-reviewer prompt and must end with
    `VERDICT: APPROVE` or `VERDICT: REQUEST_CHANGES`. The verdict is appended
    to the result; REQUEST_CHANGES marks the task failed so you triage it.
 4. Report: `PATCH /api/tasks/<id>` with status, result summary, and cost.
+
+Each worker and review invocation also sends one best-effort `run_complete`
+event with `detail.schema: "mc.run.v2"`. It contains a new run UUID, role,
+start/end timestamps, measured subprocess wall time, sanitized outcome/error
+class, task ID, and available finalized per-model token counts. Reporting
+failure cannot change the task result. Prompts, task titles, responses,
+commands, paths, credentials, free-text errors, and costs are excluded from
+this additional event.
+
+`duration_ms` is run duration, including tools and waits; it is not model
+inference latency. Claude and Grok per-model usage is preferred over their
+aggregate usage, so subagent totals are counted once. Input tokens include
+cache reads and writes; Codex input already includes its cache reads.
+Unavailable counts stay absent, and Grok's incomplete-usage flag is retained.
+Resume/continue arguments suppress token export and mark the usage scope
+`session_cumulative`, because those totals cannot safely be assigned to this
+invocation. Interactive sessions outside this dispatcher are not instrumented.
+
+Codex worker runs use the supported `--sandbox workspace-write`; Codex review
+runs use `-s read-only`. Correct any explicit per-machine override that still
+contains the retired `--full-auto` flag during approved activation. This
+source change does not install or enable telemetry on any machine.
 
 ## launchd (run at login on macOS)
 
@@ -64,7 +86,7 @@ reads it, same as the Claude Code hook) so secrets stay out of the plist.
   refuses tasks whose project folder doesn't exist.
 - Reviewers always run read-only.
 - `MC_TASK_TIMEOUT` (default 1h) kills runaway runs.
-- Autonomy flags are conservative defaults (`acceptEdits`, `--full-auto`
+- Autonomy flags are conservative defaults (`acceptEdits`, `--sandbox workspace-write`
   sandboxed). Raise them per-machine via `MC_CLAUDE_ARGS` / `MC_CODEX_ARGS`
   only if you accept the blast radius.
 - Anything requiring judgment or credentials beyond the repo should be an

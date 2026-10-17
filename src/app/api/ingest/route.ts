@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { isAuthorized } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import { report, type ReportInput } from "@/lib/store";
+import { parseRunTelemetry } from "@/lib/run-telemetry";
 
 export const maxDuration = 30;
 
@@ -40,6 +41,9 @@ export async function POST(req: Request) {
   }
   if (!body.agent_id || !body.kind) {
     return NextResponse.json({ error: "agent_id and kind are required" }, { status: 400 });
+  }
+  if (body.kind === "run_complete" && !parseRunTelemetry(body.detail)) {
+    return NextResponse.json({ error: "invalid completed-run metadata" }, { status: 400 });
   }
 
   try {

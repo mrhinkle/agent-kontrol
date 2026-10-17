@@ -10,6 +10,36 @@ export type SqlTag = (
   ...values: unknown[]
 ) => Promise<Row[]>;
 
+export type SqlQuery = { text: string; params: unknown[] };
+
+/** Run ordered parameterized statements on one ReadCommitted transaction. */
+export async function sqlTransaction(queries: SqlQuery[]): Promise<Row[][]> {
+  if (!isConfigured()) throw new Error("DATABASE_URL is not set");
+  const databaseUrl = process.env.DATABASE_URL as string;
+  if (chooseDriver(databaseUrl, process.env.MC_DB_DRIVER) === "neon") {
+    const db = neon(databaseUrl);
+    return await db.transaction(
+      queries.map(({ text, params }) => db.query(text, params)),
+      { isolationLevel: "ReadCommitted" }
+    ) as Row[][];
+  }
+  const client = await getPgPool().connect();
+  try {
+    await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+    const results: Row[][] = [];
+    for (const { text, params } of queries) {
+      results.push((await client.query(text, params)).rows as Row[]);
+    }
+    await client.query("COMMIT");
+    return results;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 export function isConfigured(): boolean {
   return Boolean(process.env.DATABASE_URL);
 }
