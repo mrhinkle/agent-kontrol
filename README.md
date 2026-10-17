@@ -41,6 +41,8 @@ Tasks page / create_task ──> queue ──> dispatcher (per machine) ──> 
 
 Agents push; nothing polls vendors. No vendor exposes a "what are my agents doing" API, so every agent reports into a store you own.
 
+Optional Langfuse fleet activity export and project access: [setup and scope](docs/langfuse.md).
+
 ## Connect your agents
 
 | Agent | How | Guide |

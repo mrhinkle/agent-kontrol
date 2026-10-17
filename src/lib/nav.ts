@@ -3,6 +3,7 @@ export const NAV_LINKS: { href: string; label: string; accent?: boolean }[] = [
   { href: "/", label: "Fleet" },
   { href: "/progress", label: "Progress" },
   { href: "/usage", label: "Usage and Costs" },
+  { href: "/observability", label: "Langfuse" },
   { href: "/tasks", label: "Tasks" },
   { href: "/history", label: "History" },
   { href: "/memory", label: "Memory" },
