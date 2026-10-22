@@ -17,6 +17,7 @@ Secrets in query strings (`?key=`) are not supported. Send tokens in the `Author
 | Ingest routes: `POST /api/v1/traces`, `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, `POST /api/usage/ingest` | `Authorization: Bearer <MC_TOKEN>` only |
 | MCP transport: `/api/mcp` | `Authorization: Bearer <MC_TOKEN>`, or an OAuth access token (JWT) issued by this server |
 | Login, OAuth, and discovery: `/login`, `/api/login`, `/oauth/*`, `/.well-known/*` | No cookie gate; these routes enforce their own auth |
+| Public agent docs: `GET /llms.txt`, `GET /docs/mcp.md`, `GET /docs/api.md`, `GET /docs/agents.md` | None. Any other `/docs` name stays behind the dashboard gate |
 
 Ingest routes answer `401` with `"error": "unauthorized"` (plus `code`, `fix`, and `retryable` — see [Errors](#errors)) without a valid bearer token. If `MC_TOKEN` is unset, they are allowed only when `NODE_ENV` is `development` or `test`; in any other environment they are denied.
 
