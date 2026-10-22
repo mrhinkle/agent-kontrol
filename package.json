@@ -20,6 +20,7 @@
     "test:usage-window": "npx tsx scripts/run-usage-window-tests.ts",
     "test:messages": "npx tsx scripts/run-message-tests.ts",
     "test:pg": "npx tsx scripts/run-pg-tests.ts",
+    "test:mcp": "npx tsx scripts/run-mcp-client-tests.ts",
     "migrate": "node scripts/apply-schema.mjs"
   },
   "dependencies": {
@@ -36,6 +37,7 @@
     "zod": "^3.24.0"
   },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
     "@tailwindcss/postcss": "^4.0.0",
     "@types/node": "^22.0.0",
     "@types/pg": "^8.23.1",
@@ -49,7 +51,7 @@
   },
   "license": "Apache-2.0",
   "overrides": {
-    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@modelcontextprotocol/sdk": "1.32.1",
     "postcss": "^8.5.23"
   }
 }
