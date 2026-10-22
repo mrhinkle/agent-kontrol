@@ -1,5 +1,6 @@
 import { gunzipSync } from "node:zlib";
 import { NextResponse } from "next/server";
+import { apiError, publicError } from "@/lib/api-error";
 import { isAuthorized } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import { pruneSpans, upsertSpans } from "@/lib/trace-store";
@@ -42,11 +43,13 @@ async function readCapped(req: Request, max: number): Promise<Buffer | null> {
  */
 export async function POST(req: Request) {
   if (!(await isAuthorized(req))) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+    return apiError("unauthorized");
   }
   const type = req.headers.get("content-type") ?? "";
   if (!type.includes("json")) {
-    return NextResponse.json({ error: "send OTLP as JSON (Content-Type: application/json); protobuf is not supported" }, { status: 415 });
+    return apiError("unsupported_media_type", {
+      message: "send OTLP as JSON (Content-Type: application/json); protobuf is not supported",
+    });
   }
 
   let text: string;
@@ -54,28 +57,28 @@ export async function POST(req: Request) {
     // Refuse early on a declared size, then read the stream with a hard cap so an
     // oversized body is never fully buffered.
     const declared = Number(req.headers.get("content-length") ?? 0);
-    if (declared > MAX_BODY_BYTES) return NextResponse.json({ error: "request too large" }, { status: 413 });
+    if (declared > MAX_BODY_BYTES) return apiError("payload_too_large");
     const raw = await readCapped(req, MAX_BODY_BYTES);
-    if (raw === null) return NextResponse.json({ error: "request too large" }, { status: 413 });
+    if (raw === null) return apiError("payload_too_large");
     let buf = raw;
     if ((req.headers.get("content-encoding") ?? "").toLowerCase() === "gzip") {
       buf = gunzipSync(buf, { maxOutputLength: MAX_BODY_BYTES });
     }
     text = buf.toString("utf8");
   } catch {
-    return NextResponse.json({ error: "could not read body (too large or bad gzip)" }, { status: 400 });
+    return apiError("validation_failed", { message: "could not read body (too large or bad gzip)" });
   }
 
   let body: unknown;
   try {
     body = JSON.parse(text);
   } catch {
-    return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
+    return apiError("invalid_json");
   }
 
   const { spans, rejected, errors } = parseOtlp(body, { captureContent: captureContentEnabled() });
   if (spans.length === 0 && rejected === 0 && errors.length > 0) {
-    return NextResponse.json({ error: errors[0] }, { status: 400 });
+    return apiError("validation_failed", { message: errors[0], fields: { body: errors[0] } });
   }
   const partialSuccess = rejected > 0 ? { rejectedSpans: rejected, errorMessage: errors.join("; ") } : {};
 
@@ -87,7 +90,6 @@ export async function POST(req: Request) {
     if (Math.random() < 0.02) pruneSpans().catch((e) => console.error("[traces] prune failed", e));
     return NextResponse.json({ partialSuccess });
   } catch (e) {
-    console.error("[traces] write failed", e);
-    return NextResponse.json({ error: "could not store spans" }, { status: 500 });
+    return publicError("[traces] write failed", e, "could not store spans");
   }
 }

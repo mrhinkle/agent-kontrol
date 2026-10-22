@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { claimNextTask, report } from "@/lib/store";
 
@@ -19,10 +20,13 @@ export async function POST(req: Request) {
   try {
     body = await req.json();
   } catch {
-    return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
+    return apiError("invalid_json");
   }
   if (!body.platform || !body.agent_id) {
-    return NextResponse.json({ error: "platform and agent_id are required" }, { status: 400 });
+    const fields: Record<string, string> = {};
+    if (!body.platform) fields.platform = "platform is required";
+    if (!body.agent_id) fields.agent_id = "agent_id is required";
+    return apiError("missing_field", { message: "platform and agent_id are required", fields });
   }
   try {
     const task = await claimNextTask({
@@ -42,6 +46,6 @@ export async function POST(req: Request) {
     }
     return NextResponse.json({ task });
   } catch (e) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    return publicError("[tasks] claim failed", e);
   }
 }

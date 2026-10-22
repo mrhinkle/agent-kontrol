@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { apiError } from "@/lib/api-error";
 import { authCookieValue, secretsMatch } from "@/lib/authcrypto";
 
 /**
@@ -46,7 +47,10 @@ export async function middleware(req: NextRequest) {
     if (!isPublic && isUnprotectedWithRealData()) {
       const message = "MC_DASHBOARD_PASSWORD is not set. Set it to serve the dashboard.";
       return pathname.startsWith("/api/")
-        ? NextResponse.json({ error: message }, { status: 503 })
+        ? apiError("setup_required", {
+            message,
+            fix: "Set MC_DASHBOARD_PASSWORD and redeploy.",
+          })
         : new NextResponse(message, { status: 503, headers: { "content-type": "text/plain" } });
     }
     return NextResponse.next();
@@ -69,7 +73,7 @@ export async function middleware(req: NextRequest) {
   }
 
   if (pathname.startsWith("/api/")) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+    return apiError("unauthorized");
   }
 
   const url = req.nextUrl.clone();

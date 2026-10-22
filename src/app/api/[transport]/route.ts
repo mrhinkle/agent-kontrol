@@ -1,5 +1,6 @@
 import { createMcpHandler, withMcpAuth } from "mcp-handler";
 import { z } from "zod";
+import { memoryKeyError, toolResultFromCaught, type McpToolResult } from "@/lib/api-error";
 import { secretsMatch, verifyAccessToken } from "@/lib/authcrypto";
 import { isConfigured } from "@/lib/db";
 import { claimNextTask, createTask, fetchMessages, fleet, listTasks, recall, remember, replyFromAgent, report, updateTask } from "@/lib/store";
@@ -9,6 +10,15 @@ import { OPERATOR } from "@/lib/operator";
 import { demoProgress } from "@/lib/demo-progress";
 
 export const maxDuration = 60;
+
+/** Caught tool failures become an isError result. The text is the JSON error body, never the exception. */
+async function guardTool(label: string, run: () => Promise<McpToolResult>): Promise<McpToolResult> {
+  try {
+    return await run();
+  } catch (e) {
+    return toolResultFromCaught(label, e);
+  }
+}
 
 /**
  * Agent Kontrol MCP server — /api/mcp
@@ -40,7 +50,7 @@ const handler = createMcpHandler(
           summary: z.string().optional().describe("One-line summary of the overall task"),
         },
       },
-      async (args) => {
+      async (args) => guardTool("report_status", async () => {
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Agent Kontrol is in demo mode (no database configured); status not stored." }] };
         }
@@ -57,7 +67,7 @@ const handler = createMcpHandler(
           summary: args.summary ?? args.title,
         });
         return { content: [{ type: "text", text: "Status reported to Agent Kontrol." }] };
-      }
+      }),
     );
 
     server.registerTool(
@@ -68,7 +78,7 @@ const handler = createMcpHandler(
           "See what every agent in the fleet (Claude Code, Cowork, ChatGPT Work, Hermes, ...) is currently doing, with recent activity. Use this to avoid duplicating work another agent is already on.",
         inputSchema: {},
       },
-      async () => {
+      async () => guardTool("get_fleet_status", async () => {
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Agent Kontrol is in demo mode (no database configured)." }] };
         }
@@ -87,7 +97,7 @@ const handler = createMcpHandler(
           lines.push(`- [${e.created_at}] ${e.agent_id}: ${e.kind}${e.title ? ` — ${e.title}` : ""}`);
         }
         return { content: [{ type: "text", text: lines.join("\n") }] };
-      }
+      }),
     );
 
     server.registerTool(
@@ -103,7 +113,7 @@ const handler = createMcpHandler(
             .describe("Time window to summarise; defaults to 24h"),
         },
       },
-      async (args) => {
+      async (args) => guardTool("get_progress_digest", async () => {
         if (!isConfigured()) {
           return { content: [{ type: "text", text: formatDigest(demoProgress(args.window ?? "24h")) }] };
         }
@@ -117,7 +127,7 @@ const handler = createMcpHandler(
             },
           ],
         };
-      }
+      }),
     );
 
     server.registerTool(
@@ -133,13 +143,15 @@ const handler = createMcpHandler(
           agent_id: z.string().optional().describe("Who is writing this note"),
         },
       },
-      async (args) => {
+      async (args) => guardTool("remember", async () => {
+        const badKey = memoryKeyError(args.key);
+        if (badKey) return badKey;
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Demo mode; note not stored." }] };
         }
         const item = await remember(args);
         return { content: [{ type: "text", text: `Stored memory #${item.id}${item.key ? ` (key: ${item.key})` : ""}.` }] };
-      }
+      }),
     );
 
     server.registerTool(
@@ -155,7 +167,9 @@ const handler = createMcpHandler(
           limit: z.number().int().min(1).max(100).optional(),
         },
       },
-      async (args) => {
+      async (args) => guardTool("recall", async () => {
+        const badKey = memoryKeyError(args.key);
+        if (badKey) return badKey;
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Demo mode; no stored memory." }] };
         }
@@ -170,7 +184,7 @@ const handler = createMcpHandler(
           )
           .join("\n\n");
         return { content: [{ type: "text", text }] };
-      }
+      }),
     );
 
     server.registerTool(
@@ -189,7 +203,7 @@ const handler = createMcpHandler(
             .describe("Mark messages read so they aren't returned again (default true)"),
         },
       },
-      async (args) => {
+      async (args) => guardTool("check_inbox", async () => {
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Demo mode; no inbox." }] };
         }
@@ -210,7 +224,7 @@ const handler = createMcpHandler(
             { type: "text", text: `You have ${msgs.length} message(s) from ${OPERATOR}:\n${text}` },
           ],
         };
-      }
+      }),
     );
 
     // `reply_to_mark` is the tool's original name. Existing agents are told to call it
@@ -248,7 +262,7 @@ const handler = createMcpHandler(
               .describe("Optional id of the inbound message you are answering"),
           },
         },
-        async (args) => {
+        async (args) => guardTool(tool.name, async () => {
           if (!isConfigured()) {
             return { content: [{ type: "text", text: "Demo mode; reply not stored." }] };
           }
@@ -267,7 +281,7 @@ const handler = createMcpHandler(
               },
             ],
           };
-        }
+        }),
       );
     }
 
@@ -293,7 +307,7 @@ const handler = createMcpHandler(
           created_by: z.string().optional().describe("Your agent id"),
         },
       },
-      async (args) => {
+      async (args) => guardTool("create_task", async () => {
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Demo mode; task not queued." }] };
         }
@@ -303,7 +317,7 @@ const handler = createMcpHandler(
             { type: "text", text: `Task #${task.id} queued for ${task.platform} (priority ${task.priority}).` },
           ],
         };
-      }
+      }),
     );
 
     server.registerTool(
@@ -319,7 +333,7 @@ const handler = createMcpHandler(
             .describe("Filter (default 'open')"),
         },
       },
-      async (args) => {
+      async (args) => guardTool("get_task_queue", async () => {
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Demo mode; no task queue." }] };
         }
@@ -337,7 +351,7 @@ const handler = createMcpHandler(
           )
           .join("\n");
         return { content: [{ type: "text", text }] };
-      }
+      }),
     );
 
     server.registerTool(
@@ -352,7 +366,7 @@ const handler = createMcpHandler(
           agent_id: z.string().describe("Your agent id"),
         },
       },
-      async (args) => {
+      async (args) => guardTool("claim_task", async () => {
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Demo mode; no tasks." }] };
         }
@@ -373,7 +387,7 @@ const handler = createMcpHandler(
             },
           ],
         };
-      }
+      }),
     );
 
     server.registerTool(
@@ -390,7 +404,7 @@ const handler = createMcpHandler(
           agent_id: z.string().optional().describe("Your agent id (for the activity feed)"),
         },
       },
-      async (args) => {
+      async (args) => guardTool("update_task", async () => {
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Demo mode; task not updated." }] };
         }
@@ -404,7 +418,7 @@ const handler = createMcpHandler(
           });
         }
         return { content: [{ type: "text", text: `Task #${task.id} updated (${task.status}).` }] };
-      }
+      }),
     );
   },
   {},

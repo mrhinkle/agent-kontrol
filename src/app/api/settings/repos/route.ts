@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
+import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { REPOS } from "@/lib/progress-config";
-import { MAX_REPOS, validateRepoList } from "@/lib/repo-validation";
+import { MAX_REPOS, validateRepoList, type RepoError } from "@/lib/repo-validation";
 import { getWatchedRepos, listVersion, replaceWatchedRepos } from "@/lib/watched-repos";
 
 export const dynamic = "force-dynamic";
@@ -12,10 +13,11 @@ export const dynamic = "force-dynamic";
  * GET  /api/settings/repos
  *      -> { source: "database" | "file", writable, max, version, repos: [...] }
  * PUT  /api/settings/repos  { repos: [...], version?: string }
- *      Replaces the whole list, in order. 400 { errors: [{ index, field, message }] }
- *      when invalid, 409 when no database is connected. If `version` (from the GET
- *      the caller started from) is sent and the list has changed since, answers
- *      409 { code: "stale" } instead of overwriting someone else's change.
+ *      Replaces the whole list, in order. 400 keeps `errors: [{ index, field, message }]`
+ *      and adds code, fix, retryable, and fields. 409 when no database is connected.
+ *      If `version` (from the GET the caller started from) is sent and the list has
+ *      changed since, answers 409 { code: "stale" } instead of overwriting someone
+ *      else's change.
  *
  * Auth is enforced by middleware: dashboard session cookie or MC_TOKEN bearer.
  * The collector calls GET each tick to learn which repos to sweep.
@@ -25,10 +27,18 @@ async function current() {
   return { source, writable: isConfigured(), max: MAX_REPOS, version: listVersion(repos), repos };
 }
 
+function repoFields(errors: RepoError[]): Record<string, string> {
+  const fields: Record<string, string> = {};
+  for (const row of errors) {
+    const key = row.index < 0 ? row.field : `${row.index}.${row.field}`;
+    fields[key] = fields[key] ? `${fields[key]} ${row.message}` : row.message;
+  }
+  return fields;
+}
+
 // Log the real error server-side; the response stays generic so database details never reach the browser.
 function failure(e: unknown, what: string) {
-  console.error(`[settings/repos] ${what}`, e);
-  return NextResponse.json({ error: `Could not ${what}.` }, { status: 500 });
+  return publicError(`[settings/repos] ${what}`, e, `Could not ${what}.`);
 }
 
 export async function GET() {
@@ -44,23 +54,31 @@ export async function PUT(req: Request) {
   try {
     body = await req.json();
   } catch {
-    return NextResponse.json(
-      { errors: [{ index: -1, field: "repos", message: "Request body must be JSON." }] },
-      { status: 400 },
-    );
+    const row = { index: -1, field: "repos" as const, message: "Request body must be JSON." };
+    return apiError("invalid_json", {
+      message: row.message,
+      fields: { repos: row.message },
+      extra: { errors: [row] },
+    });
   }
   const checked = validateRepoList((body as { repos?: unknown } | null)?.repos);
-  if (!checked.ok) return NextResponse.json({ errors: checked.errors }, { status: 400 });
+  if (!checked.ok) {
+    return apiError("repo_list_invalid", {
+      message: checked.errors[0]?.message ?? "The repo list is invalid.",
+      fields: repoFields(checked.errors),
+      extra: { errors: checked.errors },
+    });
+  }
   if (!isConfigured()) {
-    return NextResponse.json({ error: "Settings can only be saved when a database is connected." }, { status: 409 });
+    return apiError("conflict", {
+      message: "Settings can only be saved when a database is connected.",
+      fix: "Connect a database (DATABASE_URL) and retry the save.",
+    });
   }
   try {
     const sent = (body as { version?: unknown } | null)?.version;
     if (typeof sent === "string" && sent !== (await current()).version) {
-      return NextResponse.json(
-        { code: "stale", error: "The list changed since you loaded it. Reload to see the latest, then make your change again." },
-        { status: 409 },
-      );
+      return apiError("stale");
     }
     await replaceWatchedRepos(checked.repos);
     return NextResponse.json(await current());
