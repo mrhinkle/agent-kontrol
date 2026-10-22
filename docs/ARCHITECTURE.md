@@ -77,6 +77,8 @@ See [API.md](API.md). Demo mode: no `DATABASE_URL` means sample data and nothing
 - `src/app/api/v1/traces` — OTLP/HTTP JSON ingest; `src/app/traces` — the viewer
 - `src/lib/usage-store.ts`
 - `src/lib/db.ts` — driver selection
+- `src/lib/auth.ts` and `src/middleware.ts` — auth. Middleware forwards `akc_` bearers to `/api` because it cannot open Postgres; the route accepts or rejects them.
+- `src/lib/public-docs.ts`, `src/app/llms.txt`, `src/app/docs/[name]` — public `/llms.txt` and the three Markdown docs
 - `src/lib/oauth.ts` and `src/app/oauth` — OAuth
 - `agents/` — adapters
 - `scripts/` — collector, migrate, quickstart
