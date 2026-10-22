@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Per-agent credentials. Settings issues a revocable `akc_…` token with scopes enforced on every MCP tool and on the agent REST routes. The token is shown once. The database stores the label, an 8-character prefix, the SHA-256 of the token, the scopes, and timestamps (`created_at`, `expires_at`, `revoked_at`, `last_used_at`). It does not store the token, prompts, or tool input. `MC_TOKEN` and a verified OAuth access token keep the access they already had. A missing scope returns `403` with `code: "insufficient_scope"`. Revoked and expired credentials return `401`.
 
+- Public agent index at `GET /llms.txt` (`text/plain`) and the MCP, API and agent guides as Markdown at `GET /docs/mcp.md`, `/docs/api.md` and `/docs/agents.md`. No dashboard session. The route returns 404 for any other name. With the dashboard password set, those other names stay behind the gate with the rest of the dashboard, and data routes are unchanged.
 - Traces: step-by-step spans for agent sessions. `POST /api/v1/traces` accepts OTLP/HTTP JSON from any OpenTelemetry exporter, `/traces` shows a waterfall, and the Claude Code hook emits session, turn and tool spans (register the new `PreToolUse` and `PostToolUse` hooks). Prompt and tool content is not stored unless `MC_TRACE_CAPTURE_CONTENT=1`; spans are pruned after `MC_TRACE_RETENTION_DAYS` (default 30). Docs: `docs/TELEMETRY.md`.
 
 ### Changed

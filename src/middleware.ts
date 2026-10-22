@@ -22,6 +22,8 @@ const PUBLIC_PATHS: RegExp[] = [
   /^\/api\/(mcp|sse|message)(\/.*)?$/, // MCP transports (token-authed in route)
   /^\/\.well-known\//, // OAuth AS + protected-resource metadata
   /^\/oauth\//, // OAuth authorize / token / register
+  /^\/llms\.txt$/, // public agent index
+  /^\/docs\/(mcp|api|agents)\.md$/, // those three Markdown docs, exact names only
 ];
 
 /**
