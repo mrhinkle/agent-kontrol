@@ -131,9 +131,10 @@ function childEnv(port: number): NodeJS.ProcessEnv {
     PORT: String(port),
     NEXT_TELEMETRY_DISABLED: "1",
   };
-  // Demo mode is "no DATABASE_URL". Drop a developer shell's database so
-  // this run cannot write to it and then mistake that for demo mode.
-  delete env.DATABASE_URL;
+  // Demo mode is "no DATABASE_URL". Set it empty (falsy, so still demo mode)
+  // rather than deleting it: Next.js would otherwise load a developer's
+  // .env.local database URL and this run could write to it.
+  env.DATABASE_URL = "";
   return env;
 }
 
