@@ -52,6 +52,19 @@ describe("middleware with no dashboard password", () => {
     assert.notEqual((await middleware(req("/api/ingest"))).status, 503);
     assert.notEqual((await middleware(req("/api/mcp"))).status, 503);
   });
+
+  it("serves the public agent docs while data routes stay refused", async () => {
+    delete env.MC_DASHBOARD_PASSWORD;
+    env.NODE_ENV = "production";
+    env.DATABASE_URL = "postgres://x";
+    assert.notEqual((await middleware(req("/llms.txt"))).status, 503);
+    assert.notEqual((await middleware(req("/docs/mcp.md"))).status, 503);
+    assert.notEqual((await middleware(req("/docs/api.md"))).status, 503);
+    assert.notEqual((await middleware(req("/docs/agents.md"))).status, 503);
+    assert.equal((await middleware(req("/api/fleet"))).status, 503);
+    assert.equal((await middleware(req("/docs/deploy.md"))).status, 503);
+    assert.equal((await middleware(req("/tasks"))).status, 503);
+  });
 });
 
 describe("middleware with a dashboard password", () => {
@@ -68,5 +81,40 @@ describe("middleware with a dashboard password", () => {
     env.MC_TOKEN = "tok";
     const res = await middleware(req("/api/fleet", { authorization: "Bearer tok" }));
     assert.equal(res.status, 200);
+  });
+
+  it("lets only the agent index and the three markdown docs through the gate", async () => {
+    env.MC_DASHBOARD_PASSWORD = "pw";
+    env.NODE_ENV = "production";
+    delete env.MC_TOKEN;
+    for (const path of ["/llms.txt", "/docs/mcp.md", "/docs/api.md", "/docs/agents.md", "/login", "/api/mcp", "/api/ingest"]) {
+      assert.equal((await middleware(req(path))).status, 200, path);
+    }
+    assert.equal((await middleware(req("/llms.txt?from=agent"))).status, 200);
+    const gatedPages = [
+      "/tasks",
+      "/help",
+      "/help/mcp",
+      "/",
+      "/settings",
+      "/docs",
+      "/docs/deploy.md",
+      "/docs/MCP.md",
+      "/docs/mcp.mdx",
+      "/docs/mcp.md/extra",
+      "/llms.txt.bak",
+      "/llms.txt/",
+      "/docs/%2e%2e%2fpackage.json",
+    ];
+    for (const path of gatedPages) {
+      const res = await middleware(req(path));
+      assert.equal(res.status, 307, path);
+      assert.match(new URL(res.headers.get("location") ?? "", "http://localhost").pathname, /^\/login\/?$/, path);
+    }
+    for (const path of ["/api/fleet", "/api/memory", "/api/tasks"]) {
+      assert.equal((await middleware(req(path))).status, 401, path);
+    }
+    const escaped = await middleware(req("/docs/../package.json"));
+    assert.equal(escaped.status, 307);
   });
 });

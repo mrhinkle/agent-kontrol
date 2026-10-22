@@ -2,6 +2,8 @@
 
 Agent Kontrol exposes fleet coordination to AI coding agents over the Model Context Protocol. This document covers how to connect, the 11 tools, how shared memory works, and a block of standing instructions you can paste into an agent.
 
+An agent that only has the deployment URL can start at [/llms.txt](/llms.txt).
+
 ## Connecting
 
 - Endpoint: `https://<deploy>/api/mcp`
