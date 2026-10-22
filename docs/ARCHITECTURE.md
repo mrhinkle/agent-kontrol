@@ -75,6 +75,7 @@ See [API.md](API.md). Demo mode: no `DATABASE_URL` means sample data and nothing
 - `src/lib/usage-store.ts`
 - `src/lib/db.ts` — driver selection
 - `src/lib/auth.ts` and `src/middleware.ts` — auth
+- `src/lib/public-docs.ts`, `src/app/llms.txt`, `src/app/docs/[name]` — public `/llms.txt` and the three Markdown docs
 - `src/lib/oauth.ts` and `src/app/oauth` — OAuth
 - `agents/` — adapters
 - `scripts/` — collector, migrate, quickstart
