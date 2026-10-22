@@ -206,7 +206,7 @@ A tool failure returns `isError: true`. The text of the result is JSON with the 
 
 `error` is a string. `retryable` is `true` only for `rate_limited` and `internal_error`. A handler that throws is logged on the server and returned as `internal_error` with a generic `error` string. The exception text is not in the result.
 
-`remember` and `recall` return `memory_key_invalid` when `key` is empty, longer than 200 characters, or contains a control character. Omitting `key` is valid. `update_task` returns `task_not_found` when the id does not exist. `reply_to_operator` returns `not_found` or `forbidden` when `in_reply_to` does not exist or belongs to another agent.
+`remember` and `recall` return `memory_key_invalid` when `key` is empty, longer than 200 characters, or contains a control character. Omitting `key` is valid. `update_task` returns `task_not_found` when a database is connected and the id does not exist. Demo mode answers with plain text, not an error. `reply_to_operator` returns `not_found` or `forbidden` when `in_reply_to` does not exist or belongs to another agent.
 
 `task_not_claimable` is defined so a caller can handle it. No tool returns it. `claim_task` with nothing queued is a normal result whose text says there is no queued task, not an error.
 
@@ -217,21 +217,21 @@ The HTTP `401` for a missing or invalid bearer is unchanged: `WWW-Authenticate` 
 | Code | Retryable | When a tool returns it |
 | --- | --- | --- |
 | `unauthorized` | no | Not returned inside a tool result. The HTTP `401` above covers a bad bearer. |
-| `forbidden` | no | `in_reply_to` belongs to a different agent. |
-| `not_found` | no | `in_reply_to` does not exist. |
-| `validation_failed` | no | A value this server rejected after the schema check, including a privacy refusal. |
+| `forbidden` | no | `reply_to_operator` when `in_reply_to` belongs to a different agent. |
+| `not_found` | no | `reply_to_operator` when `in_reply_to` does not exist. |
+| `validation_failed` | no | Not returned by a current tool. A privacy refusal on `POST /api/usage/ingest` is this code. Schema failures are the SDK message, not this JSON. |
 | `invalid_json` | no | Not returned by a tool. REST only. |
 | `missing_field` | no | Not returned by a tool. The input schema rejects a missing argument first. |
-| `rate_limited` | yes | Not returned by a tool. Login and OAuth consent only. |
+| `rate_limited` | yes | Not returned by a tool. `POST /api/login` only. The OAuth consent form shares that limiter and answers with HTML, not this JSON. |
 | `conflict` | no | Not returned by a tool. REST settings save with no database. |
 | `stale` | no | Not returned by a tool. REST settings save with a stale `version`. |
-| `task_not_found` | no | `update_task` when the id does not exist. |
+| `task_not_found` | no | `update_task` when a database is connected and the id does not exist. Demo mode is the text `Demo mode; task not updated.`, not an error. |
 | `task_not_claimable` | no | Defined, not returned. See above. |
 | `memory_key_invalid` | no | `remember` or `recall` with a bad `key`. |
 | `repo_list_invalid` | no | Not returned by a tool. REST settings only. |
 | `payload_too_large` | no | Not returned by a tool. REST trace export only. |
 | `unsupported_media_type` | no | Not returned by a tool. REST trace export only. |
-| `setup_required` | no | Not returned by a tool. REST messaging and usage setup only. |
+| `setup_required` | no | Not returned by a tool. HTTP 503 from messaging routes, `POST /api/usage/ingest`, and the production middleware on `/api/*` when a database is set and `MC_DASHBOARD_PASSWORD` is not. `GET /api/usage` stays HTTP 200. |
 | `internal_error` | yes | The handler threw. Retry once. The server log has the detail. |
 
 The full HTTP status for each code is in [API.md](API.md#errors).

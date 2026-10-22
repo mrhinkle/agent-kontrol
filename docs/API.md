@@ -174,7 +174,7 @@ See [Telemetry and traces](TELEMETRY.md) for the full contract.
 
 - `POST /api/v1/traces` — bearer `MC_TOKEN` — an OTLP/HTTP JSON export. Answers `200 { partialSuccess: { rejectedSpans?, errorMessage? } }`. `415` for protobuf, `413` over 2 MB, `401` for a bad token.
 - `GET /api/traces?agent=&errors=1&before=&limit=` — `{ demo, traces: TraceSummary[] }`.
-- `GET /api/traces/:traceId` — `{ demo, spans: Span[] }`; `404` when the trace is unknown or pruned.
+- `GET /api/traces/:traceId` — `{ demo, spans: Span[] }`. With a database, an unknown or pruned trace is `404` `not_found`. Demo mode returns `200` and an empty `spans` list.
 
 ### Login
 
@@ -199,21 +199,21 @@ OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this sha
 | Code | Status | Retryable | When |
 | --- | --- | --- | --- |
 | `unauthorized` | 401 | no | Missing or invalid bearer on an ingest route, or a wrong dashboard password (`error` is `wrong password` on `POST /api/login`, and `unauthorized` on the ingest routes). |
-| `forbidden` | 403 | no | `in_reply_to` names a message that belongs to a different agent. |
-| `not_found` | 404 | no | Unknown trace id on `GET /api/traces/:traceId`, or `in_reply_to` names a message that does not exist. |
-| `validation_failed` | 400 | no | A field is present but not usable: a bad timestamp, a bad task or trace id, a privacy refusal, or an OTLP body the parser rejected. |
+| `forbidden` | 403 | no | `POST /api/messages/reply` when `in_reply_to` names a message that belongs to a different agent. |
+| `not_found` | 404 | no | Unknown trace id on `GET /api/traces/:traceId` when a database is connected (demo mode returns 200 and an empty `spans` list), or `POST /api/messages/reply` when `in_reply_to` names a message that does not exist. |
+| `validation_failed` | 400 | no | A field is present but not usable: a bad `before` on `GET /api/traces`, a bad `since` and `until` pair on `GET /api/usage` (a `since` without `until` is ignored), a bad `collected_at` on usage or progress ingest, a bad task or trace id, a privacy refusal, or an OTLP body the parser rejected. |
 | `invalid_json` | 400 | no | The body is not JSON. On `POST /api/login` the `error` string stays `invalid request`. |
 | `missing_field` | 400 | no | A required field is absent. `fields` names it. |
-| `rate_limited` | 429 | yes | More than 5 login or OAuth consent attempts in 10 minutes from one client IP. `Retry-After` is seconds. |
+| `rate_limited` | 429 | yes | More than 5 `POST /api/login` attempts in 10 minutes from one client IP. `Retry-After` is seconds. The OAuth consent form shares this limiter and answers with HTML, not this JSON. |
 | `conflict` | 409 | no | `PUT /api/settings/repos` when no database is connected. |
 | `stale` | 409 | no | `PUT /api/settings/repos` when `version` does not match the list currently stored. |
-| `task_not_found` | 404 | no | `PATCH /api/tasks/:id` or MCP `update_task` when that id does not exist. |
+| `task_not_found` | 404 | no | `PATCH /api/tasks/:id` or MCP `update_task` when a database is connected and that id does not exist. `error` stays `Task not found`. Demo mode does not look the id up. |
 | `task_not_claimable` | 409 | no | Defined, not returned. See above. |
 | `memory_key_invalid` | 400 | no | MCP `remember` or `recall` when `key` is empty, longer than 200 characters, or contains a control character. |
 | `repo_list_invalid` | 400 | no | `PUT /api/settings/repos` when the list fails validation. `errors` is unchanged. |
 | `payload_too_large` | 413 | no | `POST /api/v1/traces` over 2 MB. |
 | `unsupported_media_type` | 415 | no | `POST /api/v1/traces` when the body is not JSON. |
-| `setup_required` | 503 | no | Messaging or usage tables are missing, or a production deploy has a database and no `MC_DASHBOARD_PASSWORD`. Existing `setup_required` and `message` keys stay on the messaging and usage responses. |
+| `setup_required` | 503 | no | Messaging routes or `POST /api/usage/ingest` when those tables are missing, or a production `/api/*` request when a database is set and `MC_DASHBOARD_PASSWORD` is not (other pages are `text/plain`). `GET /api/usage` stays HTTP 200 with `setup_required: true` and no `code`. Messaging and usage-ingest bodies keep `setup_required` and `message`. |
 | `internal_error` | 500 | yes | Anything else that failed while handling the request. `GET /api/progress/digest` uses this JSON body too. Success from that route stays `text/plain`. |
 
 `fix` tells the caller what to change. It is a sentence, specific to the code, and overridable per response when the default would be the wrong instruction (a wrong dashboard password does not ask for `MC_TOKEN`).

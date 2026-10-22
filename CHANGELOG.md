@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- The error tables in `docs/API.md` and `docs/MCP.md` match the handlers. `PATCH /api/tasks/:id` and MCP `update_task` return `task_not_found` for a missing id, and `error` stays `Task not found`. OAuth consent rate limiting stays HTML. `GET /api/usage` stays HTTP 200 when its table is missing. An unknown trace is `404` only when a database is connected. No current MCP tool returns `validation_failed`.
+
 ### Added
 
 - REST and MCP errors include `code`, `fix`, and `retryable` next to the existing `error` string (`src/lib/api-error.ts`). A 500 logs the exception and returns `internal_error` with a generic message. `PUT /api/settings/repos` keeps `errors` and `code: "stale"`. Docs: `docs/API.md`, `docs/MCP.md`.
