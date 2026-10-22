@@ -24,6 +24,9 @@ COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/next.config.ts ./next.config.ts
 COPY --from=build /app/supabase ./supabase
 COPY --from=build /app/scripts ./scripts
+# /llms.txt and /docs/{mcp,api,agents}.md read these at request time.
+# next start does not unpack outputFileTracingIncludes, so the image must contain them.
+COPY --from=build /app/docs/MCP.md /app/docs/API.md /app/docs/AGENTS.md /app/docs/
 USER node
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
