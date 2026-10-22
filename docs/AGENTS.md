@@ -70,6 +70,10 @@ Read-only. It reads Hermes session usage and posts token counts, costs, model an
 
 Operator messages reach an agent only when that agent polls (`check_inbox` or the hook), and replies appear only if the agent calls `reply_to_operator`, so a message can sit queued. The Fleet card shows the queued, delivered and replied states.
 
+## Credentials
+
+Adapters can keep sending `MC_TOKEN`. That token has every scope. Settings can also issue an `akc_…` credential with a subset of scopes; send it as `Authorization: Bearer`. Revoke it from Settings without redeploying. The server stores the label, an 8-character prefix, the SHA-256 of the token, the scopes, and timestamps. It does not store the token. Collector routes (progress ingest, usage ingest, trace export) are not in the scope table, so those adapters keep using `MC_TOKEN`. The scope table is in [MCP.md](MCP.md).
+
 ## See also
 
 - [MCP.md](MCP.md) — the MCP server and its tools.

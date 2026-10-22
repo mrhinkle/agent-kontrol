@@ -1,6 +1,6 @@
 import { gunzipSync } from "node:zlib";
 import { NextResponse } from "next/server";
-import { isAuthorized } from "@/lib/auth";
+import { enforceBearer } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import { pruneSpans, upsertSpans } from "@/lib/trace-store";
 import { captureContentEnabled, dedupeSpans, MAX_BODY_BYTES, parseOtlp } from "@/lib/traces";
@@ -41,9 +41,8 @@ async function readCapped(req: Request, max: number): Promise<Buffer | null> {
  * unless MC_TRACE_CAPTURE_CONTENT is set (credentials are never kept).
  */
 export async function POST(req: Request) {
-  if (!(await isAuthorized(req))) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
-  }
+  const denied = await enforceBearer(req);
+  if (denied) return denied;
   const type = req.headers.get("content-type") ?? "";
   if (!type.includes("json")) {
     return NextResponse.json({ error: "send OTLP as JSON (Content-Type: application/json); protobuf is not supported" }, { status: 415 });

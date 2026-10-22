@@ -48,6 +48,7 @@ Every ingest path writes Postgres. The dashboard pages read through the REST API
 - `repo_snapshots` — one append-only row per repo per collector tick; re-running the same instant updates in place
 - `spans` — agent traces: one row per (trace_id, span_id), upserted so an open span can be closed later; pruned after `MC_TRACE_RETENTION_DAYS`
 - `model_prices`, `usage_accounts`, `usage_facts`, `account_snapshots` — usage ledger
+- `agent_credentials` — label, token prefix, SHA-256 of the token, scopes, timestamps. The token itself is not stored
 
 ## Status derivation
 
@@ -59,8 +60,10 @@ The page never calls GitHub. The collector owns the API budget and writes snapsh
 
 ## Auth layers
 
-- Data routes: dashboard password cookie (`mc_auth`, 30 days) or `MC_TOKEN` bearer.
-- Agent routes and MCP: `MC_TOKEN` bearer or OAuth.
+- Data routes: dashboard password cookie (`mc_auth`, 30 days), `MC_TOKEN` bearer, or an agent credential whose scopes allow the route.
+- Agent routes and MCP: `MC_TOKEN` (every scope), an agent credential (its scopes), or OAuth (all mapped tools; verification unchanged).
+- `GET`/`POST`/`DELETE /api/settings/credentials`: dashboard session only.
+- Scope table and the single check: `src/lib/scopes.ts`. Credential store: `src/lib/credentials.ts`.
 
 See [API.md](API.md). Demo mode: no `DATABASE_URL` means sample data and nothing stored.
 
@@ -74,7 +77,7 @@ See [API.md](API.md). Demo mode: no `DATABASE_URL` means sample data and nothing
 - `src/app/api/v1/traces` — OTLP/HTTP JSON ingest; `src/app/traces` — the viewer
 - `src/lib/usage-store.ts`
 - `src/lib/db.ts` — driver selection
-- `src/lib/auth.ts` and `src/middleware.ts` — auth
+- `src/lib/auth.ts` and `src/middleware.ts` — auth. Middleware forwards `akc_` bearers to `/api` because it cannot open Postgres; the route accepts or rejects them.
 - `src/lib/oauth.ts` and `src/app/oauth` — OAuth
 - `agents/` — adapters
 - `scripts/` — collector, migrate, quickstart

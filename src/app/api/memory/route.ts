@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { enforceApi } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import { recall } from "@/lib/store";
 import { demoMemory } from "@/lib/demo-data";
@@ -8,6 +9,8 @@ export const maxDuration = 30;
 
 /** GET /api/memory?query=&tag=&limit= — memory browser feed for the dashboard. */
 export async function GET(req: Request) {
+  const denied = await enforceApi(req);
+  if (denied) return denied;
   if (!isConfigured()) {
     return NextResponse.json({ demo: true, items: demoMemory() });
   }

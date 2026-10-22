@@ -9,10 +9,41 @@ Agent Kontrol exposes fleet coordination to AI coding agents over the Model Cont
 
 The MCP endpoint does not use the dashboard session cookie. It enforces its own auth and accepts one of:
 
-- `Authorization: Bearer <MC_TOKEN>` — the same static token the ingest API uses.
-- An OAuth access token (JWT) issued by this server.
+- `Authorization: Bearer <MC_TOKEN>` — the same static token the ingest API uses. This legacy token has every scope.
+- `Authorization: Bearer <akc_…>` — a per-agent credential issued from Settings. The token is shown once, at creation. Scopes on that credential are enforced.
+- An OAuth access token (JWT) issued by this server. Verification and issuance are unchanged. An authenticated OAuth principal has access to every mapped tool. The scope string on that token is `mcp`, and that string is not checked against the table below.
 
-Without valid auth the endpoint answers `401` with a `WWW-Authenticate` header pointing at `/.well-known/oauth-protected-resource`.
+Without valid auth the endpoint answers `401` with a `WWW-Authenticate` header pointing at `/.well-known/oauth-protected-resource`. A revoked, expired, or unknown agent credential takes that same `401` path. A valid credential that lacks the scope for the tool answers `403`:
+
+```json
+{ "error": "The credential does not have the tasks:write scope.", "code": "insufficient_scope", "fix": "Use a credential that has the tasks:write scope", "retryable": false }
+```
+
+A tool that is not in the table below is denied for every caller, including `MC_TOKEN` and OAuth.
+
+### Scopes
+
+| Scope | MCP tools | REST routes an agent credential may call |
+| --- | --- | --- |
+| `status:write` | `report_status` | `POST /api/ingest` |
+| `fleet:read` | `get_fleet_status` | `GET /api/fleet` |
+| `tasks:read` | `get_task_queue` | `GET /api/tasks` |
+| `tasks:write` | `create_task`, `claim_task`, `update_task` | `POST /api/tasks`, `POST /api/tasks/claim`, `PATCH /api/tasks/:id` |
+| `memory:read` | `recall` | `GET /api/memory` |
+| `memory:write` | `remember` | — |
+| `messages:read` | `check_inbox` | `GET /api/messages` |
+| `messages:write` | `reply_to_operator`, `reply_to_mark` | `POST /api/messages/reply` |
+| `progress:read` | `get_progress_digest` | `GET /api/progress`, `GET /api/progress/digest` |
+
+`reply_to_mark` is the deprecated alias of `reply_to_operator` and requires the same scope.
+
+Collector and operator routes are not in this table. An agent credential cannot call them. `MC_TOKEN` and the dashboard session still can. That set is `POST /api/progress/ingest`, `POST /api/usage/ingest`, `GET /api/usage`, `POST /api/v1/traces`, `GET /api/traces`, `GET /api/traces/:traceId`, `POST /api/messages`, `PATCH /api/messages`, and `GET`/`PUT /api/settings/repos`. `GET`/`POST`/`DELETE /api/settings/credentials` accepts only the dashboard session.
+
+`check_inbox` and `GET /api/messages?ack=true` can mark inbox rows delivered. That side effect is part of `messages:read`, which is how the inbox already worked.
+
+### What a credential stores
+
+`agent_credentials` stores the label, the first 8 characters of the token (so the list can show which token it is), the SHA-256 hex of the full token, the scope list, and timestamps: `created_at`, `expires_at`, `revoked_at`, `last_used_at`. It does not store the token, prompts, or tool input or output. `last_used_at` is the last time the credential authenticated. If that timestamp write fails, the request still completes.
 
 ### Which hosts use which
 

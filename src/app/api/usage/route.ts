@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { enforceApi } from "@/lib/auth";
 import { isUndefinedTableError, USAGE_SETUP_MESSAGE } from "@/lib/usage-errors";
 import { resolveUsageWindow } from "@/lib/usage-window";
 import { getUsageSummary } from "@/lib/usage-store";
@@ -12,6 +13,8 @@ export const dynamic = "force-dynamic";
  * Defaults: rolling 7d ending now (computed at request time).
  */
 export async function GET(req: Request) {
+  const denied = await enforceApi(req);
+  if (denied) return denied;
   const url = new URL(req.url);
   const resolved = resolveUsageWindow({
     window: url.searchParams.get("window"),

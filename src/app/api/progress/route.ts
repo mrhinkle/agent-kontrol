@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { enforceApi } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import { isWindow, type TimeWindow } from "@/lib/progress-config";
 import { progress } from "@/lib/progress-store";
@@ -14,6 +15,8 @@ export const maxDuration = 30;
  * Postgres — never from GitHub. The collector owns the API budget.
  */
 export async function GET(req: Request) {
+  const denied = await enforceApi(req);
+  if (denied) return denied;
   const param = new URL(req.url).searchParams.get("window");
   const window: TimeWindow = isWindow(param) ? param : "24h";
 

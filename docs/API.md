@@ -2,12 +2,15 @@
 
 ## Authentication
 
-Two credentials protect Agent Kontrol:
+Three credentials protect Agent Kontrol:
 
-- The dashboard password (env `MC_DASHBOARD_PASSWORD`) gates the UI and the data routes through a session cookie named `mc_auth`. Callers get the cookie by posting the password to `POST /api/login`.
-- `MC_TOKEN` is a static bearer token. Data routes accept `Authorization: Bearer <MC_TOKEN>` as an alternative to the cookie, and the ingest routes require it.
+- The dashboard password (env `MC_DASHBOARD_PASSWORD`) gates the UI and the data routes through a session cookie named `mc_auth`. Callers get the cookie by posting the password to `POST /api/login`. The session can do everything an operator can do, including issuing agent credentials.
+- `MC_TOKEN` is a static bearer token. It has every scope. Data routes accept `Authorization: Bearer <MC_TOKEN>` as an alternative to the cookie, and the ingest routes require a bearer.
+- An agent credential is a token shaped `akc_` plus 32 random bytes, base64url. Settings shows it once. It can call only the MCP tools and REST routes its scopes allow. It cannot call `GET`/`POST`/`DELETE /api/settings/credentials`, and neither can `MC_TOKEN`.
 
-Secrets in query strings (`?key=`) are not supported. Send tokens in the `Authorization` header.
+Secrets in query strings (`?key=`) are not supported. Send tokens in the `Authorization` header. Agent credentials are not accepted in the query string.
+
+The `agent_credentials` table stores the label, the first 8 characters of the token, the SHA-256 hex of the full token, the scopes, and timestamps (`created_at`, `expires_at`, `revoked_at`, `last_used_at`). It does not store the token, prompts, or tool input or output. If the `last_used_at` write fails, the request still completes. With no `DATABASE_URL`, the same rules run against an in-memory list that is not shared across processes.
 
 ### Auth by route group
 
@@ -15,10 +18,17 @@ Secrets in query strings (`?key=`) are not supported. Send tokens in the `Author
 | --- | --- |
 | Dashboard UI and data routes (default) | Session cookie `mc_auth`, or `Authorization: Bearer <MC_TOKEN>` |
 | Ingest routes: `POST /api/v1/traces`, `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, `POST /api/usage/ingest` | `Authorization: Bearer <MC_TOKEN>` only |
-| MCP transport: `/api/mcp` | `Authorization: Bearer <MC_TOKEN>`, or an OAuth access token (JWT) issued by this server |
+| MCP transport: `/api/mcp` | `Authorization: Bearer <MC_TOKEN>`, an agent credential, or an OAuth access token (JWT) issued by this server |
+| Credential management: `GET`/`POST`/`DELETE /api/settings/credentials` | Dashboard session only |
 | Login, OAuth, and discovery: `/login`, `/api/login`, `/oauth/*`, `/.well-known/*` | No cookie gate; these routes enforce their own auth |
 
-Ingest routes answer `401 {"error":"unauthorized"}` without a valid bearer token. If `MC_TOKEN` is unset, they are allowed only when `NODE_ENV` is `development` or `test`; in any other environment they are denied.
+Ingest routes answer `401 {"error":"unauthorized"}` without a valid bearer token. If `MC_TOKEN` is unset, they are allowed only when `NODE_ENV` is `development` or `test`; in any other environment they are denied. A presented `akc_` token is checked even in those environments. A revoked, expired, or unknown agent credential is `401`. A valid one that lacks the route's scope is `403`:
+
+```json
+{ "error": "The credential does not have the tasks:write scope.", "code": "insufficient_scope", "fix": "Use a credential that has the tasks:write scope", "retryable": false }
+```
+
+The scope for each agent route is listed in [MCP.md](MCP.md). A route that is not in that table is denied to agent credentials. `MC_TOKEN` and the dashboard session can still call it. OAuth on `/api/mcp` is unchanged: a verified access token can call every mapped tool.
 
 If `MC_DASHBOARD_PASSWORD` is unset, the gate is open in local development and on deploys with no `DATABASE_URL` (demo mode). A production build with `DATABASE_URL` set answers `503` on gated routes until the password is set.
 
@@ -40,6 +50,9 @@ If `MC_DASHBOARD_PASSWORD` is unset, the gate is open in local development and o
 | POST | `/api/progress/ingest` | Bearer | One collection tick from `scripts/collect-progress.sh` |
 | GET | `/api/settings/repos` | Cookie or bearer | The repos the progress board watches |
 | PUT | `/api/settings/repos` | Cookie or bearer | Replace the watched repos |
+| GET | `/api/settings/credentials` | Session only | List agent credentials. No token and no hash |
+| POST | `/api/settings/credentials` | Session only | Create one. The response includes `token` once |
+| DELETE | `/api/settings/credentials` | Session only | Revoke by `{ "id" }` |
 | GET | `/api/tasks` | Cookie or bearer | List tasks |
 | POST | `/api/tasks` | Cookie or bearer | Create a task |
 | POST | `/api/tasks/claim` | Cookie or bearer | Atomically claim the next queued task |
@@ -159,7 +172,17 @@ Each entry in `repos`:
 - `GET /api/settings/repos` returns `{ "source": "database" | "file", "writable": true, "max": 25, "version": "...", "repos": [{ "repo", "label", "short", "color", "blockedLabel" }] }`. `source` is `file` when no list has been saved yet, or when there is no database; `repos` is then the default from `progress.config.json`. The collector calls this on every tick.
 - `PUT /api/settings/repos` with `{ "repos": [...], "version": "..." }` replaces the whole list, in order, and returns the stored list in the same shape. `version` is optional; send the one from your last GET and the save is refused with `409 { "code": "stale" }` if someone changed the list since, so two open tabs cannot overwrite each other. The replace is a single SQL statement, so a failed save leaves the old list intact. It answers `400 { "errors": [{ "index", "field", "message" }] }` when invalid (`index` is `-1` for an error about the whole list), and `409` when no database is connected. A list needs 1 to 25 repos, each `owner/name`, with a unique short name and a `#rrggbb` color.
 
-Anyone with a dashboard session or `MC_TOKEN` can change this list, which matches the rest of the trust model (see [SECURITY.md](../SECURITY.md)).
+Anyone with a dashboard session or `MC_TOKEN` can change this list, which matches the rest of the trust model (see [SECURITY.md](../SECURITY.md)). An agent credential cannot.
+
+### Agent credentials
+
+`GET /api/settings/credentials` returns `{ "credentials": [{ "id", "label", "token_prefix", "scopes", "created_at", "expires_at", "revoked_at", "last_used_at" }] }`. There is no `token` and no `token_hash`.
+
+`POST /api/settings/credentials` with `{ "label", "scopes": ["tasks:read"], "expires_at": null }` creates one. `scopes` must be a non-empty subset of the scopes in [MCP.md](MCP.md). `expires_at` is optional and must be an ISO timestamp in the future. The response is `{ "credential": { ... , "token" } }`. `token` is only in this response. A bad body is `400 { "error" }`.
+
+`DELETE /api/settings/credentials` with `{ "id" }` sets `revoked_at`. Unknown ids are `404`. Revoking again returns the same row.
+
+A request that sends `Authorization`, including a valid `MC_TOKEN` or a valid agent credential, is `401`. With no dashboard password (local demo) a request that sends no `Authorization` header is allowed, the same way the rest of the dashboard is open. With a password set, the `mc_auth` cookie is required.
 
 ### Usage
 
@@ -182,7 +205,8 @@ See [Telemetry and traces](TELEMETRY.md) for the full contract.
 
 ## Errors
 
-- `401 {"error":"unauthorized"}` — missing or invalid bearer token on `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, or `POST /api/usage/ingest`.
+- `401 {"error":"unauthorized"}` — missing or invalid bearer token on `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, or `POST /api/usage/ingest`, and on any route when an agent credential is revoked, expired, or unknown.
+- `403 {"error","code":"insufficient_scope","fix","retryable":false}` — the agent credential is valid and does not have the scope for that tool or route.
 - `401 {"error":"wrong password"}` — wrong password on `POST /api/login`.
 - `401` with a `WWW-Authenticate` header pointing at `/.well-known/oauth-protected-resource` — missing or invalid credentials on `/api/mcp`.
 - `400` — invalid JSON on `POST /api/ingest`; missing `platform` or `agent_id` on `POST /api/tasks/claim`.

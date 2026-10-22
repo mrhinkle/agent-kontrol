@@ -1,7 +1,9 @@
 import { createMcpHandler, withMcpAuth } from "mcp-handler";
 import { z } from "zod";
 import { secretsMatch, verifyAccessToken } from "@/lib/authcrypto";
+import { resolveAgentCredential } from "@/lib/credentials";
 import { isConfigured } from "@/lib/db";
+import { evaluateMcpMessages, insufficientScopeBody, principalFromMcpAuth } from "@/lib/scopes";
 import { claimNextTask, createTask, fetchMessages, fleet, listTasks, recall, remember, replyFromAgent, report, updateTask } from "@/lib/store";
 import { progress } from "@/lib/progress-store";
 import { formatDigest } from "@/lib/progress-digest";
@@ -423,16 +425,35 @@ async function verifyToken(_req: Request, bearerToken?: string) {
   if (!bearerToken) return undefined;
 
   // 1. Legacy shared secret — keeps existing dispatchers/agents working.
+  //    It has every scope. The scope list on the AuthInfo stays ["mcp"]
+  //    so nothing that read that field changes; enforcement uses extra.kind.
   const mcToken = process.env.MC_TOKEN;
   if (mcToken && (await secretsMatch(bearerToken, mcToken))) {
     return {
       token: bearerToken,
       clientId: "mc-token",
       scopes: ["mcp"],
+      extra: { kind: "legacy" },
     };
   }
 
-  // 2. OAuth access token (HS256 JWT).
+  // 2. Per-agent credential. Unknown, revoked, expired, or a store error
+  //    returns undefined: the same 401 + WWW-Authenticate as any other
+  //    bad bearer. Do not fall through to OAuth.
+  if (bearerToken.startsWith("akc_")) {
+    const resolved = await resolveAgentCredential(bearerToken);
+    if (resolved.status !== "ok") return undefined;
+    return {
+      token: bearerToken,
+      clientId: resolved.credential.id,
+      scopes: [...resolved.credential.scopes],
+      extra: { kind: "agent" },
+    };
+  }
+
+  // 3. OAuth access token (HS256 JWT). Verification and this return value
+  //    are unchanged. An authenticated OAuth principal keeps all-access;
+  //    the "mcp" scope string is not checked against the scope table.
   const payload = await verifyAccessToken(bearerToken);
   if (!payload) return undefined;
   if (payload.typ === "refresh") return undefined;
@@ -446,9 +467,53 @@ async function verifyToken(_req: Request, bearerToken?: string) {
   };
 }
 
-const authed = withMcpAuth(handler, verifyToken, {
-  required: true,
-  resourceMetadataPath: "/.well-known/oauth-protected-resource",
-});
+function scopeDenied(body: { error: string; code: string; fix: string; retryable: false }): Response {
+  return new Response(JSON.stringify(body), {
+    status: 403,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/**
+ * tools/call is checked here, before the tool runs. A body we cannot parse
+ * is denied. initialize and the other non-tool methods are left to the handler.
+ */
+async function enforceMcpScope(req: Request): Promise<Response | null> {
+  if (req.method !== "POST") return null;
+  let text = "";
+  try {
+    text = await req.clone().text();
+  } catch {
+    return scopeDenied(insufficientScopeBody(null));
+  }
+  if (!text.trim()) return null;
+  const contentType = req.headers.get("content-type") ?? "";
+  const trimmed = text.trim();
+  const looksJson =
+    contentType.includes("json") || trimmed.startsWith("{") || trimmed.startsWith("[");
+  if (!looksJson) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return scopeDenied(insufficientScopeBody(null));
+  }
+  const decision = evaluateMcpMessages(principalFromMcpAuth(req.auth), parsed);
+  if (decision.ok) return null;
+  return scopeDenied(decision.body);
+}
+
+const authed = withMcpAuth(
+  async (req) => {
+    const denied = await enforceMcpScope(req);
+    if (denied) return denied;
+    return handler(req);
+  },
+  verifyToken,
+  {
+    required: true,
+    resourceMetadataPath: "/.well-known/oauth-protected-resource",
+  },
+);
 
 export { authed as GET, authed as POST, authed as DELETE };

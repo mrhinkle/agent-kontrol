@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { enforceApi } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import { claimNextTask, report } from "@/lib/store";
 
@@ -12,6 +13,8 @@ export const maxDuration = 30;
  * queue is empty for that platform.
  */
 export async function POST(req: Request) {
+  const denied = await enforceApi(req);
+  if (denied) return denied;
   if (!isConfigured()) {
     return NextResponse.json({ task: null, demo: true });
   }

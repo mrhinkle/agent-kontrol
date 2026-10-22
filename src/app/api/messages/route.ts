@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { enforceApi } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import {
   enqueueMessage,
@@ -29,6 +30,8 @@ function setupResponse() {
 }
 
 export async function GET(req: Request) {
+  const denied = await enforceApi(req);
+  if (denied) return denied;
   const url = new URL(req.url);
   const agent_id = url.searchParams.get("agent_id");
   if (!agent_id) {
@@ -54,6 +57,8 @@ export async function GET(req: Request) {
 }
 
 export async function POST(req: Request) {
+  const denied = await enforceApi(req);
+  if (denied) return denied;
   if (!isConfigured()) {
     return NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; message dropped" });
   }
@@ -80,6 +85,8 @@ export async function POST(req: Request) {
 }
 
 export async function PATCH(req: Request) {
+  const denied = await enforceApi(req);
+  if (denied) return denied;
   if (!isConfigured()) {
     return NextResponse.json({ ok: true, demo: true });
   }
