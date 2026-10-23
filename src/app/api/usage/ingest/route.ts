@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { enforceBearer } from "@/lib/auth";
+import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { isUndefinedTableError, USAGE_SETUP_MESSAGE } from "@/lib/usage-errors";
 import { ingestAccountSnapshot, ingestUsageFacts } from "@/lib/usage-store";
@@ -36,13 +37,16 @@ export async function POST(req: Request) {
   try {
     body = await req.json();
   } catch {
-    return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
+    return apiError("invalid_json");
   }
   if (!Array.isArray(body.facts)) {
-    return NextResponse.json({ error: "facts[] is required" }, { status: 400 });
+    return apiError("missing_field", { message: "facts[] is required", fields: { facts: "facts[] is required" } });
   }
   if (body.collected_at && Number.isNaN(Date.parse(body.collected_at))) {
-    return NextResponse.json({ error: "collected_at must be ISO 8601" }, { status: 400 });
+    return apiError("validation_failed", {
+      message: "collected_at must be ISO 8601",
+      fields: { collected_at: "collected_at must be ISO 8601" },
+    });
   }
 
   try {
@@ -53,17 +57,12 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true, written });
   } catch (e) {
     if (isUndefinedTableError(e)) {
-      return NextResponse.json(
-        {
-          error: USAGE_SETUP_MESSAGE,
-          setup_required: true,
-          message: USAGE_SETUP_MESSAGE,
-        },
-        { status: 503 },
-      );
+      return apiError("setup_required", {
+        message: USAGE_SETUP_MESSAGE,
+        fix: "Run supabase/schema.sql, then install the collector and retry.",
+        extra: { setup_required: true, message: USAGE_SETUP_MESSAGE },
+      });
     }
-    const msg = (e as Error).message || "ingest failed";
-    const status = msg.startsWith("privacy:") ? 400 : 500;
-    return NextResponse.json({ error: msg }, { status });
+    return publicError("[usage] ingest failed", e);
   }
 }

@@ -229,6 +229,46 @@ Report progress or completion on a task you claimed.
 
 When to call: whenever the status of a claimed task changes, and when it finishes or fails.
 
+## Errors
+
+A tool failure returns `isError: true`. The text of the result is JSON with the same keys as a REST error:
+
+```json
+{ "error": "Memory key is invalid.", "code": "memory_key_invalid", "fix": "Use a key of 1 to 200 characters with no control characters, or omit the key.", "retryable": false, "fields": { "key": "Use 1 to 200 characters and no control characters, or omit the key." } }
+```
+
+`error` is a string. `retryable` is `true` only for `rate_limited` and `internal_error`. A handler that throws is logged on the server and returned as `internal_error` with a generic `error` string. The exception text is not in the result.
+
+`remember` and `recall` return `memory_key_invalid` when `key` is empty, longer than 200 characters, or contains a control character. Omitting `key` is valid. `update_task` returns `task_not_found` when a database is connected and the id does not exist. Demo mode answers with plain text, not an error. `reply_to_operator` returns `not_found` or `forbidden` when `in_reply_to` does not exist or belongs to another agent.
+
+`task_not_claimable` is defined so a caller can handle it. No tool returns it. `claim_task` with nothing queued is a normal result whose text says there is no queued task, not an error.
+
+Arguments that fail the tool's input schema are rejected by the MCP SDK before the handler runs. That result is `isError: true` whose text is the schema message, not this JSON. The catalogue below is what the handler itself returns.
+
+The HTTP `401` for a missing or invalid bearer is unchanged: `WWW-Authenticate` points at `/.well-known/oauth-protected-resource`.
+
+| Code | Retryable | When a tool returns it |
+| --- | --- | --- |
+| `unauthorized` | no | Not returned inside a tool result. The HTTP `401` above covers a bad bearer. |
+| `forbidden` | no | `reply_to_operator` when `in_reply_to` belongs to a different agent. |
+| `not_found` | no | `reply_to_operator` when `in_reply_to` does not exist. |
+| `validation_failed` | no | Not returned by a current tool. A privacy refusal on `POST /api/usage/ingest` is this code. Schema failures are the SDK message, not this JSON. |
+| `invalid_json` | no | Not returned by a tool. REST only. |
+| `missing_field` | no | Not returned by a tool. The input schema rejects a missing argument first. |
+| `rate_limited` | yes | Not returned by a tool. `POST /api/login` only. The OAuth consent form shares that limiter and answers with HTML, not this JSON. |
+| `conflict` | no | Not returned by a tool. REST settings save with no database. |
+| `stale` | no | Not returned by a tool. REST settings save with a stale `version`. |
+| `task_not_found` | no | `update_task` when a database is connected and the id does not exist. Demo mode is the text `Demo mode; task not updated.`, not an error. |
+| `task_not_claimable` | no | Defined, not returned. See above. |
+| `memory_key_invalid` | no | `remember` or `recall` with a bad `key`. |
+| `repo_list_invalid` | no | Not returned by a tool. REST settings only. |
+| `payload_too_large` | no | Not returned by a tool. REST trace export only. |
+| `unsupported_media_type` | no | Not returned by a tool. REST trace export only. |
+| `setup_required` | no | Not returned by a tool. HTTP 503 from messaging routes, `POST /api/usage/ingest`, and the production middleware on `/api/*` when a database is set and `MC_DASHBOARD_PASSWORD` is not. `GET /api/usage` stays HTTP 200. |
+| `internal_error` | yes | The handler threw. Retry once. The server log has the detail. |
+
+The full HTTP status for each code is in [API.md](API.md#errors).
+
 ## Memory
 
 See [Memory (Notes)](MEMORY.md) for what this store is and is not, including the automatic session notes. Shared memory is one Postgres table, `memory`, with a unique optional `key`, `content`, a `tags` text array, an `agent_id`, and timestamps. Apart from the automatic note written when a session ends (see [Memory (Notes)](MEMORY.md)), nothing writes to it; only agents that call `remember` do. Search is substring matching (ILIKE), not semantic: `recall` finds notes whose content contains the query string, case-insensitively, and returns the most recently updated notes first.

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { enforceApi } from "@/lib/auth";
+import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { createTask, listTasks } from "@/lib/store";
 import { demoTasks } from "@/lib/demo-data";
@@ -30,7 +31,7 @@ export async function GET(req: Request) {
     });
     return NextResponse.json({ demo: false, tasks });
   } catch (e) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    return publicError("[tasks] list failed", e);
   }
 }
 
@@ -53,15 +54,15 @@ export async function POST(req: Request) {
   try {
     body = await req.json();
   } catch {
-    return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
+    return apiError("invalid_json");
   }
   if (!body.title) {
-    return NextResponse.json({ error: "title is required" }, { status: 400 });
+    return apiError("missing_field", { message: "title is required", fields: { title: "title is required" } });
   }
   try {
     const task = await createTask({ ...body, title: body.title });
     return NextResponse.json({ ok: true, task });
   } catch (e) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    return publicError("[tasks] create failed", e);
   }
 }

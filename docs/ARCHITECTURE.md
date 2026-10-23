@@ -70,6 +70,8 @@ See [API.md](API.md). Demo mode: no `DATABASE_URL` means sample data and nothing
 ## Code map
 
 - `src/app` — routes and pages
+- `src/lib/api-error.ts` — REST and MCP error catalogue (`code`, `fix`, `retryable`)
+- `src/lib/trace-response.ts` — one-trace HTTP response (kept out of the route module so Next.js only sees `GET`)
 - `src/lib/store.ts` — agents, memory, messages, tasks
 - `src/lib/progress-store.ts`
 - `src/lib/traces.ts` — OTLP parsing, sanitizing and the waterfall layout (pure)

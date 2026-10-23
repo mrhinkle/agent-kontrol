@@ -1,4 +1,5 @@
 import { authCookieValue, secretsMatch } from "./authcrypto";
+import { errorBody } from "@/lib/api-error";
 import { resolveAgentCredential } from "./credentials";
 import {
   authorizeRoute,
@@ -30,12 +31,12 @@ import {
 
 export type Access =
   | { ok: true; principal: Principal }
-  | { ok: false; status: 401; body: { error: "unauthorized" } }
+  | { ok: false; status: 401; body: ReturnType<typeof errorBody> }
   | { ok: false; status: 403; body: ScopeErrorBody }
   | { ok: false; status: 503; body: { error: "credential_store_unavailable" } };
 
 const STORE_UNAVAILABLE: Access = { ok: false, status: 503, body: { error: "credential_store_unavailable" } };
-const UNAUTHORIZED: Access = { ok: false, status: 401, body: { error: "unauthorized" } };
+const UNAUTHORIZED: Access = { ok: false, status: 401, body: errorBody("unauthorized") };
 
 function jsonDenied(decision: Access): Response | null {
   if (decision.ok) return null;

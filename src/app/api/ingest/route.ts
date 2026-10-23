@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { enforceBearer } from "@/lib/auth";
+import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { report, type ReportInput } from "@/lib/store";
 
@@ -35,16 +36,19 @@ export async function POST(req: Request) {
   try {
     body = (await req.json()) as ReportInput;
   } catch {
-    return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
+    return apiError("invalid_json");
   }
   if (!body.agent_id || !body.kind) {
-    return NextResponse.json({ error: "agent_id and kind are required" }, { status: 400 });
+    const fields: Record<string, string> = {};
+    if (!body.agent_id) fields.agent_id = "agent_id is required";
+    if (!body.kind) fields.kind = "kind is required";
+    return apiError("missing_field", { message: "agent_id and kind are required", fields });
   }
 
   try {
     await report(body);
     return NextResponse.json({ ok: true });
   } catch (e) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    return publicError("[ingest]", e);
   }
 }

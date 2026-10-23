@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { enforceApi } from "@/lib/auth";
+import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { demoSpans, demoSummary } from "@/lib/demo-traces";
 import { listTraces } from "@/lib/trace-store";
@@ -19,7 +20,10 @@ export async function GET(req: Request) {
   }
   const before = url.searchParams.get("before");
   if (before && Number.isNaN(Date.parse(before))) {
-    return NextResponse.json({ error: "before must be an ISO timestamp" }, { status: 400 });
+    return apiError("validation_failed", {
+      message: "before must be an ISO timestamp",
+      fields: { before: "before must be an ISO timestamp" },
+    });
   }
   const limit = Number(url.searchParams.get("limit") ?? 50);
   try {
@@ -31,7 +35,6 @@ export async function GET(req: Request) {
     });
     return NextResponse.json({ demo: false, traces });
   } catch (e) {
-    console.error("[traces] list failed", e);
-    return NextResponse.json({ error: "could not read traces" }, { status: 500 });
+    return publicError("[traces] list failed", e, "could not read traces");
   }
 }

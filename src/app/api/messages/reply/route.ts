@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { enforceBearer } from "@/lib/auth";
+import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { replyFromAgent } from "@/lib/store";
 import { isMessagesSetupError, MESSAGES_SETUP_MESSAGE } from "@/lib/message-errors";
@@ -28,10 +29,13 @@ export async function POST(req: Request) {
   try {
     body = await req.json();
   } catch {
-    return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
+    return apiError("invalid_json");
   }
   if (!body.agent_id || !body.body?.trim()) {
-    return NextResponse.json({ error: "agent_id and body are required" }, { status: 400 });
+    const fields: Record<string, string> = {};
+    if (!body.agent_id) fields.agent_id = "agent_id is required";
+    if (!body.body?.trim()) fields.body = "body is required";
+    return apiError("missing_field", { message: "agent_id and body are required", fields });
   }
   try {
     const msg = await replyFromAgent({
@@ -43,11 +47,12 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true, id: msg.id, message: msg });
   } catch (e) {
     if (isMessagesSetupError(e)) {
-      return NextResponse.json(
-        { setup_required: true, error: MESSAGES_SETUP_MESSAGE, message: MESSAGES_SETUP_MESSAGE },
-        { status: 503 }
-      );
+      return apiError("setup_required", {
+        message: MESSAGES_SETUP_MESSAGE,
+        fix: "Run supabase/migrations/20261005_messages_two_way.sql (or supabase/schema.sql), then retry.",
+        extra: { setup_required: true, message: MESSAGES_SETUP_MESSAGE },
+      });
     }
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    return publicError("[messages] reply failed", e);
   }
 }
