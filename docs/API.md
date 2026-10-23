@@ -19,7 +19,7 @@ Secrets in query strings (`?key=`) are not supported. Send tokens in the `Author
 | Login, OAuth, and discovery: `/login`, `/api/login`, `/oauth/*`, `/.well-known/*` | No cookie gate; these routes enforce their own auth |
 | Public agent docs: `GET /llms.txt`, `GET /docs/mcp.md`, `GET /docs/api.md`, `GET /docs/agents.md` | None. Any other `/docs` name stays behind the dashboard gate |
 
-Ingest routes answer `401 {"error":"unauthorized"}` without a valid bearer token. If `MC_TOKEN` is unset, they are allowed only when `NODE_ENV` is `development` or `test`; in any other environment they are denied.
+Ingest routes answer `401` with `"error": "unauthorized"` (plus `code`, `fix`, and `retryable` — see [Errors](#errors)) without a valid bearer token. If `MC_TOKEN` is unset, they are allowed only when `NODE_ENV` is `development` or `test`; in any other environment they are denied.
 
 If `MC_DASHBOARD_PASSWORD` is unset, the gate is open in local development and on deploys with no `DATABASE_URL` (demo mode). A production build with `DATABASE_URL` set answers `503` on gated routes until the password is set.
 
@@ -37,7 +37,7 @@ If `MC_DASHBOARD_PASSWORD` is unset, the gate is open in local development and o
 | PATCH | `/api/messages` | Cookie or bearer | Operator marks outbound replies read |
 | POST | `/api/messages/reply` | Bearer | Non-MCP agents post replies |
 | GET | `/api/progress` | Cookie or bearer | Everything the progress board needs |
-| GET | `/api/progress/digest` | Cookie or bearer | The board as plain text, for schedulers and terminals |
+| GET | `/api/progress/digest` | Cookie or bearer | The board as plain text, for schedulers and terminals. A failure is the JSON error body, not plain text. |
 | POST | `/api/progress/ingest` | Bearer | One collection tick from `scripts/collect-progress.sh` |
 | GET | `/api/settings/repos` | Cookie or bearer | The repos the progress board watches |
 | PUT | `/api/settings/repos` | Cookie or bearer | Replace the watched repos |
@@ -158,7 +158,7 @@ Each entry in `repos`:
 ### Settings
 
 - `GET /api/settings/repos` returns `{ "source": "database" | "file", "writable": true, "max": 25, "version": "...", "repos": [{ "repo", "label", "short", "color", "blockedLabel" }] }`. `source` is `file` when no list has been saved yet, or when there is no database; `repos` is then the default from `progress.config.json`. The collector calls this on every tick.
-- `PUT /api/settings/repos` with `{ "repos": [...], "version": "..." }` replaces the whole list, in order, and returns the stored list in the same shape. `version` is optional; send the one from your last GET and the save is refused with `409 { "code": "stale" }` if someone changed the list since, so two open tabs cannot overwrite each other. The replace is a single SQL statement, so a failed save leaves the old list intact. It answers `400 { "errors": [{ "index", "field", "message" }] }` when invalid (`index` is `-1` for an error about the whole list), and `409` when no database is connected. A list needs 1 to 25 repos, each `owner/name`, with a unique short name and a `#rrggbb` color.
+- `PUT /api/settings/repos` with `{ "repos": [...], "version": "..." }` replaces the whole list, in order, and returns the stored list in the same shape. `version` is optional; send the one from your last GET and the save is refused with `409 { "code": "stale" }` if someone changed the list since, so two open tabs cannot overwrite each other. The replace is a single SQL statement, so a failed save leaves the old list intact. It answers `400` with `errors: [{ "index", "field", "message" }]` when invalid (`index` is `-1` for an error about the whole list), and `409` with `code` `conflict` when no database is connected. Those bodies also include `error` (a string), `fix`, `retryable`, and `fields`. The `errors` array and `code: "stale"` stay. A list needs 1 to 25 repos, each `owner/name`, with a unique short name and a `#rrggbb` color.
 
 Anyone with a dashboard session or `MC_TOKEN` can change this list, which matches the rest of the trust model (see [SECURITY.md](../SECURITY.md)).
 
@@ -175,20 +175,49 @@ See [Telemetry and traces](TELEMETRY.md) for the full contract.
 
 - `POST /api/v1/traces` — bearer `MC_TOKEN` — an OTLP/HTTP JSON export. Answers `200 { partialSuccess: { rejectedSpans?, errorMessage? } }`. `415` for protobuf, `413` over 2 MB, `401` for a bad token.
 - `GET /api/traces?agent=&errors=1&before=&limit=` — `{ demo, traces: TraceSummary[] }`.
-- `GET /api/traces/:traceId` — `{ demo, spans: Span[] }`; `404` when the trace is unknown or pruned.
+- `GET /api/traces/:traceId` — `{ demo, spans: Span[] }`. With a database, an unknown or pruned trace is `404` `not_found`. Demo mode returns `200` and an empty `spans` list.
 
 ### Login
 
-`POST /api/login` takes body `{password}` and, on success, establishes the `mc_auth` session cookie. A wrong password answers `401 {"error":"wrong password"}`. The route allows 5 attempts per 10 minutes per client IP, shared with the OAuth consent form; past that it answers `429` with a `Retry-After` header in seconds. The limiter is in memory and per serverless instance.
+`POST /api/login` takes body `{password}` and, on success, establishes the `mc_auth` session cookie. A wrong password answers `401` with `"error": "wrong password"` and `code` `unauthorized`. The route allows 5 attempts per 10 minutes per client IP, shared with the OAuth consent form; past that it answers `429` with a `Retry-After` header in seconds and `code` `rate_limited`. The limiter is in memory and per serverless instance.
 
 ## Errors
 
-- `401 {"error":"unauthorized"}` — missing or invalid bearer token on `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, or `POST /api/usage/ingest`.
-- `401 {"error":"wrong password"}` — wrong password on `POST /api/login`.
-- `401` with a `WWW-Authenticate` header pointing at `/.well-known/oauth-protected-resource` — missing or invalid credentials on `/api/mcp`.
-- `400` — invalid JSON on `POST /api/ingest`; missing `platform` or `agent_id` on `POST /api/tasks/claim`.
-- `429` with a `Retry-After` header (seconds) — more than 5 attempts in 10 minutes from one client IP on `POST /api/login`, shared with the OAuth consent form.
-- `503` — gated routes on a production build with `DATABASE_URL` set and `MC_DASHBOARD_PASSWORD` unset.
+REST JSON errors use one flat shape. `error` stays a string. The other fields are added beside it:
+
+```json
+{ "error": "title is required", "code": "missing_field", "fix": "Add the fields listed in fields and send the request again.", "retryable": false, "fields": { "title": "title is required" } }
+```
+
+`fields` is omitted when there is nothing to correct field by field. A route that already returned extra keys still returns them. `PUT /api/settings/repos` still returns `errors` and, when the list is stale, `code` `stale`.
+
+HTTP status stays the status in the table. A 500 logs the exception on the server and answers `internal_error` with `retryable: true` and a generic `error` string. The exception text is not in the body.
+
+OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this shape. `/api/mcp` still answers `401` with a `WWW-Authenticate` header pointing at `/.well-known/oauth-protected-resource` when the bearer is missing or invalid. That 401 is the MCP SDK's response, not this body.
+
+`task_not_claimable` is defined so a caller can handle it. No route returns it. An empty claim is HTTP 200 `{ "task": null }`.
+
+| Code | Status | Retryable | When |
+| --- | --- | --- | --- |
+| `unauthorized` | 401 | no | Missing or invalid bearer on an ingest route, or a wrong dashboard password (`error` is `wrong password` on `POST /api/login`, and `unauthorized` on the ingest routes). |
+| `forbidden` | 403 | no | `POST /api/messages/reply` when `in_reply_to` names a message that belongs to a different agent. |
+| `not_found` | 404 | no | Unknown trace id on `GET /api/traces/:traceId` when a database is connected (demo mode returns 200 and an empty `spans` list), or `POST /api/messages/reply` when `in_reply_to` names a message that does not exist. |
+| `validation_failed` | 400 | no | A field is present but not usable: a bad `before` on `GET /api/traces`, a bad `since` and `until` pair on `GET /api/usage` (a `since` without `until` is ignored), a bad `collected_at` on usage or progress ingest, a bad task or trace id, a privacy refusal, or an OTLP body the parser rejected. |
+| `invalid_json` | 400 | no | The body is not JSON. On `POST /api/login` the `error` string stays `invalid request`. |
+| `missing_field` | 400 | no | A required field is absent. `fields` names it. |
+| `rate_limited` | 429 | yes | More than 5 `POST /api/login` attempts in 10 minutes from one client IP. `Retry-After` is seconds. The OAuth consent form shares this limiter and answers with HTML, not this JSON. |
+| `conflict` | 409 | no | `PUT /api/settings/repos` when no database is connected. |
+| `stale` | 409 | no | `PUT /api/settings/repos` when `version` does not match the list currently stored. |
+| `task_not_found` | 404 | no | `PATCH /api/tasks/:id` or MCP `update_task` when a database is connected and that id does not exist. `error` stays `Task not found`. Demo mode does not look the id up. |
+| `task_not_claimable` | 409 | no | Defined, not returned. See above. |
+| `memory_key_invalid` | 400 | no | MCP `remember` or `recall` when `key` is empty, longer than 200 characters, or contains a control character. |
+| `repo_list_invalid` | 400 | no | `PUT /api/settings/repos` when the list fails validation. `errors` is unchanged. |
+| `payload_too_large` | 413 | no | `POST /api/v1/traces` over 2 MB. |
+| `unsupported_media_type` | 415 | no | `POST /api/v1/traces` when the body is not JSON. |
+| `setup_required` | 503 | no | Messaging routes or `POST /api/usage/ingest` when those tables are missing, or a production `/api/*` request when a database is set and `MC_DASHBOARD_PASSWORD` is not (other pages are `text/plain`). `GET /api/usage` stays HTTP 200 with `setup_required: true` and no `code`. Messaging and usage-ingest bodies keep `setup_required` and `message`. |
+| `internal_error` | 500 | yes | Anything else that failed while handling the request. `GET /api/progress/digest` uses this JSON body too. Success from that route stays `text/plain`. |
+
+`fix` tells the caller what to change. It is a sentence, specific to the code, and overridable per response when the default would be the wrong instruction (a wrong dashboard password does not ask for `MC_TOKEN`).
 
 ## Demo mode
 

@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { apiError, publicError } from "@/lib/api-error";
 import { isAuthorized } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import { ingestSnapshots, type IngestInput } from "@/lib/progress-store";
@@ -26,7 +27,7 @@ export const maxDuration = 30;
  */
 export async function POST(req: Request) {
   if (!(await isAuthorized(req))) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+    return apiError("unauthorized");
   }
   if (!isConfigured()) {
     return NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; snapshot dropped" });
@@ -36,19 +37,22 @@ export async function POST(req: Request) {
   try {
     body = (await req.json()) as IngestInput;
   } catch {
-    return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
+    return apiError("invalid_json");
   }
   if (!Array.isArray(body.repos) || body.repos.length === 0) {
-    return NextResponse.json({ error: "repos[] is required" }, { status: 400 });
+    return apiError("missing_field", { message: "repos[] is required", fields: { repos: "repos[] is required" } });
   }
   if (body.collected_at && Number.isNaN(Date.parse(body.collected_at))) {
-    return NextResponse.json({ error: "collected_at must be ISO 8601" }, { status: 400 });
+    return apiError("validation_failed", {
+      message: "collected_at must be ISO 8601",
+      fields: { collected_at: "collected_at must be ISO 8601" },
+    });
   }
 
   try {
     const written = await ingestSnapshots(body);
     return NextResponse.json({ ok: true, written });
   } catch (e) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    return publicError("[progress] ingest failed", e);
   }
 }

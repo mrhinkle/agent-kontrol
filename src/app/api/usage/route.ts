@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { apiError, publicError } from "@/lib/api-error";
 import { isUndefinedTableError, USAGE_SETUP_MESSAGE } from "@/lib/usage-errors";
 import { resolveUsageWindow } from "@/lib/usage-window";
 import { getUsageSummary } from "@/lib/usage-store";
@@ -19,7 +20,10 @@ export async function GET(req: Request) {
     until: url.searchParams.get("until"),
   });
   if (Number.isNaN(Date.parse(resolved.since)) || Number.isNaN(Date.parse(resolved.until))) {
-    return NextResponse.json({ error: "since/until must be ISO 8601" }, { status: 400 });
+    const fields: Record<string, string> = {};
+    if (Number.isNaN(Date.parse(resolved.since))) fields.since = "since must be ISO 8601";
+    if (Number.isNaN(Date.parse(resolved.until))) fields.until = "until must be ISO 8601";
+    return apiError("validation_failed", { message: "since/until must be ISO 8601", fields });
   }
   try {
     const summary = await getUsageSummary({
@@ -57,6 +61,6 @@ export async function GET(req: Request) {
       };
       return NextResponse.json(body);
     }
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    return publicError("[usage]", e);
   }
 }
