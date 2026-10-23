@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { updateTask, report } from "@/lib/store";
 import type { TaskStatus } from "@/lib/types";
@@ -18,7 +19,7 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
   const { id } = await ctx.params;
   const taskId = Number(id);
   if (!Number.isFinite(taskId)) {
-    return NextResponse.json({ error: "invalid task id" }, { status: 400 });
+    return apiError("validation_failed", { message: "invalid task id", fields: { id: "invalid task id" } });
   }
   let body: {
     status?: TaskStatus;
@@ -31,7 +32,7 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
   try {
     body = await req.json();
   } catch {
-    return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
+    return apiError("invalid_json");
   }
   try {
     const task = await updateTask({ id: taskId, ...body });
@@ -45,6 +46,6 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
     }
     return NextResponse.json({ ok: true, task });
   } catch (e) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    return publicError("[tasks] update failed", e);
   }
 }

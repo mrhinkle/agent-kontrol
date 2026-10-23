@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { recall } from "@/lib/store";
 import { demoMemory } from "@/lib/demo-data";
@@ -20,6 +21,6 @@ export async function GET(req: Request) {
     });
     return NextResponse.json({ demo: false, items });
   } catch (e) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    return publicError("[memory]", e);
   }
 }

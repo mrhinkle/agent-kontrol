@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { apiError } from "@/lib/api-error";
 import { authCookieValue, secretsMatch } from "@/lib/authcrypto";
 import { clientIp } from "@/lib/rate-limit";
 import { loginLimiter } from "@/lib/login-limiter";
@@ -12,7 +13,7 @@ export async function POST(req: Request) {
   const ip = clientIp(req);
   const { allowed, retryAfterSec } = loginLimiter.check(ip);
   if (!allowed) {
-    return NextResponse.json({ error: "too many attempts" }, { status: 429, headers: { "Retry-After": String(retryAfterSec) } });
+    return apiError("rate_limited", { headers: { "Retry-After": String(retryAfterSec) } });
   }
 
   // Reserve the attempt synchronously (no await between check and fail) so a
@@ -24,11 +25,14 @@ export async function POST(req: Request) {
     const body = (await req.json()) as { password?: string };
     submitted = body.password ?? "";
   } catch {
-    return NextResponse.json({ error: "invalid request" }, { status: 400 });
+    return apiError("invalid_json", { message: "invalid request" });
   }
 
   if (!(await secretsMatch(submitted, password))) {
-    return NextResponse.json({ error: "wrong password" }, { status: 401 });
+    return apiError("unauthorized", {
+      message: "wrong password",
+      fix: "Check the dashboard password and try again.",
+    });
   }
 
   // Correct password: release the reservation.
