@@ -31,8 +31,10 @@ import {
 export type Access =
   | { ok: true; principal: Principal }
   | { ok: false; status: 401; body: { error: "unauthorized" } }
-  | { ok: false; status: 403; body: ScopeErrorBody };
+  | { ok: false; status: 403; body: ScopeErrorBody }
+  | { ok: false; status: 503; body: { error: "credential_store_unavailable" } };
 
+const STORE_UNAVAILABLE: Access = { ok: false, status: 503, body: { error: "credential_store_unavailable" } };
 const UNAUTHORIZED: Access = { ok: false, status: 401, body: { error: "unauthorized" } };
 
 function jsonDenied(decision: Access): Response | null {
@@ -85,6 +87,8 @@ async function decideBearer(
 
   if (headerToken?.startsWith("akc_")) {
     const resolved = await resolveAgentCredential(headerToken);
+    // A store outage is not a revocation: answer 503 so agents retry instead of dropping the key.
+    if (resolved.status === "unavailable") return STORE_UNAVAILABLE;
     if (resolved.status !== "ok") return UNAUTHORIZED;
     const principal: Principal = {
       kind: "agent",
