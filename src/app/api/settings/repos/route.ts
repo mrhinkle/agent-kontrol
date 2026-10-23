@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { enforceApi } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { REPOS } from "@/lib/progress-config";
@@ -19,8 +20,8 @@ export const dynamic = "force-dynamic";
  *      changed since, answers 409 { code: "stale" } instead of overwriting someone
  *      else's change.
  *
- * Auth is enforced by middleware: dashboard session cookie or MC_TOKEN bearer.
- * The collector calls GET each tick to learn which repos to sweep.
+ * Auth: dashboard session or MC_TOKEN. An agent credential cannot call this
+ * route (it is not in the scope table). The collector uses MC_TOKEN.
  */
 async function current() {
   const { source, repos } = await getWatchedRepos(REPOS);
@@ -41,7 +42,9 @@ function failure(e: unknown, what: string) {
   return publicError(`[settings/repos] ${what}`, e, `Could not ${what}.`);
 }
 
-export async function GET() {
+export async function GET(req: Request) {
+  const denied = await enforceApi(req);
+  if (denied) return denied;
   try {
     return NextResponse.json(await current());
   } catch (e) {
@@ -50,6 +53,8 @@ export async function GET() {
 }
 
 export async function PUT(req: Request) {
+  const denied = await enforceApi(req);
+  if (denied) return denied;
   let body: unknown;
   try {
     body = await req.json();

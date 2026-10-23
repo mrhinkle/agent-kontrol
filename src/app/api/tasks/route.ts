@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { enforceApi } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { createTask, listTasks } from "@/lib/store";
@@ -9,13 +10,16 @@ export const maxDuration = 30;
 
 /**
  * Task queue.
- * Auth is enforced by middleware: dashboard cookie or MC_TOKEN bearer.
+ * Auth: dashboard session, legacy MC_TOKEN, or an agent credential with the
+ * route's scope (tasks:read on GET, tasks:write on POST).
  *
  * GET  /api/tasks?status=open|all|<status>&limit=N
  * POST /api/tasks { title, description?, project?, platform?, machine?,
  *                   priority?, reviewer_platform?, created_by? }
  */
 export async function GET(req: Request) {
+  const denied = await enforceApi(req);
+  if (denied) return denied;
   if (!isConfigured()) {
     return NextResponse.json({ demo: true, tasks: demoTasks() });
   }
@@ -32,6 +36,8 @@ export async function GET(req: Request) {
 }
 
 export async function POST(req: Request) {
+  const denied = await enforceApi(req);
+  if (denied) return denied;
   if (!isConfigured()) {
     return NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; task dropped" });
   }

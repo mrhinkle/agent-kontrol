@@ -1,7 +1,7 @@
 import { gunzipSync } from "node:zlib";
 import { NextResponse } from "next/server";
+import { enforceBearer } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
-import { isAuthorized } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import { pruneSpans, upsertSpans } from "@/lib/trace-store";
 import { captureContentEnabled, dedupeSpans, MAX_BODY_BYTES, parseOtlp } from "@/lib/traces";
@@ -42,9 +42,8 @@ async function readCapped(req: Request, max: number): Promise<Buffer | null> {
  * unless MC_TRACE_CAPTURE_CONTENT is set (credentials are never kept).
  */
 export async function POST(req: Request) {
-  if (!(await isAuthorized(req))) {
-    return apiError("unauthorized");
-  }
+  const denied = await enforceBearer(req);
+  if (denied) return denied;
   const type = req.headers.get("content-type") ?? "";
   if (!type.includes("json")) {
     return apiError("unsupported_media_type", {

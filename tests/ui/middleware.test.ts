@@ -83,6 +83,20 @@ describe("middleware with a dashboard password", () => {
     assert.equal(res.status, 200);
   });
 
+  it("forwards an agent-credential bearer to API routes and still blocks pages", async () => {
+    env.MC_DASHBOARD_PASSWORD = "pw";
+    env.MC_TOKEN = "tok";
+    const headers = { authorization: "Bearer akc_example-not-a-secret" };
+    assert.equal((await middleware(req("/api/fleet", headers))).status, 200);
+    assert.equal((await middleware(req("/tasks", headers))).status, 307);
+  });
+
+  it("still 401s a non-credential bearer on API routes", async () => {
+    env.MC_DASHBOARD_PASSWORD = "pw";
+    env.MC_TOKEN = "tok";
+    assert.equal((await middleware(req("/api/fleet", { authorization: "Bearer nope" }))).status, 401);
+  });
+
   it("lets only the agent index and the three markdown docs through the gate", async () => {
     env.MC_DASHBOARD_PASSWORD = "pw";
     env.NODE_ENV = "production";

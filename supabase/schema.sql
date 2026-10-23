@@ -319,3 +319,30 @@ alter table memory add column if not exists facts_at timestamptz;
 create index if not exists memory_auto_idx on memory (updated_at) where source = 'automatic-session';
 create index if not exists events_session_idx on events (session_id, created_at);
 create index if not exists spans_session_kind_idx on spans (session_id, kind);
+
+-- Per-agent credentials. The token is shown once at creation and is not stored.
+-- token_prefix is the first 8 characters, for the settings list.
+-- token_hash is the SHA-256 hex of the full token.
+-- scopes is the allow-list enforced on MCP tools and agent REST routes.
+-- Timestamps record creation, optional expiry, revocation, and last successful use.
+-- Prompts and tool input/output are not stored in this table.
+create table if not exists agent_credentials (
+  id text primary key,
+  label text not null,
+  token_prefix text not null,
+  token_hash text not null,
+  scopes text[] not null,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz,
+  revoked_at timestamptz,
+  last_used_at timestamptz
+);
+alter table agent_credentials add column if not exists label text;
+alter table agent_credentials add column if not exists token_prefix text;
+alter table agent_credentials add column if not exists token_hash text;
+alter table agent_credentials add column if not exists scopes text[];
+alter table agent_credentials add column if not exists created_at timestamptz not null default now();
+alter table agent_credentials add column if not exists expires_at timestamptz;
+alter table agent_credentials add column if not exists revoked_at timestamptz;
+alter table agent_credentials add column if not exists last_used_at timestamptz;
+create unique index if not exists agent_credentials_token_hash_idx on agent_credentials (token_hash);

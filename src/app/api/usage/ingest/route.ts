@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
+import { enforceBearer } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
-import { isAuthorized } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import { isUndefinedTableError, USAGE_SETUP_MESSAGE } from "@/lib/usage-errors";
 import { ingestAccountSnapshot, ingestUsageFacts } from "@/lib/usage-store";
@@ -14,9 +14,8 @@ export const maxDuration = 60;
  * Dedicated endpoint — do not overload /api/ingest (liveness only).
  */
 export async function POST(req: Request) {
-  if (!(await isAuthorized(req))) {
-    return apiError("unauthorized");
-  }
+  const denied = await enforceBearer(req);
+  if (denied) return denied;
   if (!isConfigured()) {
     return NextResponse.json({
       ok: true,

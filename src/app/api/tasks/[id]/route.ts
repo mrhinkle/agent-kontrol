@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { enforceApi } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { updateTask, report } from "@/lib/store";
@@ -13,6 +14,8 @@ export const maxDuration = 30;
  * requeues. `agent_id` (optional) attributes the change in the event feed.
  */
 export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }> }) {
+  const denied = await enforceApi(req);
+  if (denied) return denied;
   if (!isConfigured()) {
     return NextResponse.json({ ok: true, demo: true });
   }

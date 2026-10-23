@@ -8,7 +8,7 @@ import { authCookieValue, secretsMatch } from "@/lib/authcrypto";
  * - MC_DASHBOARD_PASSWORD unset -> no gate in local dev and database-less demo
  *   deploys; a production build with DATABASE_URL set refuses to serve (503).
  * - Agent endpoints (/api/ingest and the MCP transport routes) are excluded
- *   here; they enforce their own MC_TOKEN bearer auth.
+ *   here; they enforce their own bearer auth (legacy MC_TOKEN or an agent credential).
  * - Data endpoints (/api/fleet, /api/memory) accept either the session
  *   cookie or the MC_TOKEN bearer header.
  */
@@ -71,6 +71,14 @@ export async function middleware(req: NextRequest) {
     bearer?.startsWith("Bearer ") &&
     (await secretsMatch(bearer.slice(7), process.env.MC_TOKEN))
   ) {
+    return NextResponse.next();
+  }
+
+  // An agent credential (`akc_…`) is checked in the Node route. Middleware
+  // runs on the edge and cannot open Postgres. Forwarding is not a grant.
+  // Pages still require the dashboard session.
+  const agentToken = bearer?.match(/^Bearer\s+(akc_\S+)/i)?.[1];
+  if (agentToken && pathname.startsWith("/api/")) {
     return NextResponse.next();
   }
 

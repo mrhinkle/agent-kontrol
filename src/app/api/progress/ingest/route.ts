@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
+import { enforceBearer } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
-import { isAuthorized } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import { ingestSnapshots, type IngestInput } from "@/lib/progress-store";
 
@@ -26,9 +26,8 @@ export const maxDuration = 30;
  * }
  */
 export async function POST(req: Request) {
-  if (!(await isAuthorized(req))) {
-    return apiError("unauthorized");
-  }
+  const denied = await enforceBearer(req);
+  if (denied) return denied;
   if (!isConfigured()) {
     return NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; snapshot dropped" });
   }

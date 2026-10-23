@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { enforceApi } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { demoSpans, demoSummary } from "@/lib/demo-traces";
@@ -11,6 +12,8 @@ export const dynamic = "force-dynamic";
  * Trace summaries, newest first. Auth is enforced by middleware.
  */
 export async function GET(req: Request) {
+  const denied = await enforceApi(req);
+  if (denied) return denied;
   const url = new URL(req.url);
   if (!isConfigured()) {
     return NextResponse.json({ demo: true, traces: [demoSummary(demoSpans())] });

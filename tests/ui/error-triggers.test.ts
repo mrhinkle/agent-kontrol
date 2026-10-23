@@ -50,6 +50,18 @@ process.env.MC_DB_DRIVER = "pg";
 process.env.MC_TOKEN = TOKEN;
 process.env.MC_DASHBOARD_PASSWORD = DASHBOARD;
 
+
+// Route handlers now enforce auth themselves (#40). These tests exercise error
+// shapes, not auth, so requests carry the test token unless they set their own.
+const NativeRequest = globalThis.Request;
+globalThis.Request = class extends NativeRequest {
+  constructor(input: RequestInfo | URL, init?: RequestInit) {
+    const headers = new Headers(init?.headers);
+    if (!headers.has("authorization") && !String(input).includes("/api/mcp")) headers.set("authorization", `Bearer ${process.env.MC_TOKEN}`);
+    super(input, { ...init, headers });
+  }
+} as typeof Request;
+
 (globalThis as unknown as { __mcPgPool?: { query: (text: string) => Promise<{ rows: Record<string, unknown>[] }>; on: () => void } }).__mcPgPool = {
   on() {},
   async query(text: string) {
@@ -212,6 +224,7 @@ beforeEach(() => {
 });
 
 after(() => {
+  globalThis.Request = NativeRequest;
   if (saved.db === undefined) delete process.env.DATABASE_URL;
   else process.env.DATABASE_URL = saved.db;
   if (saved.driver === undefined) delete process.env.MC_DB_DRIVER;

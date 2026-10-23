@@ -39,6 +39,18 @@ const saved = {
   password: process.env.MC_DASHBOARD_PASSWORD,
 };
 
+
+// Route handlers now enforce auth themselves (#40). These tests exercise error
+// shapes, not auth, so requests carry the test token unless they set their own.
+const NativeRequest = globalThis.Request;
+globalThis.Request = class extends NativeRequest {
+  constructor(input: RequestInfo | URL, init?: RequestInit) {
+    const headers = new Headers(init?.headers);
+    if (!headers.has("authorization")) headers.set("authorization", `Bearer ${process.env.MC_TOKEN}`);
+    super(input, { ...init, headers });
+  }
+} as typeof Request;
+
 let putRepos: (req: Request) => Promise<Response>;
 let postTraces: (req: Request) => Promise<Response>;
 let postLogin: (req: Request) => Promise<Response>;
@@ -53,6 +65,7 @@ before(async () => {
 });
 
 after(() => {
+  globalThis.Request = NativeRequest;
   if (saved.token === undefined) delete process.env.MC_TOKEN;
   else process.env.MC_TOKEN = saved.token;
   if (saved.db === undefined) delete process.env.DATABASE_URL;
