@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `npm run test:mcp` starts the app in demo mode and drives `/api/mcp` with the official MCP client (`@modelcontextprotocol/sdk` 1.32.1). An unauthenticated call must be `401` with `WWW-Authenticate`, and `tools/list` must be the 11 documented tools plus the `reply_to_mark` alias. CI runs this check. Demo mode does not store tool writes.
+
 - REST and MCP errors include `code`, `fix`, and `retryable` next to the existing `error` string (`src/lib/api-error.ts`). A 500 logs the exception and returns `internal_error` with a generic message. `PUT /api/settings/repos` keeps `errors` and `code: "stale"`. Docs: `docs/API.md`, `docs/MCP.md`.
 - Public agent index at `GET /llms.txt` (`text/plain`) and the MCP, API and agent guides as Markdown at `GET /docs/mcp.md`, `/docs/api.md` and `/docs/agents.md`. No dashboard session. The route returns 404 for any other name. With the dashboard password set, those other names stay behind the gate with the rest of the dashboard, and data routes are unchanged.
 - Traces: step-by-step spans for agent sessions. `POST /api/v1/traces` accepts OTLP/HTTP JSON from any OpenTelemetry exporter, `/traces` shows a waterfall, and the Claude Code hook emits session, turn and tool spans (register the new `PreToolUse` and `PostToolUse` hooks). Prompt and tool content is not stored unless `MC_TRACE_CAPTURE_CONTENT=1`; spans are pruned after `MC_TRACE_RETENTION_DAYS` (default 30). Docs: `docs/TELEMETRY.md`.
