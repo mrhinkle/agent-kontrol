@@ -21,6 +21,8 @@ export const maxDuration = 60;
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
 const WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false } as const;
 const WRITE_IDEMPOTENT = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
+/** Overwrites existing state (a keyed note, a task's status and result) and appends an event, so not idempotent. */
+const WRITE_DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false } as const;
 
 /** Caught tool failures become an isError result. The text is the JSON error body, never the exception. */
 async function guardTool(label: string, run: () => Promise<McpToolResult>): Promise<McpToolResult> {
@@ -148,7 +150,7 @@ const handler = createMcpHandler(
       "remember",
       {
         title: "Remember",
-        annotations: WRITE,
+        annotations: WRITE_DESTRUCTIVE,
         description:
           "Write a note to Agent Kontrol shared memory so other agents (and future sessions) can see it. Use for decisions, handoffs, and 'don't duplicate this' coordination notes.",
         inputSchema: {
@@ -415,7 +417,7 @@ const handler = createMcpHandler(
       "update_task",
       {
         title: "Update task",
-        annotations: WRITE_IDEMPOTENT,
+        annotations: WRITE_DESTRUCTIVE,
         description:
           "Update a task you're working on: mark it running, done, or failed, and attach a result summary (and cost if known).",
         inputSchema: {
