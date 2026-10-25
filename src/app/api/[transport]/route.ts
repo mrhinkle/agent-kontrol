@@ -1,6 +1,6 @@
 import { createMcpHandler, withMcpAuth } from "mcp-handler";
 import { z } from "zod";
-import { memoryKeyError, toolResultFromCaught, type McpToolResult } from "@/lib/api-error";
+import { apiError, memoryKeyError, toolResultFromCaught, type McpToolResult } from "@/lib/api-error";
 import { secretsMatch, verifyAccessToken } from "@/lib/authcrypto";
 import { resolveAgentCredential } from "@/lib/credentials";
 import { isConfigured } from "@/lib/db";
@@ -489,8 +489,11 @@ function scopeDenied(body: { error: string; code: string; fix: string; retryable
 }
 
 /**
- * tools/call is checked here, before the tool runs. A body we cannot parse
- * is denied. initialize and the other non-tool methods are left to the handler.
+ * tools/call is checked here, before the tool runs. An empty body or a body
+ * that is not JSON is HTTP 400 invalid_json, so mcp-handler never sees a
+ * SyntaxError from req.json(). A JSON body that is not a tool call is left
+ * to the handler. Auth still runs first: a missing bearer is 401 with
+ * WWW-Authenticate and never reaches this function.
  */
 async function enforceMcpScope(req: Request): Promise<Response | null> {
   if (req.method !== "POST") return null;
@@ -498,19 +501,13 @@ async function enforceMcpScope(req: Request): Promise<Response | null> {
   try {
     text = await req.clone().text();
   } catch {
-    return scopeDenied(insufficientScopeBody(null));
+    return apiError("invalid_json");
   }
-  if (!text.trim()) return null;
-  const contentType = req.headers.get("content-type") ?? "";
-  const trimmed = text.trim();
-  const looksJson =
-    contentType.includes("json") || trimmed.startsWith("{") || trimmed.startsWith("[");
-  if (!looksJson) return null;
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    return scopeDenied(insufficientScopeBody(null));
+    return apiError("invalid_json");
   }
   const decision = evaluateMcpMessages(principalFromMcpAuth(req.auth), parsed);
   if (decision.ok) return null;
