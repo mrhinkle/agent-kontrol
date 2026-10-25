@@ -89,8 +89,11 @@ if [[ ${#OVERRIDE_REPOS[@]} -gt 0 ]]; then
   REPOS_JSON="$(printf '%s\n' "${OVERRIDE_REPOS[@]}" | jq -R . | jq -s 'map({repo:., label:(split("/")[1]), short:(split("/")[1]), blockedLabel:null})')"
   REPO_SOURCE="flags"
 elif [[ "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_TOKEN:-}" ]]; then
+  # A reachable dashboard is authoritative, including when its list is empty:
+  # an operator who cleared Settings meant it. Only an unreachable or malformed
+  # response falls back to the local file.
   if body="$(curl -fsS -m 20 -H "Authorization: Bearer $MC_TOKEN" "${MC_URL%/}/api/settings/repos" 2>/dev/null)" \
-     && echo "$body" | jq -e '.repos|length>0' >/dev/null 2>&1; then
+     && echo "$body" | jq -e '.repos|type=="array"' >/dev/null 2>&1; then
     REPOS_JSON="$(echo "$body" | jq -c '[.repos[] | {repo, label, short, blockedLabel}]')"
     REPO_SOURCE="dashboard"
   fi
@@ -114,6 +117,28 @@ gh_retry() {
   fi
 }
 
+# fetch <limit> <cmd...> — runs a gh list command, records a failure or a
+# truncated page in REPO_ERRORS instead of returning a comforting empty list.
+# A brief with a hole says so and exits 2; it never prints a zero it did not measure.
+# fetch is called inside $(...), so it records errors in a file, not a shell array.
+ERR_FILE="$(mktemp -t morning-brief-errors)"
+trap 'rm -f "$ERR_FILE"' EXIT
+fetch() {
+  local limit="$1"; shift
+  local out what
+  what="$(printf '%s' "$*" | sed -E 's/ --json.*//; s/^gh //')"
+  if ! out="$(gh_retry "$@")"; then
+    printf '%s failed\n' "$what" >>"$ERR_FILE"; printf '[]'; return 0
+  fi
+  if ! jq -e 'type=="array"' >/dev/null 2>&1 <<<"$out"; then
+    printf '%s returned non-JSON\n' "$what" >>"$ERR_FILE"; printf '[]'; return 0
+  fi
+  if [[ "$(jq 'length' <<<"$out")" -ge "$limit" ]]; then
+    printf '%s truncated at %s\n' "$what" "$limit" >>"$ERR_FILE"
+  fi
+  printf '%s' "$out"
+}
+
 hours_between() { # iso_a iso_b -> hours (float), b-a
   jq -n --arg a "$1" --arg b "$2" 'def ts: sub("\\.[0-9]+(?=Z$)"; "") | fromdateiso8601; (($b|ts) - ($a|ts)) / 3600'
 }
@@ -126,23 +151,26 @@ while IFS= read -r entry; do
   short="$(echo "$entry" | jq -r .short)"
   blocked_label="$(echo "$entry" | jq -r '.blockedLabel // empty')"
 
-  merged="$(gh_retry gh pr list -R "$repo" --state merged --search "merged:>=$SINCE" --limit 200 \
-             --json number,title,createdAt,mergedAt,author,url || echo '[]')"
-  opened_n="$(gh_retry gh issue list -R "$repo" --state all --search "created:>=$SINCE" --limit 500 --json number -q length || echo 0)"
-  closed_n="$(gh_retry gh issue list -R "$repo" --state closed --search "closed:>=$SINCE" --limit 500 --json number -q length || echo 0)"
+  : >"$ERR_FILE"
+  merged="$(fetch 500 gh pr list -R "$repo" --state merged --search "merged:>=$SINCE" --limit 500 \
+             --json number,title,createdAt,mergedAt,author,url)"
+  opened="$(fetch 1000 gh issue list -R "$repo" --state all --search "created:>=$SINCE" --limit 1000 --json number)"
+  closed="$(fetch 1000 gh issue list -R "$repo" --state closed --search "closed:>=$SINCE" --limit 1000 --json number)"
+  opened_n="$(jq 'length' <<<"$opened")"; closed_n="$(jq 'length' <<<"$closed")"
 
   # One GraphQL list covers open count, stale, blocked and decision labels.
-  open_issues="$(gh_retry gh issue list -R "$repo" --state open --limit 1000 \
-                  --json number,title,createdAt,updatedAt,labels,url || echo '[]')"
-  open_prs="$(gh_retry gh pr list -R "$repo" --state open --limit 100 \
-               --json number,title,createdAt,updatedAt,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,url,author || echo '[]')"
+  open_issues="$(fetch 2000 gh issue list -R "$repo" --state open --limit 2000 \
+                  --json number,title,createdAt,updatedAt,labels,url)"
+  open_prs="$(fetch 500 gh pr list -R "$repo" --state open --limit 500 \
+               --json number,title,createdAt,updatedAt,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,url,author)"
+  errors_json="$(jq -R . <"$ERR_FILE" | jq -s -c 'map(select(length>0))')"
 
   one="$(jq -n \
     --arg repo "$repo" --arg label "$label" --arg short "$short" --arg blocked "$blocked_label" \
     --arg since "$SINCE" --arg now "$NOW_ISO" --arg stale_before "$STALE_BEFORE" \
     --argjson stuck_h "$STUCK_PR_HOURS" --argjson decision_labels "$DECISION_LABELS_JSON" \
     --argjson merged "$merged" --argjson opened "$opened_n" --argjson closed "$closed_n" \
-    --argjson issues "$open_issues" --argjson prs "$open_prs" '
+    --argjson issues "$open_issues" --argjson prs "$open_prs" --argjson errors "$errors_json" '
     def ts: sub("\\.[0-9]+(?=Z$)"; "") | fromdateiso8601;
     def hours(a; b): ((b|ts) - (a|ts)) / 3600;
     def median: if length == 0 then null else (sort | if length % 2 == 1 then .[length/2|floor] else (.[length/2-1] + .[length/2]) / 2 end) end;
@@ -152,9 +180,10 @@ while IFS= read -r entry; do
 
     ($issues | map(select(.labels | any(.name == $blocked and $blocked != "")))) as $blocked_issues
     | ($issues | map(select(.updatedAt < $stale_before))) as $stale
-    | ($issues | map(select(.labels | any(.name as $n | $decision_labels | index($n))))
+    | def is_decision_label($n): $decision_labels | any(. as $p | ($p == $n) or (($p|endswith("*")) and ($n|startswith($p[:-1]))));
+    ($issues | map(select(.labels | any(is_decision_label(.name))))
         | map({repo: $short, number, title, url, age_days: (hours(.createdAt; $now) / 24 | floor),
-               labels: [.labels[].name | select(. as $n | $decision_labels | index($n))]})) as $decisions
+               labels: [.labels[].name | select(is_decision_label(.))]})) as $decisions
     | ($prs | map(. + {age_h: hours(.createdAt; $now),
                        idle_h: hours(.updatedAt; $now),
                        failing: [ (.statusCheckRollup // [])[] | select(bad_check) | check_name ] | unique,
@@ -173,6 +202,7 @@ while IFS= read -r entry; do
               | sort_by(-.age_days)) as $stuck
     | {
         repo: $repo, label: $label, short: $short,
+        incomplete: (($errors|length) > 0), errors: $errors,
         merged_prs: ($merged|length),
         median_lead_hours: ([$merged[] | hours(.createdAt; .mergedAt)] | median),
         issues_opened: $opened, issues_closed: $closed, net_backlog: ($opened - $closed),
@@ -198,7 +228,7 @@ if [[ -n "$COORD_ID" && "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_T
     coordinator="$(jq -c --arg id "$COORD_ID" --arg now "$NOW_ISO" --argjson max_h "$COORD_MAX_H" --arg kinds "$COORD_WORK_KINDS" '
       def ts: sub("\\.[0-9]+(?=Z$)"; "") | fromdateiso8601;
     def hours(a; b): ((b|ts) - (a|ts)) / 3600;
-      (.agents[] | select(.id == $id)) as $a
+      ((.agents // []) | map(select(.id == $id)) | .[0]) as $a
       | ([.events[] | select(.agent_id == $id)] | sort_by(.created_at) | reverse) as $ev
       | ($ev | map(select(.kind | test($kinds))) | .[0]) as $work
       | ($ev | .[0]) as $any
@@ -231,22 +261,25 @@ brief="$(jq -n --arg at "$NOW_ISO" --argjson window "$WINDOW_H" --arg repo_sourc
     generated_at: $at, window_hours: $window, repo_source: $repo_source,
     thresholds: {stuck_pr_hours: $stuck_h, stale_issue_days: $stale_d},
     coordinator: $coordinator,
-    totals: {
-      merged_prs: ([$repos[].merged_prs] | add // 0),
-      issues_opened: ([$repos[].issues_opened] | add // 0),
-      issues_closed: ([$repos[].issues_closed] | add // 0),
-      net_backlog: ([$repos[].net_backlog] | add // 0),
-      stuck_prs: ([$repos[].stuck_prs | length] | add // 0),
-      decisions: ([$repos[].decisions | length] | add // 0)
-    },
+    incomplete_repos: [$repos[] | select(.incomplete) | {repo, errors}],
+    totals: ([$repos[] | select(.incomplete | not)] as $ok | {
+      merged_prs: ([$ok[].merged_prs] | add // 0),
+      issues_opened: ([$ok[].issues_opened] | add // 0),
+      issues_closed: ([$ok[].issues_closed] | add // 0),
+      net_backlog: ([$ok[].net_backlog] | add // 0),
+      stuck_prs: ([$ok[].stuck_prs | length] | add // 0),
+      decisions: ([$ok[].decisions | length] | add // 0),
+      repos_counted: ($ok|length), repos_total: ($repos|length)
+    }),
     repos: $repos,
     stuck_prs: ([$repos[].stuck_prs[]] | sort_by(-.age_days)),
     decisions: ([$repos[].decisions[]] | sort_by(-.age_days))
   }')"
 
+n_incomplete="$(jq '.incomplete_repos|length' <<<"$brief")"
 if [[ "$AS_JSON" -eq 1 ]]; then
   jq . <<<"$brief"
-  exit 0
+  [[ "$n_incomplete" -eq 0 ]] && exit 0 || exit 2
 fi
 
 # ---------------------------------------------------------------------- text
@@ -262,6 +295,12 @@ t_net="$(jq -r .totals.net_backlog <<<"$brief")"
 if   [[ "$t_net" -gt 0 ]]; then verdict="the queue grew by $t_net"
 elif [[ "$t_net" -lt 0 ]]; then verdict="the queue shrank by ${t_net#-}"
 else verdict="the queue held level"; fi
+rc="$(jq -r .totals.repos_counted <<<"$brief")"; rt="$(jq -r .totals.repos_total <<<"$brief")"
+if [[ "$n_incomplete" -gt 0 ]]; then
+  echo "!! DATA INCOMPLETE for $n_incomplete of $rt repos; totals below cover $rc repos only."
+  jq -r '.incomplete_repos[] | "   \(.repo): \(.errors | join("; "))"' <<<"$brief"
+  echo
+fi
 echo "$t_merged PRs merged, $t_closed issues closed, $t_opened opened — $verdict."
 echo
 
@@ -276,7 +315,7 @@ if [[ "$coord_conf" == "true" ]]; then
 fi
 
 printf '%-14s %7s %9s %6s %6s %6s %6s %8s\n' "REPO" "merged" "issues±" "net" "open" "stale" "stuck" "lead-med"
-jq -r '.repos[] | [ .label, .merged_prs, ("+\(.issues_opened)/-\(.issues_closed)"),
+jq -r '.repos[] | [ (if .incomplete then "!! " + .label else .label end), .merged_prs, ("+\(.issues_opened)/-\(.issues_closed)"),
                    (if .net_backlog > 0 then "+\(.net_backlog)" else (.net_backlog|tostring) end),
                    .open_issues,
                    (if .stale_ratio == null then "-" else "\(.stale_ratio * 100 | floor)%" end),
@@ -309,3 +348,5 @@ fi
 echo
 
 jq -r '.repos[] | select(.merged_prs > 0) | "SHIPPED — \(.label):", (.merged_list[] | "  #\(.number)  \(.title[0:80])  (\(.author), \(.lead_hours*10|floor/10)h)")' <<<"$brief"
+
+[[ "$n_incomplete" -eq 0 ]] && exit 0 || exit 2
