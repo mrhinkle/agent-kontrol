@@ -129,7 +129,7 @@ report truthfully when it cannot.
   the repo's preflight before it is opened.
 - Every acceptance criterion in the spec is addressed or explicitly listed as not done.
 - The commit carries the vendor identity (`Agent-Vendor:` trailer, or a per-vendor lane-bot
-  identity the repo registers) so the Reviewer, the Dispatcher's gate and the ledger resolve
+  identity registered in the operator's fleet configuration, outside the repo) so the Reviewer, the Dispatcher's gate and the ledger resolve
   who built it (see "Provenance has one reading").
 
 **Inputs.** One claimed issue with a spec. A fresh git worktree on its own branch. The repo's
@@ -186,7 +186,8 @@ work it produced.
 Read-only access to the code.
 
 **Output.** A structured review-evidence comment the gate can read: a header naming the exact
-head SHA reviewed, one line per required lens stating `cleared` or a finding, the findings
+head SHA reviewed, the reviewer's vendor and model tier (`tier: top|mid`), one line per required
+lens stating `cleared` or a finding, the findings
 with file and line, and a final line that is exactly `VERDICT: APPROVE` or
 `VERDICT: REQUEST_CHANGES`. A comment missing any required lens line is not evidence, whatever
 its verdict says. On Tier C, an adversarial pass that tries to break the change, not just read
@@ -262,7 +263,8 @@ comment carries a `cleared`-or-finding line for every lens the repo requires at 
 `VERDICT: APPROVE` (a `REQUEST_CHANGES`, a missing verdict, or a verdict for another SHA is not
 evidence); the comment's author resolves to a different vendor from the PR's author, both read
 as "Provenance has one reading" defines (trailer or registered lane-bot identity); and for
-Tier C, two such comments from two different vendors. Update a stale
+Tier C, two such comments from two different vendors, at least one of which declares
+`tier: top` (a missing tier line is a missing field, and the comment is not evidence). Update a stale
 branch from its base. Remove stale claims past their TTL. Alert the owner on the channel
 configured for the brief when a VELOCITY.md threshold is crossed (once, then every 12 hours
 while it holds).
