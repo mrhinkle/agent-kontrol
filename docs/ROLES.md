@@ -11,11 +11,11 @@ Three rules before the cards:
   contract; the Owner role is held by a person. Agent Kontrol routes by task class; the contract is identical wherever it runs.
 - **Whoever wrote it does not review it.** The Implementer and the Reviewer on one unit of work
   are different vendors, and so are the Spec Writer and the agent that scores its spec. A fleet
-  with a single vendor has no agent that may review, so it has no agent review path and no
-  Dispatcher merge path: a human performs the review (the same lenses, the same verdict line,
-  posted as evidence under the human's identity) and a human merges. Same-vendor agent output,
-  sequential or not, fresh context or not, is never review evidence and never a basis for a
-  merge. The Dispatcher's merge gate below does not relax for a single-vendor fleet.
+  with a single vendor has no agent that may review. Its reviewer is a human, registered in the
+  operator's registry as a vendor of its own (vendor `human`, tier `top`), who posts the same
+  structured evidence comment with the same lenses and verdict line. The Dispatcher's merge gate
+  then applies unchanged: the human's identity is the different vendor it requires. Same-vendor
+  agent output, sequential or not, fresh context or not, is never review evidence.
 - **Provenance has one reading, and the registry is not in any lane.** The PR author's vendor
   is the `Agent-Vendor:` trailer on the PR's commits; where a repo commits through a per-vendor
   lane-bot identity instead, the gate reads the vendor from the bot's registered identity (one
@@ -24,7 +24,10 @@ Three rules before the cards:
   and is excluded from every lane's file scope; an Implementer cannot add or change an entry.
   A commit whose trailer names a vendor that does not match its author's registered identity
   is a provenance failure, not a different vendor. Both forms resolve to a vendor name; a
-  commit with neither has no vendor and does not merge.
+  commit with neither has no vendor and does not merge. The same registry entry carries each
+  reviewer identity's **model tier** (`top` or `mid`), set by the operator when the identity is
+  registered. The gate reads tier from the registry, never from anything the reviewer writes;
+  a comment may state a tier, and the registry wins when they differ.
 - **Numbers, not adjectives.** Every latency and depth in these cards is a number the brief
   reports and a breach it names: review verdict within 4 hours (Tier A/B) or 12 hours (Tier C)
   of green-at-head; a lane older than 48 hours is stuck; dispatch-ready depth capped at 10 per
@@ -186,7 +189,8 @@ work it produced.
 Read-only access to the code.
 
 **Output.** A structured review-evidence comment the gate can read: a header naming the exact
-head SHA reviewed, the reviewer's vendor and model tier (`tier: top|mid`), one line per required
+head SHA reviewed, the reviewer's registered identity (from which the gate resolves vendor and
+tier; anything the comment says about its own tier is informational), one line per required
 lens stating `cleared` or a finding, the findings
 with file and line, and a final line that is exactly `VERDICT: APPROVE` or
 `VERDICT: REQUEST_CHANGES`. A comment missing any required lens line is not evidence, whatever
@@ -263,8 +267,9 @@ comment carries a `cleared`-or-finding line for every lens the repo requires at 
 `VERDICT: APPROVE` (a `REQUEST_CHANGES`, a missing verdict, or a verdict for another SHA is not
 evidence); the comment's author resolves to a different vendor from the PR's author, both read
 as "Provenance has one reading" defines (trailer or registered lane-bot identity); and for
-Tier C, two such comments from two different vendors, at least one of which declares
-`tier: top` (a missing tier line is a missing field, and the comment is not evidence). Update a stale
+Tier C, two such comments from two different vendors, at least one from an identity whose
+registry tier is `top` (resolved from the operator's registry by the comment author's identity,
+never from text in the comment). Update a stale
 branch from its base. Remove stale claims past their TTL. Alert the owner on the channel
 configured for the brief when a VELOCITY.md threshold is crossed (once, then every 12 hours
 while it holds).
