@@ -46,6 +46,9 @@ export interface Message {
   agent_id: string;
   body: string;
   created_by: string | null;
+  /** Set by the server from the authenticated credential. Null on older rows. */
+  actor_type: "human" | "agent" | null;
+  actor_id: string | null;
   created_at: string;
   delivered_at: string | null;
   acked_at: string | null;
@@ -79,6 +82,9 @@ export interface Task {
   result: string | null;
   cost_usd: number | null;
   created_by: string | null;
+  /** Set by the server from the authenticated credential. Null on older rows. */
+  actor_type: "human" | "agent" | null;
+  actor_id: string | null;
   created_at: string;
   claimed_at: string | null;
   updated_at: string;
