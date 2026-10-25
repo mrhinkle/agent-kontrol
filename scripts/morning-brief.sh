@@ -237,9 +237,10 @@ if [[ -n "$COORD_ID" && "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_T
     def hours(a; b): ((b|ts) - (a|ts)) / 3600;
       ((.agents // []) | map(select(.id == $id)) | .[0]) as $a
       | ([.events[] | select(.agent_id == $id)] | sort_by(.created_at) | reverse) as $ev
-      | ($ev | map(select(.kind | test($kinds))) | .[0]) as $work
+      | ("^(" + $kinds + ")$") as $kinds_re
+      | ($ev | map(select(.kind | test($kinds_re))) | .[0]) as $work
       | ($ev | map(select(hours(.created_at; $now) <= $max_h)) ) as $recent
-      | ($recent | map(select(.kind | test($kinds))) | .[0]) as $recent_work
+      | ($recent | map(select(.kind | test($kinds_re))) | .[0]) as $recent_work
       | ($recent | map(select(.kind == "error")) | length) as $recent_errors
       | ($ev | .[0]) as $any
       | {configured: true, agent_id: $id,

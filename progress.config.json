@@ -29,8 +29,7 @@
   "brief": {
     "decisionLabels": [
       "needs-owner",
-      "owner-gate-tierc",
-      "owner-gate-schema",
+      "owner-gate-*",
       "decision"
     ],
     "stuckPrHours": 48,
