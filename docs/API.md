@@ -42,6 +42,7 @@ If `MC_DASHBOARD_PASSWORD` is unset, the gate is open in local development and o
 | GET | `/api/fleet` | Cookie or bearer | Everything the dashboard needs in one call |
 | POST | `/api/ingest` | Bearer | Deterministic telemetry from hooks, watchers, and daemons |
 | GET | `/api/memory` | Cookie or bearer | Memory browser feed |
+| POST | `/api/memory` | Cookie or bearer | Store a note, or preview an overwrite with `dry_run` |
 | GET | `/api/messages` | Cookie or bearer | Agent pulls its inbound inbox, or the full conversation |
 | POST | `/api/messages` | Cookie or bearer | Operator enqueues an inbound message |
 | PATCH | `/api/messages` | Cookie or bearer | Operator marks outbound replies read |
@@ -108,6 +109,8 @@ Invalid JSON answers `400`.
 
 `GET /api/memory?query=&tag=&limit=` is the memory browser feed. Default limit is 50.
 
+`POST /api/memory` stores a note the same way MCP `remember` does. Body: `content` (required string), optional `key`, `tags` (array of strings), `agent_id`, and `dry_run`. `dry_run: true` returns `{ "dry_run": true, "applied": false, "would_write", "action": "overwrite_memory" | "insert_memory", "changes", "affected" }` and writes nothing. `action` is `overwrite_memory` when the key already exists. A non-boolean `dry_run` is `400` and writes nothing. With no database, a dry run still describes the note and sets `would_write` to false. An agent credential needs `memory:write`.
+
 ### Messages
 
 - `GET /api/messages?agent_id=X&ack=true` — the agent pulls its inbound inbox; `ack` marks the messages read.
@@ -137,7 +140,7 @@ Task statuses: `queued`, `claimed`, `running`, `review`, `done`, `failed`, `canc
 | `actor_id` | string | — | Response only. Credential id, `mc-token`, the OAuth client id, or `operator` for a signed-in dashboard session. Null in the same cases as `actor_type`. |
 
 - `POST /api/tasks/claim` — body `{platform, machine?, agent_id}`. `platform` and `agent_id` are required; the request answers `400` otherwise. The claim is atomic: it returns the next queued task routed to the given platform (or to `any`), or `{task: null}` when there is none.
-- `PATCH /api/tasks/:id` — body `{status?, result?, cost_usd?, session_id?, assigned_agent?, agent_id?}`. Dispatchers use it to report progress and completion; the dashboard uses it to cancel or requeue tasks.
+- `PATCH /api/tasks/:id` — body `{status?, result?, cost_usd?, session_id?, assigned_agent?, agent_id?, dry_run?}`. Dispatchers use it to report progress and completion; the dashboard uses it to cancel or requeue tasks. `dry_run: true` returns the affected task and the field diff (`action` is `cancel_task` when status is `cancelled`) and does not update the row or write an activity event. A missing id is still `404`. A non-boolean `dry_run` is `400` and writes nothing.
 
 ### Progress
 
@@ -173,7 +176,7 @@ Each entry in `repos`:
 ### Settings
 
 - `GET /api/settings/repos` returns `{ "source": "database" | "file", "writable": true, "max": 25, "version": "...", "repos": [{ "repo", "label", "short", "color", "blockedLabel" }] }`. `source` is `file` when no list has been saved yet, or when there is no database; `repos` is then the default from `progress.config.json`. The collector calls this on every tick.
-- `PUT /api/settings/repos` with `{ "repos": [...], "version": "..." }` replaces the whole list, in order, and returns the stored list in the same shape. `version` is optional; send the one from your last GET and the save is refused with `409 { "code": "stale" }` if someone changed the list since, so two open tabs cannot overwrite each other. The replace is a single SQL statement, so a failed save leaves the old list intact. It answers `400` with `errors: [{ "index", "field", "message" }]` when invalid (`index` is `-1` for an error about the whole list), and `409` with `code` `conflict` when no database is connected. Those bodies also include `error` (a string), `fix`, `retryable`, and `fields`. The `errors` array and `code: "stale"` stay. A list needs 1 to 25 repos, each `owner/name`, with a unique short name and a `#rrggbb` color.
+- `PUT /api/settings/repos` with `{ "repos": [...], "version": "...", "dry_run": true }` replaces the whole list, in order, and returns the stored list in the same shape. `version` is optional; send the one from your last GET and the save is refused with `409 { "code": "stale" }` if someone changed the list since, so two open tabs cannot overwrite each other. The replace is a single SQL statement, so a failed save leaves the old list intact. It answers `400` with `errors: [{ "index", "field", "message" }]` when invalid (`index` is `-1` for an error about the whole list), and `409` with `code` `conflict` when no database is connected. Those bodies also include `error` (a string), `fix`, `retryable`, and `fields`. The `errors` array and `code: "stale"` stay. A list needs 1 to 25 repos, each `owner/name`, with a unique short name and a `#rrggbb` color. `dry_run: true` returns the diff against the list GET would show (`changes` for adds, removes, updates, and reorders) and writes nothing. A stale `version` is still `409`. With no database, a dry run returns that diff with `would_write: false` instead of `409`. A non-boolean `dry_run` is `400` and writes nothing.
 
 Anyone with a dashboard session or `MC_TOKEN` can change this list, which matches the rest of the trust model (see [SECURITY.md](../SECURITY.md)). An agent credential cannot.
 
