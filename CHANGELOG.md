@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `docs/ROLES.md`: job descriptions for the four fleet roles (Spec Writer, Implementer, Reviewer, Dispatcher) and the Owner. Each card states mission, accountabilities, inputs, output artifact, may/never, quality bar, cadence and cost shape, the brief signals that show it working or failing, a dated failure seen in this fleet, and the Gibson playbook it maps to. Non-normative: binding rules stay in each repo's `AGENTS.md`.
+- Velocity layer, part 1: `scripts/morning-brief.sh` prints one screen a day — PRs merged, issues opened/closed and net backlog per repo, median open-to-merge lead time, stale-issue share, every stuck PR with its age and the check or conflict it is stuck on, the decisions waiting on the owner (issues carrying a configured label, oldest first), and whether the coordinator is working or only posting telemetry (a work event within `brief.coordinator.maxSilenceHours`, never a heartbeat). Repos come from the dashboard's Settings list when `MC_URL`/`MC_TOKEN` are set, else `progress.config.json`. `--json` emits the same facts for `/api/brief`. New `decisions` table (`supabase/migrations/20261025_decisions.sql`) and `brief` block in `progress.config.json`. Spec and rollout order: `docs/VELOCITY.md`.
 
 ### Fixed
 
