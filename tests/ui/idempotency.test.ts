@@ -1,0 +1,492 @@
+import { describe, it, before, beforeEach, afterEach, after } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { authCookieValue } from "../../src/lib/authcrypto";
+import { createCredential, resetCredentialsForTests } from "../../src/lib/credentials";
+import { setSqlForTests, type Row } from "../../src/lib/db";
+import {
+  hashPayload,
+  IdempotencyConflict,
+  IdempotencyKeyInvalid,
+  runIdempotent,
+  setIdempotencyClockForTests,
+} from "../../src/lib/idempotency";
+import { createTask, enqueueMessage, replyFromAgent } from "../../src/lib/store";
+
+/**
+ * Same idempotency key and same arguments return the original row.
+ * Same key and different arguments conflict. Keys expire after 24 hours.
+ * The key comes from the caller. The actor comes from the credential.
+ */
+
+const env = process.env as Record<string, string | undefined>;
+const TOKEN = "idem-test-token";
+const PASSWORD = "idem-dashboard";
+const FIXTURE_URL = "postgres://test:test@127.0.0.1:5432/ak_idem";
+
+const saved = {
+  db: env.DATABASE_URL,
+  driver: env.MC_DB_DRIVER,
+  token: env.MC_TOKEN,
+  password: env.MC_DASHBOARD_PASSWORD,
+  node: env.NODE_ENV,
+};
+
+type Route = (req: Request) => Promise<Response>;
+type Handle = { unref?: () => void };
+type IdemRow = {
+  scope: string;
+  idempotency_key: string;
+  request_hash: string;
+  response: unknown;
+  expires_at: string;
+};
+
+let postTasks: Route;
+let postMessages: Route;
+let postReply: Route;
+let mcpPost: Route;
+
+const creds: Row[] = [];
+const inserts: { table: string; row: Row }[] = [];
+const idem = new Map<string, IdemRow>();
+let seq = 1;
+
+function columnsOf(text: string): string[] {
+  const match = text.match(/insert into [a-z_]+ \(([^)]+)\)/i);
+  if (!match) return [];
+  return match[1].split(",").map((part) => part.trim()).filter(Boolean);
+}
+
+function rowFrom(strings: TemplateStringsArray, values: unknown[]): Row {
+  let text = strings[0] ?? "";
+  for (let i = 0; i < values.length; i++) text += `$${i + 1}${strings[i + 1] ?? ""}`;
+  const flat = text.replace(/\s+/g, " ");
+  const cols = columnsOf(flat);
+  const slots = (flat.match(/values \(([^)]*)\)/i)?.[1] ?? "").split(",").map((part) => part.trim());
+  const row: Row = {};
+  cols.forEach((col, i) => {
+    const slot = slots[i] ?? "";
+    const ref = /^\$(\d+)$/.exec(slot);
+    if (ref) row[col] = values[Number(ref[1]) - 1];
+    else if (slot.startsWith("'") && slot.endsWith("'")) row[col] = slot.slice(1, -1);
+    else row[col] = null;
+  });
+  return row;
+}
+
+function tableOf(text: string): string {
+  return text.match(/insert into ([a-z_]+)/i)?.[1] ?? "";
+}
+
+function idemId(scope: string, key: string): string {
+  return `${scope}\0${key}`;
+}
+
+function installFake() {
+  creds.length = 0;
+  inserts.length = 0;
+  idem.clear();
+  seq = 1;
+  setSqlForTests(async (strings, ...values) => {
+    const text = strings.join(" ").replace(/\s+/g, " ").trim();
+    const lower = text.toLowerCase();
+    if (lower.includes("insert into agent_credentials")) {
+      creds.push(rowFrom(strings, values));
+      return [];
+    }
+    if (lower.includes("from agent_credentials")) {
+      return creds.filter((row) => row.token_hash === values[0]);
+    }
+    if (lower.includes("update agent_credentials")) return [];
+    if (lower.includes("delete from idempotency_keys") && lower.includes("expires_at")) {
+      const [scope, key, now] = values as string[];
+      const row = idem.get(idemId(scope, key));
+      if (row && row.expires_at <= now) idem.delete(idemId(scope, key));
+      return [];
+    }
+    if (lower.includes("delete from idempotency_keys") && lower.includes("response is null")) {
+      const [scope, key] = values as string[];
+      const row = idem.get(idemId(scope, key));
+      if (row && row.response == null) idem.delete(idemId(scope, key));
+      return [];
+    }
+    if (lower.includes("insert into idempotency_keys")) {
+      const [scope, key, requestHash, expiresAt] = values as string[];
+      const id = idemId(scope, key);
+      if (idem.has(id)) return [];
+      const row: IdemRow = {
+        scope,
+        idempotency_key: key,
+        request_hash: requestHash,
+        response: null,
+        expires_at: expiresAt,
+      };
+      idem.set(id, row);
+      return [row];
+    }
+    if (lower.includes("update idempotency_keys")) {
+      const [body, scope, key] = values as string[];
+      const row = idem.get(idemId(scope, key));
+      if (row) row.response = JSON.parse(body);
+      return [];
+    }
+    if (lower.includes("from idempotency_keys")) {
+      const [scope, key] = values as string[];
+      const row = idem.get(idemId(scope, key));
+      return row ? [row] : [];
+    }
+    if (lower.includes("insert into ")) {
+      const row = rowFrom(strings, values);
+      row.id = seq++;
+      if (row.created_at == null) row.created_at = "2026-10-25T00:00:00.000Z";
+      if (lower.includes("insert into tasks") && row.status == null) row.status = "queued";
+      if (lower.includes("insert into tasks") && row.priority == null) row.priority = 2;
+      if (lower.includes("insert into tasks") && row.platform == null) row.platform = "any";
+      inserts.push({ table: tableOf(text), row });
+      return [row];
+    }
+    if (lower.includes("update messages") && lower.includes("thread_id")) {
+      const id = values[values.length - 1];
+      const found = inserts.find((item) => item.table === "messages" && item.row.id === id);
+      if (!found) return [];
+      found.row.thread_id = values[0];
+      return [found.row];
+    }
+    return [];
+  });
+}
+
+function restoreEnv() {
+  for (const [key, value] of [
+    ["DATABASE_URL", saved.db],
+    ["MC_DB_DRIVER", saved.driver],
+    ["MC_TOKEN", saved.token],
+    ["MC_DASHBOARD_PASSWORD", saved.password],
+    ["NODE_ENV", saved.node],
+  ] as const) {
+    if (value === undefined) delete env[key];
+    else env[key] = value;
+  }
+}
+
+function handles(): Handle[] {
+  const get = (process as unknown as { _getActiveHandles?: () => Handle[] })._getActiveHandles;
+  return get ? get() : [];
+}
+
+before(async () => {
+  const origInterval = global.setInterval;
+  global.setInterval = ((fn: TimerHandler, ms?: number) => {
+    const timer = origInterval(fn, ms);
+    (timer as Handle).unref?.();
+    return timer;
+  }) as typeof setInterval;
+  try {
+    ({ POST: postTasks } = await import("../../src/app/api/tasks/route"));
+    ({ POST: postMessages } = await import("../../src/app/api/messages/route"));
+    ({ POST: postReply } = await import("../../src/app/api/messages/reply/route"));
+    ({ POST: mcpPost } = await import(pathToFileURL(path.join(process.cwd(), "src/app/api/[transport]/route.ts")).href));
+  } finally {
+    global.setInterval = origInterval;
+  }
+});
+
+beforeEach(() => {
+  env.DATABASE_URL = FIXTURE_URL;
+  env.MC_DB_DRIVER = "pg";
+  env.MC_TOKEN = TOKEN;
+  env.MC_DASHBOARD_PASSWORD = PASSWORD;
+  env.NODE_ENV = "test";
+  resetCredentialsForTests();
+  setIdempotencyClockForTests(null);
+  installFake();
+});
+
+afterEach(() => {
+  setSqlForTests(null);
+  setIdempotencyClockForTests(null);
+  resetCredentialsForTests();
+  restoreEnv();
+});
+
+after(() => {
+  for (const handle of handles()) handle.unref?.();
+});
+
+function jsonReq(url: string, body: unknown, headers: Record<string, string> = {}) {
+  return new Request(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify(body),
+  });
+}
+
+const actorA = { actor_type: "agent" as const, actor_id: "cred-a" };
+
+describe("idempotency keys", { concurrency: false }, () => {
+  it("adds the idempotency_keys table in schema.sql and the changelog migration", () => {
+    const schema = fs.readFileSync("supabase/schema.sql", "utf8");
+    const migration = fs.readFileSync("supabase/migrations/20261025_idempotency.sql", "utf8");
+    for (const sql of [schema, migration]) {
+      assert.match(sql, /create table if not exists idempotency_keys/i);
+      assert.match(sql, /primary key \(scope, idempotency_key\)/i);
+      assert.match(sql, /response jsonb/i);
+      assert.match(sql, /expires_at timestamptz not null/i);
+    }
+  });
+
+  it("hashes the same arguments once, whatever the key order", () => {
+    assert.equal(hashPayload({ b: 1, a: "x" }), hashPayload({ a: "x", b: 1 }));
+    assert.notEqual(hashPayload({ title: "a" }), hashPayload({ title: "a", created_by: "dashboard" }));
+  });
+
+  it("replays, conflicts, and expires a key", async () => {
+    setIdempotencyClockForTests(() => new Date("2026-10-25T00:00:00.000Z"));
+    let calls = 0;
+    const run = (title: string) => runIdempotent({
+      actor: actorA,
+      route: "create_task",
+      key: " same-key ",
+      payload: { title },
+      execute: async () => ({ id: ++calls, title }),
+    });
+    const first = await run("ship it");
+    const replay = await run("ship it");
+    assert.deepEqual(replay, first);
+    assert.equal(calls, 1);
+    await assert.rejects(() => run("other"), IdempotencyConflict);
+    assert.equal(calls, 1);
+    setIdempotencyClockForTests(() => new Date("2026-10-25T23:59:59.000Z"));
+    const still = await run("ship it");
+    assert.equal(still.id, first.id);
+    assert.equal(calls, 1);
+    setIdempotencyClockForTests(() => new Date("2026-10-26T00:00:00.000Z"));
+    const after = await run("other");
+    assert.equal(after.id, 2);
+    assert.equal(calls, 2);
+  });
+
+  it("keeps one caller's key from satisfying a different actor", async () => {
+    let calls = 0;
+    const run = (actor_id: string) => runIdempotent({
+      actor: { actor_type: "agent", actor_id },
+      route: "create_task",
+      key: "shared",
+      payload: { title: "same" },
+      execute: async () => ({ id: ++calls }),
+    });
+    assert.equal((await run("a")).id, 1);
+    assert.equal((await run("b")).id, 2);
+    assert.equal((await run("a")).id, 1);
+  });
+
+  it("releases the claim when the write fails, and reports an in-progress key", async () => {
+    let calls = 0;
+    await assert.rejects(() => runIdempotent({
+      actor: actorA,
+      route: "create_task",
+      key: "retry",
+      payload: { title: "a" },
+      execute: async () => {
+        calls += 1;
+        throw new Error("boom");
+      },
+    }));
+    const nested = runIdempotent({
+      actor: actorA,
+      route: "create_task",
+      key: "busy",
+      payload: { title: "a" },
+      execute: async () => {
+        await assert.rejects(() => runIdempotent({
+          actor: actorA,
+          route: "create_task",
+          key: "busy",
+          payload: { title: "a" },
+          execute: async () => ({ id: 9 }),
+        }), (err: unknown) => err instanceof IdempotencyConflict && /in progress/.test(err.message));
+        return { id: 3 };
+      },
+    });
+    assert.deepEqual(await nested, { id: 3 });
+    const recovered = await runIdempotent({
+      actor: actorA,
+      route: "create_task",
+      key: "retry",
+      payload: { title: "a" },
+      execute: async () => ({ id: ++calls }),
+    });
+    assert.equal(recovered.id, 2);
+    assert.equal(calls, 2);
+  });
+
+  it("rejects a key that is too long or contains a control character, and ignores a blank key", async () => {
+    await assert.rejects(
+      () => createTask({ title: "a", idempotency_key: "x".repeat(201) }),
+      IdempotencyKeyInvalid,
+    );
+    await assert.rejects(
+      () => createTask({ title: "a", idempotency_key: "bad\nkey" }),
+      IdempotencyKeyInvalid,
+    );
+    await createTask({ title: "one", idempotency_key: "   " });
+    await createTask({ title: "two", idempotency_key: "" });
+    assert.equal(inserts.filter((item) => item.table === "tasks").length, 2);
+  });
+
+  it("records one task when POST /api/tasks repeats an Idempotency-Key", async () => {
+    const headers = { authorization: `Bearer ${TOKEN}`, "idempotency-key": "task-1" };
+    const body = { title: "queue the digest", created_by: "someone-else", actor_id: "root" };
+    const first = await postTasks(jsonReq("http://x/api/tasks", body, headers));
+    const second = await postTasks(jsonReq("http://x/api/tasks", body, headers));
+    assert.equal(first.status, 200, await first.clone().text());
+    assert.equal(second.status, 200);
+    const a = await first.json() as { task: Row };
+    const b = await second.json() as { task: Row };
+    assert.equal(b.task.id, a.task.id);
+    assert.equal(a.task.actor_type, "agent");
+    assert.equal(a.task.actor_id, "mc-token");
+    assert.equal(a.task.created_by, "someone-else");
+    assert.equal(inserts.filter((item) => item.table === "tasks").length, 1);
+    assert.equal([...idem.values()][0]?.scope, "agent:mc-token:create_task");
+  });
+
+  it("returns idempotency_conflict when the same header carries a different task", async () => {
+    const headers = { authorization: `Bearer ${TOKEN}`, "Idempotency-Key": "task-2" };
+    const ok = await postTasks(jsonReq("http://x/api/tasks", { title: "first" }, headers));
+    assert.equal(ok.status, 200, await ok.clone().text());
+    const conflict = await postTasks(jsonReq("http://x/api/tasks", { title: "second" }, headers));
+    assert.equal(conflict.status, 409);
+    const body = await conflict.json() as Record<string, unknown>;
+    assert.equal(body.code, "idempotency_conflict");
+    assert.equal(body.retryable, false);
+    assert.equal(typeof body.error, "string");
+    assert.equal(typeof body.fix, "string");
+    assert.match(String((body.fields as { idempotency_key: string }).idempotency_key), /different arguments/);
+    assert.equal(inserts.filter((item) => item.table === "tasks").length, 1);
+  });
+
+  it("creates a new task after the key expires, and a body field is not a key", async () => {
+    setIdempotencyClockForTests(() => new Date("2026-10-25T00:00:00.000Z"));
+    const headers = { authorization: `Bearer ${TOKEN}`, "idempotency-key": "task-3" };
+    await postTasks(jsonReq("http://x/api/tasks", { title: "first" }, headers));
+    setIdempotencyClockForTests(() => new Date("2026-10-26T00:00:00.000Z"));
+    const again = await postTasks(jsonReq("http://x/api/tasks", { title: "second" }, headers));
+    assert.equal(again.status, 200, await again.clone().text());
+    assert.equal(inserts.filter((item) => item.table === "tasks").length, 2);
+
+    await postTasks(jsonReq("http://x/api/tasks", { title: "plain", idempotency_key: "not-a-header" }, {
+      authorization: `Bearer ${TOKEN}`,
+    }));
+    await postTasks(jsonReq("http://x/api/tasks", { title: "plain", idempotency_key: "not-a-header" }, {
+      authorization: `Bearer ${TOKEN}`,
+    }));
+    assert.equal(inserts.filter((item) => item.table === "tasks").length, 4);
+  });
+
+  it("replays an operator message and conflicts a reply from the header", async () => {
+    const cookie = await authCookieValue(PASSWORD);
+    const messageHeaders = { cookie: `mc_auth=${cookie}`, "idempotency-key": "msg-1" };
+    const message = { agent_id: "worker-one", body: "please look", created_by: "not-the-operator" };
+    const first = await postMessages(jsonReq("http://x/api/messages", message, messageHeaders));
+    const second = await postMessages(jsonReq("http://x/api/messages", message, messageHeaders));
+    assert.equal(first.status, 200, await first.clone().text());
+    const a = await first.json() as { message: Row };
+    const b = await second.json() as { message: Row };
+    assert.equal(b.message.id, a.message.id);
+    assert.equal(a.message.actor_type, "human");
+    assert.equal(a.message.actor_id, "operator");
+    assert.equal([...idem.values()][0]?.scope, "human:operator:enqueue_message");
+    assert.equal(inserts.filter((item) => item.table === "messages").length, 1);
+
+    const replyHeaders = { authorization: `Bearer ${TOKEN}`, "idempotency-key": "reply-1" };
+    const reply = await postReply(jsonReq("http://x/api/messages/reply", {
+      agent_id: "worker-one",
+      body: "done",
+    }, replyHeaders));
+    assert.equal(reply.status, 200, await reply.clone().text());
+    const clash = await postReply(jsonReq("http://x/api/messages/reply", {
+      agent_id: "worker-one",
+      body: "done differently",
+    }, replyHeaders));
+    assert.equal(clash.status, 409);
+    assert.equal((await clash.json() as { code: string }).code, "idempotency_conflict");
+    assert.equal(inserts.filter((item) => item.table === "messages").length, 2);
+    const replyScope = [...idem.values()].find((row) => row.idempotency_key === "reply-1");
+    assert.equal(replyScope?.scope, "agent:mc-token:reply_to_operator");
+  });
+
+  it("stores one MCP create_task for a repeated key and conflicts a different title", async () => {
+    const created = await createCredential({ label: "idempotency", scopes: ["tasks:write"] });
+    assert.equal(created.ok, true);
+    if (!created.ok) throw new Error("credential was not issued");
+    const before = new Set(handles());
+    const call = async (title: string, id: number) => {
+      const res = await mcpPost(new Request("http://localhost/api/mcp", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${created.token}`,
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: {
+            name: "create_task",
+            arguments: { title, idempotency_key: "mcp-1", created_by: "someone-else" },
+          },
+        }),
+      }));
+      const text = await res.text();
+      return { status: res.status, text };
+    };
+    let results: { status: number; text: string }[] = [];
+    try {
+      results = [await call("mcp task", 1), await call("mcp task", 2), await call("other task", 3)];
+    } finally {
+      for (const handle of handles()) {
+        if (!before.has(handle)) handle.unref?.();
+      }
+    }
+    assert.equal(results[0].status, 200, results[0].text.slice(0, 400));
+    const taskLine = (text: string) => text.match(/Task #\d+ queued[^"\\]*/)?.[0];
+    assert.equal(taskLine(results[0].text), taskLine(results[1].text));
+    assert.match(results[2].text, /idempotency_conflict/);
+    const stored = inserts.filter((item) => item.table === "tasks");
+    assert.equal(stored.length, 1);
+    assert.equal(stored[0].row.actor_id, created.credential.id);
+    assert.equal(stored[0].row.created_by, "someone-else");
+    assert.equal([...idem.values()][0]?.scope, `agent:${created.credential.id}:create_task`);
+  });
+
+  it("registers idempotency_key on create_task and both reply tools", () => {
+    const src = fs.readFileSync("src/app/api/[transport]/route.ts", "utf8");
+    const matches = src.match(/idempotency_key: z/g) ?? [];
+    assert.equal(matches.length, 2);
+    assert.match(src, /idempotency_key: args\.idempotency_key/);
+  });
+
+  it("scopes a store reply to reply_to_operator", async () => {
+    await replyFromAgent({
+      agent_id: "worker-one",
+      body: "ack",
+      idempotency_key: "store-reply",
+      actor: actorA,
+    });
+    await enqueueMessage({
+      agent_id: "worker-one",
+      body: "hello",
+      idempotency_key: "store-msg",
+      actor: { actor_type: "human", actor_id: "operator" },
+    });
+    const reply = [...idem.values()].find((row) => row.idempotency_key === "store-reply");
+    const message = [...idem.values()].find((row) => row.idempotency_key === "store-msg");
+    assert.equal(reply?.scope, "agent:cred-a:reply_to_operator");
+    assert.equal(message?.scope, "human:operator:enqueue_message");
+  });
+});

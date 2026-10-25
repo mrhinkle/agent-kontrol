@@ -112,9 +112,9 @@ Invalid JSON answers `400`.
 
 - `GET /api/messages?agent_id=X&ack=true` — the agent pulls its inbound inbox; `ack` marks the messages read.
 - `GET /api/messages?agent_id=X&conversation=true` — full history for the agent.
-- `POST /api/messages` — body `{agent_id, body, created_by?}` — the operator enqueues an inbound message for the agent. The server sets `actor_type` and `actor_id` from the authenticated credential (`human` / `operator` for a dashboard session). When `MC_DASHBOARD_PASSWORD` is unset and the request presents no credential, both fields are null. `created_by` is stored as a label and does not set those fields.
+- `POST /api/messages` — body `{agent_id, body, created_by?}` — the operator enqueues an inbound message for the agent. The server sets `actor_type` and `actor_id` from the authenticated credential (`human` / `operator` for a dashboard session). When `MC_DASHBOARD_PASSWORD` is unset and the request presents no credential, both fields are null. `created_by` is stored as a label and does not set those fields. Optional header `Idempotency-Key`: the same key and the same body return the original message for 24 hours and do not insert a second row. The same key with a different body answers `409` `idempotency_conflict`. The key is scoped to the authenticated actor. A blank header is the same as omitting it.
 - `PATCH /api/messages` — body `{agent_id}` — the operator marks outbound replies read.
-- `POST /api/messages/reply` — bearer `MC_TOKEN` or an agent credential with `messages:write` — body `{agent_id, body, in_reply_to?, created_by?}` — non-MCP agents post replies. `in_reply_to` is the id of the inbound message being answered. `actor_type` and `actor_id` are taken from the bearer, not from `created_by`.
+- `POST /api/messages/reply` — bearer `MC_TOKEN` or an agent credential with `messages:write` — body `{agent_id, body, in_reply_to?, created_by?}` — non-MCP agents post replies. `in_reply_to` is the id of the inbound message being answered. `actor_type` and `actor_id` are taken from the bearer, not from `created_by`. Optional header `Idempotency-Key`: the same key and the same body return the original reply for 24 hours. The same key with a different body answers `409` `idempotency_conflict`. The key is scoped to the authenticated actor.
 
 ### Tasks
 
@@ -135,6 +135,8 @@ Task statuses: `queued`, `claimed`, `running`, `review`, `done`, `failed`, `canc
 | `created_by` | string | no | Free-text label. It is stored and does not set the actor. |
 | `actor_type` | string | — | Response only. `human` or `agent`, from the authenticated credential. Null on older rows, and null when the local dashboard is open because `MC_DASHBOARD_PASSWORD` is unset and the request presented no credential. |
 | `actor_id` | string | — | Response only. Credential id, `mc-token`, the OAuth client id, or `operator` for a signed-in dashboard session. Null in the same cases as `actor_type`. |
+
+Optional header `Idempotency-Key`. The same key and the same body fields return the original task for 24 hours and do not insert a second row. The same key with different body fields answers `409` `idempotency_conflict`. The key is scoped to the authenticated actor. Omit the header, or send it blank, to create a new task on every call. The key is not a body field.
 
 - `POST /api/tasks/claim` — body `{platform, machine?, agent_id}`. `platform` and `agent_id` are required; the request answers `400` otherwise. The claim is atomic: it returns the next queued task routed to the given platform (or to `any`), or `{task: null}` when there is none.
 - `PATCH /api/tasks/:id` — body `{status?, result?, cost_usd?, session_id?, assigned_agent?, agent_id?}`. Dispatchers use it to report progress and completion; the dashboard uses it to cancel or requeue tasks.
@@ -229,11 +231,12 @@ OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this sha
 | `credential_store_unavailable` | 503 | yes | An `akc_` credential was presented and the credential store could not be read. Not a revocation; retry. Its body is `{ "error": "credential_store_unavailable" }` only. |
 | `forbidden` | 403 | no | `POST /api/messages/reply` when `in_reply_to` names a message that belongs to a different agent. |
 | `not_found` | 404 | no | Unknown trace id on `GET /api/traces/:traceId` when a database is connected (demo mode returns 200 and an empty `spans` list), or `POST /api/messages/reply` when `in_reply_to` names a message that does not exist. |
-| `validation_failed` | 400 | no | A field is present but not usable: a bad `before` on `GET /api/traces`, a bad `since` and `until` pair on `GET /api/usage` (a `since` without `until` is ignored), a bad `collected_at` on usage or progress ingest, a bad task or trace id, a privacy refusal, or an OTLP body the parser rejected. |
+| `validation_failed` | 400 | no | A field is present but not usable: a bad `before` on `GET /api/traces`, a bad `since` and `until` pair on `GET /api/usage` (a `since` without `until` is ignored), a bad `collected_at` on usage or progress ingest, a bad task or trace id, a privacy refusal, an OTLP body the parser rejected, or an idempotency key longer than 200 characters or containing a control character. |
 | `invalid_json` | 400 | no | The body is not JSON. On `POST /api/login` the `error` string stays `invalid request`. On `POST /api/mcp` an empty or non-JSON body uses this code and `error` `invalid JSON`. A missing bearer on that route is still `401` with `WWW-Authenticate`. |
 | `missing_field` | 400 | no | A required field is absent. `fields` names it. |
 | `rate_limited` | 429 | yes | More than 5 `POST /api/login` attempts in 10 minutes from one client IP. `Retry-After` is seconds. The OAuth consent form shares this limiter and answers with HTML, not this JSON. |
 | `conflict` | 409 | no | `PUT /api/settings/repos` when no database is connected. |
+| `idempotency_conflict` | 409 | no | `POST /api/tasks`, `POST /api/messages`, or `POST /api/messages/reply` reused an `Idempotency-Key` with different arguments, or the first request with that key is still in progress. MCP `create_task` and `reply_to_operator` return the same code. The same key and the same arguments return the original result. |
 | `stale` | 409 | no | `PUT /api/settings/repos` when `version` does not match the list currently stored. |
 | `task_not_found` | 404 | no | `PATCH /api/tasks/:id` or MCP `update_task` when a database is connected and that id does not exist. `error` stays `Task not found`. Demo mode does not look the id up. |
 | `task_not_claimable` | 409 | no | Defined, not returned. See above. |

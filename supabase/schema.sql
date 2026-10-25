@@ -380,3 +380,18 @@ create table if not exists decisions (
 );
 create index if not exists decisions_status_first_seen_idx on decisions (status, first_seen_at);
 create index if not exists decisions_repo_number_idx on decisions (repo, number);
+
+-- Client idempotency keys for create_task, operator messages, and replies.
+-- scope is actor_type:actor_id:route, so two callers can reuse one key string.
+-- response is null while the write is in progress, then the stored result.
+-- A key is unused after expires_at (24 hours from the claim).
+-- Changelog: supabase/migrations/20261025_idempotency.sql.
+create table if not exists idempotency_keys (
+  scope text not null,
+  idempotency_key text not null,
+  request_hash text not null,
+  response jsonb,
+  expires_at timestamptz not null,
+  created_at timestamptz not null default now(),
+  primary key (scope, idempotency_key)
+);

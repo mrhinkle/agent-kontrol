@@ -1,4 +1,5 @@
 import type { Actor } from "./actor";
+import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent } from "./idempotency";
 import { writeSessionNote } from "./session-memory";
 import { sql } from "./db";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
@@ -359,14 +360,28 @@ function asTask(row: Record<string, unknown>): Task {
   };
 }
 
-/** Operator → agent. Sets direction=inbound and thread_id = own id when new. */
-export async function enqueueMessage(input: {
+type EnqueueInput = {
   agent_id: string;
   body: string;
   created_by?: string;
   /** From the authenticated principal. Never taken from the request body. */
   actor?: Actor | null;
-}): Promise<Message> {
+  /** Optional client key. Blank is the same as omitting it. */
+  idempotency_key?: string | null;
+};
+
+/** Operator → agent. Sets direction=inbound and thread_id = own id when new. */
+export async function enqueueMessage(input: EnqueueInput): Promise<Message> {
+  return runIdempotent({
+    actor: input.actor,
+    route: IDEMPOTENCY_ROUTE.enqueueMessage,
+    key: input.idempotency_key,
+    payload: payloadOf(input, ["agent_id", "body", "created_by"]),
+    execute: () => insertEnqueuedMessage(input),
+  });
+}
+
+async function insertEnqueuedMessage(input: EnqueueInput): Promise<Message> {
   const db = sql();
   const actor = actorFields(input.actor);
   try {
@@ -396,15 +411,29 @@ export async function enqueueMessage(input: {
   }
 }
 
-/** Agent → operator reply. */
-export async function replyFromAgent(input: {
+type ReplyInput = {
   agent_id: string;
   body: string;
   in_reply_to?: number;
   created_by?: string;
   /** From the authenticated principal. Never taken from the request body. */
   actor?: Actor | null;
-}): Promise<Message> {
+  /** Optional client key. Blank is the same as omitting it. */
+  idempotency_key?: string | null;
+};
+
+/** Agent → operator reply. */
+export async function replyFromAgent(input: ReplyInput): Promise<Message> {
+  return runIdempotent({
+    actor: input.actor,
+    route: IDEMPOTENCY_ROUTE.reply,
+    key: input.idempotency_key,
+    payload: payloadOf(input, ["agent_id", "body", "in_reply_to", "created_by"]),
+    execute: () => insertReply(input),
+  });
+}
+
+async function insertReply(input: ReplyInput): Promise<Message> {
   const db = sql();
   const agentId = slugify(input.agent_id);
   const actor = actorFields(input.actor);
@@ -554,7 +583,7 @@ export async function markConversationRead(input: {
 // Tasks — the work queue that turns Agent Kontrol into a harness.
 // ---------------------------------------------------------------------------
 
-export async function createTask(input: {
+type CreateTaskInput = {
   title: string;
   description?: string;
   project?: string;
@@ -565,7 +594,30 @@ export async function createTask(input: {
   created_by?: string;
   /** From the authenticated principal. Never taken from the request body. */
   actor?: Actor | null;
-}): Promise<Task> {
+  /** Optional client key. Blank is the same as omitting it. */
+  idempotency_key?: string | null;
+};
+
+export async function createTask(input: CreateTaskInput): Promise<Task> {
+  return runIdempotent({
+    actor: input.actor,
+    route: IDEMPOTENCY_ROUTE.createTask,
+    key: input.idempotency_key,
+    payload: payloadOf(input, [
+      "title",
+      "description",
+      "project",
+      "platform",
+      "machine",
+      "priority",
+      "reviewer_platform",
+      "created_by",
+    ]),
+    execute: () => insertTask(input),
+  });
+}
+
+async function insertTask(input: CreateTaskInput): Promise<Task> {
   const db = sql();
   const actor = actorFields(input.actor);
   try {

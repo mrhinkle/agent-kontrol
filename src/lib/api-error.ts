@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { IdempotencyConflict, IdempotencyKeyInvalid } from "./idempotency";
 
 /**
  * Machine-readable errors for REST and MCP.
@@ -57,6 +58,12 @@ export const API_ERRORS = {
     status: 409,
     message: "conflict",
     fix: "Reload the current state and retry the change.",
+    retryable: false,
+  },
+  idempotency_conflict: {
+    status: 409,
+    message: "idempotency conflict",
+    fix: "Send the same arguments with this key, or use a new key.",
     retryable: false,
   },
   stale: {
@@ -207,6 +214,14 @@ interface SafeCaught {
  * so the original text is not returned.
  */
 function safeCaught(err: unknown): SafeCaught | null {
+  if (err instanceof IdempotencyConflict || (err instanceof Error && err.name === "IdempotencyConflict")) {
+    const fields = err instanceof IdempotencyConflict ? err.fields : { idempotency_key: err.message };
+    return { code: "idempotency_conflict", message: err.message, fields };
+  }
+  if (err instanceof IdempotencyKeyInvalid || (err instanceof Error && err.name === "IdempotencyKeyInvalid")) {
+    const fields = err instanceof IdempotencyKeyInvalid ? err.fields : { idempotency_key: err.message };
+    return { code: "validation_failed", message: err.message, fields };
+  }
   const msg = err instanceof Error ? err.message : "";
   if (msg === "Task not found") return { code: "task_not_found", message: msg };
   if (msg === "in_reply_to belongs to a different agent") {

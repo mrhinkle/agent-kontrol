@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { sql } from "../src/lib/db";
+import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
 import { report, remember, recall, createTask, claimNextTask, listTasks } from "../src/lib/store";
 import { getWatchedRepos, replaceWatchedRepos } from "../src/lib/watched-repos";
 import type { RepoConfig } from "../src/lib/progress-config";
@@ -186,6 +187,51 @@ async function main() {
   delete process.env.MC_MEMORY_WRITEBACK;
   await sql()`delete from memory where key like ${"session/" + tag + "%"}`;
   await sql()`delete from spans where session_id like ${tag + "%"}`;
+
+  // Idempotency: replay returns the original task, a different body conflicts,
+  // and a key older than 24 hours can be used again.
+  const idemKey = `idem-${tag}`;
+  const idemPlatform = `pgtest-idem-${tag}`;
+  try {
+    const first = await createTask({
+      title: `idem ${tag}`,
+      platform: idemPlatform,
+      priority: 1,
+      idempotency_key: idemKey,
+    });
+    const replay = await createTask({
+      title: `idem ${tag}`,
+      platform: idemPlatform,
+      priority: 1,
+      idempotency_key: idemKey,
+    });
+    assert.equal(String(replay.id), String(first.id), "the same idempotency key returns the original task");
+    const queued = await sql()`select count(*)::int as n from tasks where platform = ${idemPlatform}`;
+    assert.equal(Number(queued[0].n), 1, "a replay does not insert a second task");
+    await assert.rejects(
+      () => createTask({
+        title: `other ${tag}`,
+        platform: idemPlatform,
+        priority: 1,
+        idempotency_key: idemKey,
+      }),
+      (err: unknown) => err instanceof IdempotencyConflict,
+    );
+    const stillOne = await sql()`select count(*)::int as n from tasks where platform = ${idemPlatform}`;
+    assert.equal(Number(stillOne[0].n), 1, "a conflict does not insert a task");
+    setIdempotencyClockForTests(() => new Date(Date.now() + 25 * 60 * 60 * 1000));
+    const afterExpiry = await createTask({
+      title: `other ${tag}`,
+      platform: idemPlatform,
+      priority: 1,
+      idempotency_key: idemKey,
+    });
+    assert.notEqual(String(afterExpiry.id), String(first.id), "an expired key can create a new task");
+    await sql()`delete from tasks where platform = ${idemPlatform}`;
+    await sql()`delete from idempotency_keys where idempotency_key = ${idemKey}`;
+  } finally {
+    setIdempotencyClockForTests(null);
+  }
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
 }
