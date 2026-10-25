@@ -133,7 +133,9 @@ fetch() {
   if ! jq -e 'type=="array"' >/dev/null 2>&1 <<<"$out"; then
     printf '%s returned non-JSON\n' "$what" >>"$ERR_FILE"; printf '[]'; return 0
   fi
-  if [[ "$(jq 'length' <<<"$out")" -ge "$limit" ]]; then
+  # The gh call asks for limit+1 rows; more than `limit` back means the page
+  # was cut, exactly `limit` means complete.
+  if [[ "$(jq 'length' <<<"$out")" -gt "$limit" ]]; then
     printf '%s truncated at %s\n' "$what" "$limit" >>"$ERR_FILE"
   fi
   printf '%s' "$out"
@@ -152,17 +154,17 @@ while IFS= read -r entry; do
   blocked_label="$(echo "$entry" | jq -r '.blockedLabel // empty')"
 
   : >"$ERR_FILE"
-  merged="$(fetch 500 gh pr list -R "$repo" --state merged --search "merged:>=$SINCE" --limit 500 \
+  merged="$(fetch 500 gh pr list -R "$repo" --state merged --search "merged:>=$SINCE" --limit 501 \
              --json number,title,createdAt,mergedAt,author,url)"
-  opened="$(fetch 1000 gh issue list -R "$repo" --state all --search "created:>=$SINCE" --limit 1000 --json number)"
-  closed="$(fetch 1000 gh issue list -R "$repo" --state closed --search "closed:>=$SINCE" --limit 1000 --json number)"
+  opened="$(fetch 1000 gh issue list -R "$repo" --state all --search "created:>=$SINCE" --limit 1001 --json number)"
+  closed="$(fetch 1000 gh issue list -R "$repo" --state closed --search "closed:>=$SINCE" --limit 1001 --json number)"
   opened_n="$(jq 'length' <<<"$opened")"; closed_n="$(jq 'length' <<<"$closed")"
 
   # One GraphQL list covers open count, stale, blocked and decision labels.
-  open_issues="$(fetch 2000 gh issue list -R "$repo" --state open --limit 2000 \
+  open_issues="$(fetch 2000 gh issue list -R "$repo" --state open --limit 2001 \
                   --json number,title,createdAt,updatedAt,labels,url)"
-  open_prs="$(fetch 500 gh pr list -R "$repo" --state open --limit 500 \
-               --json number,title,createdAt,updatedAt,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,url,author)"
+  open_prs="$(fetch 500 gh pr list -R "$repo" --state open --limit 501 \
+               --json number,title,createdAt,updatedAt,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,url,author,labels)"
   errors_json="$(jq -R . <"$ERR_FILE" | jq -s -c 'map(select(length>0))')"
 
   one="$(jq -n \
@@ -181,8 +183,9 @@ while IFS= read -r entry; do
     ($issues | map(select(.labels | any(.name == $blocked and $blocked != "")))) as $blocked_issues
     | ($issues | map(select(.updatedAt < $stale_before))) as $stale
     | def is_decision_label($n): $decision_labels | any(. as $p | ($p == $n) or (($p|endswith("*")) and ($n|startswith($p[:-1]))));
-    ($issues | map(select(.labels | any(is_decision_label(.name))))
-        | map({repo: $short, number, title, url, age_days: (hours(.createdAt; $now) / 24 | floor),
+    (($issues + $prs) | map(select((.labels // []) | any(is_decision_label(.name))))
+        | map({repo: $short, number, title, url, kind: (if has("isDraft") then "pr" else "issue" end),
+               age_hours: hours(.createdAt; $now), age_days: (hours(.createdAt; $now) / 24 | floor),
                labels: [.labels[].name | select(is_decision_label(.))]})) as $decisions
     | ($prs | map(. + {age_h: hours(.createdAt; $now),
                        idle_h: hours(.updatedAt; $now),
@@ -190,7 +193,7 @@ while IFS= read -r entry; do
                        pending: [ (.statusCheckRollup // [])[] | select(pending_check) | check_name ] | unique})) as $prs2
     | ($prs2 | map(select(.isDraft | not)
                 | select(.age_h >= $stuck_h or (.mergeStateStatus | IN("DIRTY","BLOCKED","BEHIND","UNSTABLE")))
-                | {repo: $short, number, title, url, author: .author.login, age_days: (.age_h/24|floor), idle_days: (.idle_h/24|floor),
+                | {repo: $short, number, title, url, author: .author.login, age_hours: .age_h, age_days: (.age_h/24|floor), idle_days: (.idle_h/24|floor),
                    state: .mergeStateStatus, review: (.reviewDecision // null),
                    reason: (if .mergeStateStatus == "DIRTY" then "merge conflict with base"
                             elif (.failing|length) > 0 then "failing: " + (.failing[0:3] | join(", "))
@@ -199,10 +202,11 @@ while IFS= read -r entry; do
                             elif .reviewDecision == "REVIEW_REQUIRED" then "no review yet"
                             elif .mergeStateStatus == "BEHIND" then "behind base, needs update"
                             else "open " + ((.age_h/24|floor)|tostring) + "d with no blocker reported" end)})
-              | sort_by(-.age_days)) as $stuck
+              | sort_by(-.age_hours)) as $stuck
+    | (($errors|length) > 0) as $incomplete
     | {
         repo: $repo, label: $label, short: $short,
-        incomplete: (($errors|length) > 0), errors: $errors,
+        incomplete: $incomplete, errors: $errors,
         merged_prs: ($merged|length),
         median_lead_hours: ([$merged[] | hours(.createdAt; .mergedAt)] | median),
         issues_opened: $opened, issues_closed: $closed, net_backlog: ($opened - $closed),
@@ -214,7 +218,10 @@ while IFS= read -r entry; do
         stuck_prs: $stuck,
         decisions: $decisions,
         merged_list: [$merged[] | {number, title, url, author: .author.login, lead_hours: hours(.createdAt; .mergedAt)}]
-      }')"
+      }
+    # An incomplete repo keeps only its identity and its errors. Every measured
+    # field is null: a number we did not measure is not a zero.
+    | if $incomplete then with_entries(if (.key | IN("repo","label","short","incomplete","errors")) then . else .value = null end) else . end')"
   repo_results="$(jq -c --argjson one "$one" '. + [$one]' <<<"$repo_results")"
 done < <(jq -c '.[]' <<<"$REPOS_JSON")
 
@@ -231,6 +238,9 @@ if [[ -n "$COORD_ID" && "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_T
       ((.agents // []) | map(select(.id == $id)) | .[0]) as $a
       | ([.events[] | select(.agent_id == $id)] | sort_by(.created_at) | reverse) as $ev
       | ($ev | map(select(.kind | test($kinds))) | .[0]) as $work
+      | ($ev | map(select(hours(.created_at; $now) <= $max_h)) ) as $recent
+      | ($recent | map(select(.kind | test($kinds))) | .[0]) as $recent_work
+      | ($recent | map(select(.kind == "error")) | length) as $recent_errors
       | ($ev | .[0]) as $any
       | {configured: true, agent_id: $id,
          found: ($a != null),
@@ -241,11 +251,12 @@ if [[ -n "$COORD_ID" && "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_T
          last_work_hours: (if $work then hours($work.created_at; $now) else null end),
          last_any_kind: ($any.kind // null),
          max_silence_hours: $max_h,
+         recent_errors: $recent_errors,
          verdict: (if $a == null then "unknown: agent not registered"
-                   elif ($work == null and ($ev | map(select(.kind == "error")) | length) > 0) then "FAILING: error events but no completed work in the window"
-                   elif $work == null then "NOT WORKING: no work event in the dashboard window (only " + ($any.kind // "nothing") + ")"
-                   elif hours($work.created_at; $now) > $max_h then "NOT WORKING: last work event " + ((hours($work.created_at; $now))|floor|tostring) + "h ago (limit " + ($max_h|tostring) + "h)"
-                   else "working: last work event " + ((hours($work.created_at; $now)*10|floor)/10|tostring) + "h ago" end)}' <<<"$fleet")"
+                   elif $recent_work != null then "working: last work event " + ((hours($recent_work.created_at; $now)*10|floor)/10|tostring) + "h ago"
+                   elif $recent_errors > 0 then "FAILING: " + ($recent_errors|tostring) + " error event(s) in the last " + ($max_h|tostring) + "h and no completed work"
+                   elif $work != null then "NOT WORKING: last work event " + ((hours($work.created_at; $now))|floor|tostring) + "h ago (limit " + ($max_h|tostring) + "h)"
+                   else "NOT WORKING: no work event in the dashboard window (only " + ($any.kind // "nothing") + ")" end)}' <<<"$fleet")"
   else
     coordinator="$(jq -c '. + {verdict: "unknown: dashboard unreachable"}' <<<"$coordinator")"
   fi
@@ -272,8 +283,8 @@ brief="$(jq -n --arg at "$NOW_ISO" --argjson window "$WINDOW_H" --arg repo_sourc
       repos_counted: ($ok|length), repos_total: ($repos|length)
     }),
     repos: $repos,
-    stuck_prs: ([$repos[].stuck_prs[]] | sort_by(-.age_days)),
-    decisions: ([$repos[].decisions[]] | sort_by(-.age_days))
+    stuck_prs: ([$repos[] | select(.incomplete | not) | .stuck_prs[]] | sort_by(-.age_hours)),
+    decisions: ([$repos[] | select(.incomplete | not) | .decisions[]] | sort_by(-.age_hours))
   }')"
 
 n_incomplete="$(jq '.incomplete_repos|length' <<<"$brief")"
@@ -315,12 +326,12 @@ if [[ "$coord_conf" == "true" ]]; then
 fi
 
 printf '%-14s %7s %9s %6s %6s %6s %6s %8s\n' "REPO" "merged" "issues±" "net" "open" "stale" "stuck" "lead-med"
-jq -r '.repos[] | [ (if .incomplete then "!! " + .label else .label end), .merged_prs, ("+\(.issues_opened)/-\(.issues_closed)"),
+jq -r '.repos[] | if .incomplete then [ "!! " + .label, "-", "-", "-", "-", "-", "-", "-" ] else [ .label, .merged_prs, ("+\(.issues_opened)/-\(.issues_closed)"),
                    (if .net_backlog > 0 then "+\(.net_backlog)" else (.net_backlog|tostring) end),
                    .open_issues,
                    (if .stale_ratio == null then "-" else "\(.stale_ratio * 100 | floor)%" end),
                    (.stuck_prs|length),
-                   (if .median_lead_hours == null then "-" else "\(.median_lead_hours * 10 | floor / 10)h" end) ] | @tsv' <<<"$brief" \
+                   (if .median_lead_hours == null then "-" else "\(.median_lead_hours * 10 | floor / 10)h" end) ] end | @tsv' <<<"$brief" \
 | while IFS=$'\t' read -r l m i n o s k h; do printf '%-14s %7s %9s %6s %6s %6s %6s %8s\n' "${l:0:14}" "$m" "$i" "$n" "$o" "$s" "$k" "$h"; done
 echo "  stale = open issue untouched ${STALE_ISSUE_DAYS}d+ · stuck = non-draft PR open ${STUCK_PR_HOURS}h+ or blocked/dirty · lead-med = median hours PR open→merge"
 echo
@@ -343,7 +354,7 @@ if [[ "$n_dec" -eq 0 ]]; then
   fi
 else
   echo "DECISIONS FOR YOU ($n_dec) — oldest first; each one is work nobody else can unblock"
-  jq -r '.decisions[] | "  \(.repo) #\(.number)  \(.age_days)d  [\(.labels|join(","))]  \(.title[0:70])\n      \(.url)"' <<<"$brief"
+  jq -r '.decisions[] | "  \(.repo) \(if .kind == "pr" then "PR " else "" end)#\(.number)  \(.age_days)d  [\(.labels|join(","))]  \(.title[0:70])\n      \(.url)"' <<<"$brief"
 fi
 echo
 
