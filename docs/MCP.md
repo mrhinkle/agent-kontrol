@@ -245,7 +245,7 @@ A tool failure returns `isError: true`. The text of the result is JSON with the 
 
 Arguments that fail the tool's input schema are rejected by the MCP SDK before the handler runs. That result is `isError: true` whose text is the schema message, not this JSON. The catalogue below is what the handler itself returns.
 
-The HTTP `401` for a missing or invalid bearer is unchanged: `WWW-Authenticate` points at `/.well-known/oauth-protected-resource`.
+The HTTP `401` for a missing or invalid bearer is unchanged: `WWW-Authenticate` points at `/.well-known/oauth-protected-resource`. An authenticated `POST /api/mcp` whose body is empty or not JSON answers HTTP `400` with `code` `invalid_json` and `error` `invalid JSON`. That response is not a tool result.
 
 | Code | Retryable | When a tool returns it |
 | --- | --- | --- |
@@ -253,7 +253,7 @@ The HTTP `401` for a missing or invalid bearer is unchanged: `WWW-Authenticate` 
 | `forbidden` | no | `reply_to_operator` when `in_reply_to` belongs to a different agent. |
 | `not_found` | no | `reply_to_operator` when `in_reply_to` does not exist. |
 | `validation_failed` | no | Not returned by a current tool. A privacy refusal on `POST /api/usage/ingest` is this code. Schema failures are the SDK message, not this JSON. |
-| `invalid_json` | no | Not returned by a tool. REST only. |
+| `invalid_json` | no | Not a tool result. Authenticated `POST /api/mcp` returns HTTP 400 when the body is empty or not JSON. A missing bearer stays HTTP 401 with `WWW-Authenticate`. |
 | `missing_field` | no | Not returned by a tool. The input schema rejects a missing argument first. |
 | `rate_limited` | yes | Not returned by a tool. `POST /api/login` only. The OAuth consent form shares that limiter and answers with HTML, not this JSON. |
 | `conflict` | no | Not returned by a tool. REST settings save with no database. |
