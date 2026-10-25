@@ -67,7 +67,9 @@ STALE_ISSUE_DAYS="$(cfg '.brief.staleIssueDays')";  STALE_ISSUE_DAYS="${STALE_IS
 COORD_ID="$(cfg '.brief.coordinator.agentId')"
 COORD_MAX_H="$(cfg '.brief.coordinator.maxSilenceHours')"; COORD_MAX_H="${COORD_MAX_H:-3}"
 COORD_WORK_KINDS="$(cfg '.brief.coordinator.workKinds')"
-COORD_WORK_KINDS="${COORD_WORK_KINDS:-session_start|session_end|turn_start|milestone|status|waiting|notification|error}"
+# Work means output: a round ended, a milestone or status was posted. turn_start and error
+# are activity without output and do not count (docs/VELOCITY.md).
+COORD_WORK_KINDS="${COORD_WORK_KINDS:-session_end|milestone|status}"
 DECISION_LABELS_JSON="$(jq -c '.brief.decisionLabels // []' "$CONFIG_FILE")"
 
 # BSD date (macOS) and GNU date both understood.
@@ -210,6 +212,7 @@ if [[ -n "$COORD_ID" && "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_T
          last_any_kind: ($any.kind // null),
          max_silence_hours: $max_h,
          verdict: (if $a == null then "unknown: agent not registered"
+                   elif ($work == null and ($ev | map(select(.kind == "error")) | length) > 0) then "FAILING: error events but no completed work in the window"
                    elif $work == null then "NOT WORKING: no work event in the dashboard window (only " + ($any.kind // "nothing") + ")"
                    elif hours($work.created_at; $now) > $max_h then "NOT WORKING: last work event " + ((hours($work.created_at; $now))|floor|tostring) + "h ago (limit " + ($max_h|tostring) + "h)"
                    else "working: last work event " + ((hours($work.created_at; $now)*10|floor)/10|tostring) + "h ago" end)}' <<<"$fleet")"
@@ -267,7 +270,7 @@ if [[ "$coord_conf" == "true" ]]; then
   cv="$(jq -r .coordinator.verdict <<<"$brief")"
   cid="$(jq -r .coordinator.agent_id <<<"$brief")"
   seen="$(jq -r '.coordinator.last_seen_hours // empty | (. * 10 | floor) / 10' <<<"$brief")"
-  case "$cv" in NOT*) mark="!!";; working*) mark="ok";; *) mark="??";; esac
+  case "$cv" in NOT*|FAILING*) mark="!!";; working*) mark="ok";; *) mark="??";; esac
   echo "COORDINATOR  [$mark] $cid — $cv${seen:+  (telemetry seen ${seen}h ago)}"
   echo
 fi
