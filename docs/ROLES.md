@@ -1,6 +1,6 @@
 # Roles: the job descriptions
 
-A fleet that drains a backlog has four jobs. This page is written so that anyone adopting
+A fleet that drains a backlog has four agent jobs and one human one. This page is written so that anyone adopting
 Agent Kontrol and the Gibson can decide **which agent holds which job**, what that agent is
 accountable for, what it may never do, what it costs, and how to tell from the morning brief
 whether it is doing the work.
@@ -30,7 +30,8 @@ raw issue ──(Spec Writer)──> dispatch-ready ──(Dispatcher)──> in
 ```
 
 The morning brief shows the count at each stage. A deep pile at one stage names the role that
-is behind. Measured in this fleet on 2026-10-25: the same harness and vendors produced 136
+is behind. Observed in one fleet on 2026-10-25 (figures throughout this page are dated
+observations from that fleet, not benchmarks): the same harness and vendors produced 136
 merges in 30 days in one repo and 15 in another. Two repos is not a controlled comparison, but
 the visible differences were specs per issue and an owner answering daily, and in neither repo
 was the Implementer the stage with the pile.
@@ -41,7 +42,7 @@ was the Implementer the stage with the pile.
 |---|---|---|---|---|---|
 | **Spec Writer** | work that can be built without asking | high | top reasoning (Claude Fable/Opus class) | scheduled, budgeted per day | tokens per spec; the cheapest place to be wrong |
 | **Implementer** | correct diff, small, in scope | medium | fast coding tier (Grok, Codex, Claude Sonnet class) | per lane, parallel | tokens per PR; rework dominates |
-| **Reviewer** | defects caught before merge | high, adversarial | a *different* vendor from the Implementer, read-only; mid tier for A/B, top tier for Tier C | per PR, within hours | tokens per review; latency matters more than tokens |
+| **Reviewer** | defects caught before merge | high, adversarial | a *different* vendor from the Implementer, read-only; mid tier for A/B; Tier C needs two reviewers from two vendors, at least one top tier | per PR, within hours | tokens per review; latency matters more than tokens |
 | **Dispatcher** | lanes busy, nothing stuck silently | none | a script, not a model | every few minutes | compute only |
 | **Owner** | decisions answered, priorities stated | highest | a human | daily, from the brief | minutes; the scarcest budget in the system |
 
@@ -190,7 +191,8 @@ Implementer.
 that matters: a September review of this fleet's process (the-gibson#392) concluded that review
 and merge latency, not coding parallelism, was the constraint; the brief now measures
 time-in-review separately so that claim can be checked rather than repeated. Mid tier for
-Tier A/B; top tier plus a second lens for Tier C. Escaped defects are counted from post-merge
+Tier A/B. Tier C: two reviewers from two different vendors, one of them top tier; a second
+lens run by the same reviewer does not count as the second review. Escaped defects are counted from post-merge
 fix PRs that reference the original.
 
 **You know it is working when** time-in-review is a small share of lead time and the
@@ -235,10 +237,16 @@ the brief says the repo has unprioritised work.
 **Output.** Lanes started, PRs merged, decision rows filed, a round receipt per cycle with
 counts: claimed, started, presented for review, merged, escalated.
 
-**May.** Claim, start and stop lanes. Trigger reviews. Merge PRs that carry review evidence at
-the current head and pass every required check (the evidence check is a string match on the
-head SHA in a structured comment, not a judgment). Update a stale branch from its base. Remove stale claims past their TTL. Alert the
-owner on the agreed channel when a threshold is crossed (once, then every 12 hours).
+**May.** Claim, start and stop lanes. Trigger reviews. Merge a PR only when all of the
+following hold, each a mechanical check and none a judgment: every required check is green at
+the current head; a structured review-evidence comment names that exact head SHA; that
+comment's verdict line is `VERDICT: APPROVE` (a `REQUEST_CHANGES`, a missing verdict, or a
+verdict for another SHA is not evidence); the comment's author is a different vendor from the
+PR's author, read from the vendor identity on the comment and the `Agent-Vendor` trailer on
+the commits; and for Tier C, two such comments from two different vendors. Update a stale
+branch from its base. Remove stale claims past their TTL. Alert the owner on the channel
+configured for the brief when a VELOCITY.md threshold is crossed (once, then every 12 hours
+while it holds).
 
 **Never.** Write a spec, edit code, or pick between options. Merge on green CI alone where the
 repo's rules require evidence. Retry the same failing item a third time. Hold a lock without a
@@ -268,7 +276,8 @@ loop in `loop-step`. Agent Kontrol's per-machine dispatcher is the reference imp
 
 ## Owner
 
-The one role a model cannot hold. Accountable for answering the decision queue (ordered by tier
+Mission: answer what only a human can, fast enough that nothing waits on it for long. The one
+role a model cannot hold. Accountable for answering the decision queue (ordered by tier
 then age, in a time-boxed daily session), keeping a pinned priority list the Spec Writer and
 Dispatcher read, and deciding tier-C *product* questions: whether a feature exists, who pays,
 who consents, who may see what. The owner is not in the review loop on individual PRs, Tier C
