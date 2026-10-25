@@ -55,14 +55,17 @@ export interface Message {
   read_by_dashboard_at: string | null;
 }
 
-export type TaskStatus =
-  | "queued"
-  | "claimed"
-  | "running"
-  | "review"
-  | "done"
-  | "failed"
-  | "cancelled";
+export const TASK_STATUSES = [
+  "queued",
+  "claimed",
+  "running",
+  "review",
+  "done",
+  "failed",
+  "cancelled",
+] as const;
+
+export type TaskStatus = (typeof TASK_STATUSES)[number];
 
 export interface Task {
   id: number;

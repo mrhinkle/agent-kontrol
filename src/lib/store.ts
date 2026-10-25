@@ -2,6 +2,19 @@ import { writeSessionNote } from "./session-memory";
 import { sql } from "./db";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
 
+/** Documented `kind` values for POST /api/ingest. The route stores any string. */
+export const INGEST_KINDS = [
+  "session_start",
+  "turn_start",
+  "waiting",
+  "notification",
+  "session_end",
+  "milestone",
+  "status",
+  "error",
+  "heartbeat",
+] as const;
+
 export interface ReportInput {
   agent_id: string;
   platform?: string;

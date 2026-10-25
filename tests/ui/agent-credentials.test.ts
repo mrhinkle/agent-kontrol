@@ -186,7 +186,7 @@ describe("scope table", { concurrency: false }, () => {
     assert.doesNotMatch(schema, /drop table/);
   });
 
-  it("requires every API route except login and the MCP transport to enforce auth itself", () => {
+  it("requires every API route except login, the MCP transport, and the public OpenAPI document to enforce auth itself", () => {
     const root = "src/app/api";
     const files: string[] = [];
     const walk = (dir: string) => {
@@ -201,6 +201,10 @@ describe("scope table", { concurrency: false }, () => {
     for (const file of files) {
       if (file.includes(`${path.sep}login${path.sep}`)) continue;
       if (file.includes("[transport]")) continue;
+      // The OpenAPI document is the public contract, same as GET /docs/api.md.
+      // It must not grow an auth check that would hide it, and it must not
+      // become a pattern for other routes to skip enforcement.
+      if (file.includes(`${path.sep}openapi.json${path.sep}`)) continue;
       const src = fs.readFileSync(file, "utf8");
       assert.match(
         src,

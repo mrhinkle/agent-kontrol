@@ -25,6 +25,7 @@ const PUBLIC_PATHS: RegExp[] = [
   /^\/oauth\//, // OAuth authorize / token / register
   /^\/llms\.txt$/, // public agent index
   /^\/docs\/(mcp|api|agents)\.md$/, // those three Markdown docs, exact names only
+  /^\/api\/openapi\.json$/, // public REST contract; no secrets
 ];
 
 /**
