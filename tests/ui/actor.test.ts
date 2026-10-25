@@ -8,6 +8,7 @@ import { authCookieValue } from "../../src/lib/authcrypto";
 import { createCredential, resetCredentialsForTests } from "../../src/lib/credentials";
 import { setSqlForTests, type Row } from "../../src/lib/db";
 import { principalFromMcpAuth } from "../../src/lib/scopes";
+import { claimNextTask, listTasks } from "../../src/lib/store";
 
 /**
  * Actor is taken from the authenticated credential. created_by in the body
@@ -97,6 +98,21 @@ function installFake() {
       if (!found) return [];
       found.row.thread_id = values[0];
       return [found.row];
+    }
+    if (lower.includes("from tasks")) {
+      return inserts
+        .filter((item) => item.table === "tasks")
+        .map((item) => ({ ...item.row }));
+    }
+    if (lower.includes("update tasks")) {
+      const id = values[values.length - 1];
+      const found = inserts.find((item) => item.table === "tasks" && item.row.id === id);
+      if (!found || found.row.status !== "queued") return [];
+      found.row.status = "claimed";
+      found.row.assigned_agent = values[0];
+      found.row.claimed_at = values[1];
+      found.row.updated_at = values[2];
+      return [{ ...found.row }];
     }
     return [];
   });
@@ -318,5 +334,104 @@ describe("actor attribution", { concurrency: false }, () => {
     assert.equal(stored[0].row.actor_id, credential.credential.id);
     assert.equal(stored[0].row.created_by, "someone-else");
     assert.match(text, /Task #\d+ queued/);
+  });
+
+  it("returns actor fields from list and claim, normalizing blank columns to null", async () => {
+    inserts.push(
+      {
+        table: "tasks",
+        row: {
+          id: 7,
+          title: "with actor",
+          status: "queued",
+          platform: "any",
+          priority: 2,
+          machine: null,
+          actor_type: "agent",
+          actor_id: "cred-a",
+          created_at: "2026-10-25T00:00:00.000Z",
+        },
+      },
+      {
+        table: "tasks",
+        row: {
+          id: 8,
+          title: "legacy blank actor",
+          status: "queued",
+          platform: "grok",
+          priority: 3,
+          machine: null,
+          actor_type: "",
+          actor_id: "",
+          created_at: "2026-10-25T00:00:01.000Z",
+        },
+      },
+    );
+
+    const listed = await listTasks({ status: "all" });
+    const withActor = listed.find((task) => task.id === 7);
+    const blank = listed.find((task) => task.id === 8);
+    assert.ok(withActor);
+    assert.equal(withActor.actor_type, "agent");
+    assert.equal(withActor.actor_id, "cred-a");
+    assert.ok(blank);
+    assert.equal(blank.actor_type, null);
+    assert.equal(blank.actor_id, null);
+
+    const claimed = await claimNextTask({ platform: "any", agent_id: "worker-1" });
+    assert.ok(claimed);
+    assert.equal(claimed.id, 7);
+    assert.equal(claimed.actor_type, "agent");
+    assert.equal(claimed.actor_id, "cred-a");
+
+    const claimedBlank = await claimNextTask({ platform: "grok", agent_id: "worker-1" });
+    assert.ok(claimedBlank);
+    assert.equal(claimedBlank.id, 8);
+    assert.equal(claimedBlank.actor_type, null);
+    assert.equal(claimedBlank.actor_id, null);
+  });
+
+  it("records credential A when reply_to_operator is called over MCP", async () => {
+    const credential = await issue(["messages:write"]);
+    const before = new Set(handles());
+    let text = "";
+    let status = 0;
+    try {
+      const res = await mcpPost(new Request("http://localhost/api/mcp", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${credential.token}`,
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: {
+            name: "reply_to_operator",
+            arguments: {
+              agent_id: "worker-one",
+              body: "finished the queue",
+              created_by: "someone-else",
+              actor_id: "root",
+            },
+          },
+        }),
+      }));
+      status = res.status;
+      text = await res.text();
+    } finally {
+      for (const handle of handles()) {
+        if (!before.has(handle)) handle.unref?.();
+      }
+    }
+    assert.equal(status, 200, text.slice(0, 500));
+    const stored = inserts.filter((item) => item.table === "messages");
+    assert.equal(stored.length, 1, text.slice(0, 500));
+    assert.equal(stored[0].row.actor_type, "agent");
+    assert.equal(stored[0].row.actor_id, credential.credential.id);
+    assert.notEqual(stored[0].row.actor_id, "root");
+    assert.match(text, /Reply #\d+ delivered/);
   });
 });

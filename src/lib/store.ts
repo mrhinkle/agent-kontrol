@@ -351,6 +351,14 @@ function actorFields(actor: Actor | null | undefined): { actor_type: string | nu
   return { actor_type: actor.actor_type, actor_id: actor.actor_id };
 }
 
+function asTask(row: Record<string, unknown>): Task {
+  return {
+    ...(row as unknown as Task),
+    actor_type: row.actor_type === "human" || row.actor_type === "agent" ? row.actor_type : null,
+    actor_id: row.actor_id == null || row.actor_id === "" ? null : String(row.actor_id),
+  };
+}
+
 /** Operator → agent. Sets direction=inbound and thread_id = own id when new. */
 export async function enqueueMessage(input: {
   agent_id: string;
@@ -581,7 +589,7 @@ export async function createTask(input: {
       returning *
     `;
     if (!rows[0]) throw new Error("tasks insert returned no row");
-    return rows[0] as Task;
+    return asTask(rows[0] as Record<string, unknown>);
   } catch (e) {
     throw new Error(errMsg(e));
   }
@@ -605,7 +613,7 @@ export async function listTasks(input?: {
         order by status asc, priority asc, updated_at desc
         limit ${limit}
       `;
-      return rows as Task[];
+      return (rows as Record<string, unknown>[]).map(asTask);
     }
     if (status !== "all") {
       const rows = await db`
@@ -614,14 +622,14 @@ export async function listTasks(input?: {
         order by status asc, priority asc, updated_at desc
         limit ${limit}
       `;
-      return rows as Task[];
+      return (rows as Record<string, unknown>[]).map(asTask);
     }
     const rows = await db`
       select * from tasks
       order by status asc, priority asc, updated_at desc
       limit ${limit}
     `;
-    return rows as Task[];
+    return (rows as Record<string, unknown>[]).map(asTask);
   } catch (e) {
     throw new Error(errMsg(e));
   }
@@ -647,7 +655,7 @@ export async function claimNextTask(input: {
       order by priority asc, created_at asc
       limit 10
     `;
-    candidates = rows as Task[];
+    candidates = (rows as Record<string, unknown>[]).map(asTask);
   } catch (e) {
     throw new Error(errMsg(e));
   }
@@ -666,7 +674,7 @@ export async function claimNextTask(input: {
         where id = ${t.id} and status = 'queued'
         returning *
       `;
-      if (claimed.length > 0) return claimed[0] as Task;
+      if (claimed.length > 0) return asTask(claimed[0] as Record<string, unknown>);
     } catch (e) {
       throw new Error(errMsg(e));
     }
@@ -707,7 +715,7 @@ export async function updateTask(input: {
       returning *
     `;
     if (!rows[0]) throw new Error("Task not found");
-    return rows[0] as Task;
+    return asTask(rows[0] as Record<string, unknown>);
   } catch (e) {
     throw new Error(errMsg(e));
   }
