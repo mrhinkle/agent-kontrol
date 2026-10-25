@@ -346,3 +346,29 @@ alter table agent_credentials add column if not exists expires_at timestamptz;
 alter table agent_credentials add column if not exists revoked_at timestamptz;
 alter table agent_credentials add column if not exists last_used_at timestamptz;
 create unique index if not exists agent_credentials_token_hash_idx on agent_credentials (token_hash);
+
+-- Decisions queue (see supabase/migrations/20261025_decisions.sql and docs/VELOCITY.md)
+create table if not exists decisions (
+  id bigint generated always as identity primary key,
+  key text not null unique,
+  source text not null,
+  repo text,
+  number int,
+  url text,
+  title text not null,
+  why text,
+  options jsonb,
+  recommended text,
+  requested_by text,
+  status text not null default 'open',
+  decision text,
+  decided_by text,
+  decided_at timestamptz,
+  defer_until timestamptz,
+  first_seen_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists decisions_status_first_seen_idx on decisions (status, first_seen_at);
+create index if not exists decisions_repo_number_idx on decisions (repo, number);

@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Velocity layer, part 1: `scripts/morning-brief.sh` prints one screen a day — PRs merged, issues opened/closed and net backlog per repo, median open-to-merge lead time, stale-issue share, every stuck PR with its age and the check or conflict it is stuck on, the decisions waiting on the owner (issues carrying a configured label, oldest first), and whether the coordinator is working or only posting telemetry (a work event within `brief.coordinator.maxSilenceHours`, never a heartbeat). Repos come from the dashboard's Settings list when `MC_URL`/`MC_TOKEN` are set, else `progress.config.json`. `--json` emits the same facts for `/api/brief`. New `decisions` table (`supabase/migrations/20261025_decisions.sql`) and `brief` block in `progress.config.json`. Spec and rollout order: `docs/VELOCITY.md`.
+
 ### Fixed
 
 - The error tables in `docs/API.md` and `docs/MCP.md` match the handlers. `PATCH /api/tasks/:id` and MCP `update_task` return `task_not_found` for a missing id, and `error` stays `Task not found`. OAuth consent rate limiting stays HTML. `GET /api/usage` stays HTTP 200 when its table is missing. An unknown trace is `404` only when a database is connected. No current MCP tool returns `validation_failed`.
