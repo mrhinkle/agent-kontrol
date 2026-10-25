@@ -7,19 +7,24 @@ whether it is doing the work.
 
 Three rules before the cards:
 
-- **A role is a contract, not a vendor.** Any runtime can hold any role if it keeps the
-  contract. Agent Kontrol routes by task class; the contract is identical wherever it runs.
+- **A role is a contract, not a vendor.** Any runtime can hold any agent role if it keeps the
+  contract; the Owner role is held by a person. Agent Kontrol routes by task class; the contract is identical wherever it runs.
 - **Whoever wrote it does not review it.** The Implementer and the Reviewer on one unit of work
   are different vendors, and so are the Spec Writer and the agent that scores its spec. A fleet
-  with a single vendor has no second vendor to review with, so it has no Dispatcher merge path:
-  a human merges after reading the review. The Dispatcher's merge gate below does not relax for
-  it. (One agent holding two roles sequentially in a fresh context reduces blind spots inside a
-  vendor; it does not satisfy the cross-vendor rule and never counts as review evidence.)
-- **Provenance has one reading.** The PR author's vendor is the `Agent-Vendor:` trailer on the
-  PR's commits; where a repo commits through a per-vendor lane-bot identity instead, the gate
-  reads the vendor from the bot's registered identity (one bot per vendor, in the repo's
-  identities file). Both forms resolve to a vendor name; a commit with neither has no vendor
-  and does not merge.
+  with a single vendor has no agent that may review, so it has no agent review path and no
+  Dispatcher merge path: a human performs the review (the same lenses, the same verdict line,
+  posted as evidence under the human's identity) and a human merges. Same-vendor agent output,
+  sequential or not, fresh context or not, is never review evidence and never a basis for a
+  merge. The Dispatcher's merge gate below does not relax for a single-vendor fleet.
+- **Provenance has one reading, and the registry is not in any lane.** The PR author's vendor
+  is the `Agent-Vendor:` trailer on the PR's commits; where a repo commits through a per-vendor
+  lane-bot identity instead, the gate reads the vendor from the bot's registered identity (one
+  bot per vendor). The identities registry lives outside every repo the fleet works on (in the
+  operator's fleet configuration, not in the target repo), is writable only by the operator,
+  and is excluded from every lane's file scope; an Implementer cannot add or change an entry.
+  A commit whose trailer names a vendor that does not match its author's registered identity
+  is a provenance failure, not a different vendor. Both forms resolve to a vendor name; a
+  commit with neither has no vendor and does not merge.
 - **Numbers, not adjectives.** Every latency and depth in these cards is a number the brief
   reports and a breach it names: review verdict within 4 hours (Tier A/B) or 12 hours (Tier C)
   of green-at-head; a lane older than 48 hours is stuck; dispatch-ready depth capped at 10 per
@@ -180,9 +185,12 @@ work it produced.
 **Inputs.** A green PR at a named head, its issue and spec, the tier label, the repo's lenses.
 Read-only access to the code.
 
-**Output.** A review ending in exactly one line, `VERDICT: APPROVE` or
-`VERDICT: REQUEST_CHANGES`, with findings above it, posted as review evidence the gate can
-read. On Tier C, an adversarial pass that tries to break the change, not just read it.
+**Output.** A structured review-evidence comment the gate can read: a header naming the exact
+head SHA reviewed, one line per required lens stating `cleared` or a finding, the findings
+with file and line, and a final line that is exactly `VERDICT: APPROVE` or
+`VERDICT: REQUEST_CHANGES`. A comment missing any required lens line is not evidence, whatever
+its verdict says. On Tier C, an adversarial pass that tries to break the change, not just read
+it, recorded as its own lens line.
 
 **May.** Read everything. Run the build, lint and tests locally. Request changes. Re-tier a PR
 whose diff drifted into money, consent, auth or schema.
@@ -237,8 +245,9 @@ escalate instead of guessing. It has no judgment and needs none.
 - Posting a work event (not a heartbeat) at the end of every round, so the brief can tell
   working from alive.
 
-**Inputs.** The queue (`dispatch-ready` items across watched repos, ordered by the owner's
-pinned list, then priority label P0 > P1 > P2, then age), the live claims, the PR list with
+**Inputs.** The queue (`dispatch-ready` items that do not also carry the repo's blocked label,
+across watched repos, ordered by the owner's pinned list, then priority label P0 > P1 > P2,
+then age), the live claims, the PR list with
 check states, the merge train order. Where no priority label exists the item sorts last and
 the brief says the repo has unprioritised work.
 
@@ -248,10 +257,12 @@ counts: claimed, started, presented for review, merged, escalated.
 **May.** Claim, start and stop lanes. Trigger reviews. Merge a PR only when all of the
 following hold, each a mechanical check and none a judgment: every required check is green at
 the current head; a structured review-evidence comment names that exact head SHA; that
-comment's verdict line is `VERDICT: APPROVE` (a `REQUEST_CHANGES`, a missing verdict, or a
-verdict for another SHA is not evidence); the comment's author resolves to a different vendor
-from the PR's author, both read as "Provenance has one reading" defines (trailer or registered
-lane-bot identity); and for Tier C, two such comments from two different vendors. Update a stale
+comment carries a `cleared`-or-finding line for every lens the repo requires at the PR's tier
+(a comment with a missing lens line is not evidence, whatever its verdict); its verdict line is
+`VERDICT: APPROVE` (a `REQUEST_CHANGES`, a missing verdict, or a verdict for another SHA is not
+evidence); the comment's author resolves to a different vendor from the PR's author, both read
+as "Provenance has one reading" defines (trailer or registered lane-bot identity); and for
+Tier C, two such comments from two different vendors. Update a stale
 branch from its base. Remove stale claims past their TTL. Alert the owner on the channel
 configured for the brief when a VELOCITY.md threshold is crossed (once, then every 12 hours
 while it holds).
