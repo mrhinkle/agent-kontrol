@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server";
-import { IdempotencyConflict, IdempotencyKeyInvalid } from "./idempotency";
 
 /**
  * Machine-readable errors for REST and MCP.
@@ -213,14 +212,31 @@ interface SafeCaught {
  * happens to contain one of these phrases must fall through to internal_error
  * so the original text is not returned.
  */
+/**
+ * Match by name. api-error is imported by middleware, which cannot load
+ * node:crypto, so this file does not import the idempotency module.
+ */
+function namedError(err: unknown, name: string): (Error & { fields?: Record<string, string> }) | null {
+  if (!(err instanceof Error) || err.name !== name) return null;
+  return err as Error & { fields?: Record<string, string> };
+}
+
 function safeCaught(err: unknown): SafeCaught | null {
-  if (err instanceof IdempotencyConflict || (err instanceof Error && err.name === "IdempotencyConflict")) {
-    const fields = err instanceof IdempotencyConflict ? err.fields : { idempotency_key: err.message };
-    return { code: "idempotency_conflict", message: err.message, fields };
+  const conflict = namedError(err, "IdempotencyConflict");
+  if (conflict) {
+    return {
+      code: "idempotency_conflict",
+      message: conflict.message,
+      fields: conflict.fields ?? { idempotency_key: conflict.message },
+    };
   }
-  if (err instanceof IdempotencyKeyInvalid || (err instanceof Error && err.name === "IdempotencyKeyInvalid")) {
-    const fields = err instanceof IdempotencyKeyInvalid ? err.fields : { idempotency_key: err.message };
-    return { code: "validation_failed", message: err.message, fields };
+  const invalidKey = namedError(err, "IdempotencyKeyInvalid");
+  if (invalidKey) {
+    return {
+      code: "validation_failed",
+      message: invalidKey.message,
+      fields: invalidKey.fields ?? { idempotency_key: invalidKey.message },
+    };
   }
   const msg = err instanceof Error ? err.message : "";
   if (msg === "Task not found") return { code: "task_not_found", message: msg };
