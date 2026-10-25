@@ -21,6 +21,7 @@ export const SCOPES = [
   "messages:read",
   "messages:write",
   "progress:read",
+  "decisions:write",
 ] as const;
 
 export type Scope = (typeof SCOPES)[number];
@@ -64,6 +65,10 @@ const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   { method: "POST", path: /^\/api\/tasks$/, scope: "tasks:write" },
   { method: "POST", path: /^\/api\/tasks\/claim$/, scope: "tasks:write" },
   { method: "PATCH", path: /^\/api\/tasks\/[^/]+$/, scope: "tasks:write" },
+  // GET and POST stay off this table: the collector uses MC_TOKEN and the
+  // dashboard uses the session. An agent credential can change a decision
+  // only when it holds decisions:write.
+  { method: "PATCH", path: /^\/api\/decisions\/[^/]+$/, scope: "decisions:write" },
 ];
 
 export type Principal =

@@ -12,6 +12,15 @@ import type { RepoConfig } from "../src/lib/progress-config";
 import { getTrace, listTraces, pruneSpans, upsertSpans } from "../src/lib/trace-store";
 import { pruneAutomaticNotes, upsertAutomaticNote } from "../src/lib/session-memory";
 import type { SpanInput } from "../src/lib/traces";
+import {
+  ageDays,
+  listDecisions,
+  patchDecision,
+  reconcileDecisions,
+  toBriefDecisions,
+  upsertDecision,
+  type UpsertInput,
+} from "../src/lib/decisions";
 
 async function main() {
   if (!process.env.DATABASE_URL) {
@@ -187,7 +196,212 @@ async function main() {
   await sql()`delete from memory where key like ${"session/" + tag + "%"}`;
   await sql()`delete from spans where session_id like ${tag + "%"}`;
 
+  await testDecisions(tag);
+
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
+}
+
+async function testDecisions(tag: string) {
+  const repo = `pgtest/d${tag.replace(/\W/g, "")}`;
+  const key = (n: number) => `github:${repo}#${n}`;
+  const opened = "2026-07-21T12:00:00.000Z";
+  const body = (n: number, over: Partial<UpsertInput> = {}): UpsertInput => ({
+    key: key(n),
+    source: "github-label",
+    repo,
+    repo_short: "app",
+    number: n,
+    url: `https://github.com/${repo}/issues/${n}`,
+    title: `decision ${n}`,
+    why: "needs-owner",
+    options: null,
+    recommended: null,
+    requested_by: "owner",
+    kind: n === 1 ? "issue" : "pr",
+    labels: ["needs-owner"],
+    opened_at: opened,
+    first_seen_at: n === 2 ? "2026-01-01T00:00:00.000Z" : opened,
+    github_present: true,
+    force: false,
+    ...over,
+  });
+
+  await sql()`delete from decisions where repo = ${repo}`;
+  try {
+    const cols = await sql()`
+      select column_name from information_schema.columns
+      where table_schema = 'public' and table_name = 'decisions'
+        and column_name in ('kind', 'labels', 'opened_at', 'repo_short', 'github_present')
+    `;
+    assert.equal(cols.length, 5, "schema.sql adds the brief columns");
+
+    const first = await upsertDecision(body(1));
+    assert.equal(typeof first.decision.id, "number");
+    assert.equal(first.status_held, false);
+    assert.equal(first.decision.status, "open");
+    assert.equal(first.decision.github_present, true);
+    assert.deepEqual(first.decision.labels, ["needs-owner"]);
+    assert.equal(first.decision.age_days, ageDays(opened, new Date().toISOString()));
+    assert.equal(first.decision.requested_by, "owner");
+
+    const decided = await patchDecision(first.decision.id, {
+      status: "decided",
+      decision: "Ship it",
+      setDecision: true,
+      decided_by: "mark",
+      setDecidedBy: true,
+      defer_until: null,
+      setDefer: false,
+    });
+    assert.equal(decided?.status, "decided");
+    assert.equal(decided?.decision, "Ship it");
+    assert.ok(decided?.decided_at);
+
+    const held = await upsertDecision(body(1, {
+      title: "renamed",
+      requested_by: "collector",
+      opened_at: "2026-10-01T00:00:00.000Z",
+      why: "needs-owner, decision",
+    }));
+    assert.equal(held.status_held, true);
+    assert.equal(held.decision.status, "decided");
+    assert.equal(held.decision.decision, "Ship it");
+    assert.equal(held.decision.title, "renamed");
+    assert.equal(held.decision.requested_by, "owner");
+    assert.ok(held.decision.opened_at?.startsWith("2026-07-21"));
+
+    const forced = await upsertDecision(body(1, { force: true, title: "reopened" }));
+    assert.equal(forced.status_held, false);
+    assert.equal(forced.decision.status, "open");
+    assert.equal(forced.decision.decision, null);
+    assert.equal(forced.decision.decided_by, null);
+    assert.equal(forced.decision.decided_at, null);
+
+    const again = await patchDecision(first.decision.id, {
+      status: "decided",
+      decision: "Ship it",
+      setDecision: true,
+      decided_by: "mark",
+      setDecidedBy: true,
+      defer_until: null,
+      setDefer: false,
+    });
+    assert.equal(again?.status, "decided");
+
+    const missing = await upsertDecision(body(2, { title: "will withdraw", kind: "issue" }));
+    assert.equal(missing.decision.status, "open");
+    const deferred = await upsertDecision(body(3, { title: "due", kind: "issue", first_seen_at: "2026-08-01T00:00:00.000Z" }));
+    const parked = await patchDecision(deferred.decision.id, {
+      status: "deferred",
+      decision: null,
+      setDecision: false,
+      decided_by: null,
+      setDecidedBy: false,
+      defer_until: "2020-01-01T00:00:00.000Z",
+      setDefer: true,
+    });
+    assert.equal(parked?.status, "deferred");
+
+    const future = await upsertDecision(body(5, { title: "later", kind: "issue", opened_at: "2026-10-24T00:00:00.000Z" }));
+    await patchDecision(future.decision.id, {
+      status: "deferred",
+      decision: null,
+      setDecision: false,
+      decided_by: null,
+      setDecidedBy: false,
+      defer_until: "2099-01-01T00:00:00.000Z",
+      setDefer: true,
+    });
+    const openBefore = await listDecisions({ status: "open", repo, source: "github-label", limit: 100 });
+    const openIds = openBefore.map((row) => row.number);
+    assert.ok(openIds.includes(2) && openIds.includes(3), "due deferred rows sit in the open queue");
+    assert.equal(openIds.includes(1), false, "a decided row is not in the open queue");
+    assert.equal(openIds.includes(5), false, "a future deferral stays out of the open queue");
+
+    const forcedDefer = await upsertDecision(body(5, { force: true, title: "later", opened_at: "2026-10-24T00:00:00.000Z" }));
+    assert.equal(forcedDefer.decision.status, "open");
+    assert.equal(forcedDefer.decision.defer_until, null);
+
+    const briefBefore = toBriefDecisions(
+      await listDecisions({ status: "all", repo, source: null, limit: 100 }),
+      "2026-10-25T12:00:00Z",
+    );
+    assert.ok(briefBefore.some((row) => row.number === 1 && row.repo === "app"));
+
+    const reconciled = await reconcileDecisions({
+      repo,
+      source: "github-label",
+      seen_keys: [key(1), key(5)],
+    });
+    assert.equal(reconciled.withdrawn, 2, "the missing open row and the due deferred row withdraw");
+    assert.ok(reconciled.reconciled >= 2);
+
+    const after = await listDecisions({ status: "all", repo, source: null, limit: 100 });
+    const byNumber = new Map(after.map((row) => [row.number, row]));
+    assert.equal(byNumber.get(1)?.status, "decided");
+    assert.equal(byNumber.get(1)?.github_present, true, "a key the collector still saw stays present");
+    assert.equal(byNumber.get(1)?.decision, "Ship it");
+    assert.equal(byNumber.get(2)?.status, "withdrawn");
+    assert.equal(byNumber.get(2)?.github_present, false);
+    assert.equal(byNumber.get(3)?.status, "withdrawn");
+    assert.equal(byNumber.get(3)?.defer_until, null);
+    assert.equal(byNumber.get(5)?.status, "open");
+    assert.equal(byNumber.get(5)?.github_present, true);
+
+    const brief = toBriefDecisions(after, "2026-10-25T12:00:00Z");
+    assert.deepEqual(brief.map((row) => row.number), [1, 5], "oldest first, and a decided row still on GitHub stays in the brief");
+    assert.ok(brief.every((row) => row.repo === "app"));
+
+    const dropped = await reconcileDecisions({ repo, source: "github-label", seen_keys: [key(5)] });
+    assert.equal(dropped.withdrawn, 0, "losing the label does not withdraw a decided row");
+    const hidden = (await listDecisions({ status: "all", repo, source: null, limit: 100 })).find((row) => row.number === 1);
+    assert.equal(hidden?.status, "decided");
+    assert.equal(hidden?.github_present, false);
+    assert.equal(hidden?.decision, "Ship it");
+    const briefAfterDrop = toBriefDecisions(
+      await listDecisions({ status: "all", repo, source: null, limit: 100 }),
+      "2026-10-25T12:00:00Z",
+    );
+    assert.deepEqual(briefAfterDrop.map((row) => row.number), [5]);
+
+    const back = await upsertDecision(body(2, { title: "label returned", requested_by: "collector" }));
+    assert.equal(back.decision.status, "open");
+    assert.equal(back.decision.github_present, true);
+    assert.equal(back.status_held, false);
+
+    const empty = await reconcileDecisions({ repo, source: "github-label", seen_keys: [] });
+    assert.ok(empty.withdrawn >= 1, "an empty sweep withdraws the open rows");
+    const kept = await listDecisions({ status: "decided", repo, source: null, limit: 100 });
+    assert.equal(kept.length, 1);
+    assert.equal(kept[0].number, 1);
+    assert.equal(kept[0].github_present, false);
+    assert.equal(kept[0].decision, "Ship it");
+
+    const cleared = await patchDecision(first.decision.id, {
+      status: "open",
+      decision: null,
+      setDecision: false,
+      decided_by: null,
+      setDecidedBy: false,
+      defer_until: null,
+      setDefer: false,
+    });
+    assert.equal(cleared?.status, "open");
+    assert.equal(cleared?.decision, null);
+    assert.equal(cleared?.decided_at, null);
+
+    await sql()`
+      insert into decisions (key, source, repo, repo_short, number, title, status, kind, opened_at, first_seen_at, github_present)
+      values (${key(9)}, 'github-label', ${repo}, 'app', 9, 'pre-column', 'open', 'issue', ${"2026-10-23T00:00:00.000Z"}, ${"2026-10-23T00:00:00.000Z"}, null)
+    `;
+    const withNull = toBriefDecisions(
+      await listDecisions({ status: "all", repo, source: null, limit: 100 }),
+      "2026-10-25T12:00:00Z",
+    );
+    assert.ok(withNull.some((row) => row.number === 9), "a null github_present still shows in the brief");
+  } finally {
+    await sql()`delete from decisions where repo = ${repo}`;
+  }
 }
 
 main().then(() => process.exit(0)).catch((e) => {
