@@ -10,9 +10,16 @@ Three rules before the cards:
 - **A role is a contract, not a vendor.** Any runtime can hold any role if it keeps the
   contract. Agent Kontrol routes by task class; the contract is identical wherever it runs.
 - **Whoever wrote it does not review it.** The Implementer and the Reviewer on one unit of work
-  are different vendors, and so are the Spec Writer and the agent that scores its spec. In a
-  solo fleet one agent may hold Implementer and Reviewer only *sequentially*, in a fresh context
-  per role; it never implements a spec it wrote.
+  are different vendors, and so are the Spec Writer and the agent that scores its spec. A fleet
+  with a single vendor has no second vendor to review with, so it has no Dispatcher merge path:
+  a human merges after reading the review. The Dispatcher's merge gate below does not relax for
+  it. (One agent holding two roles sequentially in a fresh context reduces blind spots inside a
+  vendor; it does not satisfy the cross-vendor rule and never counts as review evidence.)
+- **Provenance has one reading.** The PR author's vendor is the `Agent-Vendor:` trailer on the
+  PR's commits; where a repo commits through a per-vendor lane-bot identity instead, the gate
+  reads the vendor from the bot's registered identity (one bot per vendor, in the repo's
+  identities file). Both forms resolve to a vendor name; a commit with neither has no vendor
+  and does not merge.
 - **Numbers, not adjectives.** Every latency and depth in these cards is a number the brief
   reports and a breach it names: review verdict within 4 hours (Tier A/B) or 12 hours (Tier C)
   of green-at-head; a lane older than 48 hours is stuck; dispatch-ready depth capped at 10 per
@@ -116,8 +123,9 @@ report truthfully when it cannot.
 - The PR closes exactly the issue it claimed, touches only the declared file scope, and passes
   the repo's preflight before it is opened.
 - Every acceptance criterion in the spec is addressed or explicitly listed as not done.
-- The commit carries the vendor identity (`Agent-Vendor:` trailer or lane-bot identity) so the
-  Reviewer and the ledger know who built it.
+- The commit carries the vendor identity (`Agent-Vendor:` trailer, or a per-vendor lane-bot
+  identity the repo registers) so the Reviewer, the Dispatcher's gate and the ledger resolve
+  who built it (see "Provenance has one reading").
 
 **Inputs.** One claimed issue with a spec. A fresh git worktree on its own branch. The repo's
 `AGENTS.md`, lessons ledger, and preflight script. Nothing else: an Implementer that needs more
@@ -241,9 +249,9 @@ counts: claimed, started, presented for review, merged, escalated.
 following hold, each a mechanical check and none a judgment: every required check is green at
 the current head; a structured review-evidence comment names that exact head SHA; that
 comment's verdict line is `VERDICT: APPROVE` (a `REQUEST_CHANGES`, a missing verdict, or a
-verdict for another SHA is not evidence); the comment's author is a different vendor from the
-PR's author, read from the vendor identity on the comment and the `Agent-Vendor` trailer on
-the commits; and for Tier C, two such comments from two different vendors. Update a stale
+verdict for another SHA is not evidence); the comment's author resolves to a different vendor
+from the PR's author, both read as "Provenance has one reading" defines (trailer or registered
+lane-bot identity); and for Tier C, two such comments from two different vendors. Update a stale
 branch from its base. Remove stale claims past their TTL. Alert the owner on the channel
 configured for the brief when a VELOCITY.md threshold is crossed (once, then every 12 hours
 while it holds).
