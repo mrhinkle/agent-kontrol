@@ -10,8 +10,13 @@ Three rules before the cards:
 - **A role is a contract, not a vendor.** Any runtime can hold any role if it keeps the
   contract. Agent Kontrol routes by task class; the contract is identical wherever it runs.
 - **Whoever wrote it does not review it.** The Implementer and the Reviewer on one unit of work
-  are different vendors. A single agent may hold both roles in a solo fleet only *sequentially*,
-  with a fresh context per role.
+  are different vendors, and so are the Spec Writer and the agent that scores its spec. In a
+  solo fleet one agent may hold Implementer and Reviewer only *sequentially*, in a fresh context
+  per role; it never implements a spec it wrote.
+- **Numbers, not adjectives.** Every latency and depth in these cards is a number the brief
+  reports and a breach it names: review verdict within 4 hours (Tier A/B) or 12 hours (Tier C)
+  of green-at-head; a lane older than 48 hours is stuck; dispatch-ready depth capped at 10 per
+  repo; a decision older than 14 days is a breach.
 - **The binding rules live in the target repository's `AGENTS.md`** (and, where the Gibson is
   adopted, in its role contracts). These cards explain the jobs and how to staff them. They do
   not add or weaken a gate.
@@ -26,8 +31,9 @@ raw issue ──(Spec Writer)──> dispatch-ready ──(Dispatcher)──> in
 
 The morning brief shows the count at each stage. A deep pile at one stage names the role that
 is behind. Measured in this fleet on 2026-10-25: the same harness and vendors produced 136
-merges in 30 days in a repo with specs and a daily owner, and 15 in a repo with neither. The
-difference was never the Implementer.
+merges in 30 days in one repo and 15 in another. Two repos is not a controlled comparison, but
+the visible differences were specs per issue and an owner answering daily, and in neither repo
+was the Implementer the stage with the pile.
 
 ## Staffing matrix
 
@@ -49,9 +55,14 @@ question, and refuse to pretend when it cannot.
 **Accountable for**
 
 - Every issue it touches ends in exactly one of two states: `dispatch-ready` with a spec, or a
-  filed decision that names what only the owner can answer.
+  filed decision that names what only the owner can answer. **Filing a decision is not the
+  cheap exit.** A decision row must name the files the Spec Writer read and the two scopings it
+  could not choose between; a row without both is returned to the Spec Writer, not the owner.
+  The brief reports decisions filed per spec written; above one to one, the Spec Writer is
+  deferring and is the role at fault.
 - The spec is one mergeable unit of work. If it is not, the Spec Writer splits it.
-- The dispatch-ready queue never runs dry while raw issues exist and decisions are answered.
+- The dispatch-ready queue never runs dry while raw issues exist and decisions are answered,
+  and never exceeds the cap (10 per repo).
 
 **Inputs.** Raw issues (no spec, or a spec that failed the gate), the repo's `AGENTS.md`, the
 lessons ledger, the open claims table, the live code, the owner's stated priorities.
@@ -76,12 +87,13 @@ allowed).
 state the first file it would open and the first test it would write. The repo's spec gate
 (where one exists) is the floor, not the bar.
 
-**Cadence and budget.** Scheduled, a few issues per run, with a daily token budget. Priority
-order: issues the owner named, then the oldest P0, then whatever unblocks the most others.
-It stops when the dispatch-ready queue holds more than the fleet can build in two days.
+**Cadence and budget.** Scheduled, a few issues per run, with a daily cap (default ten issues
+or the token budget, whichever first). Priority order: issues the owner named, then the oldest
+P0, then whatever unblocks the most others. It stops when the repo's dispatch-ready depth
+reaches the cap.
 
-**You know it is working when** the brief shows dispatch-ready depth between two and ten per
-repo, the decisions it files are answered rather than withdrawn, and Implementer PRs stop
+**You know it is working when** the brief shows dispatch-ready depth between two and the cap
+per repo, decisions filed per spec written stays well under one, and Implementer PRs stop
 carrying "clarification" comments. **You know it is failing when** dispatch-ready is empty
 while raw issues pile up, or when lanes fail on the first run because the spec was wrong.
 
@@ -118,8 +130,9 @@ often as it likes. Push to its own branch. Comment on the issue when the spec is
 
 **Never.** Edit outside the scope or in the canonical checkout. Merge. Review its own work.
 Weaken or delete a failing test to go green. Add a dependency casually. Rebase or force-push
-a branch under review (it invalidates the review's pinned head). Mark a check green it did not
-run.
+a branch under review (it invalidates the review's pinned head; when the branch falls behind,
+the Dispatcher merges the base in and re-requests review, see below). Mark a check green it did
+not run.
 
 **Quality bar.** Green at the exact head on every required check; diff under the repo's PR-size
 limit; a reviewer can trace each hunk to a criterion.
@@ -148,8 +161,8 @@ work it produced.
 
 **Accountable for**
 
-- A verdict within the agreed latency (hours, not days) on every PR the Dispatcher presents,
-  pinned to the exact head SHA reviewed.
+- A verdict within 4 hours (Tier A/B) or 12 hours (Tier C) of the PR going green at its head,
+  pinned to the exact head SHA reviewed. The brief lists every breach by PR and hours over.
 - Findings with file and line, graded by severity, across the lenses the repo requires
   (correctness, tests, security, scope, contract, maintainability).
 - A post-merge verification on Tier C and on anything deployed: does production do what the
@@ -174,9 +187,11 @@ checked. Escaped defects (found after merge) are counted against the Reviewer, n
 Implementer.
 
 **Cadence and budget.** Per PR, triggered by the gate or the Dispatcher. Latency is the metric
-that matters: the September measurement in this fleet found review and merge latency, not
-coding parallelism, was the throughput constraint. Mid tier for Tier A/B; top tier plus a
-second lens for Tier C.
+that matters: a September review of this fleet's process (the-gibson#392) concluded that review
+and merge latency, not coding parallelism, was the constraint; the brief now measures
+time-in-review separately so that claim can be checked rather than repeated. Mid tier for
+Tier A/B; top tier plus a second lens for Tier C. Escaped defects are counted from post-merge
+fix PRs that reference the original.
 
 **You know it is working when** time-in-review is a small share of lead time and the
 escaped-defect count stays near zero. **You know it is failing when** PRs sit green with
@@ -201,20 +216,28 @@ escalate instead of guessing. It has no judgment and needs none.
 - Claiming the highest-priority dispatch-ready item atomically (two machines never take the
   same one) and starting the lane within minutes.
 - Presenting every green PR to a Reviewer and merging what has evidence, in dependency order,
-  one at a time.
+  one at a time. Immediately before each merge it re-reads the head SHA and confirms the
+  evidence names that SHA; a mismatch is a re-review, never a merge.
+- Keeping PRs mergeable: when a serial merge leaves the next PR behind its base, the
+  Dispatcher merges the base branch into it (a merge commit, never a rebase or force-push),
+  and re-requests review of the new head. This is mechanical; without it, serial merges and
+  the no-rebase rule deadlock each other.
 - Opening a decision row for anything that fails twice, conflicts, or waits on a label only a
   human can set, and then leaving it alone.
 - Posting a work event (not a heartbeat) at the end of every round, so the brief can tell
   working from alive.
 
-**Inputs.** The queue (`dispatch-ready` items across watched repos, by priority), the live
-claims, the PR list with check states, the merge train order.
+**Inputs.** The queue (`dispatch-ready` items across watched repos, ordered by the owner's
+pinned list, then priority label P0 > P1 > P2, then age), the live claims, the PR list with
+check states, the merge train order. Where no priority label exists the item sorts last and
+the brief says the repo has unprioritised work.
 
 **Output.** Lanes started, PRs merged, decision rows filed, a round receipt per cycle with
 counts: claimed, started, presented for review, merged, escalated.
 
 **May.** Claim, start and stop lanes. Trigger reviews. Merge PRs that carry review evidence at
-the current head and pass every required check. Remove stale claims past their TTL. Alert the
+the current head and pass every required check (the evidence check is a string match on the
+head SHA in a structured comment, not a judgment). Update a stale branch from its base. Remove stale claims past their TTL. Alert the
 owner on the agreed channel when a threshold is crossed (once, then every 12 hours).
 
 **Never.** Write a spec, edit code, or pick between options. Merge on green CI alone where the
@@ -224,8 +247,9 @@ PID and TTL. Approve another agent's permission prompt. Run two lanes in one che
 **Quality bar.** Deterministic: given the same queue and repo state it does the same thing. A
 round receipt exists for every scheduled run. Zero items in `claimed` older than the TTL.
 
-**Cadence.** Every few minutes while the queue is non-empty. One instance per machine, with a
-kill switch the owner can flip in one command.
+**Cadence.** Every few minutes while the queue is non-empty. One instance per machine. It
+holds no merge authority until a one-command kill switch exists that halts the script and
+revokes its merge credential, and the repo has a revert-first policy for bad merges.
 
 **You know it is working when** the brief's coordinator line says *working*, dispatch-ready
 depth falls while lanes stay busy, and stuck PRs each carry a reason. **You know it is failing
@@ -244,11 +268,15 @@ loop in `loop-step`. Agent Kontrol's per-machine dispatcher is the reference imp
 
 ## Owner
 
-The one role a model cannot hold. Accountable for answering the decision queue (oldest first,
-every working day), stating priorities the Spec Writer can read, and deciding tier-C questions
-about money, consent, auth and schema. Never in the review loop on individual PRs: that is the
-Reviewer's job, and an owner attestation is a bypass of it. The brief exists so this role costs
-minutes a day; a decision older than fourteen days is the system's failure, not the owner's.
+The one role a model cannot hold. Accountable for answering the decision queue (ordered by tier
+then age, in a time-boxed daily session), keeping a pinned priority list the Spec Writer and
+Dispatcher read, and deciding tier-C *product* questions: whether a feature exists, who pays,
+who consents, who may see what. The owner is not in the review loop on individual PRs, Tier C
+included: in this fleet Tier C clears on two-vendor review plus the deterministic gates
+(decision D-014), and an owner attestation on a PR is a bypass of review, not a form of it.
+Tier C changes still need the owner's product decision *before* dispatch; that is what the
+decision queue is for. The brief exists so this role costs minutes a day. A decision older than
+fourteen days is a breach the brief names; the fix is a shorter queue, not a faster owner.
 
 ## Choosing who holds what
 
@@ -257,9 +285,10 @@ minutes a day; a decision older than fourteen days is the system's failure, not 
 2. Put your most capable model on the Spec Writer, on a budget. It is the cheapest place to be
    wrong and the most expensive to skip.
 3. Put your cheapest competent coder on the Implementer and let it run many lanes.
-4. Measure with the brief for two weeks before adding any role, gate or agent. Process scales
-   with measured throughput; a repo under about twenty merges a month needs a thin path, not
-   more supervision.
+4. Measure with the brief for two weeks before adding any *further* role, gate or agent beyond
+   these four. Process scales with measured throughput; a repo under about twenty merges a
+   month needs thin gates, not more supervision. That is a rule about gates, not about intake:
+   a slow repo still needs a Spec Writer, it does not need a fifth required check.
 
 Related: [VELOCITY.md](VELOCITY.md) (the brief and the decision queue), [PLAYBOOK.md](../PLAYBOOK.md)
 (the operating model), the Gibson's `docs/03-roles.md` and `playbooks/` (binding contracts and
