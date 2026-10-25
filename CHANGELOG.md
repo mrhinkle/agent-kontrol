@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `docs/ROLES.md`: job descriptions for the four fleet roles (Spec Writer, Implementer, Reviewer, Dispatcher) and the Owner. Each card states mission, accountabilities, inputs, output artifact, may/never, quality bar, cadence and cost shape, the brief signals that show it working or failing, a dated failure seen in this fleet, and the Gibson playbook it maps to. Non-normative: binding rules stay in each repo's `AGENTS.md`.
+
 ### Fixed
 
 - The error tables in `docs/API.md` and `docs/MCP.md` match the handlers. `PATCH /api/tasks/:id` and MCP `update_task` return `task_not_found` for a missing id, and `error` stays `Task not found`. OAuth consent rate limiting stays HTML. `GET /api/usage` stays HTTP 200 when its table is missing. An unknown trace is `404` only when a database is connected. No current MCP tool returns `validation_failed`.

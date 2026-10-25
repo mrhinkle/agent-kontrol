@@ -73,6 +73,7 @@ Agent Kontrol is in **1.0 beta** ([release notes](https://github.com/mrhinkle/ag
 | [Telemetry and traces](docs/TELEMETRY.md) | Spans, OpenTelemetry ingest, retention, privacy |
 | [Memory (Notes)](docs/MEMORY.md) | What the notes store does and does not do |
 | [Usage and Costs](docs/USAGE.md) | The experimental cost ledger |
+| [Roles](docs/ROLES.md) | Job descriptions for Spec Writer, Implementer, Reviewer, Dispatcher and Owner: who should hold each, and how the brief shows it working |
 | [Playbook](PLAYBOOK.md) | How to run a multi-vendor agent fleet |
 | [Security](SECURITY.md) | Threat model and reporting |
 
