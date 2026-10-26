@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { enforceApi } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
+import { diffRepoList, readDryRun } from "@/lib/dry-run";
 import { REPOS } from "@/lib/progress-config";
 import { MAX_REPOS, validateRepoList, type RepoError } from "@/lib/repo-validation";
 import { getWatchedRepos, listVersion, replaceWatchedRepos } from "@/lib/watched-repos";
@@ -13,12 +14,13 @@ export const dynamic = "force-dynamic";
  *
  * GET  /api/settings/repos
  *      -> { source: "database" | "file", writable, max, version, repos: [...] }
- * PUT  /api/settings/repos  { repos: [...], version?: string }
+ * PUT  /api/settings/repos  { repos: [...], version?: string, dry_run?: boolean }
  *      Replaces the whole list, in order. 400 keeps `errors: [{ index, field, message }]`
  *      and adds code, fix, retryable, and fields. 409 when no database is connected.
  *      If `version` (from the GET the caller started from) is sent and the list has
  *      changed since, answers 409 { code: "stale" } instead of overwriting someone
- *      else's change.
+ *      else's change. `dry_run: true` returns that diff and writes nothing.
+ *      Any other `dry_run` value is 400 and also writes nothing.
  *
  * Auth: dashboard session or MC_TOKEN. An agent credential cannot call this
  * route (it is not in the scope table). The collector uses MC_TOKEN.
@@ -74,7 +76,22 @@ export async function PUT(req: Request) {
       extra: { errors: checked.errors },
     });
   }
+  const dry = readDryRun((body as { dry_run?: unknown } | null)?.dry_run);
+  if (!dry.ok) {
+    return apiError("validation_failed", {
+      message: "dry_run must be a boolean.",
+      fields: { dry_run: "Use true to preview, or false to save." },
+    });
+  }
   if (!isConfigured()) {
+    if (dry.dryRun) {
+      try {
+        const cur = await current();
+        return NextResponse.json(diffRepoList(cur.repos, checked.repos, false));
+      } catch (e) {
+        return failure(e, "load settings");
+      }
+    }
     return apiError("conflict", {
       message: "Settings can only be saved when a database is connected.",
       fix: "Connect a database (DATABASE_URL) and retry the save.",
@@ -82,8 +99,12 @@ export async function PUT(req: Request) {
   }
   try {
     const sent = (body as { version?: unknown } | null)?.version;
-    if (typeof sent === "string" && sent !== (await current()).version) {
+    const cur = await current();
+    if (typeof sent === "string" && sent !== cur.version) {
       return apiError("stale");
+    }
+    if (dry.dryRun) {
+      return NextResponse.json(diffRepoList(cur.repos, checked.repos, true));
     }
     await replaceWatchedRepos(checked.repos);
     return NextResponse.json(await current());
