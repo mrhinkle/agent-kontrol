@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { enforceApi } from "@/lib/auth";
+import { actorFromPrincipal } from "@/lib/actor";
+import { deny, resolveApiAccess } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import {
@@ -32,8 +33,8 @@ function setupResponse() {
 }
 
 export async function GET(req: Request) {
-  const denied = await enforceApi(req);
-  if (denied) return denied;
+  const access = await resolveApiAccess(req);
+  if (!access.ok) return deny(access);
   const url = new URL(req.url);
   const agent_id = url.searchParams.get("agent_id");
   if (!agent_id) {
@@ -59,8 +60,8 @@ export async function GET(req: Request) {
 }
 
 export async function POST(req: Request) {
-  const denied = await enforceApi(req);
-  if (denied) return denied;
+  const access = await resolveApiAccess(req);
+  if (!access.ok) return deny(access);
   if (!isConfigured()) {
     return NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; message dropped" });
   }
@@ -81,6 +82,7 @@ export async function POST(req: Request) {
       agent_id: body.agent_id,
       body: body.body,
       created_by: body.created_by,
+      actor: actorFromPrincipal(access.principal),
     });
     return NextResponse.json({ ok: true, id: msg.id, message: msg });
   } catch (e) {
@@ -90,8 +92,8 @@ export async function POST(req: Request) {
 }
 
 export async function PATCH(req: Request) {
-  const denied = await enforceApi(req);
-  if (denied) return denied;
+  const access = await resolveApiAccess(req);
+  if (!access.ok) return deny(access);
   if (!isConfigured()) {
     return NextResponse.json({ ok: true, demo: true });
   }

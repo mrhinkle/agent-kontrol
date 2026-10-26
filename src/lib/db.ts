@@ -50,6 +50,12 @@ export function chooseDriver(
 
 let neonTag: SqlTag | null = null;
 let pgTag: SqlTag | null = null;
+let sqlOverride: SqlTag | null = null;
+
+/** Tests substitute the SQL tag. Production never calls this. */
+export function setSqlForTests(fn: SqlTag | null): void {
+  sqlOverride = fn;
+}
 
 /**
  * Cached SQL tag function. Callers only ever use the tagged-template form:
@@ -58,6 +64,7 @@ let pgTag: SqlTag | null = null;
  *   const rows = await db`select * from t where a = ${x}`;
  */
 export function sql(): SqlTag {
+  if (sqlOverride) return sqlOverride;
   if (!isConfigured()) throw new Error("DATABASE_URL is not set");
 
   const databaseUrl = process.env.DATABASE_URL as string;

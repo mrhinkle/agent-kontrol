@@ -70,7 +70,7 @@ export type Principal =
   | { kind: "legacy" }
   | { kind: "session" }
   | { kind: "dev-open" }
-  | { kind: "oauth" }
+  | { kind: "oauth"; id: string }
   | { kind: "agent"; id: string; scopes: readonly string[] };
 
 export type ScopeErrorBody = {
@@ -162,7 +162,11 @@ export function principalFromMcpAuth(auth: McpAuthShape | null | undefined): Pri
     };
   }
   if (auth.clientId === "mc-token" || kind === "legacy") return { kind: "legacy" };
-  if (extra && Object.prototype.hasOwnProperty.call(extra, "sub")) return { kind: "oauth" };
+  if (extra && Object.prototype.hasOwnProperty.call(extra, "sub")) {
+    const clientId = typeof auth.clientId === "string" ? auth.clientId : "";
+    const sub = typeof extra.sub === "string" ? extra.sub : "";
+    return { kind: "oauth", id: clientId || sub || "oauth" };
+  }
   return null;
 }
 

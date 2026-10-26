@@ -1,3 +1,4 @@
+import type { Actor } from "./actor";
 import { writeSessionNote } from "./session-memory";
 import { sql } from "./db";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
@@ -333,6 +334,8 @@ function asMessage(row: Record<string, unknown>): Message {
     agent_id: String(row.agent_id),
     body: String(row.body),
     created_by: (row.created_by as string | null) ?? null,
+    actor_type: row.actor_type === "human" || row.actor_type === "agent" ? row.actor_type : null,
+    actor_id: row.actor_id == null || row.actor_id === "" ? null : String(row.actor_id),
     created_at: String(row.created_at),
     delivered_at: (row.delivered_at as string | null) ?? null,
     acked_at: (row.acked_at as string | null) ?? null,
@@ -343,21 +346,39 @@ function asMessage(row: Record<string, unknown>): Message {
   };
 }
 
+function actorFields(actor: Actor | null | undefined): { actor_type: string | null; actor_id: string | null } {
+  if (!actor) return { actor_type: null, actor_id: null };
+  return { actor_type: actor.actor_type, actor_id: actor.actor_id };
+}
+
+function asTask(row: Record<string, unknown>): Task {
+  return {
+    ...(row as unknown as Task),
+    actor_type: row.actor_type === "human" || row.actor_type === "agent" ? row.actor_type : null,
+    actor_id: row.actor_id == null || row.actor_id === "" ? null : String(row.actor_id),
+  };
+}
+
 /** Operator → agent. Sets direction=inbound and thread_id = own id when new. */
 export async function enqueueMessage(input: {
   agent_id: string;
   body: string;
   created_by?: string;
+  /** From the authenticated principal. Never taken from the request body. */
+  actor?: Actor | null;
 }): Promise<Message> {
   const db = sql();
+  const actor = actorFields(input.actor);
   try {
     const rows = await db`
-      insert into messages (agent_id, body, created_by, direction)
+      insert into messages (agent_id, body, created_by, direction, actor_type, actor_id)
       values (
         ${slugify(input.agent_id)},
         ${input.body},
         ${input.created_by ?? "dashboard"},
-        'inbound'
+        'inbound',
+        ${actor.actor_type},
+        ${actor.actor_id}
       )
       returning *
     `;
@@ -381,9 +402,12 @@ export async function replyFromAgent(input: {
   body: string;
   in_reply_to?: number;
   created_by?: string;
+  /** From the authenticated principal. Never taken from the request body. */
+  actor?: Actor | null;
 }): Promise<Message> {
   const db = sql();
   const agentId = slugify(input.agent_id);
+  const actor = actorFields(input.actor);
   let threadId: string | null = null;
   let parentId: number | null = input.in_reply_to ?? null;
   if (parentId != null) {
@@ -402,14 +426,16 @@ export async function replyFromAgent(input: {
   }
   try {
     const rows = await db`
-      insert into messages (agent_id, body, created_by, direction, in_reply_to, thread_id)
+      insert into messages (agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id)
       values (
         ${agentId},
         ${input.body},
         ${input.created_by ?? agentId},
         'outbound',
         ${parentId},
-        ${threadId}
+        ${threadId},
+        ${actor.actor_type},
+        ${actor.actor_id}
       )
       returning *
     `;
@@ -537,13 +563,16 @@ export async function createTask(input: {
   priority?: number;
   reviewer_platform?: string;
   created_by?: string;
+  /** From the authenticated principal. Never taken from the request body. */
+  actor?: Actor | null;
 }): Promise<Task> {
   const db = sql();
+  const actor = actorFields(input.actor);
   try {
     const rows = await db`
       insert into tasks (
         title, description, project, platform, machine,
-        priority, reviewer_platform, created_by
+        priority, reviewer_platform, created_by, actor_type, actor_id
       )
       values (
         ${input.title},
@@ -553,12 +582,14 @@ export async function createTask(input: {
         ${input.machine ?? null},
         ${input.priority ?? 2},
         ${input.reviewer_platform ?? null},
-        ${input.created_by ?? "dashboard"}
+        ${input.created_by ?? "dashboard"},
+        ${actor.actor_type},
+        ${actor.actor_id}
       )
       returning *
     `;
     if (!rows[0]) throw new Error("tasks insert returned no row");
-    return rows[0] as Task;
+    return asTask(rows[0] as Record<string, unknown>);
   } catch (e) {
     throw new Error(errMsg(e));
   }
@@ -582,7 +613,7 @@ export async function listTasks(input?: {
         order by status asc, priority asc, updated_at desc
         limit ${limit}
       `;
-      return rows as Task[];
+      return (rows as Record<string, unknown>[]).map(asTask);
     }
     if (status !== "all") {
       const rows = await db`
@@ -591,14 +622,14 @@ export async function listTasks(input?: {
         order by status asc, priority asc, updated_at desc
         limit ${limit}
       `;
-      return rows as Task[];
+      return (rows as Record<string, unknown>[]).map(asTask);
     }
     const rows = await db`
       select * from tasks
       order by status asc, priority asc, updated_at desc
       limit ${limit}
     `;
-    return rows as Task[];
+    return (rows as Record<string, unknown>[]).map(asTask);
   } catch (e) {
     throw new Error(errMsg(e));
   }
@@ -624,7 +655,7 @@ export async function claimNextTask(input: {
       order by priority asc, created_at asc
       limit 10
     `;
-    candidates = rows as Task[];
+    candidates = (rows as Record<string, unknown>[]).map(asTask);
   } catch (e) {
     throw new Error(errMsg(e));
   }
@@ -643,7 +674,7 @@ export async function claimNextTask(input: {
         where id = ${t.id} and status = 'queued'
         returning *
       `;
-      if (claimed.length > 0) return claimed[0] as Task;
+      if (claimed.length > 0) return asTask(claimed[0] as Record<string, unknown>);
     } catch (e) {
       throw new Error(errMsg(e));
     }
@@ -684,7 +715,7 @@ export async function updateTask(input: {
       returning *
     `;
     if (!rows[0]) throw new Error("Task not found");
-    return rows[0] as Task;
+    return asTask(rows[0] as Record<string, unknown>);
   } catch (e) {
     throw new Error(errMsg(e));
   }

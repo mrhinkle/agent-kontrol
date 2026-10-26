@@ -109,7 +109,7 @@ describe("scope table", { concurrency: false }, () => {
       assert.ok(TOOL_SCOPES[name], `${name} is not in the scope table`);
     }
     const legacy = authorizeTool({ kind: "legacy" }, "not_a_real_tool");
-    const oauth = authorizeTool({ kind: "oauth" }, "not_a_real_tool");
+    const oauth = authorizeTool({ kind: "oauth", id: "oauth-client" }, "not_a_real_tool");
     const full = authorizeTool(agent([...SCOPES]), "not_a_real_tool");
     assert.equal(legacy.ok, false);
     assert.equal(oauth.ok, false);
@@ -140,7 +140,7 @@ describe("scope table", { concurrency: false }, () => {
     if (!report.ok) assert.equal(report.body.fix, "Use a credential that has the status:write scope");
     assert.equal(authorizeTool(agent(["tasks:write"]), "create_task").ok, true);
     assert.equal(authorizeTool({ kind: "legacy" }, "create_task").ok, true);
-    assert.equal(authorizeTool({ kind: "oauth" }, "report_status").ok, true);
+    assert.equal(authorizeTool({ kind: "oauth", id: "oauth-client" }, "report_status").ok, true);
   });
 
   it("treats an authenticated OAuth AuthInfo as all-access on mapped tools", () => {
@@ -204,9 +204,12 @@ describe("scope table", { concurrency: false }, () => {
       const src = fs.readFileSync(file, "utf8");
       assert.match(
         src,
-        /enforceApi|enforceBearer|requireDashboardSession/,
+        /enforceApi|enforceBearer|requireDashboardSession|resolveApiAccess|resolveBearerAccess/,
         `${file} does not enforce credentials`,
       );
+      if (/resolveApiAccess|resolveBearerAccess/.test(src)) {
+        assert.match(src, /if \(!access\.ok\) return deny\(access\)/, `${file} resolves access but does not deny`);
+      }
     }
   });
 });

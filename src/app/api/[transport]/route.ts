@@ -1,5 +1,6 @@
 import { createMcpHandler, withMcpAuth } from "mcp-handler";
 import { z } from "zod";
+import { actorFromPrincipal, currentActor, runWithActor } from "@/lib/actor";
 import { apiError, memoryKeyError, toolResultFromCaught, type McpToolResult } from "@/lib/api-error";
 import { secretsMatch, verifyAccessToken } from "@/lib/authcrypto";
 import { resolveAgentCredential } from "@/lib/credentials";
@@ -273,6 +274,7 @@ const handler = createMcpHandler(
             body: args.body,
             in_reply_to: args.in_reply_to,
             created_by: args.agent_id,
+            actor: currentActor(),
           });
           return {
             content: [
@@ -306,14 +308,17 @@ const handler = createMcpHandler(
             .enum(["claude-code", "codex", "grok"])
             .optional()
             .describe("Have a second platform review the work before it's marked done"),
-          created_by: z.string().optional().describe("Your agent id"),
+          created_by: z
+            .string()
+            .optional()
+            .describe("Free-text label stored as created_by. It does not set actor_type or actor_id; the server records the authenticated credential."),
         },
       },
       async (args) => guardTool("create_task", async () => {
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Demo mode; task not queued." }] };
         }
-        const task = await createTask(args);
+        const task = await createTask({ ...args, actor: currentActor() });
         return {
           content: [
             { type: "text", text: `Task #${task.id} queued for ${task.platform} (priority ${task.priority}).` },
@@ -518,7 +523,9 @@ const authed = withMcpAuth(
   async (req) => {
     const denied = await enforceMcpScope(req);
     if (denied) return denied;
-    return handler(req);
+    const principal = principalFromMcpAuth(req.auth);
+    if (!principal) return handler(req);
+    return runWithActor(actorFromPrincipal(principal), () => handler(req));
   },
   verifyToken,
   {
