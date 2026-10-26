@@ -207,6 +207,8 @@ interface SafeCaught {
   fields?: Record<string, string>;
   retryable?: boolean;
   fix?: string;
+  headers?: HeadersInit;
+  extra?: Record<string, unknown>;
 }
 
 /**
@@ -218,9 +220,17 @@ interface SafeCaught {
  * Match by name. api-error is imported by middleware, which cannot load
  * node:crypto, so this file does not import the idempotency module.
  */
-function namedError(err: unknown, name: string): (Error & { fields?: Record<string, string> }) | null {
+function namedError(err: unknown, name: string): (Error & {
+  fields?: Record<string, string>;
+  retryable?: boolean;
+  retryAfterSec?: number | null;
+}) | null {
   if (!(err instanceof Error) || err.name !== name) return null;
-  return err as Error & { fields?: Record<string, string> };
+  return err as Error & {
+    fields?: Record<string, string>;
+    retryable?: boolean;
+    retryAfterSec?: number | null;
+  };
 }
 
 function safeCaught(err: unknown): SafeCaught | null {
@@ -236,10 +246,22 @@ function safeCaught(err: unknown): SafeCaught | null {
   }
   const conflict = namedError(err, "IdempotencyConflict");
   if (conflict) {
+    const retryable = conflict.retryable === true;
+    const retryAfter = typeof conflict.retryAfterSec === "number" && conflict.retryAfterSec >= 1
+      ? Math.ceil(conflict.retryAfterSec)
+      : null;
     return {
       code: "idempotency_conflict",
       message: conflict.message,
       fields: conflict.fields ?? { idempotency_key: conflict.message },
+      retryable,
+      ...(retryable
+        ? {
+            fix: "Wait the number of seconds in Retry-After, then send the same key and the same arguments. The key is scoped to the actor and the route.",
+            headers: retryAfter != null ? { "Retry-After": String(retryAfter) } : undefined,
+            extra: retryAfter != null ? { retry_after: retryAfter } : undefined,
+          }
+        : {}),
     };
   }
   const invalidKey = namedError(err, "IdempotencyKeyInvalid");
@@ -273,6 +295,8 @@ export function publicError(logLabel: string, err: unknown, fallbackMessage?: st
       fields: safe.fields,
       retryable: safe.retryable,
       fix: safe.fix,
+      headers: safe.headers,
+      extra: safe.extra,
     });
   }
   return apiError("internal_error", fallbackMessage ? { message: fallbackMessage } : undefined);
@@ -287,6 +311,7 @@ export function toolResultFromCaught(logLabel: string, err: unknown): McpToolRes
       fields: safe.fields,
       retryable: safe.retryable,
       fix: safe.fix,
+      extra: safe.extra,
     });
   }
   return mcpToolError("internal_error");

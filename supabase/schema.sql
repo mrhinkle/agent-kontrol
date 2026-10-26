@@ -383,9 +383,13 @@ create index if not exists decisions_repo_number_idx on decisions (repo, number)
 
 -- Client idempotency keys for create_task, operator messages, and replies.
 -- scope is actor_type:actor_id:route, so two callers can reuse one key string.
--- response is null while the write is in progress, then the stored result.
--- A key is unused after expires_at (24 hours from the claim).
--- Changelog: supabase/migrations/20261025_idempotency.sql.
+-- response is null until the write stores a result. started_at begins a
+-- 30 second lease on that empty claim. claim_token is the attempt that
+-- owns the lease, including when the insert commits and the connection
+-- drops before RETURNING arrives. A key is unused after expires_at
+-- (24 hours from the claim).
+-- Changelog: supabase/migrations/20261025_idempotency.sql
+-- and supabase/migrations/20261026_idempotency_lease.sql.
 create table if not exists idempotency_keys (
   scope text not null,
   idempotency_key text not null,
@@ -393,5 +397,9 @@ create table if not exists idempotency_keys (
   response jsonb,
   expires_at timestamptz not null,
   created_at timestamptz not null default now(),
+  started_at timestamptz,
+  claim_token text,
   primary key (scope, idempotency_key)
 );
+alter table idempotency_keys add column if not exists started_at timestamptz;
+alter table idempotency_keys add column if not exists claim_token text;

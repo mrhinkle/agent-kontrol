@@ -3,14 +3,18 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { toolResultFromCaught } from "../../src/lib/api-error";
 import { authCookieValue } from "../../src/lib/authcrypto";
 import { createCredential, resetCredentialsForTests } from "../../src/lib/credentials";
 import { setSqlForTests, type Row } from "../../src/lib/db";
 import {
   hashPayload,
+  IDEMPOTENCY_LEASE_MS,
+  IDEMPOTENCY_TTL_MS,
   IdempotencyConflict,
   IdempotencyKeyInvalid,
   IdempotencyUnknownOutcome,
+  idempotencyScope,
   runIdempotent,
   setIdempotencyClockForTests,
 } from "../../src/lib/idempotency";
@@ -44,6 +48,8 @@ type IdemRow = {
   request_hash: string;
   response: unknown;
   expires_at: string;
+  started_at?: string | null;
+  claim_token?: string | null;
 };
 
 let postTasks: Route;
@@ -57,6 +63,8 @@ const idem = new Map<string, IdemRow>();
 let seq = 1;
 /** The next resource insert is recorded, then the client loses RETURNING. */
 let commitThenFail = false;
+/** The next claim insert is recorded, then the client loses RETURNING. */
+let claimInsertThenFail = false;
 /** Definite failure of a follow-up thread_id write. Not a connection loss. */
 let threadUpdateFault: Error | null = null;
 let threadUpdates = 0;
@@ -98,6 +106,7 @@ function installFake() {
   idem.clear();
   seq = 1;
   commitThenFail = false;
+  claimInsertThenFail = false;
   threadUpdateFault = null;
   threadUpdates = 0;
   setSqlForTests(async (strings, ...values) => {
@@ -118,13 +127,15 @@ function installFake() {
       return [];
     }
     if (lower.includes("delete from idempotency_keys") && lower.includes("response is null")) {
-      const [scope, key] = values as string[];
+      const [scope, key, token] = values as string[];
       const row = idem.get(idemId(scope, key));
-      if (row && row.response == null) idem.delete(idemId(scope, key));
+      if (row && row.response == null && row.claim_token === token) idem.delete(idemId(scope, key));
       return [];
     }
     if (lower.includes("insert into idempotency_keys")) {
-      const [scope, key, requestHash, expiresAt] = values as string[];
+      // values follow the SQL: scope, key, hash, expires_at, started_at, claim_token.
+      // response is the SQL null literal and is not a parameter.
+      const [scope, key, requestHash, expiresAt, startedAt, claimToken] = values as string[];
       const id = idemId(scope, key);
       if (idem.has(id)) return [];
       const row: IdemRow = {
@@ -133,14 +144,34 @@ function installFake() {
         request_hash: requestHash,
         response: null,
         expires_at: expiresAt,
+        started_at: startedAt,
+        claim_token: claimToken,
       };
       idem.set(id, row);
+      if (claimInsertThenFail) {
+        claimInsertThenFail = false;
+        throw new UnknownWriteOutcome(new Error("connection terminated after COMMIT before RETURNING"));
+      }
+      return [row];
+    }
+    if (lower.includes("update idempotency_keys") && lower.includes("set started_at")) {
+      // values: started_at, claim_token, request_hash, scope, key, request_hash, lease cutoff.
+      const [startedAt, claimToken, requestHash, scope, key, hashAgain, leaseCutoff] = values as string[];
+      const row = idem.get(idemId(scope, key));
+      if (!row || row.response != null) return [];
+      if (row.request_hash !== requestHash || row.request_hash !== hashAgain) return [];
+      if (row.started_at != null && row.started_at > leaseCutoff) return [];
+      row.started_at = startedAt;
+      row.claim_token = claimToken;
+      row.request_hash = requestHash;
       return [row];
     }
     if (lower.includes("update idempotency_keys")) {
-      const [body, scope, key] = values as string[];
+      const [body, scope, key, token] = values as string[];
       const row = idem.get(idemId(scope, key));
-      if (row) row.response = JSON.parse(body);
+      if (!row || (token != null && row.claim_token !== token)) return [];
+      if (lower.includes("response is null") && row.response != null) return [];
+      row.response = JSON.parse(body);
       return [];
     }
     if (lower.includes("from idempotency_keys")) {
@@ -272,6 +303,14 @@ describe("idempotency keys", { concurrency: false }, () => {
       assert.match(sql, /response jsonb/i);
       assert.match(sql, /expires_at timestamptz not null/i);
     }
+    assert.match(schema, /started_at timestamptz/);
+    assert.match(schema, /claim_token text/);
+    assert.match(schema, /alter table idempotency_keys add column if not exists started_at timestamptz/i);
+    assert.match(schema, /alter table idempotency_keys add column if not exists claim_token text/i);
+    const lease = fs.readFileSync("supabase/migrations/20261026_idempotency_lease.sql", "utf8");
+    assert.match(lease, /add column if not exists started_at timestamptz/i);
+    assert.match(lease, /add column if not exists claim_token text/i);
+    assert.equal(IDEMPOTENCY_LEASE_MS, 30_000);
   });
 
   it("hashes the same arguments once, whatever the key order", () => {
@@ -385,7 +424,14 @@ describe("idempotency keys", { concurrency: false }, () => {
           key: "busy",
           payload: { title: "a" },
           execute: async () => ({ id: 9 }),
-        }), (err: unknown) => err instanceof IdempotencyConflict && /in progress/.test(err.message));
+        }), (err: unknown) => {
+          assert.ok(err instanceof IdempotencyConflict);
+          assert.match(err.message, /in progress/);
+          assert.equal(err.retryable, true);
+          assert.equal(typeof err.retryAfterSec, "number");
+          assert.ok((err.retryAfterSec ?? 0) >= 1);
+          return true;
+        });
         return { id: 3 };
       },
     });
@@ -399,6 +445,126 @@ describe("idempotency keys", { concurrency: false }, () => {
     });
     assert.equal(recovered.id, 2);
     assert.equal(calls, 2);
+  });
+
+  it("executes once when the claim insert commits and the connection drops", async () => {
+    claimInsertThenFail = true;
+    let calls = 0;
+    const run = () => runIdempotent({
+      actor: actorA,
+      route: "create_task",
+      key: "lost-claim",
+      payload: { title: "a" },
+      execute: async () => ({ id: ++calls }),
+    });
+    const first = await run();
+    assert.equal(first.id, 1);
+    assert.equal(calls, 1);
+    const retry = await run();
+    assert.deepEqual(retry, first);
+    assert.equal(calls, 1);
+  });
+
+  it("takes over a crashed claim after the lease and executes once", async () => {
+    const start = new Date("2026-10-25T00:00:00.000Z");
+    const scope = idempotencyScope(actorA, "create_task");
+    const key = "crashed";
+    const payload = { title: "a" };
+    idem.set(idemId(scope, key), {
+      scope,
+      idempotency_key: key,
+      request_hash: hashPayload(payload),
+      response: null,
+      expires_at: new Date(start.getTime() + IDEMPOTENCY_TTL_MS).toISOString(),
+      started_at: start.toISOString(),
+      claim_token: "dead-process",
+    });
+    setIdempotencyClockForTests(() => new Date(start.getTime() + IDEMPOTENCY_LEASE_MS));
+    let calls = 0;
+    const run = () => runIdempotent({
+      actor: actorA,
+      route: "create_task",
+      key,
+      payload,
+      execute: async () => ({ id: ++calls }),
+    });
+    const first = await run();
+    assert.equal(first.id, 1);
+    assert.equal(calls, 1);
+    const replay = await run();
+    assert.deepEqual(replay, first);
+    assert.equal(calls, 1);
+  });
+
+  it("reports a live claim inside the lease as retryable and does not execute", async () => {
+    const start = new Date("2026-10-25T00:00:00.000Z");
+    const later = new Date(start.getTime() + 1000);
+    setIdempotencyClockForTests(() => later);
+    const scope = idempotencyScope(actorA, "create_task");
+    const key = "live";
+    const payload = { title: "a" };
+    idem.set(idemId(scope, key), {
+      scope,
+      idempotency_key: key,
+      request_hash: hashPayload(payload),
+      response: null,
+      expires_at: new Date(start.getTime() + IDEMPOTENCY_TTL_MS).toISOString(),
+      started_at: start.toISOString(),
+      claim_token: "other-request",
+    });
+    let calls = 0;
+    const run = (body: Record<string, unknown>) => runIdempotent({
+      actor: actorA,
+      route: "create_task",
+      key,
+      payload: body,
+      execute: async () => ({ id: ++calls }),
+    });
+    let caught: unknown;
+    await assert.rejects(() => run(payload), (err: unknown) => {
+      caught = err;
+      assert.ok(err instanceof IdempotencyConflict);
+      assert.match(err.message, /in progress/);
+      assert.equal(err.retryable, true);
+      assert.equal(err.retryAfterSec, 29);
+      return true;
+    });
+    assert.equal(calls, 0);
+    const mcp = toolResultFromCaught("[idempotency] live claim", caught);
+    const mcpBody = JSON.parse(mcp.content[0].text) as { retryable: boolean; retry_after: number };
+    assert.equal(mcpBody.retryable, true);
+    assert.equal(mcpBody.retry_after, 29);
+
+    await assert.rejects(() => run({ title: "other" }), (err: unknown) => {
+      assert.ok(err instanceof IdempotencyConflict);
+      assert.equal(err.retryable, false);
+      assert.equal(err.retryAfterSec, null);
+      return true;
+    });
+    assert.equal(calls, 0);
+
+    const httpKey = "http-live";
+    const httpScope = "agent:mc-token:create_task";
+    idem.set(idemId(httpScope, httpKey), {
+      scope: httpScope,
+      idempotency_key: httpKey,
+      request_hash: hashPayload({ title: "once" }),
+      response: null,
+      expires_at: new Date(start.getTime() + IDEMPOTENCY_TTL_MS).toISOString(),
+      started_at: start.toISOString(),
+      claim_token: "other-request",
+    });
+    const res = await postTasks(jsonReq("http://x/api/tasks", { title: "once" }, {
+      authorization: `Bearer ${TOKEN}`,
+      "idempotency-key": httpKey,
+    }));
+    assert.equal(res.status, 409, await res.clone().text());
+    const body = await res.json() as { code: string; retryable: boolean; retry_after: number };
+    assert.equal(body.code, "idempotency_conflict");
+    assert.equal(body.retryable, true);
+    assert.equal(body.retry_after, 29);
+    assert.equal(res.headers.get("Retry-After"), "29");
+    assert.equal(inserts.filter((item) => item.table === "tasks").length, 0);
   });
 
   it("rejects a key that is too long or contains a control character, and ignores a blank key", async () => {
@@ -680,6 +846,8 @@ describe("idempotency keys", { concurrency: false }, () => {
       assert.match(text, /24 hour window/);
       assert.match(text, /scoped by actor and route/);
       assert.match(text, /After 24 hours the same key starts a new write|After that window the same key starts a new write/);
+      assert.match(text, /30 second lease/);
+      assert.match(text, /Retry-After/);
     }
   });
 
