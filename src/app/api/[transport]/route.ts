@@ -6,7 +6,8 @@ import { secretsMatch, verifyAccessToken } from "@/lib/authcrypto";
 import { resolveAgentCredential } from "@/lib/credentials";
 import { isConfigured } from "@/lib/db";
 import { evaluateMcpMessages, insufficientScopeBody, principalFromMcpAuth } from "@/lib/scopes";
-import { claimNextTask, createTask, fetchMessages, fleet, listTasks, recall, remember, replyFromAgent, report, updateTask } from "@/lib/store";
+import { rememberForTool, updateTaskForTool } from "@/lib/dry-run-actions";
+import { claimNextTask, createTask, fetchMessages, fleet, listTasks, recall, replyFromAgent, report } from "@/lib/store";
 import { progress } from "@/lib/progress-store";
 import { formatDigest } from "@/lib/progress-digest";
 import { OPERATOR } from "@/lib/operator";
@@ -138,23 +139,16 @@ const handler = createMcpHandler(
       {
         title: "Remember",
         description:
-          "Write a note to Agent Kontrol shared memory so other agents (and future sessions) can see it. Use for decisions, handoffs, and 'don't duplicate this' coordination notes.",
+          "Write a note to Agent Kontrol shared memory so other agents (and future sessions) can see it. Use for decisions, handoffs, and 'don't duplicate this' coordination notes. Pass dry_run true to preview an insert or key overwrite without writing.",
         inputSchema: {
           content: z.string().describe("The note to store"),
           key: z.string().optional().describe("Optional stable key; writing the same key overwrites (good for living docs like 'project-x/status')"),
           tags: z.array(z.string()).optional().describe("Tags for filtering, e.g. ['agent-kontrol','decision']"),
           agent_id: z.string().optional().describe("Who is writing this note"),
+          dry_run: z.boolean().optional().describe("When true, return what would be written and write nothing"),
         },
       },
-      async (args) => guardTool("remember", async () => {
-        const badKey = memoryKeyError(args.key);
-        if (badKey) return badKey;
-        if (!isConfigured()) {
-          return { content: [{ type: "text", text: "Demo mode; note not stored." }] };
-        }
-        const item = await remember(args);
-        return { content: [{ type: "text", text: `Stored memory #${item.id}${item.key ? ` (key: ${item.key})` : ""}.` }] };
-      }),
+      async (args) => guardTool("remember", () => rememberForTool(args)),
     );
 
     server.registerTool(
@@ -415,30 +409,17 @@ const handler = createMcpHandler(
       {
         title: "Update task",
         description:
-          "Update a task you're working on: mark it running, done, or failed, and attach a result summary (and cost if known).",
+          "Update a task you're working on: mark it running, done, or failed, and attach a result summary (and cost if known). Pass dry_run true to preview the update, including a cancel, without writing.",
         inputSchema: {
           id: z.number().int(),
           status: z.enum(["running", "review", "done", "failed", "cancelled"]).optional(),
           result: z.string().optional().describe("What happened — 1-6 lines"),
           cost_usd: z.number().optional(),
           agent_id: z.string().optional().describe("Your agent id (for the activity feed)"),
+          dry_run: z.boolean().optional().describe("When true, return what would change and write nothing"),
         },
       },
-      async (args) => guardTool("update_task", async () => {
-        if (!isConfigured()) {
-          return { content: [{ type: "text", text: "Demo mode; task not updated." }] };
-        }
-        const task = await updateTask(args);
-        if (args.status && args.agent_id) {
-          await report({
-            agent_id: args.agent_id,
-            kind: args.status === "failed" ? "error" : "status",
-            title: `Task #${task.id} → ${args.status}: ${task.title}`,
-            detail: { task_id: task.id },
-          });
-        }
-        return { content: [{ type: "text", text: `Task #${task.id} updated (${task.status}).` }] };
-      }),
+      async (args) => guardTool("update_task", () => updateTaskForTool(args)),
     );
   },
   {},

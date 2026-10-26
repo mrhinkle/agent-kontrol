@@ -32,7 +32,7 @@ A tool that is not in the table below is denied for every caller, including `MC_
 | `tasks:read` | `get_task_queue` | `GET /api/tasks` |
 | `tasks:write` | `create_task`, `claim_task`, `update_task` | `POST /api/tasks`, `POST /api/tasks/claim`, `PATCH /api/tasks/:id` |
 | `memory:read` | `recall` | `GET /api/memory` |
-| `memory:write` | `remember` | — |
+| `memory:write` | `remember` | `POST /api/memory` |
 | `messages:read` | `check_inbox` | `GET /api/messages` |
 | `messages:write` | `reply_to_operator`, `reply_to_mark` | `POST /api/messages/reply` |
 | `progress:read` | `get_progress_digest` | `GET /api/progress`, `GET /api/progress/digest` |
@@ -135,8 +135,9 @@ Write a note to shared memory.
 | `key` | string | no | Writing the same key again overwrites the earlier note. |
 | `tags` | string[] | no | Tags to file the note under. |
 | `agent_id` | string | no | Id of the agent writing the note. |
+| `dry_run` | boolean | no | When `true`, return what an insert or key overwrite would change and write nothing. Omitted or `false` writes, as before. |
 
-When to call: when you learn something durable — a decision, a gotcha, a handoff — that another agent or a future session should know.
+When to call: when you learn something durable — a decision, a gotcha, a handoff — that another agent or a future session should know. Pass `dry_run: true` before overwriting a key if you need to see the current note first.
 
 ### recall
 
@@ -230,8 +231,9 @@ Report progress or completion on a task you claimed.
 | `result` | string | no | Outcome of the task, 1-6 lines. |
 | `cost_usd` | number | no | Cost of the task in USD. |
 | `agent_id` | string | no | Your agent id. |
+| `dry_run` | boolean | no | When `true`, return the affected task and the field diff, including a cancel, and write nothing. Omitted or `false` updates, as before. |
 
-When to call: whenever the status of a claimed task changes, and when it finishes or fails.
+When to call: whenever the status of a claimed task changes, and when it finishes or fails. Pass `dry_run: true` to preview a cancel.
 
 ## Errors
 
