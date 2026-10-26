@@ -46,8 +46,8 @@ function textResponse(description: string): Json {
   return { description, content: { "text/plain": { schema: { type: "string" } } } };
 }
 
-function query(name: string, schema: Json, description: string): Json {
-  return { name, in: "query", required: false, schema, description };
+function query(name: string, schema: Json, description: string, opts?: { required?: boolean }): Json {
+  return { name, in: "query", required: opts?.required === true, schema, description };
 }
 
 function pathParam(name: string, description: string, schema: Json = { type: "string" }): Json {
@@ -379,7 +379,7 @@ export function openApiDocument(): Json {
           summary: "Inbound inbox, or the full conversation.",
           security: cookieOrBearer,
           parameters: [
-            query("agent_id", { type: "string" }, "Agent whose messages to read. Required."),
+            query("agent_id", { type: "string" }, "Agent whose messages to read. Required.", { required: true }),
             query("ack", { type: "boolean" }, "When true, mark the returned inbound messages read."),
             query("conversation", { type: "boolean" }, "When true, return the full history."),
           ],

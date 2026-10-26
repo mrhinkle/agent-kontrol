@@ -18,10 +18,15 @@ import { middleware } from "../../src/middleware";
 /**
  * CI check for issue #46. `npm run test:ui` runs this file. A new route
  * under src/app/api whose method is missing from the OpenAPI document
- * fails here, and so does a spec entry with no route.
+ * fails here, and so does a spec entry with no route. HEAD and OPTIONS
+ * count the same as GET, POST, PUT, PATCH, and DELETE.
  */
 
-const HTTP = ["get", "post", "put", "patch", "delete"] as const;
+const HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] as const;
+
+function methodSourcePattern(): string {
+  return HTTP_METHODS.join("|");
+}
 
 type Schema = { properties?: Record<string, unknown>; required?: string[] };
 
@@ -35,21 +40,42 @@ function walkRoutes(dir: string, out: string[]) {
 
 function exportedMethods(source: string): string[] {
   const methods = new Set<string>();
-  for (const match of source.matchAll(/export\s+(?:async\s+)?function\s+(GET|POST|PUT|PATCH|DELETE)\b/g)) {
+  const name = methodSourcePattern();
+  for (const match of source.matchAll(new RegExp(`export\\s+(?:async\\s+)?function\\s+(${name})\\b`, "g"))) {
     methods.add(match[1]);
   }
-  for (const match of source.matchAll(/export\s+const\s+(GET|POST|PUT|PATCH|DELETE)\b/g)) {
+  for (const match of source.matchAll(new RegExp(`export\\s+const\\s+(${name})\\b`, "g"))) {
     methods.add(match[1]);
   }
   for (const block of source.matchAll(/export\s*\{([^}]+)\}/g)) {
     for (const part of block[1].split(",")) {
-      const renamed = part.match(/\bas\s+(GET|POST|PUT|PATCH|DELETE)\b/);
-      const bare = part.trim().match(/^(GET|POST|PUT|PATCH|DELETE)$/);
+      const renamed = part.match(new RegExp(`\\bas\\s+(${name})\\b`));
+      const bare = part.trim().match(new RegExp(`^(${name})$`));
       if (renamed) methods.add(renamed[1]);
       else if (bare) methods.add(bare[1]);
     }
   }
   return [...methods];
+}
+
+function keysMissingFromSpec(urlPath: string, methods: string[], specItem: Record<string, unknown> | undefined): string[] {
+  const missing: string[] = [];
+  for (const method of methods) {
+    if (!specItem?.[method.toLowerCase()]) missing.push(`${method} ${urlPath}`);
+  }
+  return missing;
+}
+
+function keysInSpecWithoutRoute(paths: Record<string, Record<string, unknown>>, fromRoutes: Set<string>): string[] {
+  const missing: string[] = [];
+  for (const [urlPath, item] of Object.entries(paths)) {
+    for (const method of HTTP_METHODS) {
+      if (!item[method.toLowerCase()]) continue;
+      const key = `${method} ${urlPath}`;
+      if (!fromRoutes.has(key)) missing.push(key);
+    }
+  }
+  return missing;
 }
 
 function routePath(file: string): string {
@@ -144,22 +170,53 @@ describe("OpenAPI document", () => {
       const urlPath = routePath(file);
       const methods = exportedMethods(fs.readFileSync(file, "utf8"));
       assert.ok(methods.length > 0, `${file} exports no HTTP method`);
-      for (const method of methods) {
-        const key = `${method} ${urlPath}`;
-        fromRoutes.add(key);
-        const item = paths[urlPath];
-        assert.ok(item, `${key} is missing from the OpenAPI document (${file})`);
-        assert.ok(item[method.toLowerCase()], `${key} is missing from the OpenAPI document (${file})`);
-      }
+      for (const method of methods) fromRoutes.add(`${method} ${urlPath}`);
+      const missing = keysMissingFromSpec(urlPath, methods, paths[urlPath]);
+      assert.deepEqual(missing, [], `${missing.join(", ")} is missing from the OpenAPI document (${file})`);
     }
 
-    for (const [urlPath, item] of Object.entries(paths)) {
-      for (const method of HTTP) {
-        if (!item[method]) continue;
-        const key = `${method.toUpperCase()} ${urlPath}`;
-        assert.ok(fromRoutes.has(key), `${key} is in the spec but no route exports it`);
-      }
-    }
+    const extras = keysInSpecWithoutRoute(paths, fromRoutes);
+    assert.deepEqual(extras, [], `${extras.join(", ")} is in the spec but no route exports it`);
+  });
+
+  it("requires HEAD and OPTIONS coverage in both directions", () => {
+    assert.deepEqual(
+      exportedMethods("export async function OPTIONS() {}\nexport function HEAD() {}").sort(),
+      ["HEAD", "OPTIONS"],
+    );
+    assert.deepEqual(
+      exportedMethods("export const OPTIONS = cors;\nexport const HEAD = head;").sort(),
+      ["HEAD", "OPTIONS"],
+    );
+    assert.deepEqual(
+      exportedMethods("export { cors as OPTIONS, head as HEAD };").sort(),
+      ["HEAD", "OPTIONS"],
+    );
+    assert.deepEqual(exportedMethods("export { OPTIONS, HEAD };").sort(), ["HEAD", "OPTIONS"]);
+
+    const missing = keysMissingFromSpec(
+      "/api/example",
+      exportedMethods("export async function GET() {}\nexport async function OPTIONS() {}\nexport function HEAD() {}"),
+      { get: {} },
+    );
+    assert.deepEqual(missing.sort(), ["HEAD /api/example", "OPTIONS /api/example"]);
+
+    const extras = keysInSpecWithoutRoute(
+      { "/api/example": { get: {}, head: {}, options: {} } },
+      new Set(["GET /api/example"]),
+    );
+    assert.deepEqual(extras.sort(), ["HEAD /api/example", "OPTIONS /api/example"]);
+  });
+
+  it("marks GET /api/messages agent_id required, matching the handler", () => {
+    const doc = openApiDocument();
+    const paths = doc.paths as Record<string, { get?: { parameters?: { name: string; required?: boolean }[] } }>;
+    const params = paths["/api/messages"]?.get?.parameters ?? [];
+    const agentId = params.find((item) => item.name === "agent_id");
+    assert.ok(agentId, "GET /api/messages has an agent_id query parameter");
+    assert.equal(agentId.required, true);
+    assert.equal(params.find((item) => item.name === "ack")?.required, false);
+    assert.equal(params.find((item) => item.name === "conversation")?.required, false);
   });
 
   it("builds request schemas from the constants and interfaces the routes use", () => {
