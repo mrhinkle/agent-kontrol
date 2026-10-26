@@ -3,6 +3,7 @@ import { enforceApi } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import {
+  decisionListBody,
   listDecisions,
   parseListQuery,
   parseReconcile,
@@ -19,9 +20,11 @@ export const maxDuration = 30;
  * Auth: dashboard session or MC_TOKEN. An agent credential cannot call this
  * route; resolving a row is PATCH, and that requires decisions:write.
  *
- * GET  /api/decisions?status=open&repo=&source=&limit=
+ * GET  /api/decisions?status=open&repo=&source=&limit=&shape=row
  *      Oldest first by first_seen_at. Each row includes age_days.
  *      status=open also returns deferred rows whose defer_until has passed.
+ *      shape=brief ignores status and source and returns the morning-brief
+ *      .decisions list from this table.
  * POST /api/decisions
  *      Upsert one row by key, or { reconcile: { repo, source, seen_keys } }
  *      to withdraw label-sourced rows the collector did not see.
@@ -46,7 +49,8 @@ export async function GET(req: Request) {
     return NextResponse.json({ demo: true, decisions: [] });
   }
   try {
-    const decisions = await listDecisions(parsed);
+    const rows = await listDecisions(parsed);
+    const decisions = decisionListBody(parsed.shape, rows, new Date().toISOString());
     return NextResponse.json({ demo: false, decisions });
   } catch (e) {
     return publicError("[decisions] list failed", e);

@@ -10,9 +10,11 @@
 #   scripts/morning-brief.sh --no-dashboard  # never call MC_URL; GitHub only
 #
 # Config: the `brief` block of progress.config.json (see docs/VELOCITY.md).
-# Env:    MC_URL + MC_TOKEN (optional) read the watched-repo list and the
-#         coordinator's events from the dashboard. Without them the brief is
-#         GitHub-only and says so.
+# Env:    MC_URL + MC_TOKEN (optional) read the watched-repo list, the
+#         coordinator's events, and GET /api/decisions?shape=brief. A live
+#         database replaces the DECISIONS section (an empty list is real).
+#         A failed call keeps the GitHub label sweep. Without the env the
+#         brief is GitHub-only and says so.
 # Needs:  gh (authenticated), jq, curl.
 #
 # Why this exists: a dashboard you have to remember to open tells you about a
@@ -184,7 +186,7 @@ while IFS= read -r entry; do
     | ($issues | map(select(.updatedAt < $stale_before))) as $stale
     | def is_decision_label($n): $decision_labels | any(. as $p | ($p == $n) or (($p|endswith("*")) and ($n|startswith($p[:-1]))));
     (($issues + $prs) | map(select((.labels // []) | any(is_decision_label(.name))))
-        | map({repo: $short, number, title, url, kind: (if has("isDraft") then "pr" else "issue" end),
+        | map({repo: $repo, repo_short: $short, number, title, url, kind: (if has("isDraft") then "pr" else "issue" end),
                age_hours: hours(.createdAt; $now), age_days: (hours(.createdAt; $now) / 24 | floor),
                labels: [.labels[].name | select(is_decision_label(.))]})) as $decisions
     | ($prs | map(. + {age_h: hours(.createdAt; $now),
@@ -263,6 +265,21 @@ if [[ -n "$COORD_ID" && "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_T
   fi
 elif [[ -n "$COORD_ID" ]]; then
   coordinator="$(jq -c '. + {verdict: "unknown: no dashboard credentials (MC_URL/MC_TOKEN)"}' <<<"$coordinator")"
+fi
+
+# The DECISIONS section is the table when the dashboard can serve it.
+# demo:false is authoritative, including an empty list. A failed call, or
+# demo mode, keeps the GitHub sweep already stored on each repo.
+if [[ "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_TOKEN:-}" ]]; then
+  if table_body="$(curl -fsS -m 20 -H "Authorization: Bearer $MC_TOKEN" \
+      "${MC_URL%/}/api/decisions?shape=brief&limit=1000" 2>/dev/null)" \
+     && echo "$table_body" | jq -e '.demo == false and (.decisions | type == "array")' >/dev/null 2>&1; then
+    table_decisions="$(echo "$table_body" | jq -c '.decisions')"
+    # BEGIN table-decisions-jq
+    TABLE_DECISIONS_JQ='map(if .incomplete then . else . as $section | .decisions = [$table[] | select(.repo == $section.repo)] end)'
+    # END table-decisions-jq
+    repo_results="$(jq -c --argjson table "$table_decisions" "$TABLE_DECISIONS_JQ" <<<"$repo_results")"
+  fi
 fi
 
 # ------------------------------------------------------------------- assemble
@@ -355,7 +372,7 @@ if [[ "$n_dec" -eq 0 ]]; then
   fi
 else
   echo "DECISIONS FOR YOU ($n_dec) — oldest first; each one is work nobody else can unblock"
-  jq -r '.decisions[] | "  \(.repo) \(if .kind == "pr" then "PR " else "" end)#\(.number)  \(.age_days)d  [\(.labels|join(","))]  \(.title[0:70])\n      \(.url)"' <<<"$brief"
+  jq -r '.decisions[] | "  \(.repo_short) \(if .kind == "pr" then "PR " else "" end)#\(.number)  \(.age_days)d  [\(.labels|join(","))]  \(.title[0:70])\n      \(.url)"' <<<"$brief"
 fi
 echo
 

@@ -9,7 +9,9 @@ import {
   hoursBetween,
   isDecisionLabel,
   nextStatusOnUpsert,
+  decisionListBody,
   parseDecisionId,
+  parseListQuery,
   parsePatch,
   parseReconcile,
   parseUpsert,
@@ -199,6 +201,7 @@ describe("brief decisions match morning-brief.sh", { concurrency: false }, () =>
     const tsDefs = brief.slice(tsAt, hoursEnd);
     const decisionExpr = between(brief, "def is_decision_label", " as $decisions");
     const fromBrief = jq(`${tsDefs}\n${decisionExpr}\n| sort_by(-.age_hours)`, [
+      "--arg", "repo", REPO,
       "--arg", "short", SHORT,
       "--arg", "now", NOW,
       "--argjson", "decision_labels", JSON.stringify(PATTERNS),
@@ -235,7 +238,8 @@ describe("brief decisions match morning-brief.sh", { concurrency: false }, () =>
     assert.deepEqual(fromBrief.map((row) => row.number), [10, 20, 30]);
     assert.equal(fromBrief[0].age_hours, 2304);
     assert.equal(fromBrief[0].age_days, 96);
-    assert.equal(fromBrief[0].repo, SHORT);
+    assert.equal(fromBrief[0].repo, REPO);
+    assert.equal(fromBrief[0].repo_short, SHORT);
     assert.equal(fromBrief[0].kind, "issue");
     assert.deepEqual(fromBrief[0].labels, ["needs-owner", "decision"]);
     assert.equal(fromBrief[1].kind, "pr");
@@ -266,8 +270,95 @@ describe("brief decisions match morning-brief.sh", { concurrency: false }, () =>
     ];
     const brief = toBriefDecisions(rows, NOW);
     assert.deepEqual(brief.map((row) => row.number), [1, 4, 2]);
-    assert.equal(brief[1].repo, "other");
-    assert.equal(brief[0].repo, SHORT);
+    assert.equal(brief[1].repo, "mrhinkle/other");
+    assert.equal(brief[1].repo_short, "other");
+    assert.equal(brief[0].repo, REPO);
+    assert.equal(brief[0].repo_short, SHORT);
+  });
+
+  it("serves that list from GET /api/decisions?shape=brief and from the brief script", () => {
+    const open = decision({ key: `github:${REPO}#1`, number: 1, opened_at: "2026-10-01T12:00:00Z" });
+    const gone = decision({
+      key: `github:${REPO}#2`,
+      number: 2,
+      status: "decided",
+      decision: "Ship it",
+      decided_by: "mark",
+      github_present: false,
+      opened_at: "2026-09-01T12:00:00Z",
+    });
+    const rows = [open, gone];
+    assert.equal(decisionListBody("row", rows, NOW).length, 2);
+    const brief = decisionListBody("brief", rows, NOW);
+    assert.deepEqual(brief.map((row) => row.number), [1]);
+
+    const parsed = parseListQuery(new URLSearchParams("shape=brief&status=open&source=agent"));
+    assert.equal(parsed.ok, true);
+    if (parsed.ok) {
+      assert.equal(parsed.shape, "brief");
+      assert.equal(parsed.status, "open");
+    }
+    const badShape = parseListQuery(new URLSearchParams("shape=csv"));
+    assert.equal(badShape.ok, false);
+    if (!badShape.ok) assert.equal(badShape.fields.shape, "shape must be row or brief.");
+
+    const route = fs.readFileSync("src/app/api/decisions/route.ts", "utf8");
+    assert.match(route, /decisionListBody\(parsed\.shape, rows, new Date\(\)\.toISOString\(\)\)/);
+    const sh = fs.readFileSync("scripts/morning-brief.sh", "utf8");
+    execFileSync("bash", ["-n", "scripts/morning-brief.sh"]);
+    assert.match(sh, /\/api\/decisions\?shape=brief&limit=1000/);
+    assert.match(sh, /\.demo == false and \(\.decisions \| type == "array"\)/);
+    const program = between(sh, "TABLE_DECISIONS_JQ='", "'\n").slice("TABLE_DECISIONS_JQ='".length);
+    const repos = [
+      { repo: REPO, short: SHORT, incomplete: false, decisions: [{ repo: REPO, number: 1 }] },
+      { repo: "mrhinkle/other", short: "other", incomplete: true, decisions: null },
+    ];
+    const table = [
+      { repo: REPO, repo_short: SHORT, number: 9, title: "from table", url: "https://example.test/9", kind: "issue", age_hours: 48, age_days: 2, labels: ["decision"] },
+      { repo: "mrhinkle/other", repo_short: "other", number: 8, title: "incomplete repo", url: "https://example.test/8", kind: "issue", age_hours: 1, age_days: 0, labels: ["decision"] },
+    ];
+    const replaced = execFileSync("jq", ["-c", "--argjson", "table", JSON.stringify(table), program], {
+      encoding: "utf8",
+      input: JSON.stringify(repos),
+    });
+    const out = JSON.parse(replaced) as { short: string; incomplete: boolean; decisions: { number: number }[] | null }[];
+    assert.deepEqual(out[0].decisions?.map((row) => row.number), [9]);
+    assert.equal(out[1].incomplete, true);
+    assert.equal(out[1].decisions, null);
+  });
+
+  it("puts one decision under the one owner/name when two repos share a short name", () => {
+    const acme = decision({
+      key: "github:acme/app#12",
+      number: 12,
+      repo: "acme/app",
+      repo_short: "app",
+      title: "pick a vendor",
+      url: "https://github.com/acme/app/issues/12",
+      opened_at: "2026-10-23T12:00:00Z",
+      labels: ["decision"],
+    });
+    const brief = decisionListBody("brief", [acme], NOW) as BriefDecision[];
+    assert.equal(brief.length, 1);
+    assert.equal(brief[0].repo, "acme/app");
+    assert.equal(brief[0].repo_short, "app");
+
+    const sh = fs.readFileSync("scripts/morning-brief.sh", "utf8");
+    const program = between(sh, "TABLE_DECISIONS_JQ='", "'\n").slice("TABLE_DECISIONS_JQ='".length);
+    assert.match(program, /\.repo == \$section\.repo/);
+    assert.equal(program.includes(".short"), false);
+    const repos = [
+      { repo: "acme/app", short: "app", incomplete: false, decisions: [] },
+      { repo: "other/app", short: "app", incomplete: false, decisions: [] },
+    ];
+    const replaced = execFileSync("jq", ["-c", "--argjson", "table", JSON.stringify(brief), program], {
+      encoding: "utf8",
+      input: JSON.stringify(repos),
+    });
+    const out = JSON.parse(replaced) as { repo: string; decisions: { number: number }[] }[];
+    const owners = out.filter((section) => section.decisions.some((row) => row.number === 12)).map((section) => section.repo);
+    assert.deepEqual(owners, ["acme/app"]);
+    assert.equal(out.find((section) => section.repo === "other/app")?.decisions.length, 0);
   });
 });
 
@@ -426,6 +517,14 @@ describe("decision routes", { concurrency: false }, () => {
     const listed = await GET(new Request("http://localhost/api/decisions"));
     assert.equal(listed.status, 200);
     assert.deepEqual(await listed.json(), { demo: true, decisions: [] });
+
+    const briefShape = await GET(new Request("http://localhost/api/decisions?shape=brief"));
+    assert.equal(briefShape.status, 200);
+    assert.deepEqual(await briefShape.json(), { demo: true, decisions: [] });
+
+    const badShape = await GET(new Request("http://localhost/api/decisions?shape=csv"));
+    assert.equal(badShape.status, 400);
+    assert.equal((await badShape.json()).code, "validation_failed");
 
     const badStatus = await GET(new Request("http://localhost/api/decisions?status=nope"));
     assert.equal(badStatus.status, 400);

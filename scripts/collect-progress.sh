@@ -303,8 +303,10 @@ post_decision() {
 }
 
 # Upsert every open issue and PR that carries a decision label, then withdraw
-# the ones this repo no longer has. Decided rows are not reopened; the API
-# only clears github_present on those when the label is gone.
+# the ones this repo no longer has. A missing key is an issue that closed or
+# lost the label, so open, deferred, and decided rows become withdrawn. The
+# stored decision text and decided_by stay. An upsert does not reopen a
+# decided or deferred row unless force is set.
 sync_repo_decisions() {
   local repo="$1" short="$2"
   if [[ "$(jq 'length' <<<"$DECISION_LABELS_JSON")" -eq 0 ]]; then

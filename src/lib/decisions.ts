@@ -6,8 +6,10 @@ import { sql } from "./db";
  * Rows are upserted by `key`. A collector that sees the same GitHub label
  * again bumps `last_seen_at` and does not reopen a decided or deferred row
  * unless `force` is true. A withdrawn row comes back to `open` when the
- * label returns. `github_present` is false once that label is gone, including
- * on a decided row, so the morning brief can be rebuilt from this table.
+ * label returns. A github-label row whose issue closed or lost the label
+ * becomes `withdrawn`, including a decided row. The stored decision text,
+ * `decided_by`, and `decided_at` stay. `github_present` goes false, so the
+ * morning brief can be rebuilt from this table.
  */
 
 export const DECISION_STATUSES = ["open", "decided", "deferred", "withdrawn"] as const;
@@ -15,6 +17,10 @@ export type DecisionStatus = (typeof DECISION_STATUSES)[number];
 
 export const LIST_STATUSES = [...DECISION_STATUSES, "all"] as const;
 export type ListStatus = (typeof LIST_STATUSES)[number];
+
+/** `row` is the queue. `brief` is `morning-brief.sh --json .decisions`. */
+export const LIST_SHAPES = ["row", "brief"] as const;
+export type ListShape = (typeof LIST_SHAPES)[number];
 
 export interface Decision {
   id: number;
@@ -48,7 +54,10 @@ export interface Decision {
 
 /** One element of `morning-brief.sh --json .decisions`. */
 export interface BriefDecision {
+  /** Canonical `owner/name`. The brief joins on this, not on the short name. */
   repo: string;
+  /** Config short name. Display only. */
+  repo_short: string;
   number: number;
   title: string;
   url: string;
@@ -221,7 +230,8 @@ export function presentDecision(row: Record<string, unknown>, nowIso: string): D
 /**
  * Rows the brief can show from the table alone: GitHub-sourced, still carrying
  * the label (`github_present` is not false), and not withdrawn. Oldest first,
- * which is `sort_by(-.age_hours)` in morning-brief.sh. `repo` is the config short name.
+ * which is `sort_by(-.age_hours)` in morning-brief.sh. `repo` is `owner/name`.
+ * `repo_short` is the display name and is not a join key.
  */
 export function toBriefDecisions(rows: readonly Decision[], nowIso: string): BriefDecision[] {
   const brief: BriefDecision[] = [];
@@ -232,9 +242,11 @@ export function toBriefDecisions(rows: readonly Decision[], nowIso: string): Bri
     if (row.number == null || !Number.isFinite(row.number)) continue;
     const opened = row.opened_at ?? row.first_seen_at;
     const age_hours = hoursBetween(opened, nowIso);
-    const repo = row.repo_short ?? (row.repo?.split("/")[1] ?? row.repo ?? "");
+    const repo = row.repo ?? "";
+    const repo_short = row.repo_short ?? (row.repo?.split("/")[1] ?? row.repo ?? "");
     brief.push({
       repo,
+      repo_short,
       number: row.number,
       title: row.title,
       url: row.url ?? "",
@@ -246,6 +258,16 @@ export function toBriefDecisions(rows: readonly Decision[], nowIso: string): Bri
   }
   brief.sort((a, b) => b.age_hours - a.age_hours || a.repo.localeCompare(b.repo) || a.number - b.number);
   return brief;
+}
+
+/** What `GET /api/decisions` returns in `decisions`. `brief` is the morning-brief list. */
+export function decisionListBody(
+  shape: ListShape,
+  rows: readonly Decision[],
+  nowIso: string,
+): Decision[] | BriefDecision[] {
+  if (shape === "brief") return toBriefDecisions(rows, nowIso);
+  return [...rows];
 }
 
 function decisionLabelsOf(item: GhItem, patterns: readonly string[]): string[] {
@@ -497,7 +519,11 @@ export function parseDecisionId(raw: string): number | null {
   return Number.isSafeInteger(id) ? id : null;
 }
 
-export function parseListQuery(params: URLSearchParams): { ok: true; status: ListStatus; repo: string | null; source: string | null; limit: number } | ParseFail {
+export function parseListQuery(params: URLSearchParams): { ok: true; status: ListStatus; repo: string | null; source: string | null; limit: number; shape: ListShape } | ParseFail {
+  const shapeRaw = params.get("shape") ?? "row";
+  if (!(LIST_SHAPES as readonly string[]).includes(shapeRaw)) {
+    return fail("validation_failed", { shape: "shape must be row or brief." });
+  }
   const statusRaw = params.get("status") ?? "open";
   if (!(LIST_STATUSES as readonly string[]).includes(statusRaw)) {
     return fail("validation_failed", { status: "status must be open, decided, deferred, withdrawn, or all." });
@@ -524,6 +550,7 @@ export function parseListQuery(params: URLSearchParams): { ok: true; status: Lis
     repo: repoRaw,
     source: sourceRaw,
     limit,
+    shape: shapeRaw as ListShape,
   };
 }
 
@@ -536,13 +563,21 @@ export async function listDecisions(query: {
   repo: string | null;
   source: string | null;
   limit: number;
+  /** `brief` selects the morning-brief population and ignores status and source. */
+  shape?: ListShape;
 }): Promise<Decision[]> {
   const db = sql();
   const now = nowIso();
+  const brief = query.shape === "brief";
   const rows = await db`
     select * from decisions
     where (
       case
+        when ${brief} is true then (
+          status <> 'withdrawn'
+          and github_present is distinct from false
+          and number is not null
+        )
         when ${query.status} = 'all' then true
         when ${query.status} = 'open' then
           status = 'open'
@@ -551,7 +586,12 @@ export async function listDecisions(query: {
       end
     )
     and (${query.repo}::text is null or repo = ${query.repo})
-    and (${query.source}::text is null or source = ${query.source})
+    and (
+      case
+        when ${brief} is true then source = 'github-label'
+        else (${query.source}::text is null or source = ${query.source})
+      end
+    )
     order by first_seen_at asc, id asc
     limit ${query.limit}
   `;
@@ -653,8 +693,9 @@ export interface ReconcileResult {
 
 /**
  * Mark GitHub rows for one repo that were not in this sweep.
- * Open and deferred rows become withdrawn. A decided row keeps its answer
- * and only loses `github_present`, so removing the label does not erase it.
+ * The issue closed or lost the label, so open, deferred, and decided rows
+ * become withdrawn. The stored decision text, decided_by, and decided_at stay.
+ * A row already withdrawn with github_present false is left alone.
  */
 export async function reconcileDecisions(input: ReconcileInput): Promise<ReconcileResult> {
   const db = sql();
@@ -664,12 +705,12 @@ export async function reconcileDecisions(input: ReconcileInput): Promise<Reconci
     set
       github_present = false,
       updated_at = now(),
-      status = case when status in ('open', 'deferred') then 'withdrawn' else status end,
+      status = case when status in ('open', 'deferred', 'decided') then 'withdrawn' else status end,
       defer_until = case when status in ('open', 'deferred') then null else defer_until end
     where source = ${input.source}
       and repo = ${input.repo}
       and not (key in (select jsonb_array_elements_text(${seenJson}::jsonb)))
-      and (github_present is distinct from false or status in ('open', 'deferred'))
+      and (github_present is distinct from false or status in ('open', 'deferred', 'decided'))
     returning id, status
   `;
   return {

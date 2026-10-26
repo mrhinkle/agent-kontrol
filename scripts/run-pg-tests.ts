@@ -326,7 +326,7 @@ async function testDecisions(tag: string) {
       await listDecisions({ status: "all", repo, source: null, limit: 100 }),
       "2026-10-25T12:00:00Z",
     );
-    assert.ok(briefBefore.some((row) => row.number === 1 && row.repo === "app"));
+    assert.ok(briefBefore.some((row) => row.number === 1 && row.repo === repo && row.repo_short === "app"));
 
     const reconciled = await reconcileDecisions({
       repo,
@@ -350,19 +350,64 @@ async function testDecisions(tag: string) {
 
     const brief = toBriefDecisions(after, "2026-10-25T12:00:00Z");
     assert.deepEqual(brief.map((row) => row.number), [1, 5], "oldest first, and a decided row still on GitHub stays in the brief");
-    assert.ok(brief.every((row) => row.repo === "app"));
+    assert.ok(brief.every((row) => row.repo === repo && row.repo_short === "app"));
+    const listedBrief = await listDecisions({
+      status: "open",
+      repo,
+      source: "agent",
+      limit: 100,
+      shape: "brief",
+    });
+    assert.deepEqual(
+      listedBrief.map((row) => row.number).sort((a, b) => (a ?? 0) - (b ?? 0)),
+      [1, 5],
+      "shape=brief keeps a decided row that is still present and ignores status and source",
+    );
 
     const dropped = await reconcileDecisions({ repo, source: "github-label", seen_keys: [key(5)] });
-    assert.equal(dropped.withdrawn, 0, "losing the label does not withdraw a decided row");
+    assert.equal(dropped.withdrawn, 1, "losing the label withdraws a decided row");
     const hidden = (await listDecisions({ status: "all", repo, source: null, limit: 100 })).find((row) => row.number === 1);
-    assert.equal(hidden?.status, "decided");
+    assert.equal(hidden?.status, "withdrawn");
     assert.equal(hidden?.github_present, false);
     assert.equal(hidden?.decision, "Ship it");
+    assert.equal(hidden?.decided_by, "mark");
+    assert.ok(hidden?.decided_at, "withdrawing a decided row keeps decided_at");
     const briefAfterDrop = toBriefDecisions(
       await listDecisions({ status: "all", repo, source: null, limit: 100 }),
       "2026-10-25T12:00:00Z",
     );
     assert.deepEqual(briefAfterDrop.map((row) => row.number), [5]);
+    const listedAfterDrop = await listDecisions({ status: "all", repo, source: null, limit: 100, shape: "brief" });
+    assert.deepEqual(listedAfterDrop.map((row) => row.number), [5]);
+
+    const closing = await upsertDecision(body(6, {
+      title: "closing",
+      kind: "issue",
+      opened_at: "2026-09-01T00:00:00.000Z",
+    }));
+    const closedDecided = await patchDecision(closing.decision.id, {
+      status: "decided",
+      decision: "Close it",
+      setDecision: true,
+      decided_by: "mark",
+      setDecidedBy: true,
+      defer_until: null,
+      setDefer: false,
+    });
+    assert.equal(closedDecided?.status, "decided");
+    assert.equal(closedDecided?.decision, "Close it");
+    const closedSweep = await reconcileDecisions({ repo, source: "github-label", seen_keys: [key(5)] });
+    assert.equal(closedSweep.withdrawn, 1, "a decided row whose issue closed is withdrawn");
+    const closedRow = (await listDecisions({ status: "all", repo, source: null, limit: 100 })).find((row) => row.number === 6);
+    assert.equal(closedRow?.status, "withdrawn");
+    assert.equal(closedRow?.github_present, false);
+    assert.equal(closedRow?.decision, "Close it");
+    assert.equal(closedRow?.decided_by, "mark");
+    assert.ok(closedRow?.decided_at);
+    const stillHidden = (await listDecisions({ status: "all", repo, source: null, limit: 100 })).find((row) => row.number === 1);
+    assert.equal(stillHidden?.status, "withdrawn");
+    assert.equal(stillHidden?.decision, "Ship it");
+    assert.equal(stillHidden?.decided_by, "mark");
 
     const back = await upsertDecision(body(2, { title: "label returned", requested_by: "collector" }));
     assert.equal(back.decision.status, "open");
@@ -371,11 +416,16 @@ async function testDecisions(tag: string) {
 
     const empty = await reconcileDecisions({ repo, source: "github-label", seen_keys: [] });
     assert.ok(empty.withdrawn >= 1, "an empty sweep withdraws the open rows");
-    const kept = await listDecisions({ status: "decided", repo, source: null, limit: 100 });
-    assert.equal(kept.length, 1);
-    assert.equal(kept[0].number, 1);
-    assert.equal(kept[0].github_present, false);
-    assert.equal(kept[0].decision, "Ship it");
+    const decidedLeft = await listDecisions({ status: "decided", repo, source: null, limit: 100 });
+    assert.equal(decidedLeft.length, 0, "a closed or unlabeled decided row is no longer decided");
+    const answers = await listDecisions({ status: "withdrawn", repo, source: null, limit: 100 });
+    const ship = answers.find((row) => row.number === 1);
+    const close = answers.find((row) => row.number === 6);
+    assert.equal(ship?.decision, "Ship it");
+    assert.equal(ship?.decided_by, "mark");
+    assert.equal(ship?.github_present, false);
+    assert.equal(close?.decision, "Close it");
+    assert.equal(close?.decided_by, "mark");
 
     const cleared = await patchDecision(first.decision.id, {
       status: "open",
