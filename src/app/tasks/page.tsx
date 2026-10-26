@@ -4,6 +4,8 @@ import { useCallback, useEffect, useState } from "react";
 import { PlatformBadge, TaskStatusChip, TimeAgo } from "@/components/ui";
 import { PanelHeader } from "@/components/PanelHeader";
 import { CollapsibleMarkdown } from "@/components/Markdown";
+import { PreviewDialog } from "@/components/PreviewDialog";
+import type { DryRunResult } from "@/lib/dry-run";
 import type { Task } from "@/lib/types";
 
 const PLATFORMS = ["any", "claude-code", "codex", "grok", "hermes", "cowork-cloud"];
@@ -93,7 +95,7 @@ function NewTaskForm({ onCreated, onCancel }: { onCreated: () => void; onCancel?
   );
 }
 
-function TaskRow({ t, onAction }: { t: Task; onAction: () => void }) {
+function TaskRow({ t, onAction, onCancelTask }: { t: Task; onAction: () => void; onCancelTask?: (task: Task) => void }) {
   const open = ["queued", "claimed", "running", "review"].includes(t.status);
 
   async function patch(body: Record<string, unknown>) {
@@ -125,8 +127,8 @@ function TaskRow({ t, onAction }: { t: Task; onAction: () => void }) {
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <TaskStatusChip status={t.status} />
-          {open && (
-            <button onClick={() => patch({ status: "cancelled" })}
+          {open && onCancelTask && (
+            <button onClick={() => onCancelTask(t)}
               className="text-[11px] text-gray-500 hover:text-red-400 transition-colors" title="Cancel">
               ✕
             </button>
@@ -160,6 +162,9 @@ export default function TasksPage() {
   const [tasks, setTasks] = useState<Task[] | null>(null);
   const [composing, setComposing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [pendingCancel, setPendingCancel] = useState<{ id: number; preview: DryRunResult } | null>(null);
+  const [cancelling, setCancelling] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -178,6 +183,53 @@ export default function TasksPage() {
     const t = setInterval(load, 7000);
     return () => clearInterval(t);
   }, [load]);
+
+  async function startCancel(task: Task) {
+    setActionError(null);
+    setCancelling(true);
+    try {
+      const res = await fetch(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "cancelled", dry_run: true }),
+      });
+      const body = (await res.json().catch(() => ({}))) as Partial<DryRunResult> & { error?: string };
+      if (res.ok && body.dry_run === true && Array.isArray(body.changes)) {
+        setPendingCancel({ id: task.id, preview: body as DryRunResult });
+      } else {
+        setActionError(body.error ?? `Could not preview the cancel (${res.status}).`);
+      }
+    } catch (e) {
+      setActionError((e as Error).message);
+    } finally {
+      setCancelling(false);
+    }
+  }
+
+  async function confirmCancel() {
+    if (!pendingCancel) return;
+    setCancelling(true);
+    setActionError(null);
+    try {
+      const res = await fetch(`/api/tasks/${pendingCancel.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "cancelled" }),
+      });
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { error?: string };
+        setActionError(body.error ?? `Cancel failed (${res.status}).`);
+        setPendingCancel(null);
+        return;
+      }
+      setPendingCancel(null);
+      await load();
+    } catch (e) {
+      setActionError((e as Error).message);
+    } finally {
+      setCancelling(false);
+    }
+  }
 
   if (error) return <div className="text-red-400 text-sm">Failed to load tasks: {error}</div>;
   if (!tasks) return <div className="text-gray-500 text-sm animate-pulse">Loading the queue…</div>;
@@ -218,9 +270,11 @@ export default function TasksPage() {
         />
       )}
 
+      {actionError && <p className="mb-3 text-sm text-red-400">{actionError}</p>}
+
       <div className="grid gap-3">
         {open.map((t) => (
-          <TaskRow key={t.id} t={t} onAction={load} />
+          <TaskRow key={t.id} t={t} onAction={load} onCancelTask={(task) => void startCancel(task)} />
         ))}
         {open.length === 0 && (
           <div className="text-gray-500 text-sm">
@@ -239,6 +293,16 @@ export default function TasksPage() {
             ))}
           </div>
         </>
+      )}
+      {pendingCancel && (
+        <PreviewDialog
+          title="Cancel task"
+          preview={pendingCancel.preview}
+          confirmLabel="Cancel task"
+          busy={cancelling}
+          onConfirm={() => void confirmCancel()}
+          onCancel={() => setPendingCancel(null)}
+        />
       )}
     </div>
   );

@@ -733,3 +733,28 @@ export async function updateTask(input: {
     throw new Error(errMsg(e));
   }
 }
+
+/** Read one task. Dry-run previews use this so a cancel can show the row without updating it. */
+export async function getTask(id: number): Promise<Task | null> {
+  const db = sql();
+  try {
+    const rows = await db`select * from tasks where id = ${id} limit 1`;
+    return (rows[0] as Task | undefined) ?? null;
+  } catch (e) {
+    throw new Error(errMsg(e));
+  }
+}
+
+/**
+ * Read the note stored at a key, if any. Dry-run previews use this so an
+ * overwrite can show the current note without writing.
+ */
+export async function findMemoryByKey(key: string): Promise<MemoryItem | null> {
+  const db = sql();
+  try {
+    const rows = await db`select * from memory where key = ${key} limit 1`;
+    return (rows[0] as MemoryItem | undefined) ?? null;
+  } catch (e) {
+    throw new Error(errMsg(e));
+  }
+}
