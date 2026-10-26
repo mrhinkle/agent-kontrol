@@ -4,9 +4,9 @@
  * callers can reuse the same string. The key is never taken from a column
  * on the resource row.
  *
- * The same key and the same arguments return the stored result. The same
- * key with different arguments throws IdempotencyConflict. A key lasts 24
- * hours from the claim.
+ * The same key and the same arguments return the stored result for 24 hours
+ * from the claim. After that window the same key starts a new write. The
+ * same key with different arguments throws IdempotencyConflict.
  */
 import { createHash } from "node:crypto";
 import type { Actor } from "./actor";
@@ -26,7 +26,7 @@ export const IDEMPOTENCY_ROUTE = {
 const MISMATCH = "This idempotency key was already used with different arguments.";
 const IN_PROGRESS = "This idempotency key is already in progress.";
 const BAD_KEY = "Use 1 to 200 characters and no control characters, or omit the key.";
-const UNKNOWN_OUTCOME = "The previous attempt with this key may already have been saved. Retry the same key until it resolves or expires. A retry will not insert another row.";
+const UNKNOWN_OUTCOME = "The previous attempt with this key may already have been saved. Retry the same key and the same arguments. Within 24 hours of the claim, that retry does not insert another row. The key is scoped to this actor and this route.";
 
 /** Stored in response so a later call can tell a lost RETURNING from a live in-progress claim. */
 const UNKNOWN_MARKER = { __agent_kontrol_idempotency: "unknown_outcome" };
@@ -60,7 +60,9 @@ export class IdempotencyKeyInvalid extends Error {
 
 /**
  * The write may have committed and the client did not see the result.
- * The claim is kept until it expires. Retrying the same key does not insert another row.
+ * The claim is kept for 24 hours. Inside that window, retrying the same
+ * key and the same arguments does not insert another row. The key is
+ * scoped to the actor and the route.
  */
 export class IdempotencyUnknownOutcome extends Error {
   readonly code = "idempotency_conflict" as const;
@@ -178,7 +180,9 @@ async function retainUnknown(db: SqlTag, scope: string, key: string): Promise<vo
 /**
  * Run `execute` once per key. A missing key runs `execute` every time.
  * A definite failure releases the claim. A connection loss after the
- * statement may have committed keeps the claim until it expires.
+ * statement may have committed keeps the claim for 24 hours. Inside that
+ * window a retry does not insert another row. The key is scoped to the
+ * actor and the route.
  */
 export async function runIdempotent<T>(opts: {
   actor: Actor | null | undefined;

@@ -15,8 +15,8 @@ export const maxDuration = 30;
  * Non-MCP agents (hooks, watchers, scripts) post replies here with Bearer MC_TOKEN.
  *
  * Body: { agent_id, body, in_reply_to?, created_by? }
- * Optional header Idempotency-Key. Same key and same body return the
- * original reply for 24 hours.
+ * Optional header Idempotency-Key. Same key, actor, and route return the
+ * original reply for 24 hours. After that window the key starts a new write.
  */
 export async function POST(req: Request) {
   const access = await resolveBearerAccess(req);

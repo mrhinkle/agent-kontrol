@@ -231,7 +231,7 @@ function safeCaught(err: unknown): SafeCaught | null {
       message: unknownOutcome.message,
       fields: unknownOutcome.fields ?? { idempotency_key: unknownOutcome.message },
       retryable: true,
-      fix: "Retry the same idempotency key. It will not insert another row. The key expires 24 hours after the first claim.",
+      fix: "Retry the same idempotency key and the same arguments. Within 24 hours of the claim, that retry does not insert another row. The key is scoped to the actor and the route.",
     };
   }
   const conflict = namedError(err, "IdempotencyConflict");

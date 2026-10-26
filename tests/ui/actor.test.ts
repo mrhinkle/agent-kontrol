@@ -84,8 +84,24 @@ function installFake() {
     }
     if (lower.includes("update agent_credentials")) return [];
     if (lower.includes("insert into ")) {
-      const row = rowFrom(strings, values);
-      row.id = seq++;
+      const rootMessage = lower.includes("insert into messages") && lower.includes("overriding system value");
+      const row: Row = rootMessage
+        ? {
+            id: seq++,
+            agent_id: values[0],
+            body: values[1],
+            created_by: values[2],
+            direction: values[3],
+            in_reply_to: values[4] ?? null,
+            actor_type: values[5],
+            actor_id: values[6],
+            created_at: "2026-10-25T00:00:00.000Z",
+          }
+        : rowFrom(strings, values);
+      if (!rootMessage) row.id = seq++;
+      if (lower.includes("insert into messages") && (row.thread_id == null || row.thread_id === "")) {
+        row.thread_id = String(row.id);
+      }
       if (row.created_at == null) row.created_at = "2026-10-25T00:00:00.000Z";
       if (lower.includes("insert into tasks") && row.status == null) row.status = "queued";
       if (lower.includes("insert into tasks") && row.priority == null) row.priority = 2;

@@ -173,9 +173,9 @@ Reply to the operator. Replies appear in the Fleet conversation drawer.
 | `agent_id` | string | yes | Your agent id. |
 | `body` | string | yes | The reply, 1-20 lines. |
 | `in_reply_to` | int | no | Id of the inbound message being answered. |
-| `idempotency_key` | string | no | Optional. The same key and the same arguments return the original reply for 24 hours and do not store a second row. The same key with different arguments is `idempotency_conflict`. `reply_to_mark` accepts the same parameter and shares the key with `reply_to_operator`. |
+| `idempotency_key` | string | no | Optional. Scoped by actor and route. The same key and the same arguments return the original reply for 24 hours and do not store a second row during that window. After 24 hours the same key starts a new write. The same key with different arguments is `idempotency_conflict`. `reply_to_mark` accepts the same parameter and shares this route. |
 
-The server records `actor_type` and `actor_id` from the authenticated credential. A label in the request cannot set them. The idempotency key is scoped to that actor.
+The server records `actor_type` and `actor_id` from the authenticated credential. A label in the request cannot set them. The idempotency key is scoped by that actor and the route `reply_to_operator`.
 
 When to call: when you have an answer, a result, or a question for the operator.
 
@@ -193,7 +193,7 @@ Queue a task for the fleet. A dispatcher or another agent claims it and runs it.
 | `priority` | int | no | 1 high, 2 normal (default), 3 low. |
 | `reviewer_platform` | enum | no | `claude-code`, `codex`, or `grok`. A second platform reviews the work before done. |
 | `created_by` | string | no | Free-text label stored on the task. The server records `actor_type` and `actor_id` from the authenticated credential and ignores any actor fields in the request. |
-| `idempotency_key` | string | no | Optional. The same key and the same arguments return the original task for 24 hours and do not queue a second task. The same key with different arguments is `idempotency_conflict`. The key is scoped to the authenticated actor. |
+| `idempotency_key` | string | no | Optional. Scoped by actor and route. The same key and the same arguments return the original task for 24 hours and do not queue a second task during that window. After 24 hours the same key starts a new write. The same key with different arguments is `idempotency_conflict`. |
 
 When to call: when work should be queued for the fleet rather than done by you.
 
@@ -241,7 +241,7 @@ A tool failure returns `isError: true`. The text of the result is JSON with the 
 { "error": "Memory key is invalid.", "code": "memory_key_invalid", "fix": "Use a key of 1 to 200 characters with no control characters, or omit the key.", "retryable": false, "fields": { "key": "Use 1 to 200 characters and no control characters, or omit the key." } }
 ```
 
-`error` is a string. `retryable` is `true` for `rate_limited`, `internal_error`, and for `idempotency_conflict` when the first attempt may already have committed. A handler that throws is logged on the server and returned as `internal_error` with a generic `error` string. The exception text is not in the result.
+`error` is a string. `retryable` is `true` for `rate_limited`, `internal_error`, and for `idempotency_conflict` when the first attempt may already have committed. That retry does not insert another row while the claim is inside its 24 hour window. The key is scoped by actor and route. A handler that throws is logged on the server and returned as `internal_error` with a generic `error` string. The exception text is not in the result.
 
 `remember` and `recall` return `memory_key_invalid` when `key` is empty, longer than 200 characters, or contains a control character. Omitting `key` is valid. `update_task` returns `task_not_found` when a database is connected and the id does not exist. Demo mode answers with plain text, not an error. `reply_to_operator` returns `not_found` or `forbidden` when `in_reply_to` does not exist or belongs to another agent. `create_task` and `reply_to_operator` return `idempotency_conflict` when `idempotency_key` was already used with different arguments, or when the first request with that key is still in progress. A key longer than 200 characters or containing a control character is `validation_failed`. Omitting the key is valid.
 
@@ -261,7 +261,7 @@ The HTTP `401` for a missing or invalid bearer is unchanged: `WWW-Authenticate` 
 | `missing_field` | no | Not returned by a tool. The input schema rejects a missing argument first. |
 | `rate_limited` | yes | Not returned by a tool. `POST /api/login` only. The OAuth consent form shares that limiter and answers with HTML, not this JSON. |
 | `conflict` | no | Not returned by a tool. REST settings save with no database. |
-| `idempotency_conflict` | no | `create_task` or `reply_to_operator` reused `idempotency_key` with different arguments, or the first request with that key is still in progress. `reply_to_mark` is the same tool schema and the same key as `reply_to_operator`. The same key and the same arguments return the original result. When the first attempt may already have committed and the result was not stored, `retryable` is `true` and a retry does not insert another row. |
+| `idempotency_conflict` | no | `create_task` or `reply_to_operator` reused `idempotency_key` with different arguments, or the first request with that key is still in progress. `reply_to_mark` is the same tool schema and the same key as `reply_to_operator`. The same key, the same actor, the same route, and the same arguments return the original result for 24 hours. When the first attempt may already have committed and the result was not stored, `retryable` is `true`. A retry does not insert another row while the claim is inside its 24 hour window. After that window the same key starts a new write. The key is scoped by actor and route. |
 | `stale` | no | Not returned by a tool. REST settings save with a stale `version`. |
 | `task_not_found` | no | `update_task` when a database is connected and the id does not exist. Demo mode is the text `Demo mode; task not updated.`, not an error. |
 | `task_not_claimable` | no | Defined, not returned. See above. |

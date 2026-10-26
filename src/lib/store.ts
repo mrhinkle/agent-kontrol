@@ -1,7 +1,7 @@
 import type { Actor } from "./actor";
 import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent } from "./idempotency";
 import { writeSessionNote } from "./session-memory";
-import { sql } from "./db";
+import { sql, type SqlTag } from "./db";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
 import { asUnknownWriteOutcome } from "./write-outcome";
 
@@ -389,34 +389,82 @@ export async function enqueueMessage(input: EnqueueInput): Promise<Message> {
   });
 }
 
-async function insertEnqueuedMessage(input: EnqueueInput): Promise<Message> {
-  const db = sql();
-  const actor = actorFields(input.actor);
+type MessageWrite = {
+  agentId: string;
+  body: string;
+  createdBy: string;
+  direction: "inbound" | "outbound";
+  inReplyTo: number | null;
+  /** Null means this row is the thread root, so thread_id is its own id. */
+  threadId: string | null;
+  actorType: string | null;
+  actorId: string | null;
+};
+
+/**
+ * One statement. A new thread sets thread_id to the new id in that statement.
+ * Neon HTTP autocommits each call, so a follow-up write can commit the row
+ * and then fail on a deadlock, a cancel, or a trigger. The claim would be
+ * released and a retry would insert a second message.
+ */
+async function insertMessage(db: SqlTag, input: MessageWrite): Promise<Message> {
   try {
-    const rows = await db`
-      insert into messages (agent_id, body, created_by, direction, actor_type, actor_id)
-      values (
-        ${slugify(input.agent_id)},
-        ${input.body},
-        ${input.created_by ?? "dashboard"},
-        'inbound',
-        ${actor.actor_type},
-        ${actor.actor_id}
-      )
-      returning *
-    `;
+    const rows = input.threadId == null
+      ? await db`
+          insert into messages (
+            id, agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id
+          )
+          overriding system value
+          select
+            allocated.nid,
+            ${input.agentId},
+            ${input.body},
+            ${input.createdBy},
+            ${input.direction},
+            ${input.inReplyTo},
+            allocated.nid::text,
+            ${input.actorType},
+            ${input.actorId}
+          from (
+            select nextval(pg_get_serial_sequence('messages', 'id')) as nid
+          ) allocated
+          returning *
+        `
+      : await db`
+          insert into messages (
+            agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id
+          )
+          values (
+            ${input.agentId},
+            ${input.body},
+            ${input.createdBy},
+            ${input.direction},
+            ${input.inReplyTo},
+            ${input.threadId},
+            ${input.actorType},
+            ${input.actorId}
+          )
+          returning *
+        `;
     if (!rows[0]) throw new Error("messages insert returned no row");
-    const id = Number(rows[0].id);
-    const updated = await db`
-      update messages
-      set thread_id = coalesce(thread_id, ${String(id)})
-      where id = ${id}
-      returning *
-    `;
-    return asMessage((updated[0] ?? rows[0]) as Record<string, unknown>);
+    return asMessage(rows[0] as Record<string, unknown>);
   } catch (e) {
     rethrowStore(e);
   }
+}
+
+async function insertEnqueuedMessage(input: EnqueueInput): Promise<Message> {
+  const actor = actorFields(input.actor);
+  return insertMessage(sql(), {
+    agentId: slugify(input.agent_id),
+    body: input.body,
+    createdBy: input.created_by ?? "dashboard",
+    direction: "inbound",
+    inReplyTo: null,
+    threadId: null,
+    actorType: actor.actor_type,
+    actorId: actor.actor_id,
+  });
 }
 
 type ReplyInput = {
@@ -461,36 +509,16 @@ async function insertReply(input: ReplyInput): Promise<Message> {
       throw new Error(errMsg(e));
     }
   }
-  try {
-    const rows = await db`
-      insert into messages (agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id)
-      values (
-        ${agentId},
-        ${input.body},
-        ${input.created_by ?? agentId},
-        'outbound',
-        ${parentId},
-        ${threadId},
-        ${actor.actor_type},
-        ${actor.actor_id}
-      )
-      returning *
-    `;
-    if (!rows[0]) throw new Error("messages insert returned no row");
-    const id = Number(rows[0].id);
-    if (!threadId) {
-      const updated = await db`
-        update messages
-        set thread_id = ${String(id)}
-        where id = ${id}
-        returning *
-      `;
-      return asMessage((updated[0] ?? rows[0]) as Record<string, unknown>);
-    }
-    return asMessage(rows[0] as Record<string, unknown>);
-  } catch (e) {
-    rethrowStore(e);
-  }
+  return insertMessage(db, {
+    agentId,
+    body: input.body,
+    createdBy: input.created_by ?? agentId,
+    direction: "outbound",
+    inReplyTo: parentId,
+    threadId,
+    actorType: actor.actor_type,
+    actorId: actor.actor_id,
+  });
 }
 
 /** Fetch an agent's pending inbound (unacked) messages. Ack keeps history. */

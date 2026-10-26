@@ -266,7 +266,7 @@ const handler = createMcpHandler(
             idempotency_key: z
               .string()
               .optional()
-              .describe("Optional. The same key and the same arguments return the original reply for 24 hours and do not store a second row. The same key with different arguments is an error."),
+              .describe("Optional. Scoped by actor and route. The same key and the same arguments return the original reply for 24 hours and do not store a second row during that window. After 24 hours the same key starts a new write. The same key with different arguments is an error."),
           },
         },
         async (args) => guardTool(tool.name, async () => {
@@ -320,7 +320,7 @@ const handler = createMcpHandler(
           idempotency_key: z
             .string()
             .optional()
-            .describe("Optional. The same key and the same arguments return the original task for 24 hours and do not queue a second task. The same key with different arguments is an error."),
+            .describe("Optional. Scoped by actor and route. The same key and the same arguments return the original task for 24 hours and do not queue a second task during that window. After 24 hours the same key starts a new write. The same key with different arguments is an error."),
         },
       },
       async (args) => guardTool("create_task", async () => {

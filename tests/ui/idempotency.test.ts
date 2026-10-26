@@ -57,6 +57,9 @@ const idem = new Map<string, IdemRow>();
 let seq = 1;
 /** The next resource insert is recorded, then the client loses RETURNING. */
 let commitThenFail = false;
+/** Definite failure of a follow-up thread_id write. Not a connection loss. */
+let threadUpdateFault: Error | null = null;
+let threadUpdates = 0;
 
 function columnsOf(text: string): string[] {
   const match = text.match(/insert into [a-z_]+ \(([^)]+)\)/i);
@@ -95,6 +98,8 @@ function installFake() {
   idem.clear();
   seq = 1;
   commitThenFail = false;
+  threadUpdateFault = null;
+  threadUpdates = 0;
   setSqlForTests(async (strings, ...values) => {
     const text = strings.join(" ").replace(/\s+/g, " ").trim();
     const lower = text.toLowerCase();
@@ -144,8 +149,24 @@ function installFake() {
       return row ? [row] : [];
     }
     if (lower.includes("insert into ")) {
-      const row = rowFrom(strings, values);
-      row.id = seq++;
+      const rootMessage = lower.includes("insert into messages") && lower.includes("overriding system value");
+      const row: Row = rootMessage
+        ? {
+            id: seq++,
+            agent_id: values[0],
+            body: values[1],
+            created_by: values[2],
+            direction: values[3],
+            in_reply_to: values[4] ?? null,
+            actor_type: values[5],
+            actor_id: values[6],
+            created_at: "2026-10-25T00:00:00.000Z",
+          }
+        : rowFrom(strings, values);
+      if (!rootMessage) row.id = seq++;
+      if (lower.includes("insert into messages") && (row.thread_id == null || row.thread_id === "")) {
+        row.thread_id = String(row.id);
+      }
       if (row.created_at == null) row.created_at = "2026-10-25T00:00:00.000Z";
       if (lower.includes("insert into tasks") && row.status == null) row.status = "queued";
       if (lower.includes("insert into tasks") && row.priority == null) row.priority = 2;
@@ -158,6 +179,12 @@ function installFake() {
       return [row];
     }
     if (lower.includes("update messages") && lower.includes("thread_id")) {
+      threadUpdates += 1;
+      if (threadUpdateFault) {
+        const fault = threadUpdateFault;
+        threadUpdateFault = null;
+        throw fault;
+      }
       const id = values[values.length - 1];
       const found = inserts.find((item) => item.table === "messages" && item.row.id === id);
       if (!found) return [];
@@ -307,8 +334,11 @@ describe("idempotency keys", { concurrency: false }, () => {
     const body = await first.json() as Record<string, unknown>;
     assert.equal(body.code, "idempotency_conflict");
     assert.equal(body.retryable, true);
-    assert.equal(typeof body.fix, "string");
     assert.match(String(body.error), /may already have been saved/);
+    assert.match(String(body.error), /24 hours/);
+    assert.match(String(body.error), /actor and this route/);
+    assert.match(String(body.fix), /24 hours/);
+    assert.match(String(body.fix), /actor and the route/);
     assert.equal(inserts.filter((item) => item.table === "tasks").length, 1);
     const claim = [...idem.values()].find((row) => row.idempotency_key === "commit-then-fail");
     assert.ok(claim);
@@ -566,6 +596,91 @@ describe("idempotency keys", { concurrency: false }, () => {
     const matches = src.match(/idempotency_key: z/g) ?? [];
     assert.equal(matches.length, 2);
     assert.match(src, /idempotency_key: args\.idempotency_key/);
+  });
+
+  it("does not insert a second message when the thread_id write fails after the insert", async () => {
+    const deadlock = () => Object.assign(new Error("deadlock detected"), { code: "40P01" });
+    const messages = () => inserts.filter((item) => item.table === "messages");
+
+    threadUpdateFault = deadlock();
+    const queued = {
+      agent_id: "worker-one",
+      body: "hello",
+      idempotency_key: "thread-deadlock",
+      actor: { actor_type: "human" as const, actor_id: "operator" },
+    };
+    let firstId: number | undefined;
+    try {
+      const first = await enqueueMessage(queued);
+      firstId = first.id;
+      assert.equal(first.thread_id, String(first.id));
+      assert.equal(threadUpdates, 0);
+    } catch (err) {
+      assert.ok(err instanceof IdempotencyUnknownOutcome);
+      assert.ok(threadUpdates >= 1);
+    }
+    assert.equal(messages().length, 1);
+    if (firstId != null) {
+      const again = await enqueueMessage(queued);
+      assert.equal(again.id, firstId);
+    } else {
+      await assert.rejects(() => enqueueMessage(queued), IdempotencyUnknownOutcome);
+    }
+    assert.equal(messages().length, 1);
+
+    threadUpdateFault = deadlock();
+    threadUpdates = 0;
+    const replied = {
+      agent_id: "worker-one",
+      body: "done",
+      idempotency_key: "reply-deadlock",
+      actor: actorA,
+    };
+    let replyId: number | undefined;
+    try {
+      const reply = await replyFromAgent(replied);
+      replyId = reply.id;
+      assert.equal(reply.thread_id, String(reply.id));
+      assert.equal(threadUpdates, 0);
+    } catch (err) {
+      assert.ok(err instanceof IdempotencyUnknownOutcome);
+      assert.ok(threadUpdates >= 1);
+    }
+    assert.equal(messages().length, 2);
+    if (replyId != null) {
+      const again = await replyFromAgent(replied);
+      assert.equal(again.id, replyId);
+    } else {
+      await assert.rejects(() => replyFromAgent(replied), IdempotencyUnknownOutcome);
+    }
+    assert.equal(messages().length, 2);
+  });
+
+  it("writes a message thread in one statement, and a task in one insert", () => {
+    const src = fs.readFileSync("src/lib/store.ts", "utf8");
+    const messages = src.slice(
+      src.indexOf("export async function enqueueMessage"),
+      src.indexOf("export async function fetchMessages"),
+    );
+    const task = src.slice(
+      src.indexOf("async function insertTask"),
+      src.indexOf("const OPEN_STATUSES"),
+    );
+    assert.equal(/update\s+messages/i.test(messages), false);
+    assert.match(messages, /overriding system value/);
+    assert.match(messages, /nextval\(pg_get_serial_sequence\('messages', 'id'\)\)/);
+    assert.match(task, /insert into tasks/i);
+    assert.equal(/update\s+tasks/i.test(task), false);
+  });
+
+  it("documents the 24 hour retry window and actor-plus-route key scope", () => {
+    const api = fs.readFileSync("docs/API.md", "utf8");
+    const mcp = fs.readFileSync("docs/MCP.md", "utf8");
+    for (const text of [api, mcp]) {
+      assert.match(text, /24 hour window/);
+      assert.match(text, /scoped by actor and route/);
+      assert.match(text, /After 24 hours the same key starts a new write|After that window the same key starts a new write/);
+    }
   });
 
   it("scopes a store reply to reply_to_operator", async () => {

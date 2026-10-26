@@ -22,8 +22,8 @@ export const maxDuration = 30;
  * GET  ?agent_id=X&ack=true              -> agent pulls inbound inbox
  * GET  ?agent_id=X&conversation=true     -> full history for the drawer
  * POST { agent_id, body, created_by? }   -> operator enqueues inbound
- *   Optional header Idempotency-Key. Same key and same body return the
- *   original message for 24 hours.
+ *   Optional header Idempotency-Key. Same key, actor, and route return the
+ *   original message for 24 hours. After that window the key starts a new write.
  * PATCH { agent_id }                     -> operator marks outbound replies read
  */
 

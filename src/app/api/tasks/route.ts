@@ -18,8 +18,9 @@ export const maxDuration = 30;
  * GET  /api/tasks?status=open|all|<status>&limit=N
  * POST /api/tasks { title, description?, project?, platform?, machine?,
  *                   priority?, reviewer_platform?, created_by? }
- * Optional header Idempotency-Key. Same key and same body return the
- * original task for 24 hours. Same key and a different body is a conflict.
+ * Optional header Idempotency-Key. Same key, actor, and route return the
+ * original task for 24 hours. After that window the key starts a new write.
+ * Same key and a different body is a conflict.
  */
 export async function GET(req: Request) {
   const access = await resolveApiAccess(req);
