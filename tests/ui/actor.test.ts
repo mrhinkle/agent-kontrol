@@ -189,7 +189,7 @@ function jsonReq(url: string, body: unknown, headers: Record<string, string> = {
 }
 
 describe("actor attribution", { concurrency: false }, () => {
-  it("maps each principal to a human or an agent, and never to a request label", () => {
+  it("maps an authenticated principal to a human or an agent, and dev-open to null", () => {
     assert.deepEqual(actorFromPrincipal({ kind: "agent", id: "cred-a", scopes: [] }), {
       actor_type: "agent",
       actor_id: "cred-a",
@@ -202,10 +202,7 @@ describe("actor attribution", { concurrency: false }, () => {
       actor_type: "human",
       actor_id: DASHBOARD_ACTOR_ID,
     });
-    assert.deepEqual(actorFromPrincipal({ kind: "dev-open" }), {
-      actor_type: "human",
-      actor_id: DASHBOARD_ACTOR_ID,
-    });
+    assert.equal(actorFromPrincipal({ kind: "dev-open" }), null);
     const oauth = principalFromMcpAuth({
       clientId: "oauth-client-a",
       scopes: ["mcp"],
@@ -283,6 +280,39 @@ describe("actor attribution", { concurrency: false }, () => {
     assert.equal(body.message.actor_type, "human");
     assert.equal(body.message.actor_id, DASHBOARD_ACTOR_ID);
     assert.equal(body.message.created_by, "not-the-operator");
+  });
+
+  it("records null actor fields for dev-open, never human/operator", async () => {
+    delete env.MC_DASHBOARD_PASSWORD;
+    const task = await postTasks(jsonReq("http://x/api/tasks", {
+      title: "local open dashboard",
+      created_by: "operator",
+      actor_type: "human",
+      actor_id: "operator",
+    }));
+    assert.equal(task.status, 200, await task.clone().text());
+    const taskBody = await task.json() as { task: Row };
+    assert.equal(taskBody.task.actor_type, null);
+    assert.equal(taskBody.task.actor_id, null);
+    assert.notEqual(taskBody.task.actor_id, DASHBOARD_ACTOR_ID);
+
+    const message = await postMessages(jsonReq("http://x/api/messages", {
+      agent_id: "worker-one",
+      body: "unauthenticated",
+      created_by: "operator",
+      actor_type: "human",
+      actor_id: "operator",
+    }));
+    assert.equal(message.status, 200, await message.clone().text());
+    const messageBody = await message.json() as { message: Row };
+    assert.equal(messageBody.message.actor_type, null);
+    assert.equal(messageBody.message.actor_id, null);
+    const stored = inserts.filter((item) => item.table === "tasks" || item.table === "messages");
+    assert.equal(stored.length, 2);
+    for (const item of stored) {
+      assert.equal(item.row.actor_type, null);
+      assert.equal(item.row.actor_id, null);
+    }
   });
 
   it("records the legacy token as an agent, not as the created_by label", async () => {
