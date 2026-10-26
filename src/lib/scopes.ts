@@ -56,6 +56,7 @@ const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   { method: "GET", path: /^\/api\/fleet$/, scope: "fleet:read" },
   { method: "POST", path: /^\/api\/ingest$/, scope: "status:write" },
   { method: "GET", path: /^\/api\/memory$/, scope: "memory:read" },
+  { method: "POST", path: /^\/api\/memory$/, scope: "memory:write" },
   { method: "GET", path: /^\/api\/messages$/, scope: "messages:read" },
   { method: "POST", path: /^\/api\/messages\/reply$/, scope: "messages:write" },
   { method: "GET", path: /^\/api\/progress$/, scope: "progress:read" },
