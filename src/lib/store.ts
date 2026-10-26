@@ -3,6 +3,7 @@ import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent } from "./idempotency";
 import { writeSessionNote } from "./session-memory";
 import { sql } from "./db";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
+import { asUnknownWriteOutcome } from "./write-outcome";
 
 export interface ReportInput {
   agent_id: string;
@@ -39,6 +40,13 @@ export function slugify(input: string): string {
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/** Keep a connection loss typed so idempotency does not drop a claim that may have committed. */
+function rethrowStore(e: unknown): never {
+  const unknown = asUnknownWriteOutcome(e);
+  if (unknown) throw unknown;
+  throw new Error(errMsg(e));
 }
 
 export async function report(input: ReportInput): Promise<void> {
@@ -407,7 +415,7 @@ async function insertEnqueuedMessage(input: EnqueueInput): Promise<Message> {
     `;
     return asMessage((updated[0] ?? rows[0]) as Record<string, unknown>);
   } catch (e) {
-    throw new Error(errMsg(e));
+    rethrowStore(e);
   }
 }
 
@@ -481,7 +489,7 @@ async function insertReply(input: ReplyInput): Promise<Message> {
     }
     return asMessage(rows[0] as Record<string, unknown>);
   } catch (e) {
-    throw new Error(errMsg(e));
+    rethrowStore(e);
   }
 }
 
@@ -643,7 +651,7 @@ async function insertTask(input: CreateTaskInput): Promise<Task> {
     if (!rows[0]) throw new Error("tasks insert returned no row");
     return asTask(rows[0] as Record<string, unknown>);
   } catch (e) {
-    throw new Error(errMsg(e));
+    rethrowStore(e);
   }
 }
 

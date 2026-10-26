@@ -10,7 +10,8 @@
  */
 import { createHash } from "node:crypto";
 import type { Actor } from "./actor";
-import { sql } from "./db";
+import { sql, type SqlTag } from "./db";
+import { asUnknownWriteOutcome } from "./write-outcome";
 
 export const IDEMPOTENCY_TTL_MS = 24 * 60 * 60 * 1000;
 const KEY_MAX = 200;
@@ -25,6 +26,10 @@ export const IDEMPOTENCY_ROUTE = {
 const MISMATCH = "This idempotency key was already used with different arguments.";
 const IN_PROGRESS = "This idempotency key is already in progress.";
 const BAD_KEY = "Use 1 to 200 characters and no control characters, or omit the key.";
+const UNKNOWN_OUTCOME = "The previous attempt with this key may already have been saved. Retry the same key until it resolves or expires. A retry will not insert another row.";
+
+/** Stored in response so a later call can tell a lost RETURNING from a live in-progress claim. */
+const UNKNOWN_MARKER = { __agent_kontrol_idempotency: "unknown_outcome" };
 
 let clock: () => Date = () => new Date();
 
@@ -49,6 +54,21 @@ export class IdempotencyKeyInvalid extends Error {
   constructor(message: string) {
     super(message);
     this.name = "IdempotencyKeyInvalid";
+    this.fields = { idempotency_key: message };
+  }
+}
+
+/**
+ * The write may have committed and the client did not see the result.
+ * The claim is kept until it expires. Retrying the same key does not insert another row.
+ */
+export class IdempotencyUnknownOutcome extends Error {
+  readonly code = "idempotency_conflict" as const;
+  readonly retryable = true;
+  readonly fields: Record<string, string>;
+  constructor(message: string) {
+    super(message);
+    this.name = "IdempotencyUnknownOutcome";
     this.fields = { idempotency_key: message };
   }
 }
@@ -118,9 +138,47 @@ interface ClaimRow {
   expires_at: string | Date;
 }
 
+function isUnknownMarker(response: unknown): boolean {
+  let value = response;
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value) as unknown;
+    } catch {
+      return false;
+    }
+  }
+  if (!value || typeof value !== "object") return false;
+  return (value as { __agent_kontrol_idempotency?: unknown }).__agent_kontrol_idempotency === "unknown_outcome";
+}
+
+async function releaseClaim(db: SqlTag, scope: string, key: string): Promise<void> {
+  await db`
+    delete from idempotency_keys
+    where scope = ${scope}
+      and idempotency_key = ${key}
+      and response is null
+  `;
+}
+
+/** Leave the claim. Swallow a second connection failure so the first error still surfaces. */
+async function retainUnknown(db: SqlTag, scope: string, key: string): Promise<void> {
+  try {
+    await db`
+      update idempotency_keys
+      set response = ${JSON.stringify(UNKNOWN_MARKER)}::jsonb
+      where scope = ${scope}
+        and idempotency_key = ${key}
+        and response is null
+    `;
+  } catch {
+    // The null claim still blocks a second insert until it expires.
+  }
+}
+
 /**
  * Run `execute` once per key. A missing key runs `execute` every time.
- * A failed `execute` releases the claim so the same key can be tried again.
+ * A definite failure releases the claim. A connection loss after the
+ * statement may have committed keeps the claim until it expires.
  */
 export async function runIdempotent<T>(opts: {
   actor: Actor | null | undefined;
@@ -156,23 +214,29 @@ export async function runIdempotent<T>(opts: {
     `;
 
     if (claimed[0]) {
+      let result: T;
       try {
-        const result = await opts.execute();
+        result = await opts.execute();
+      } catch (e) {
+        if (asUnknownWriteOutcome(e)) {
+          await retainUnknown(db, scope, key);
+          throw new IdempotencyUnknownOutcome(UNKNOWN_OUTCOME);
+        }
+        await releaseClaim(db, scope, key);
+        throw e;
+      }
+      try {
         await db`
           update idempotency_keys
           set response = ${JSON.stringify(result)}::jsonb
           where scope = ${scope} and idempotency_key = ${key}
         `;
-        return result;
-      } catch (e) {
-        await db`
-          delete from idempotency_keys
-          where scope = ${scope}
-            and idempotency_key = ${key}
-            and response is null
-        `;
-        throw e;
+      } catch {
+        // execute() already returned, so the resource row may be committed.
+        await retainUnknown(db, scope, key);
+        throw new IdempotencyUnknownOutcome(UNKNOWN_OUTCOME);
       }
+      return result;
     }
 
     const existing = await db`
@@ -194,6 +258,7 @@ export async function runIdempotent<T>(opts: {
     }
     if (row.request_hash !== requestHash) throw new IdempotencyConflict(MISMATCH);
     if (row.response == null) throw new IdempotencyConflict(IN_PROGRESS);
+    if (isUnknownMarker(row.response)) throw new IdempotencyUnknownOutcome(UNKNOWN_OUTCOME);
     return parseStored<T>(row.response);
   }
 

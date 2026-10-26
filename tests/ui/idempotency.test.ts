@@ -10,10 +10,12 @@ import {
   hashPayload,
   IdempotencyConflict,
   IdempotencyKeyInvalid,
+  IdempotencyUnknownOutcome,
   runIdempotent,
   setIdempotencyClockForTests,
 } from "../../src/lib/idempotency";
 import { createTask, enqueueMessage, replyFromAgent } from "../../src/lib/store";
+import { asUnknownWriteOutcome, UnknownWriteOutcome } from "../../src/lib/write-outcome";
 
 /**
  * Same idempotency key and same arguments return the original row.
@@ -53,6 +55,8 @@ const creds: Row[] = [];
 const inserts: { table: string; row: Row }[] = [];
 const idem = new Map<string, IdemRow>();
 let seq = 1;
+/** The next resource insert is recorded, then the client loses RETURNING. */
+let commitThenFail = false;
 
 function columnsOf(text: string): string[] {
   const match = text.match(/insert into [a-z_]+ \(([^)]+)\)/i);
@@ -90,6 +94,7 @@ function installFake() {
   inserts.length = 0;
   idem.clear();
   seq = 1;
+  commitThenFail = false;
   setSqlForTests(async (strings, ...values) => {
     const text = strings.join(" ").replace(/\s+/g, " ").trim();
     const lower = text.toLowerCase();
@@ -146,6 +151,10 @@ function installFake() {
       if (lower.includes("insert into tasks") && row.priority == null) row.priority = 2;
       if (lower.includes("insert into tasks") && row.platform == null) row.platform = "any";
       inserts.push({ table: tableOf(text), row });
+      if (commitThenFail) {
+        commitThenFail = false;
+        throw new UnknownWriteOutcome(new Error("connection terminated after COMMIT before RETURNING"));
+      }
       return [row];
     }
     if (lower.includes("update messages") && lower.includes("thread_id")) {
@@ -281,6 +290,45 @@ describe("idempotency keys", { concurrency: false }, () => {
     assert.equal((await run("a")).id, 1);
     assert.equal((await run("b")).id, 2);
     assert.equal((await run("a")).id, 1);
+  });
+
+  it("treats a lost connection as an unknown write outcome and a definite error as not one", () => {
+    const lost = asUnknownWriteOutcome(Object.assign(new Error("connection terminated unexpectedly"), { code: "08006" }));
+    assert.ok(lost instanceof UnknownWriteOutcome);
+    assert.equal(asUnknownWriteOutcome(new Error("boom")), null);
+    assert.ok(asUnknownWriteOutcome(new TypeError("fetch failed")) instanceof UnknownWriteOutcome);
+  });
+
+  it("keeps the claim when the insert commits and RETURNING never arrives", async () => {
+    commitThenFail = true;
+    const headers = { authorization: `Bearer ${TOKEN}`, "idempotency-key": "commit-then-fail" };
+    const first = await postTasks(jsonReq("http://x/api/tasks", { title: "once" }, headers));
+    assert.equal(first.status, 409, await first.clone().text());
+    const body = await first.json() as Record<string, unknown>;
+    assert.equal(body.code, "idempotency_conflict");
+    assert.equal(body.retryable, true);
+    assert.equal(typeof body.fix, "string");
+    assert.match(String(body.error), /may already have been saved/);
+    assert.equal(inserts.filter((item) => item.table === "tasks").length, 1);
+    const claim = [...idem.values()].find((row) => row.idempotency_key === "commit-then-fail");
+    assert.ok(claim);
+    assert.notEqual(claim.response, null);
+
+    const retry = await postTasks(jsonReq("http://x/api/tasks", { title: "once" }, headers));
+    assert.equal(retry.status, 409);
+    assert.equal((await retry.json() as { retryable: boolean }).retryable, true);
+    assert.equal(inserts.filter((item) => item.table === "tasks").length, 1);
+
+    commitThenFail = true;
+    await assert.rejects(
+      () => createTask({ title: "direct", idempotency_key: "direct-fail", actor: actorA }),
+      (err: unknown) => err instanceof IdempotencyUnknownOutcome,
+    );
+    await assert.rejects(
+      () => createTask({ title: "direct", idempotency_key: "direct-fail", actor: actorA }),
+      (err: unknown) => err instanceof IdempotencyUnknownOutcome,
+    );
+    assert.equal(inserts.filter((item) => item.table === "tasks").length, 2);
   });
 
   it("releases the claim when the write fails, and reports an in-progress key", async () => {
@@ -462,6 +510,55 @@ describe("idempotency keys", { concurrency: false }, () => {
     assert.equal(stored[0].row.actor_id, created.credential.id);
     assert.equal(stored[0].row.created_by, "someone-else");
     assert.equal([...idem.values()][0]?.scope, `agent:${created.credential.id}:create_task`);
+  });
+
+  it("replays one MCP reply_to_operator and conflicts a different body", async () => {
+    const created = await createCredential({ label: "idempotency-reply", scopes: ["messages:write"] });
+    assert.equal(created.ok, true);
+    if (!created.ok) throw new Error("credential was not issued");
+    const before = new Set(handles());
+    const call = async (name: string, body: string, id: number) => {
+      const res = await mcpPost(new Request("http://localhost/api/mcp", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${created.token}`,
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: {
+            name,
+            arguments: { agent_id: "worker-one", body, idempotency_key: "mcp-reply-1" },
+          },
+        }),
+      }));
+      const text = await res.text();
+      return { status: res.status, text };
+    };
+    let results: { status: number; text: string }[] = [];
+    try {
+      results = [
+        await call("reply_to_operator", "finished", 1),
+        await call("reply_to_operator", "finished", 2),
+        await call("reply_to_mark", "finished", 3),
+        await call("reply_to_operator", "a different reply", 4),
+      ];
+    } finally {
+      for (const handle of handles()) {
+        if (!before.has(handle)) handle.unref?.();
+      }
+    }
+    assert.equal(results[0].status, 200, results[0].text.slice(0, 400));
+    const replyLine = (text: string) => text.match(/Reply #\d+ delivered[^"\\]*/)?.[0];
+    assert.equal(replyLine(results[0].text), replyLine(results[1].text));
+    assert.equal(replyLine(results[0].text), replyLine(results[2].text));
+    assert.match(results[3].text, /idempotency_conflict/);
+    assert.equal(inserts.filter((item) => item.table === "messages").length, 1);
+    const claim = [...idem.values()].find((row) => row.idempotency_key === "mcp-reply-1");
+    assert.equal(claim?.scope, `agent:${created.credential.id}:reply_to_operator`);
   });
 
   it("registers idempotency_key on create_task and both reply tools", () => {

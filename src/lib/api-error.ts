@@ -205,6 +205,8 @@ interface SafeCaught {
   code: ErrorCode;
   message: string;
   fields?: Record<string, string>;
+  retryable?: boolean;
+  fix?: string;
 }
 
 /**
@@ -222,6 +224,16 @@ function namedError(err: unknown, name: string): (Error & { fields?: Record<stri
 }
 
 function safeCaught(err: unknown): SafeCaught | null {
+  const unknownOutcome = namedError(err, "IdempotencyUnknownOutcome");
+  if (unknownOutcome) {
+    return {
+      code: "idempotency_conflict",
+      message: unknownOutcome.message,
+      fields: unknownOutcome.fields ?? { idempotency_key: unknownOutcome.message },
+      retryable: true,
+      fix: "Retry the same idempotency key. It will not insert another row. The key expires 24 hours after the first claim.",
+    };
+  }
   const conflict = namedError(err, "IdempotencyConflict");
   if (conflict) {
     return {
@@ -255,13 +267,27 @@ function safeCaught(err: unknown): SafeCaught | null {
 export function publicError(logLabel: string, err: unknown, fallbackMessage?: string): NextResponse {
   console.error(logLabel, err);
   const safe = safeCaught(err);
-  if (safe) return apiError(safe.code, { message: safe.message, fields: safe.fields });
+  if (safe) {
+    return apiError(safe.code, {
+      message: safe.message,
+      fields: safe.fields,
+      retryable: safe.retryable,
+      fix: safe.fix,
+    });
+  }
   return apiError("internal_error", fallbackMessage ? { message: fallbackMessage } : undefined);
 }
 
 export function toolResultFromCaught(logLabel: string, err: unknown): McpToolResult {
   console.error(logLabel, err);
   const safe = safeCaught(err);
-  if (safe) return mcpToolError(safe.code, { message: safe.message, fields: safe.fields });
+  if (safe) {
+    return mcpToolError(safe.code, {
+      message: safe.message,
+      fields: safe.fields,
+      retryable: safe.retryable,
+      fix: safe.fix,
+    });
+  }
   return mcpToolError("internal_error");
 }
