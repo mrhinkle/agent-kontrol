@@ -114,9 +114,9 @@ Invalid JSON answers `400`.
 
 - `GET /api/messages?agent_id=X&ack=true` — the agent pulls its inbound inbox; `ack` marks the messages read.
 - `GET /api/messages?agent_id=X&conversation=true` — full history for the agent.
-- `POST /api/messages` — body `{agent_id, body, created_by?}` — the operator enqueues an inbound message for the agent.
+- `POST /api/messages` — body `{agent_id, body, created_by?}` — the operator enqueues an inbound message for the agent. The server sets `actor_type` and `actor_id` from the authenticated credential (`human` / `operator` for a dashboard session). When `MC_DASHBOARD_PASSWORD` is unset and the request presents no credential, both fields are null. `created_by` is stored as a label and does not set those fields.
 - `PATCH /api/messages` — body `{agent_id}` — the operator marks outbound replies read.
-- `POST /api/messages/reply` — bearer `MC_TOKEN` only — body `{agent_id, body, in_reply_to?, created_by?}` — non-MCP agents post replies. `in_reply_to` is the id of the inbound message being answered.
+- `POST /api/messages/reply` — bearer `MC_TOKEN` or an agent credential with `messages:write` — body `{agent_id, body, in_reply_to?, created_by?}` — non-MCP agents post replies. `in_reply_to` is the id of the inbound message being answered. `actor_type` and `actor_id` are taken from the bearer, not from `created_by`.
 
 ### Tasks
 
@@ -134,7 +134,9 @@ Task statuses: `queued`, `claimed`, `running`, `review`, `done`, `failed`, `canc
 | `machine` | string | no | Pin the task to one machine's dispatcher. |
 | `priority` | int | no | 1 high, 2 normal (default), 3 low. |
 | `reviewer_platform` | string | no | `claude-code`, `codex`, or `grok`. A second platform reviews the work before done. |
-| `created_by` | string | no | Who created the task. |
+| `created_by` | string | no | Free-text label. It is stored and does not set the actor. |
+| `actor_type` | string | — | Response only. `human` or `agent`, from the authenticated credential. Null on older rows, and null when the local dashboard is open because `MC_DASHBOARD_PASSWORD` is unset and the request presented no credential. |
+| `actor_id` | string | — | Response only. Credential id, `mc-token`, the OAuth client id, or `operator` for a signed-in dashboard session. Null in the same cases as `actor_type`. |
 
 - `POST /api/tasks/claim` — body `{platform, machine?, agent_id}`. `platform` and `agent_id` are required; the request answers `400` otherwise. The claim is atomic: it returns the next queued task routed to the given platform (or to `any`), or `{task: null}` when there is none.
 - `PATCH /api/tasks/:id` — body `{status?, result?, cost_usd?, session_id?, assigned_agent?, agent_id?}`. Dispatchers use it to report progress and completion; the dashboard uses it to cancel or requeue tasks.

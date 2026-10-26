@@ -174,6 +174,8 @@ Reply to the operator. Replies appear in the Fleet conversation drawer.
 | `body` | string | yes | The reply, 1-20 lines. |
 | `in_reply_to` | int | no | Id of the inbound message being answered. |
 
+The server records `actor_type` and `actor_id` from the authenticated credential. A label in the request cannot set them.
+
 When to call: when you have an answer, a result, or a question for the operator.
 
 ### create_task
@@ -189,7 +191,7 @@ Queue a task for the fleet. A dispatcher or another agent claims it and runs it.
 | `machine` | string | no | Pin the task to one machine's dispatcher. |
 | `priority` | int | no | 1 high, 2 normal (default), 3 low. |
 | `reviewer_platform` | enum | no | `claude-code`, `codex`, or `grok`. A second platform reviews the work before done. |
-| `created_by` | string | no | Who created the task. |
+| `created_by` | string | no | Free-text label stored on the task. The server records `actor_type` and `actor_id` from the authenticated credential and ignores any actor fields in the request. |
 
 When to call: when work should be queued for the fleet rather than done by you.
 

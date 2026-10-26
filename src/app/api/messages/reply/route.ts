@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { enforceBearer } from "@/lib/auth";
+import { actorFromPrincipal } from "@/lib/actor";
+import { deny, resolveBearerAccess } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { replyFromAgent } from "@/lib/store";
@@ -15,8 +16,8 @@ export const maxDuration = 30;
  * Body: { agent_id, body, in_reply_to?, created_by? }
  */
 export async function POST(req: Request) {
-  const denied = await enforceBearer(req);
-  if (denied) return denied;
+  const access = await resolveBearerAccess(req);
+  if (!access.ok) return deny(access);
   if (!isConfigured()) {
     return NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; reply dropped" });
   }
@@ -43,6 +44,7 @@ export async function POST(req: Request) {
       body: body.body.trim(),
       in_reply_to: body.in_reply_to,
       created_by: body.created_by,
+      actor: actorFromPrincipal(access.principal),
     });
     return NextResponse.json({ ok: true, id: msg.id, message: msg });
   } catch (e) {

@@ -53,7 +53,9 @@ create table if not exists messages (
   id bigint generated always as identity primary key,
   agent_id text not null,                 -- conversation peer (the agent)
   body text not null,
-  created_by text default 'dashboard',
+  created_by text default 'dashboard',    -- free-text label from the caller; not the authenticated actor
+  actor_type text,                        -- human | agent; null on rows written before this column
+  actor_id text,                          -- credential id, mc-token, oauth client id, or operator
   created_at timestamptz default now(),
   delivered_at timestamptz,               -- when the agent fetched an inbound message
   acked_at timestamptz,                   -- when the agent consumed it (history kept)
@@ -67,6 +69,8 @@ alter table messages add column if not exists direction text not null default 'i
 alter table messages add column if not exists in_reply_to bigint;
 alter table messages add column if not exists thread_id text;
 alter table messages add column if not exists read_by_dashboard_at timestamptz;
+alter table messages add column if not exists actor_type text;
+alter table messages add column if not exists actor_id text;
 update messages set thread_id = id::text where thread_id is null;
 
 create index if not exists messages_pending_idx on messages (agent_id, acked_at, created_at);
@@ -98,12 +102,16 @@ create table if not exists tasks (
   session_id text,                        -- platform session id of the run, if known
   result text,                            -- final summary (and review verdict)
   cost_usd numeric,                       -- from claude -p json / dispatcher estimate
-  created_by text default 'dashboard',
+  created_by text default 'dashboard',    -- free-text label from the caller; not the authenticated actor
+  actor_type text,                        -- human | agent; null on rows written before this column
+  actor_id text,                          -- credential id, mc-token, oauth client id, or operator
   created_at timestamptz default now(),
   claimed_at timestamptz,
   updated_at timestamptz default now(),
   completed_at timestamptz
 );
+alter table tasks add column if not exists actor_type text;
+alter table tasks add column if not exists actor_id text;
 create index if not exists tasks_queue_idx on tasks (status, platform, priority, created_at);
 create index if not exists tasks_updated_idx on tasks (updated_at desc);
 

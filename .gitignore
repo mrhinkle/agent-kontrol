@@ -1,4 +1,5 @@
-node_modules/
+# Directory, or a symlink of the same name (worktrees link node_modules).
+node_modules
 .next/
 out/
 .env
