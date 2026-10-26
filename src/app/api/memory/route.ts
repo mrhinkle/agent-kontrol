@@ -44,12 +44,14 @@ export async function POST(req: Request) {
     tags?: unknown;
     agent_id?: unknown;
     dry_run?: unknown;
-  };
+  } | null;
   try {
     body = await req.json();
   } catch {
     return apiError("invalid_json");
   }
+  // `null` is valid JSON. Reading `.content` on it throws, which became a 500.
+  if (body === null) return apiError("invalid_json");
   if (typeof body.content !== "string") {
     return apiError("missing_field", {
       message: "content is required",

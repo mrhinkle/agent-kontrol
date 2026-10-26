@@ -20,12 +20,14 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
   const denied = await enforceApi(req);
   if (denied) return denied;
   if (!isConfigured()) {
-    let peeked: { dry_run?: unknown; status?: TaskStatus } = {};
+    let peeked: { dry_run?: unknown; status?: TaskStatus } | null;
     try {
       peeked = await req.json();
     } catch {
       return NextResponse.json({ ok: true, demo: true });
     }
+    // `null` is valid JSON. Reading `.dry_run` on it throws, which became a 500.
+    if (peeked === null) return apiError("invalid_json");
     const dry = readDryRun(peeked.dry_run);
     if (!dry.ok) {
       return apiError("validation_failed", {
@@ -56,12 +58,14 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
     assigned_agent?: string;
     agent_id?: string;
     dry_run?: unknown;
-  };
+  } | null;
   try {
     body = await req.json();
   } catch {
     return apiError("invalid_json");
   }
+  // Same null-body crash as the no-database branch above.
+  if (body === null) return apiError("invalid_json");
   const dry = readDryRun(body.dry_run);
   if (!dry.ok) {
     return apiError("validation_failed", {

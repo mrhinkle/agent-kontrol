@@ -289,16 +289,26 @@ export function diffMemoryWrite(existing: StoredMemory | null, input: MemoryWrit
   };
 }
 
-/** Lines the confirm dialog shows. They come from the preview, not a second diff. */
+function formatDetail(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return value.map((item) => String(item)).join(", ");
+  return String(value);
+}
+
+/**
+ * Lines the confirm dialog shows. They come from the preview, not a second diff.
+ * Every key on the record is shown, including nulls. An allowlist dropped
+ * `color`, `short`, `blockedLabel`, and `position`, so a one-field repo edit
+ * named the field and then hid the values.
+ */
 export function changeDetails(change: DryRunChange): string[] {
   const lines = [change.summary];
   const side = (label: string, value: Record<string, unknown> | null) => {
     if (!value) return;
     const parts: string[] = [];
-    for (const key of ["status", "content", "repo", "label", "result", "source", "agent_id", "tags"]) {
-      if (value[key] === undefined || value[key] === null) continue;
-      const shown = Array.isArray(value[key]) ? (value[key] as unknown[]).join(", ") : String(value[key]);
-      parts.push(`${key}: ${shown}`);
+    for (const key of Object.keys(value)) {
+      if (value[key] === undefined) continue;
+      parts.push(`${key}: ${formatDetail(value[key])}`);
     }
     if (parts.length) lines.push(`${label}: ${parts.join("; ")}`);
   };

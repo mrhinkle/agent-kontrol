@@ -12,6 +12,7 @@ import {
   diffRepoList,
   diffTaskUpdate,
   readDryRun,
+  type DryRunChange,
 } from "../../src/lib/dry-run";
 import { authorizeRoute } from "../../src/lib/scopes";
 import { listVersion } from "../../src/lib/watched-repos";
@@ -56,6 +57,8 @@ const TASK: Task = {
   result: null,
   cost_usd: null,
   created_by: "dashboard",
+  actor_type: null,
+  actor_id: null,
   created_at: "2026-10-25T00:00:00.000Z",
   claimed_at: null,
   updated_at: "2026-10-25T00:00:00.000Z",
@@ -82,6 +85,51 @@ function authed(url: string, body: unknown, method: string) {
     },
     body: JSON.stringify(body),
   });
+}
+
+function detailSide(change: DryRunChange, label: "Before" | "After"): string | undefined {
+  return changeDetails(change).find((line) => line.startsWith(`${label}: `));
+}
+
+function segments(line: string): string[] {
+  return line.replace(/^(Before|After): /, "").split("; ");
+}
+
+function hasSegment(line: string | undefined, field: string, shown: string): boolean {
+  return line !== undefined && segments(line).includes(`${field}: ${shown}`);
+}
+
+function hasField(line: string | undefined, field: string): boolean {
+  return line !== undefined && segments(line).some((part) => part.startsWith(`${field}:`));
+}
+
+/** The dialog line for each side must include every key the server put on that record. */
+function assertRendersRecord(change: DryRunChange, field: string, before: string | null, after: string | null) {
+  const beforeLine = detailSide(change, "Before");
+  const afterLine = detailSide(change, "After");
+  if (before === null) assert.equal(hasField(beforeLine, field), false, beforeLine);
+  else assert.ok(hasSegment(beforeLine, field, before), beforeLine);
+  if (after === null) assert.equal(hasField(afterLine, field), false, afterLine);
+  else assert.ok(hasSegment(afterLine, field, after), afterLine);
+
+  for (const [label, record] of [
+    ["Before", change.before],
+    ["After", change.after],
+  ] as const) {
+    if (!record) {
+      assert.equal(detailSide(change, label), undefined);
+      continue;
+    }
+    const line = detailSide(change, label);
+    assert.ok(line, label);
+    for (const key of Object.keys(record)) {
+      if (record[key] === undefined) continue;
+      const value = record[key];
+      const shown =
+        value === null ? "null" : Array.isArray(value) ? value.map((item) => String(item)).join(", ") : String(value);
+      assert.ok(hasSegment(line, key, shown), `${label} missing ${key}: ${shown} in ${line}`);
+    }
+  }
 }
 
 function assertReadOnly() {
@@ -146,8 +194,8 @@ describe("dry run diffs", () => {
     assert.match(cancel.changes[0].summary, /status queued → cancelled/);
     assert.match(cancel.changes[1].summary, /grok-lane/);
     const lines = changeDetails(cancel.changes[0]);
-    assert.match(lines[1] ?? "", /Before: status: queued/);
-    assert.match(lines[2] ?? "", /After: status: cancelled/);
+    assert.match(lines.join("\n"), /Before:.*status: queued/);
+    assert.match(lines.join("\n"), /After:.*status: cancelled/);
 
     const overwrite = diffMemoryWrite(NOTE, {
       content: "new note",
@@ -164,6 +212,162 @@ describe("dry run diffs", () => {
     const insert = diffMemoryWrite(null, { content: "fresh", key: "other/key" });
     assert.equal(insert.action, "insert_memory");
     assert.equal(insert.affected.length, 0);
+  });
+
+  const second: RepoInput = { ...STORED, repo: "acme/web", label: "Web", short: "web" };
+  const overwritten = () =>
+    diffMemoryWrite(NOTE, {
+      content: "new note",
+      key: NOTE.key,
+      tags: ["ops", "run"],
+      agent_id: "codex",
+    }).changes[0];
+
+  const fields: { field: string; before: string | null; after: string | null; change: () => DryRunChange }[] = [
+    {
+      field: "repo",
+      before: "acme/app",
+      after: null,
+      change: () => diffRepoList([STORED], []).changes[0],
+    },
+    {
+      field: "label",
+      before: "App",
+      after: "Renamed",
+      change: () => diffRepoList([STORED], [{ ...STORED, label: "Renamed" }]).changes[0],
+    },
+    {
+      field: "short",
+      before: "app",
+      after: "svc",
+      change: () => diffRepoList([STORED], [{ ...STORED, short: "svc" }]).changes[0],
+    },
+    {
+      field: "color",
+      before: "#112233",
+      after: "#335bb2",
+      change: () => diffRepoList([STORED], [{ ...STORED, color: "#335bb2" }]).changes[0],
+    },
+    {
+      field: "blockedLabel",
+      before: "null",
+      after: "paused",
+      change: () => diffRepoList([STORED], [{ ...STORED, blockedLabel: "paused" }]).changes[0],
+    },
+    {
+      field: "position",
+      before: "1",
+      after: "0",
+      change: () => diffRepoList([STORED, second], [second, STORED]).changes[0],
+    },
+    {
+      field: "status",
+      before: "queued",
+      after: "cancelled",
+      change: () => diffTaskUpdate(TASK, { status: "cancelled" }).changes[0],
+    },
+    {
+      field: "result",
+      before: "old output",
+      after: "new output",
+      change: () => diffTaskUpdate({ ...TASK, result: "old output" }, { result: "new output" }).changes[0],
+    },
+    {
+      field: "cost_usd",
+      before: "1.5",
+      after: "2.25",
+      change: () => diffTaskUpdate({ ...TASK, cost_usd: 1.5 }, { cost_usd: 2.25 }).changes[0],
+    },
+    {
+      field: "session_id",
+      before: "null",
+      after: "sess-9",
+      change: () => diffTaskUpdate(TASK, { session_id: "sess-9" }).changes[0],
+    },
+    {
+      field: "assigned_agent",
+      before: "null",
+      after: "lane-grok",
+      change: () => diffTaskUpdate(TASK, { assigned_agent: "lane-grok" }).changes[0],
+    },
+    {
+      field: "updated_at",
+      before: TASK.updated_at,
+      after: "(set when the write runs)",
+      change: () => diffTaskUpdate(TASK, { status: "running" }).changes[0],
+    },
+    {
+      field: "completed_at",
+      before: "null",
+      after: "(set when the write runs)",
+      change: () => diffTaskUpdate(TASK, { status: "done" }).changes[0],
+    },
+    {
+      field: "agent_id",
+      before: null,
+      after: "grok-lane",
+      change: () => diffTaskUpdate(TASK, { status: "cancelled", agent_id: "grok-lane" }).changes[1],
+    },
+    {
+      field: "task_id",
+      before: null,
+      after: "7",
+      change: () => diffTaskUpdate(TASK, { status: "cancelled", agent_id: "grok-lane" }).changes[1],
+    },
+    {
+      field: "id",
+      before: "4",
+      after: null,
+      change: overwritten,
+    },
+    {
+      field: "key",
+      before: "project/status",
+      after: "project/status",
+      change: overwritten,
+    },
+    {
+      field: "content",
+      before: "old note",
+      after: "new note",
+      change: overwritten,
+    },
+    {
+      field: "tags",
+      before: "ops",
+      after: "ops, run",
+      change: overwritten,
+    },
+    {
+      field: "source",
+      before: "automatic-session",
+      after: "null",
+      change: overwritten,
+    },
+    {
+      field: "facts_at",
+      before: "2026-10-01T00:00:00.000Z",
+      after: "null",
+      change: overwritten,
+    },
+  ];
+
+  for (const entry of fields) {
+    it(`renders ${entry.field} in the confirm dialog`, () => {
+      const change = entry.change();
+      if (entry.field === "color") assert.equal(change.summary, "Update acme/app: color.");
+      if (entry.field === "position") assert.equal(change.summary, "Move acme/web from position 2 to position 1.");
+      assertRendersRecord(change, entry.field, entry.before, entry.after);
+    });
+  }
+
+  it("renders repo on an added row", () => {
+    const added = diffRepoList([], [NEXT]).changes[0];
+    assertRendersRecord(added, "repo", null, "acme/new-app");
+  });
+
+  it("renders agent_id on a memory overwrite", () => {
+    assertRendersRecord(overwritten(), "agent_id", "grok", "codex");
   });
 });
 
@@ -320,6 +524,15 @@ describe("dry run writes nothing", () => {
       assert.equal(explicit.status, 200);
       assert.equal(explicitBody.ok, true);
       assert.equal(explicitBody.demo, true);
+
+      const nullBody = await patchTask(authed("http://x/api/tasks/7", null, "PATCH"), {
+        params: Promise.resolve({ id: "7" }),
+      });
+      assert.equal(nullBody.status, 400);
+      const nullJson = await nullBody.json();
+      assert.equal(nullJson.code, "invalid_json");
+      assert.equal(nullJson.ok, undefined);
+      assert.equal(nullJson.demo, undefined);
       assert.equal(queries.length, 0);
       assert.equal(writes.length, 0);
     } finally {
@@ -352,7 +565,7 @@ describe("dry run writes nothing", () => {
     assert.equal(body.changes[0].before.content, "old note");
     assert.equal(body.changes[0].after.content, "new note");
     assert.equal(body.changes[0].after.source, null);
-    assert.match(changeDetails(body.changes[0])[1], /Before: content: old note/);
+    assert.match(changeDetails(body.changes[0]).join("\n"), /Before:.*content: old note/);
     assertReadOnly();
     assert.equal(fixtureSnapshot(), before);
 
@@ -380,6 +593,24 @@ describe("dry run writes nothing", () => {
     assert.equal(badFlag.status, 400);
     assert.equal(queries.length, 0);
     assertReadOnly();
+  });
+
+  it("returns 400 invalid_json for a JSON null body on POST /api/memory", async () => {
+    const res = await postMemory(authed("http://x/api/memory", null, "POST"));
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).code, "invalid_json");
+    assert.equal(queries.length, 0);
+    assert.equal(writes.length, 0);
+  });
+
+  it("returns 400 invalid_json for a JSON null body on task PATCH", async () => {
+    const res = await patchTask(authed("http://x/api/tasks/7", null, "PATCH"), {
+      params: Promise.resolve({ id: "7" }),
+    });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).code, "invalid_json");
+    assert.equal(queries.length, 0);
+    assert.equal(writes.length, 0);
   });
 
   it("stores a note when dry_run is omitted, so the spy can see the upsert", async () => {
