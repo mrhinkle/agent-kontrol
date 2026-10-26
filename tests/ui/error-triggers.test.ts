@@ -372,6 +372,57 @@ describe("documented REST error triggers", () => {
     await assertFlat(task, "invalid_json", "invalid JSON");
   });
 
+  it("invalid_json: POST /api/mcp with a non-JSON or empty body", async () => {
+    const before = new Set(handles());
+    try {
+      const headers = {
+        authorization: `Bearer ${TOKEN}`,
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      };
+      const malformed = await mcpPost(new Request("http://localhost/api/mcp", {
+        method: "POST",
+        headers,
+        body: "{",
+      }));
+      const malformedBody = await assertFlat(malformed, "invalid_json", "invalid JSON");
+      assert.equal(malformedBody.fields, undefined);
+
+      const empty = await mcpPost(new Request("http://localhost/api/mcp", {
+        method: "POST",
+        headers,
+        body: "",
+      }));
+      await assertFlat(empty, "invalid_json", "invalid JSON");
+
+      const plain = await mcpPost(new Request("http://localhost/api/mcp", {
+        method: "POST",
+        headers: { ...headers, "content-type": "text/plain" },
+        body: "not-json",
+      }));
+      await assertFlat(plain, "invalid_json", "invalid JSON");
+
+      const anon = await mcpPost(new Request("http://localhost/api/mcp", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: "{",
+      }));
+      assert.equal(anon.status, 401);
+      const www = anon.headers.get("www-authenticate") ?? "";
+      assert.match(www, /resource_metadata=/);
+      assert.match(www, /\/\.well-known\/oauth-protected-resource/);
+      const anonBody = await anon.json() as Record<string, unknown>;
+      assert.equal(anonBody.code, undefined);
+    } finally {
+      for (const handle of handles()) {
+        if (!before.has(handle)) handle.unref?.();
+      }
+    }
+  });
+
   it("missing_field: a required field is absent and fields names it", async () => {
     const res = await postTasks(jsonReq("http://x/api/tasks", {}));
     const body = await assertFlat(res, "missing_field", "title is required");

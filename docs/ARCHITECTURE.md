@@ -34,6 +34,8 @@ Memory, Gibson (dashboard pages) ---------------------------+
 
 Every ingest path writes Postgres. The dashboard pages read through the REST API.
 
+How this relates to the Gibson harness, which enforces merge and review gates: [GIBSON.md](GIBSON.md). The "Gibson" dashboard page is only a 3D view of this data.
+
 ## Tables
 
 `supabase/schema.sql` is the canonical schema. It is plain Postgres; the folder name is historical.
