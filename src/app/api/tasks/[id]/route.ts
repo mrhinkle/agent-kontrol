@@ -26,7 +26,14 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
     } catch {
       return NextResponse.json({ ok: true, demo: true });
     }
-    if (peeked.dry_run === true) {
+    const dry = readDryRun(peeked.dry_run);
+    if (!dry.ok) {
+      return apiError("validation_failed", {
+        message: "dry_run must be a boolean.",
+        fields: { dry_run: "Use true to preview, or false to apply." },
+      });
+    }
+    if (dry.dryRun) {
       return NextResponse.json(
         refusedDryRun(
           peeked.status === "cancelled" ? "cancel_task" : "update_task",

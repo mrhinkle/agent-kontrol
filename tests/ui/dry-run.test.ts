@@ -274,6 +274,60 @@ describe("dry run writes nothing", () => {
     assert.ok(writes.some((sql) => /insert into agents/i.test(sql)));
   });
 
+  it("rejects a non-boolean dry_run when no database is configured", async () => {
+    const previous = process.env.DATABASE_URL;
+    delete process.env.DATABASE_URL;
+    try {
+      resetSpy();
+      for (const dry_run of ["true", 0, {}]) {
+        const res = await patchTask(
+          authed("http://x/api/tasks/7", { status: "cancelled", dry_run }, "PATCH"),
+          { params: Promise.resolve({ id: "7" }) },
+        );
+        assert.equal(res.status, 400, JSON.stringify(dry_run));
+        const body = await res.json();
+        assert.equal(body.code, "validation_failed");
+        assert.equal(body.fields.dry_run, "Use true to preview, or false to apply.");
+        assert.equal(body.ok, undefined);
+        assert.equal(body.demo, undefined);
+      }
+
+      const preview = await patchTask(
+        authed("http://x/api/tasks/7", { status: "cancelled", dry_run: true }, "PATCH"),
+        { params: Promise.resolve({ id: "7" }) },
+      );
+      const previewBody = await preview.json();
+      assert.equal(preview.status, 200);
+      assert.equal(previewBody.dry_run, true);
+      assert.equal(previewBody.would_write, false);
+      assert.equal(previewBody.applied, false);
+      assert.equal(previewBody.action, "cancel_task");
+
+      const omitted = await patchTask(
+        authed("http://x/api/tasks/7", { status: "cancelled" }, "PATCH"),
+        { params: Promise.resolve({ id: "7" }) },
+      );
+      const omittedBody = await omitted.json();
+      assert.equal(omitted.status, 200);
+      assert.equal(omittedBody.ok, true);
+      assert.equal(omittedBody.demo, true);
+
+      const explicit = await patchTask(
+        authed("http://x/api/tasks/7", { status: "done", dry_run: false }, "PATCH"),
+        { params: Promise.resolve({ id: "7" }) },
+      );
+      const explicitBody = await explicit.json();
+      assert.equal(explicit.status, 200);
+      assert.equal(explicitBody.ok, true);
+      assert.equal(explicitBody.demo, true);
+      assert.equal(queries.length, 0);
+      assert.equal(writes.length, 0);
+    } finally {
+      if (previous === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = previous;
+    }
+  });
+
   it("previews a memory overwrite and does not upsert", async () => {
     const before = fixtureSnapshot();
     setRejectWrites(true);
@@ -334,7 +388,11 @@ describe("dry run writes nothing", () => {
     );
     assert.equal(res.status, 200);
     assert.equal((await res.json()).applied, true);
-    assert.ok(writes.some((sql) => /insert into memory/i.test(sql)));
+    const upsert = writes.find((sql) => /insert into memory/i.test(sql));
+    assert.ok(upsert);
+    assert.match(upsert, /on conflict \(key\) do update set/);
+    assert.match(upsert, /source = null/);
+    assert.match(upsert, /facts_at = null/);
   });
 
   it("MCP remember and update_task preview without writing, and still write when asked", async () => {
