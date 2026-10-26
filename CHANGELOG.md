@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A `github-label` decisions row from before `kind`, `labels`, `opened_at`, and `repo_short` existed is not authoritative for `GET /api/decisions?shape=brief`. The response lists that repo in `incomplete_repos`, and `scripts/morning-brief.sh` keeps the GitHub sweep for it (kind, labels, age from `createdAt`, configured short name). The collector's next upsert fills the null columns.
 - `agents/grok/README.md`: the MCP server key in the config example is now `agent-kontrol` (was `mission-control`).
 
 - `POST /api/mcp` returns HTTP 400 `invalid_json` for an empty or non-JSON body. The handler no longer throws `SyntaxError`. A missing bearer is still `401` with `WWW-Authenticate`.

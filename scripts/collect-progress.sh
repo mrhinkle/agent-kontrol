@@ -306,7 +306,10 @@ post_decision() {
 # the ones this repo no longer has. A missing key is an issue that closed or
 # lost the label, so open, deferred, and decided rows become withdrawn. The
 # stored decision text and decided_by stay. An upsert does not reopen a
-# decided or deferred row unless force is set.
+# decided or deferred row unless force is set. The same upsert fills a null
+# kind, labels, opened_at, or repo_short left by a row created before those
+# columns existed. opened_at that is already set stays. Until that fill,
+# morning-brief.sh keeps the GitHub sweep for the repo.
 sync_repo_decisions() {
   local repo="$1" short="$2"
   if [[ "$(jq 'length' <<<"$DECISION_LABELS_JSON")" -eq 0 ]]; then

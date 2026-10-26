@@ -17,6 +17,7 @@ import {
   listDecisions,
   patchDecision,
   reconcileDecisions,
+  partitionBrief,
   toBriefDecisions,
   upsertDecision,
   type UpsertInput,
@@ -441,14 +442,58 @@ async function testDecisions(tag: string) {
     assert.equal(cleared?.decided_at, null);
 
     await sql()`
-      insert into decisions (key, source, repo, repo_short, number, title, status, kind, opened_at, first_seen_at, github_present)
-      values (${key(9)}, 'github-label', ${repo}, 'app', 9, 'pre-column', 'open', 'issue', ${"2026-10-23T00:00:00.000Z"}, ${"2026-10-23T00:00:00.000Z"}, null)
+      insert into decisions (key, source, repo, repo_short, number, title, status, kind, labels, opened_at, first_seen_at, github_present)
+      values (${key(9)}, 'github-label', ${repo}, 'app', 9, 'pre-column', 'open', 'issue', ${JSON.stringify(["needs-owner"])}::jsonb, ${"2026-10-23T00:00:00.000Z"}, ${"2026-10-23T00:00:00.000Z"}, null)
     `;
     const withNull = toBriefDecisions(
       await listDecisions({ status: "all", repo, source: null, limit: 100 }),
       "2026-10-25T12:00:00Z",
     );
     assert.ok(withNull.some((row) => row.number === 9), "a null github_present still shows in the brief");
+
+    const seenAt = "2026-10-25T00:00:00.000Z";
+    const createdAt = "2026-07-21T12:00:00.000Z";
+    await sql()`
+      insert into decisions (key, source, repo, number, title, url, status, first_seen_at)
+      values (${key(20)}, 'github-label', ${repo}, 20, 'legacy pr', ${"https://github.com/" + repo + "/pull/20"}, 'open', ${seenAt})
+    `;
+    const legacyRows = await listDecisions({ status: "all", repo, source: null, limit: 100, shape: "brief" });
+    const legacy = legacyRows.find((row) => row.number === 20);
+    assert.equal(legacy?.kind, null);
+    assert.equal(legacy?.labels, null);
+    assert.equal(legacy?.opened_at, null);
+    assert.equal(legacy?.repo_short, null);
+    const beforeFill = partitionBrief(legacyRows, "2026-10-25T12:00:00Z");
+    assert.equal(beforeFill.decisions.some((row) => row.number === 20), false, "a legacy null row is not a brief decision");
+    assert.ok(beforeFill.incomplete_repos.includes(repo), "the repo stays on the GitHub sweep");
+    assert.equal(
+      beforeFill.decisions.some((row) => row.kind === "issue" && row.labels.length === 0 && row.repo_short === repo.split("/")[1]),
+      false,
+    );
+
+    const filled = await upsertDecision(body(20, {
+      title: "legacy pr",
+      kind: "pr",
+      labels: ["needs-owner"],
+      opened_at: createdAt,
+      repo_short: "app",
+      url: `https://github.com/${repo}/pull/20`,
+    }));
+    assert.equal(filled.decision.kind, "pr");
+    assert.deepEqual(filled.decision.labels, ["needs-owner"]);
+    assert.ok(filled.decision.opened_at?.startsWith("2026-07-21"));
+    assert.equal(filled.decision.repo_short, "app");
+    assert.ok(filled.decision.first_seen_at.startsWith("2026-10-25"), "backfill does not move first_seen_at");
+    const afterFill = partitionBrief(
+      await listDecisions({ status: "all", repo, source: null, limit: 100, shape: "brief" }),
+      "2026-10-25T12:00:00Z",
+    );
+    const shown = afterFill.decisions.find((row) => row.number === 20);
+    assert.equal(shown?.kind, "pr");
+    assert.deepEqual(shown?.labels, ["needs-owner"]);
+    assert.equal(shown?.age_days, ageDays(createdAt, "2026-10-25T12:00:00Z"));
+    assert.equal(shown?.repo_short, "app");
+    assert.equal(afterFill.incomplete_repos.includes(repo), false);
   } finally {
     await sql()`delete from decisions where repo = ${repo}`;
   }

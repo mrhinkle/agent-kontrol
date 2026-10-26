@@ -3,11 +3,11 @@ import { enforceApi } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import {
-  decisionListBody,
   listDecisions,
   parseListQuery,
   parseReconcile,
   parseUpsert,
+  partitionBrief,
   reconcileDecisions,
   upsertDecision,
 } from "@/lib/decisions";
@@ -23,8 +23,10 @@ export const maxDuration = 30;
  * GET  /api/decisions?status=open&repo=&source=&limit=&shape=row
  *      Oldest first by first_seen_at. Each row includes age_days.
  *      status=open also returns deferred rows whose defer_until has passed.
- *      shape=brief ignores status and source and returns the morning-brief
- *      .decisions list from this table.
+ *      shape=brief ignores status and source. decisions is the morning-brief
+ *      list from complete rows. incomplete_repos names repos whose rows are
+ *      missing kind, labels, opened_at, or repo_short; the brief keeps the
+ *      GitHub sweep for those repos.
  * POST /api/decisions
  *      Upsert one row by key, or { reconcile: { repo, source, seen_keys } }
  *      to withdraw label-sourced rows the collector did not see.
@@ -50,8 +52,16 @@ export async function GET(req: Request) {
   }
   try {
     const rows = await listDecisions(parsed);
-    const decisions = decisionListBody(parsed.shape, rows, new Date().toISOString());
-    return NextResponse.json({ demo: false, decisions });
+    const now = new Date().toISOString();
+    if (parsed.shape === "brief") {
+      const brief = partitionBrief(rows, now);
+      return NextResponse.json({
+        demo: false,
+        decisions: brief.decisions,
+        incomplete_repos: brief.incomplete_repos,
+      });
+    }
+    return NextResponse.json({ demo: false, decisions: rows });
   } catch (e) {
     return publicError("[decisions] list failed", e);
   }

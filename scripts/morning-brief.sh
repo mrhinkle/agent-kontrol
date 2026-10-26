@@ -13,8 +13,11 @@
 # Env:    MC_URL + MC_TOKEN (optional) read the watched-repo list, the
 #         coordinator's events, and GET /api/decisions?shape=brief. A live
 #         database replaces the DECISIONS section (an empty list is real).
-#         A failed call keeps the GitHub label sweep. Without the env the
-#         brief is GitHub-only and says so.
+#         A repo in incomplete_repos keeps the GitHub sweep: one of its rows
+#         is missing kind, labels, opened_at, or repo_short, and the table
+#         must not invent those. The collector fills them on its next upsert.
+#         A failed call keeps the GitHub label sweep for every repo. Without
+#         the env the brief is GitHub-only and says so.
 # Needs:  gh (authenticated), jq, curl.
 #
 # Why this exists: a dashboard you have to remember to open tells you about a
@@ -275,10 +278,14 @@ if [[ "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_TOKEN:-}" ]]; then
       "${MC_URL%/}/api/decisions?shape=brief&limit=1000" 2>/dev/null)" \
      && echo "$table_body" | jq -e '.demo == false and (.decisions | type == "array")' >/dev/null 2>&1; then
     table_decisions="$(echo "$table_body" | jq -c '.decisions')"
+    # A legacy row (null kind, labels, opened_at, or repo_short) puts its repo
+    # in incomplete_repos. Keep that repo's GitHub sweep. The collector upsert
+    # fills those columns; until then the table row is not the brief.
+    incomplete_repos="$(echo "$table_body" | jq -c 'if (.incomplete_repos | type) == "array" then .incomplete_repos else [] end')"
     # BEGIN table-decisions-jq
-    TABLE_DECISIONS_JQ='map(if .incomplete then . else . as $section | .decisions = [$table[] | select(.repo == $section.repo)] end)'
+    TABLE_DECISIONS_JQ='map(if .incomplete or ((.repo) as $r | $incomplete | index($r)) then . else . as $section | .decisions = [$table[] | select(.repo == $section.repo)] end)'
     # END table-decisions-jq
-    repo_results="$(jq -c --argjson table "$table_decisions" "$TABLE_DECISIONS_JQ" <<<"$repo_results")"
+    repo_results="$(jq -c --argjson table "$table_decisions" --argjson incomplete "$incomplete_repos" "$TABLE_DECISIONS_JQ" <<<"$repo_results")"
   fi
 fi
 

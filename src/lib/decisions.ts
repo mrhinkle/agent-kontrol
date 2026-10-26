@@ -10,6 +10,12 @@ import { sql } from "./db";
  * becomes `withdrawn`, including a decided row. The stored decision text,
  * `decided_by`, and `decided_at` stay. `github_present` goes false, so the
  * morning brief can be rebuilt from this table.
+ *
+ * A row written before `kind`, `labels`, `opened_at`, and `repo_short`
+ * existed has those columns null. The collector's next upsert fills them
+ * (`opened_at` only when it is still null). Until then `shape=brief` lists
+ * the repo in `incomplete_repos` and does not guess a kind, labels, age, or
+ * short name. `scripts/morning-brief.sh` keeps that repo's GitHub sweep.
  */
 
 export const DECISION_STATUSES = ["open", "decided", "deferred", "withdrawn"] as const;
@@ -41,7 +47,8 @@ export interface Decision {
   decided_at: string | null;
   defer_until: string | null;
   kind: "issue" | "pr" | null;
-  labels: string[];
+  /** Null when the column was never written. An empty list is a real value. */
+  labels: string[] | null;
   opened_at: string | null;
   github_present: boolean | null;
   first_seen_at: string;
@@ -175,12 +182,15 @@ function iso(value: unknown): string | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
 }
 
-function asLabels(value: unknown): string[] {
-  if (Array.isArray(value)) return value.filter((item) => typeof item === "string");
+/** Null stays null. An empty array is a stored list, not a missing column. */
+function asLabels(value: unknown): string[] | null {
+  if (value == null) return null;
+  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
   if (typeof value === "string") {
     try {
       const parsed = JSON.parse(value) as unknown;
-      if (Array.isArray(parsed)) return parsed.filter((item) => typeof item === "string");
+      if (parsed == null) return null;
+      if (Array.isArray(parsed)) return parsed.filter((item): item is string => typeof item === "string");
     } catch {
       return [];
     }
@@ -227,37 +237,68 @@ export function presentDecision(row: Record<string, unknown>, nowIso: string): D
   };
 }
 
+export interface BriefPartition {
+  /** Complete rows only. Oldest first, matching `sort_by(-.age_hours)` in morning-brief.sh. */
+  decisions: BriefDecision[];
+  /** Repos with a brief-eligible row missing kind, labels, opened_at, or repo_short. */
+  incomplete_repos: string[];
+}
+
+function briefEligible(row: Decision): boolean {
+  if (row.source !== "github-label") return false;
+  if (row.status === "withdrawn") return false;
+  if (row.github_present === false) return false;
+  if (row.number == null || !Number.isFinite(row.number)) return false;
+  return true;
+}
+
+/** A null column is not a value. Guessing kind, labels, age, or the basename would replace the GitHub sweep. */
+export function briefRowIncomplete(row: Decision): boolean {
+  if (row.kind !== "issue" && row.kind !== "pr") return true;
+  if (!Array.isArray(row.labels)) return true;
+  if (row.opened_at == null) return true;
+  if (row.repo_short == null || row.repo_short === "") return true;
+  return false;
+}
+
 /**
  * Rows the brief can show from the table alone: GitHub-sourced, still carrying
- * the label (`github_present` is not false), and not withdrawn. Oldest first,
- * which is `sort_by(-.age_hours)` in morning-brief.sh. `repo` is `owner/name`.
- * `repo_short` is the display name and is not a join key.
+ * the label (`github_present` is not false), not withdrawn, and complete.
+ * `repo` is `owner/name`. `repo_short` is the display name and is not a join key.
+ * A repo in `incomplete_repos` is not authoritative: morning-brief.sh keeps
+ * the GitHub sweep for it until the collector backfills the null columns.
  */
-export function toBriefDecisions(rows: readonly Decision[], nowIso: string): BriefDecision[] {
+export function partitionBrief(rows: readonly Decision[], nowIso: string): BriefPartition {
   const brief: BriefDecision[] = [];
+  const incomplete = new Set<string>();
   for (const row of rows) {
-    if (row.source !== "github-label") continue;
-    if (row.status === "withdrawn") continue;
-    if (row.github_present === false) continue;
-    if (row.number == null || !Number.isFinite(row.number)) continue;
-    const opened = row.opened_at ?? row.first_seen_at;
+    if (!briefEligible(row)) continue;
+    if (briefRowIncomplete(row)) {
+      if (row.repo) incomplete.add(row.repo);
+      continue;
+    }
+    const opened = row.opened_at;
+    if (opened == null || row.repo == null || row.repo_short == null || row.kind == null || row.labels == null || row.number == null) continue;
     const age_hours = hoursBetween(opened, nowIso);
-    const repo = row.repo ?? "";
-    const repo_short = row.repo_short ?? (row.repo?.split("/")[1] ?? row.repo ?? "");
     brief.push({
-      repo,
-      repo_short,
+      repo: row.repo,
+      repo_short: row.repo_short,
       number: row.number,
       title: row.title,
       url: row.url ?? "",
-      kind: row.kind === "pr" ? "pr" : "issue",
+      kind: row.kind,
       age_hours,
       age_days: Math.floor(age_hours / 24),
       labels: row.labels,
     });
   }
   brief.sort((a, b) => b.age_hours - a.age_hours || a.repo.localeCompare(b.repo) || a.number - b.number);
-  return brief;
+  return { decisions: brief, incomplete_repos: [...incomplete].sort() };
+}
+
+/** Complete brief rows. Incomplete repos are `partitionBrief().incomplete_repos`, not guessed rows. */
+export function toBriefDecisions(rows: readonly Decision[], nowIso: string): BriefDecision[] {
+  return partitionBrief(rows, nowIso).decisions;
 }
 
 /** What `GET /api/decisions` returns in `decisions`. `brief` is the morning-brief list. */

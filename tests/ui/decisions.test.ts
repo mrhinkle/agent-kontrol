@@ -15,6 +15,7 @@ import {
   parsePatch,
   parseReconcile,
   parseUpsert,
+  partitionBrief,
   toBriefDecisions,
   type BriefDecision,
   type Decision,
@@ -98,7 +99,7 @@ function decision(over: Partial<Decision> & Pick<Decision, "key" | "number">): D
     decided_at: over.decided_at ?? null,
     defer_until: over.defer_until ?? null,
     kind: over.kind === undefined ? "issue" : over.kind,
-    labels: over.labels ?? ["needs-owner"],
+    labels: over.labels === undefined ? ["needs-owner"] : over.labels,
     opened_at: opened,
     github_present: over.github_present === undefined ? true : over.github_present,
     first_seen_at: over.first_seen_at ?? opened ?? NOW,
@@ -254,7 +255,7 @@ describe("brief decisions match morning-brief.sh", { concurrency: false }, () =>
     );
   });
 
-  it("keeps a pre-column row and a deferred row, and uses the repo name when short is empty", () => {
+  it("keeps a null github_present and a deferred row, and does not guess a missing short name", () => {
     const rows = [
       decision({ key: "github:mrhinkle/agent-kontrol#1", number: 1, github_present: null, opened_at: "2026-10-20T12:00:00Z" }),
       decision({ key: "github:mrhinkle/agent-kontrol#2", number: 2, status: "deferred", opened_at: "2026-10-24T12:00:00Z" }),
@@ -268,12 +269,12 @@ describe("brief decisions match morning-brief.sh", { concurrency: false }, () =>
         labels: ["decision"],
       }),
     ];
-    const brief = toBriefDecisions(rows, NOW);
-    assert.deepEqual(brief.map((row) => row.number), [1, 4, 2]);
-    assert.equal(brief[1].repo, "mrhinkle/other");
-    assert.equal(brief[1].repo_short, "other");
-    assert.equal(brief[0].repo, REPO);
-    assert.equal(brief[0].repo_short, SHORT);
+    const part = partitionBrief(rows, NOW);
+    assert.deepEqual(part.decisions.map((row) => row.number), [1, 2]);
+    assert.deepEqual(part.incomplete_repos, ["mrhinkle/other"]);
+    assert.equal(part.decisions[0].repo, REPO);
+    assert.equal(part.decisions[0].repo_short, SHORT);
+    assert.equal(part.decisions.some((row) => row.repo_short === "other"), false);
   });
 
   it("serves that list from GET /api/decisions?shape=brief and from the brief script", () => {
@@ -303,7 +304,8 @@ describe("brief decisions match morning-brief.sh", { concurrency: false }, () =>
     if (!badShape.ok) assert.equal(badShape.fields.shape, "shape must be row or brief.");
 
     const route = fs.readFileSync("src/app/api/decisions/route.ts", "utf8");
-    assert.match(route, /decisionListBody\(parsed\.shape, rows, new Date\(\)\.toISOString\(\)\)/);
+    assert.match(route, /partitionBrief\(rows, now\)/);
+    assert.match(route, /incomplete_repos: brief\.incomplete_repos/);
     const sh = fs.readFileSync("scripts/morning-brief.sh", "utf8");
     execFileSync("bash", ["-n", "scripts/morning-brief.sh"]);
     assert.match(sh, /\/api\/decisions\?shape=brief&limit=1000/);
@@ -317,7 +319,7 @@ describe("brief decisions match morning-brief.sh", { concurrency: false }, () =>
       { repo: REPO, repo_short: SHORT, number: 9, title: "from table", url: "https://example.test/9", kind: "issue", age_hours: 48, age_days: 2, labels: ["decision"] },
       { repo: "mrhinkle/other", repo_short: "other", number: 8, title: "incomplete repo", url: "https://example.test/8", kind: "issue", age_hours: 1, age_days: 0, labels: ["decision"] },
     ];
-    const replaced = execFileSync("jq", ["-c", "--argjson", "table", JSON.stringify(table), program], {
+    const replaced = execFileSync("jq", ["-c", "--argjson", "table", JSON.stringify(table), "--argjson", "incomplete", "[]", program], {
       encoding: "utf8",
       input: JSON.stringify(repos),
     });
@@ -351,7 +353,7 @@ describe("brief decisions match morning-brief.sh", { concurrency: false }, () =>
       { repo: "acme/app", short: "app", incomplete: false, decisions: [] },
       { repo: "other/app", short: "app", incomplete: false, decisions: [] },
     ];
-    const replaced = execFileSync("jq", ["-c", "--argjson", "table", JSON.stringify(brief), program], {
+    const replaced = execFileSync("jq", ["-c", "--argjson", "table", JSON.stringify(brief), "--argjson", "incomplete", "[]", program], {
       encoding: "utf8",
       input: JSON.stringify(repos),
     });
@@ -359,6 +361,109 @@ describe("brief decisions match morning-brief.sh", { concurrency: false }, () =>
     const owners = out.filter((section) => section.decisions.some((row) => row.number === 12)).map((section) => section.repo);
     assert.deepEqual(owners, ["acme/app"]);
     assert.equal(out.find((section) => section.repo === "other/app")?.decisions.length, 0);
+  });
+
+  it("keeps the GitHub sweep when a legacy null-column row would replace it", () => {
+    const briefSrc = fs.readFileSync("scripts/morning-brief.sh", "utf8");
+    const labelAt = briefSrc.indexOf("def is_decision_label");
+    const tsAt = briefSrc.lastIndexOf("def ts:", labelAt);
+    const hoursAt = briefSrc.indexOf("def hours(a; b):", tsAt);
+    const hoursEnd = briefSrc.indexOf("\n", hoursAt);
+    assert.ok(tsAt >= 0 && hoursAt > tsAt && hoursEnd > hoursAt);
+    const decisionExpr = between(briefSrc, "def is_decision_label", " as $decisions");
+    const sweep = jq(`${briefSrc.slice(tsAt, hoursEnd)}\n${decisionExpr}\n| sort_by(-.age_hours)`, [
+      "--arg", "repo", REPO,
+      "--arg", "short", SHORT,
+      "--arg", "now", NOW,
+      "--argjson", "decision_labels", JSON.stringify(PATTERNS),
+      "--argjson", "issues", JSON.stringify(issues),
+      "--argjson", "prs", JSON.stringify(prs),
+    ]) as BriefDecision[];
+    const swept = sweep.find((row) => row.number === 20);
+    assert.ok(swept);
+    assert.equal(swept.kind, "pr");
+    assert.deepEqual(swept.labels, ["owner-gate-schema"]);
+    assert.equal(swept.age_days, 5);
+    assert.equal(swept.repo_short, SHORT);
+    assert.notEqual(SHORT, REPO.split("/")[1]);
+
+    const legacy = decision({
+      key: `github:${REPO}#20`,
+      number: 20,
+      repo: REPO,
+      repo_short: null,
+      kind: null,
+      labels: null,
+      opened_at: null,
+      first_seen_at: "2026-10-25T00:00:00Z",
+      title: "Schema gate",
+      url: `https://github.com/${REPO}/pull/20`,
+    });
+    const guessed = {
+      kind: "issue" as const,
+      labels: [] as string[],
+      age_days: ageDays(legacy.first_seen_at, NOW),
+      repo_short: REPO.split("/")[1],
+    };
+    assert.notEqual(guessed.kind, swept.kind);
+    assert.notDeepEqual(guessed.labels, swept.labels);
+    assert.notEqual(guessed.age_days, swept.age_days);
+    assert.notEqual(guessed.repo_short, swept.repo_short);
+
+    for (const field of ["kind", "labels", "opened_at", "repo_short"] as const) {
+      const row = decision({
+        key: `github:${REPO}#20`,
+        number: 20,
+        kind: "pr",
+        labels: ["owner-gate-schema"],
+        opened_at: "2026-10-20T12:00:00Z",
+        repo_short: SHORT,
+        [field]: null,
+      });
+      const one = partitionBrief([row], NOW);
+      assert.deepEqual(one.decisions, [], field);
+      assert.deepEqual(one.incomplete_repos, [REPO], field);
+    }
+
+    const completeOther = decision({
+      key: "github:mrhinkle/other#3",
+      number: 3,
+      repo: "mrhinkle/other",
+      repo_short: "other",
+      kind: "pr",
+      labels: ["decision"],
+      opened_at: "2026-10-23T12:00:00Z",
+      title: "table wins here",
+      url: "https://github.com/mrhinkle/other/pull/3",
+    });
+    const part = partitionBrief([legacy, completeOther], NOW);
+    assert.equal(part.decisions.some((row) => row.number === 20), false);
+    assert.deepEqual(part.incomplete_repos, [REPO]);
+    assert.equal(part.decisions.some((row) => row.kind === guessed.kind && row.repo_short === guessed.repo_short), false);
+
+    const program = between(briefSrc, "TABLE_DECISIONS_JQ='", "'\n").slice("TABLE_DECISIONS_JQ='".length);
+    const sections = [
+      { repo: REPO, short: SHORT, incomplete: false, decisions: sweep },
+      { repo: "mrhinkle/other", short: "other", incomplete: false, decisions: [{ repo: "mrhinkle/other", number: 1, kind: "issue", labels: ["stale"], age_days: 1, repo_short: "other" }] },
+    ];
+    const replaced = execFileSync(
+      "jq",
+      ["-c", "--argjson", "table", JSON.stringify(part.decisions), "--argjson", "incomplete", JSON.stringify(part.incomplete_repos), program],
+      { encoding: "utf8", input: JSON.stringify(sections) },
+    );
+    const out = JSON.parse(replaced) as { repo: string; decisions: BriefDecision[] }[];
+    const kept = out.find((section) => section.repo === REPO)?.decisions.find((row) => row.number === 20);
+    assert.ok(kept);
+    assert.equal(kept.kind, swept.kind);
+    assert.deepEqual(kept.labels, swept.labels);
+    assert.equal(kept.age_days, swept.age_days);
+    assert.equal(kept.age_hours, swept.age_hours);
+    assert.equal(kept.repo_short, swept.repo_short);
+    assert.deepEqual(
+      out.find((section) => section.repo === REPO)?.decisions.map((row) => row.number),
+      sweep.map((row) => row.number),
+    );
+    assert.deepEqual(out.find((section) => section.repo === "mrhinkle/other")?.decisions.map((row) => row.number), [3]);
   });
 });
 
