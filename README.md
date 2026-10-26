@@ -70,6 +70,7 @@ Agent Kontrol is in **1.0 beta** ([release notes](https://github.com/mrhinkle/ag
 | [Database](docs/DATABASE.md) | Neon or any Postgres, driver selection |
 | [Architecture](docs/ARCHITECTURE.md) | Data flow, tables, code map |
 | [Progress board](docs/PROGRESS-BOARD.md) | How the net-backlog board works |
+| [The Gibson](docs/GIBSON.md) | How Agent Kontrol (the manager) and the Gibson (the law) fit together |
 | [Velocity](docs/VELOCITY.md) | The morning brief, stuck PRs, coordinator liveness and the owner decision queue |
 | [Telemetry and traces](docs/TELEMETRY.md) | Spans, OpenTelemetry ingest, retention, privacy |
 | [Memory (Notes)](docs/MEMORY.md) | What the notes store does and does not do |
