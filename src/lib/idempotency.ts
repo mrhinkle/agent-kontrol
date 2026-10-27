@@ -12,9 +12,14 @@
  * During the lease another caller gets a retryable in-progress conflict
  * and a retry-after. After the lease a retry with the same arguments takes
  * over the claim and runs the write. `claim_token` is how a caller recognizes
- * its own insert when that insert commits and the connection dies before
+ * its own claim when that insert commits and the connection dies before
  * RETURNING arrives. The resource write has not started in that case, so
  * the same attempt runs it once.
+ *
+ * A resource write and its stored response are one statement. The insert's
+ * WHERE checks `claim_token`, so a takeover that already swapped the token
+ * inserts nothing. A committed row therefore always has a stored response,
+ * and a later takeover cannot run the write again.
  */
 import { createHash, randomUUID } from "node:crypto";
 import type { Actor } from "./actor";
@@ -46,6 +51,24 @@ let clock: () => Date = () => new Date();
 /** Tests move the expiry clock. Production never calls this. */
 export function setIdempotencyClockForTests(fn: (() => Date) | null): void {
   clock = fn ?? (() => new Date());
+}
+
+/** The attempt that owns the current lease. The resource statement must check `token`. */
+export type IdempotencyClaim = {
+  scope: string;
+  key: string;
+  token: string;
+};
+
+/**
+ * Runs after the claim is owned and before the resource statement.
+ * Tests use it to let another caller take the lease first.
+ * Production never calls this.
+ */
+let beforeWrite: (() => Promise<void>) | null = null;
+
+export function setBeforeIdempotentWriteForTests(fn: (() => Promise<void>) | null): void {
+  beforeWrite = fn;
 }
 
 export class IdempotencyConflict extends Error {
@@ -206,20 +229,22 @@ async function releaseClaim(db: SqlTag, scope: string, key: string, token: strin
   `;
 }
 
-/** Leave the claim. Swallow a second connection failure so the first error still surfaces. */
+/**
+ * Mark a null claim whose result could not be read. Only the in-memory
+ * path uses this: a resource statement stores its own response, so a
+ * committed row is never left null for a takeover to repeat.
+ * A second connection failure leaves the null claim; the lease still blocks
+ * another insert, and this error is not swallowed into a success.
+ */
 async function retainUnknown(db: SqlTag, scope: string, key: string, token: string): Promise<void> {
-  try {
-    await db`
-      update idempotency_keys
-      set response = ${JSON.stringify(UNKNOWN_MARKER)}::jsonb
-      where scope = ${scope}
-        and idempotency_key = ${key}
-        and response is null
-        and claim_token = ${token}
-    `;
-  } catch {
-    // The null claim still blocks a second insert until the lease ends.
-  }
+  await db`
+    update idempotency_keys
+    set response = ${JSON.stringify(UNKNOWN_MARKER)}::jsonb
+    where scope = ${scope}
+      and idempotency_key = ${key}
+      and response is null
+      and claim_token = ${token}
+  `;
 }
 
 async function readClaim(db: SqlTag, scope: string, key: string): Promise<ClaimRow | undefined> {
@@ -232,24 +257,30 @@ async function readClaim(db: SqlTag, scope: string, key: string): Promise<ClaimR
   return existing[0] as ClaimRow | undefined;
 }
 
+/** In-memory results only. A resource row is stored by its own statement. */
 async function completeClaim<T>(
   db: SqlTag,
   scope: string,
   key: string,
   token: string,
-  execute: () => Promise<T>,
+  execute: () => Promise<T | null>,
 ): Promise<T> {
-  let result: T;
+  let result: T | null;
   try {
     result = await execute();
   } catch (e) {
     if (asUnknownWriteOutcome(e)) {
-      await retainUnknown(db, scope, key, token);
+      try {
+        await retainUnknown(db, scope, key, token);
+      } catch (markErr) {
+        if (!asUnknownWriteOutcome(markErr)) throw markErr;
+      }
       throw new IdempotencyUnknownOutcome(UNKNOWN_OUTCOME);
     }
     await releaseClaim(db, scope, key, token);
     throw e;
   }
+  if (result == null) throw new Error("idempotent write returned no result");
   try {
     await db`
       update idempotency_keys
@@ -258,12 +289,24 @@ async function completeClaim<T>(
         and idempotency_key = ${key}
         and claim_token = ${token}
     `;
-  } catch {
-    // execute() already returned, so the resource row may be committed.
-    await retainUnknown(db, scope, key, token);
+  } catch (e) {
+    if (!asUnknownWriteOutcome(e)) {
+      await releaseClaim(db, scope, key, token);
+      throw e;
+    }
+    try {
+      await retainUnknown(db, scope, key, token);
+    } catch (markErr) {
+      if (!asUnknownWriteOutcome(markErr)) throw markErr;
+    }
     throw new IdempotencyUnknownOutcome(UNKNOWN_OUTCOME);
   }
   return result;
+}
+
+function storedRaw(row: ClaimRow | undefined): unknown | undefined {
+  if (!row || row.response == null || isUnknownMarker(row.response)) return undefined;
+  return row.response;
 }
 
 type Next<T> =
@@ -274,20 +317,38 @@ type Next<T> =
 
 /**
  * Run `execute` once per key. A missing key runs `execute` every time.
- * A definite failure releases this attempt's claim. A connection loss after
- * the resource statement may have committed keeps the claim for 24 hours.
- * A connection loss on the claim insert is re-read: when `claim_token`
- * matches, this attempt owns the row and runs the write once.
+ * A definite failure releases this attempt's claim. A connection loss on
+ * the claim insert is re-read: when `claim_token` matches, this attempt
+ * owns the row and runs the write once.
+ *
+ * `storesResponse` means `execute` inserts the resource and stores the
+ * response in one statement, and inserts nothing when `claim.token` no
+ * longer matches. A null return is that refusal. A connection loss after
+ * that statement is re-read: a stored response is returned, and a null
+ * response with this token still held means the statement rolled back.
+ *
+ * `restore` maps that stored row JSON to `T`. The live return applies the
+ * same function to the JSON the statement stored, so a retry matches it.
  */
 export async function runIdempotent<T>(opts: {
   actor: Actor | null | undefined;
   route: string;
   key: unknown;
   payload: Record<string, unknown>;
-  execute: () => Promise<T>;
+  execute: (claim: IdempotencyClaim | null) => Promise<T | null>;
+  storesResponse?: boolean;
+  restore?: (stored: unknown) => T;
 }): Promise<T> {
+  const present = (response: unknown): T => {
+    const parsed = parseStored<unknown>(response);
+    return opts.restore ? opts.restore(parsed) : (parsed as T);
+  };
   const key = normalizeKey(opts.key);
-  if (!key) return opts.execute();
+  if (!key) {
+    const value = await opts.execute(null);
+    if (value == null) throw new Error("write returned no result");
+    return value;
+  }
 
   const db = sql();
   const scope = idempotencyScope(opts.actor, opts.route);
@@ -324,7 +385,7 @@ export async function runIdempotent<T>(opts: {
       if (isUnknownMarker(row.response)) {
         return { kind: "throw", error: new IdempotencyUnknownOutcome(UNKNOWN_OUTCOME) };
       }
-      if (row.response != null) return { kind: "return", value: parseStored<T>(row.response) };
+      if (row.response != null) return { kind: "return", value: present(row.response) };
       if (row.claim_token === token) return { kind: "owned" };
       if (!leaseOpen(row.started_at, now)) {
         const owned = await takeOver();
@@ -365,11 +426,84 @@ export async function runIdempotent<T>(opts: {
       }
     };
 
+    const claim: IdempotencyClaim = { scope, key, token };
+
+    const afterRefusal = async (): Promise<{ settled: true; value: T } | { settled: false }> => {
+      const row = await readClaim(db, scope, key);
+      const stored = storedRaw(row);
+      if (stored !== undefined) return { settled: true, value: present(stored) };
+      if (row && isUnknownMarker(row.response)) {
+        throw new IdempotencyUnknownOutcome(UNKNOWN_OUTCOME);
+      }
+      // This token still owns an empty claim, and the statement inserted nothing.
+      // settle() would report "owned" and write again.
+      if (row && row.claim_token === token && row.response == null) {
+        throw new Error("idempotent write inserted nothing while this attempt still held the claim");
+      }
+      return finish(await settle(row));
+    };
+
+    const writeAtomic = async (): Promise<{ settled: true; value: T } | { settled: false }> => {
+      const once = () => opts.execute(claim);
+      try {
+        const result = await once();
+        if (result == null) return afterRefusal();
+        return { settled: true, value: result };
+      } catch (e) {
+        if (!asUnknownWriteOutcome(e)) {
+          await releaseClaim(db, scope, key, token);
+          throw e;
+        }
+        let row: ClaimRow | undefined;
+        try {
+          row = await readClaim(db, scope, key);
+        } catch (readErr) {
+          if (asUnknownWriteOutcome(readErr)) throw new IdempotencyUnknownOutcome(UNKNOWN_OUTCOME);
+          throw readErr;
+        }
+        const stored = storedRaw(row);
+        if (stored !== undefined) return { settled: true, value: present(stored) };
+        if (row && isUnknownMarker(row.response)) {
+          throw new IdempotencyUnknownOutcome(UNKNOWN_OUTCOME);
+        }
+        // The statement rolled back. This token still owns an empty claim.
+        if (row && row.claim_token === token && row.response == null) {
+          try {
+            const again = await once();
+            if (again == null) return afterRefusal();
+            return { settled: true, value: again };
+          } catch (againErr) {
+            if (!asUnknownWriteOutcome(againErr)) {
+              await releaseClaim(db, scope, key, token);
+              throw againErr;
+            }
+            try {
+              const saved = storedRaw(await readClaim(db, scope, key));
+              if (saved !== undefined) return { settled: true, value: present(saved) };
+            } catch (readErr) {
+              if (!asUnknownWriteOutcome(readErr)) throw readErr;
+            }
+            throw new IdempotencyUnknownOutcome(UNKNOWN_OUTCOME);
+          }
+        }
+        return afterRefusal();
+      }
+    };
+
     const finish = async (next: Next<T>): Promise<{ settled: true; value: T } | { settled: false }> => {
       if (next.kind === "continue") return { settled: false };
       if (next.kind === "throw") throw next.error;
       if (next.kind === "return") return { settled: true, value: next.value };
-      return { settled: true, value: await completeClaim(db, scope, key, token, opts.execute) };
+      if (beforeWrite) {
+        const hook = beforeWrite;
+        beforeWrite = null;
+        await hook();
+      }
+      if (opts.storesResponse) return writeAtomic();
+      return {
+        settled: true,
+        value: await completeClaim(db, scope, key, token, () => opts.execute(claim)),
+      };
     };
 
     try {
@@ -383,7 +517,11 @@ export async function runIdempotent<T>(opts: {
         on conflict (scope, idempotency_key) do nothing
         returning scope, idempotency_key, request_hash, response, expires_at, started_at, claim_token
       `;
-      if (claimed[0]) return completeClaim(db, scope, key, token, opts.execute);
+      if (claimed[0]) {
+        const done = await finish({ kind: "owned" });
+        if (done.settled) return done.value;
+        continue;
+      }
     } catch (e) {
       if (!asUnknownWriteOutcome(e)) throw e;
       let row: ClaimRow | undefined;

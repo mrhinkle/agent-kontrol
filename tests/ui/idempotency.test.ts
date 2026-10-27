@@ -16,6 +16,7 @@ import {
   IdempotencyUnknownOutcome,
   idempotencyScope,
   runIdempotent,
+  setBeforeIdempotentWriteForTests,
   setIdempotencyClockForTests,
 } from "../../src/lib/idempotency";
 import { createTask, enqueueMessage, replyFromAgent } from "../../src/lib/store";
@@ -68,6 +69,10 @@ let claimInsertThenFail = false;
 /** Definite failure of a follow-up thread_id write. Not a connection loss. */
 let threadUpdateFault: Error | null = null;
 let threadUpdates = 0;
+/** Reads of the claim that should fail after a committed write. */
+let failReads = 0;
+/** Atomic inserts that saw a claim token they no longer own. */
+let refusedAtomic = 0;
 
 function columnsOf(text: string): string[] {
   const match = text.match(/insert into [a-z_]+ \(([^)]+)\)/i);
@@ -109,6 +114,8 @@ function installFake() {
   claimInsertThenFail = false;
   threadUpdateFault = null;
   threadUpdates = 0;
+  failReads = 0;
+  refusedAtomic = 0;
   setSqlForTests(async (strings, ...values) => {
     const text = strings.join(" ").replace(/\s+/g, " ").trim();
     const lower = text.toLowerCase();
@@ -166,6 +173,69 @@ function installFake() {
       row.request_hash = requestHash;
       return [row];
     }
+    if (
+      (lower.includes("insert into tasks") || lower.includes("insert into messages"))
+      && lower.includes("update idempotency_keys")
+      && lower.includes("claim_token")
+    ) {
+      const [scope, key, token] = values as string[];
+      const claim = idem.get(idemId(scope, key));
+      if (!claim || claim.claim_token !== token || claim.response != null) {
+        refusedAtomic += 1;
+        return [];
+      }
+      const rootMessage = lower.includes("insert into messages") && lower.includes("overriding system value");
+      const replyMessage = lower.includes("insert into messages") && !rootMessage;
+      const resource: Row = rootMessage
+        ? {
+            id: seq++,
+            agent_id: values[3],
+            body: values[4],
+            created_by: values[5],
+            direction: values[6],
+            in_reply_to: values[7] ?? null,
+            actor_type: values[8],
+            actor_id: values[9],
+            created_at: "2026-10-25T00:00:00.000Z",
+          }
+        : replyMessage
+          ? {
+              id: seq++,
+              agent_id: values[3],
+              body: values[4],
+              created_by: values[5],
+              direction: values[6],
+              in_reply_to: values[7] ?? null,
+              thread_id: values[8],
+              actor_type: values[9],
+              actor_id: values[10],
+              created_at: "2026-10-25T00:00:00.000Z",
+            }
+          : {
+              id: seq++,
+              title: values[3],
+              description: values[4] ?? null,
+              project: values[5] ?? null,
+              platform: values[6] ?? "any",
+              machine: values[7] ?? null,
+              priority: values[8] ?? 2,
+              reviewer_platform: values[9] ?? null,
+              created_by: values[10],
+              actor_type: values[11],
+              actor_id: values[12],
+              status: "queued",
+              created_at: "2026-10-25T00:00:00.000Z",
+            };
+      if (rootMessage) resource.thread_id = String(resource.id);
+      claim.response = JSON.parse(JSON.stringify(resource)) as Row;
+      inserts.push({ table: tableOf(text), row: resource });
+      if (commitThenFail) {
+        commitThenFail = false;
+        failReads += 1;
+        throw new UnknownWriteOutcome(new Error("connection terminated after COMMIT before RETURNING"));
+      }
+      return [{ response: claim.response }];
+    }
     if (lower.includes("update idempotency_keys")) {
       const [body, scope, key, token] = values as string[];
       const row = idem.get(idemId(scope, key));
@@ -175,6 +245,10 @@ function installFake() {
       return [];
     }
     if (lower.includes("from idempotency_keys")) {
+      if (failReads > 0) {
+        failReads -= 1;
+        throw new UnknownWriteOutcome(new Error("connection terminated before the stored response could be read"));
+      }
       const [scope, key] = values as string[];
       const row = idem.get(idemId(scope, key));
       return row ? [row] : [];
@@ -275,6 +349,7 @@ beforeEach(() => {
 afterEach(() => {
   setSqlForTests(null);
   setIdempotencyClockForTests(null);
+  setBeforeIdempotentWriteForTests(null);
   resetCredentialsForTests();
   restoreEnv();
 });
@@ -365,9 +440,9 @@ describe("idempotency keys", { concurrency: false }, () => {
     assert.ok(asUnknownWriteOutcome(new TypeError("fetch failed")) instanceof UnknownWriteOutcome);
   });
 
-  it("keeps the claim when the insert commits and RETURNING never arrives", async () => {
+  it("returns the stored row when the write commits and the caller dies before reading it", async () => {
     commitThenFail = true;
-    const headers = { authorization: `Bearer ${TOKEN}`, "idempotency-key": "commit-then-fail" };
+    const headers = { authorization: `Bearer ${TOKEN}`, "idempotency-key": "commit-then-die" };
     const first = await postTasks(jsonReq("http://x/api/tasks", { title: "once" }, headers));
     assert.equal(first.status, 409, await first.clone().text());
     const body = await first.json() as Record<string, unknown>;
@@ -378,26 +453,85 @@ describe("idempotency keys", { concurrency: false }, () => {
     assert.match(String(body.error), /actor and this route/);
     assert.match(String(body.fix), /24 hours/);
     assert.match(String(body.fix), /actor and the route/);
-    assert.equal(inserts.filter((item) => item.table === "tasks").length, 1);
-    const claim = [...idem.values()].find((row) => row.idempotency_key === "commit-then-fail");
+    const tasks = () => inserts.filter((item) => item.table === "tasks");
+    assert.equal(tasks().length, 1);
+    const claim = [...idem.values()].find((row) => row.idempotency_key === "commit-then-die");
     assert.ok(claim);
-    assert.notEqual(claim.response, null);
+    const stored = claim.response as { title?: string; __agent_kontrol_idempotency?: string };
+    assert.equal(stored.title, "once");
+    assert.notEqual(stored.__agent_kontrol_idempotency, "unknown_outcome");
 
     const retry = await postTasks(jsonReq("http://x/api/tasks", { title: "once" }, headers));
-    assert.equal(retry.status, 409);
-    assert.equal((await retry.json() as { retryable: boolean }).retryable, true);
-    assert.equal(inserts.filter((item) => item.table === "tasks").length, 1);
+    assert.equal(retry.status, 200, await retry.clone().text());
+    const saved = await retry.json() as { task: { id: number; title: string } };
+    assert.equal(saved.task.title, "once");
+    assert.equal(saved.task.id, tasks()[0].row.id);
+    assert.equal(tasks().length, 1);
 
     commitThenFail = true;
-    await assert.rejects(
-      () => createTask({ title: "direct", idempotency_key: "direct-fail", actor: actorA }),
-      (err: unknown) => err instanceof IdempotencyUnknownOutcome,
-    );
-    await assert.rejects(
-      () => createTask({ title: "direct", idempotency_key: "direct-fail", actor: actorA }),
-      (err: unknown) => err instanceof IdempotencyUnknownOutcome,
-    );
-    assert.equal(inserts.filter((item) => item.table === "tasks").length, 2);
+    const queued = {
+      agent_id: "worker-one",
+      body: "hello",
+      idempotency_key: "msg-die",
+      actor: { actor_type: "human" as const, actor_id: "operator" },
+    };
+    await assert.rejects(() => enqueueMessage(queued), (err: unknown) => err instanceof IdempotencyUnknownOutcome);
+    const messages = () => inserts.filter((item) => item.table === "messages");
+    assert.equal(messages().length, 1);
+    const again = await enqueueMessage(queued);
+    assert.equal(again.id, messages()[0].row.id);
+    assert.equal(again.thread_id, String(again.id));
+    assert.equal(messages().length, 1);
+  });
+
+  it("refuses the old owner's insert after the lease is taken over", async () => {
+    const start = new Date("2026-10-25T00:00:00.000Z");
+    setIdempotencyClockForTests(() => start);
+    const task = { title: "once", idempotency_key: "stall-task", actor: actorA };
+    let secondTask: { id: number } | undefined;
+    setBeforeIdempotentWriteForTests(async () => {
+      setIdempotencyClockForTests(() => new Date(start.getTime() + IDEMPOTENCY_LEASE_MS + 1));
+      secondTask = await createTask(task);
+    });
+    const lateTask = await createTask(task);
+    assert.ok(secondTask);
+    assert.equal(refusedAtomic, 1);
+    assert.equal(inserts.filter((item) => item.table === "tasks").length, 1);
+    assert.equal(lateTask.id, secondTask.id);
+    assert.equal(lateTask.title, "once");
+
+    refusedAtomic = 0;
+    inserts.length = 0;
+    const message = {
+      agent_id: "worker-one",
+      body: "hello",
+      idempotency_key: "stall-msg",
+      actor: { actor_type: "human" as const, actor_id: "operator" },
+    };
+    let secondMessage: { id: number } | undefined;
+    setIdempotencyClockForTests(() => start);
+    setBeforeIdempotentWriteForTests(async () => {
+      setIdempotencyClockForTests(() => new Date(start.getTime() + IDEMPOTENCY_LEASE_MS + 1));
+      secondMessage = await enqueueMessage(message);
+    });
+    const lateMessage = await enqueueMessage(message);
+    assert.ok(secondMessage);
+    assert.equal(refusedAtomic, 1);
+    assert.equal(inserts.filter((item) => item.table === "messages").length, 1);
+    assert.equal(lateMessage.id, secondMessage.id);
+    assert.equal(lateMessage.thread_id, String(lateMessage.id));
+  });
+
+  it("executes the resource write once when the claim commits and the write never starts", async () => {
+    claimInsertThenFail = true;
+    const input = { title: "once", idempotency_key: "claim-lost", actor: actorA };
+    const first = await createTask(input);
+    const tasks = () => inserts.filter((item) => item.table === "tasks");
+    assert.equal(tasks().length, 1);
+    const retry = await createTask(input);
+    assert.equal(retry.id, first.id);
+    assert.equal(retry.title, "once");
+    assert.equal(tasks().length, 1);
   });
 
   it("releases the claim when the write fails, and reports an in-progress key", async () => {
@@ -590,7 +724,7 @@ describe("idempotency keys", { concurrency: false }, () => {
     assert.equal(second.status, 200);
     const a = await first.json() as { task: Row };
     const b = await second.json() as { task: Row };
-    assert.equal(b.task.id, a.task.id);
+    assert.deepEqual(b.task, a.task);
     assert.equal(a.task.actor_type, "agent");
     assert.equal(a.task.actor_id, "mc-token");
     assert.equal(a.task.created_by, "someone-else");
@@ -640,7 +774,7 @@ describe("idempotency keys", { concurrency: false }, () => {
     assert.equal(first.status, 200, await first.clone().text());
     const a = await first.json() as { message: Row };
     const b = await second.json() as { message: Row };
-    assert.equal(b.message.id, a.message.id);
+    assert.deepEqual(b.message, a.message);
     assert.equal(a.message.actor_type, "human");
     assert.equal(a.message.actor_id, "operator");
     assert.equal([...idem.values()][0]?.scope, "human:operator:enqueue_message");
@@ -835,7 +969,15 @@ describe("idempotency keys", { concurrency: false }, () => {
     assert.equal(/update\s+messages/i.test(messages), false);
     assert.match(messages, /overriding system value/);
     assert.match(messages, /nextval\(pg_get_serial_sequence\('messages', 'id'\)\)/);
+    assert.match(messages, /update idempotency_keys/i);
+    assert.match(messages, /claim_token/);
+    assert.match(messages, /for update/i);
+    assert.match(messages, /select response from stored/i);
     assert.match(task, /insert into tasks/i);
+    assert.match(task, /update idempotency_keys/i);
+    assert.match(task, /claim_token/);
+    assert.match(task, /for update/i);
+    assert.match(task, /select response from stored/i);
     assert.equal(/update\s+tasks/i.test(task), false);
   });
 
