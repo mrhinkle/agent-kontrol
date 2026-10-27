@@ -62,24 +62,34 @@ interface Span {
   end: number;
 }
 
+/** A marker counts only when it is alone on its line. Prose that quotes a marker is left alone. */
+function markerLines(text: string): { kind: "begin" | "end"; start: number; end: number }[] {
+  const found: { kind: "begin" | "end"; start: number; end: number }[] = [];
+  let offset = 0;
+  for (const line of text.split("\n")) {
+    const bare = line.endsWith("\r") ? line.slice(0, -1) : line;
+    if (bare === POINTERS_BEGIN) found.push({ kind: "begin", start: offset, end: offset + bare.length });
+    else if (bare === POINTERS_END) found.push({ kind: "end", start: offset, end: offset + bare.length });
+    offset += line.length + 1;
+  }
+  return found;
+}
+
 function findSpans(text: string): Span[] {
   const spans: Span[] = [];
-  let from = 0;
-  for (;;) {
-    const begin = text.indexOf(POINTERS_BEGIN, from);
-    const stray = text.indexOf(POINTERS_END, from);
-    if (begin === -1) {
-      if (stray !== -1) throw new MalformedBlockError("end marker without begin");
-      return spans;
+  let open: number | null = null;
+  for (const marker of markerLines(text)) {
+    if (marker.kind === "begin") {
+      if (open !== null) throw new MalformedBlockError("nested begin marker");
+      open = marker.start;
+    } else {
+      if (open === null) throw new MalformedBlockError("end marker without begin");
+      spans.push({ start: open, end: marker.end });
+      open = null;
     }
-    if (stray !== -1 && stray < begin) throw new MalformedBlockError("end marker without begin");
-    const end = text.indexOf(POINTERS_END, begin + POINTERS_BEGIN.length);
-    if (end === -1) throw new MalformedBlockError("begin marker without end");
-    const nested = text.indexOf(POINTERS_BEGIN, begin + POINTERS_BEGIN.length);
-    if (nested !== -1 && nested < end) throw new MalformedBlockError("nested begin marker");
-    spans.push({ start: begin, end: end + POINTERS_END.length });
-    from = end + POINTERS_END.length;
   }
+  if (open !== null) throw new MalformedBlockError("begin marker without end");
+  return spans;
 }
 
 function appendBlock(text: string, rendered: string, eol: string): string {

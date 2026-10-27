@@ -86,6 +86,12 @@ describe("applyPointerBlock", () => {
     assert.deepEqual(applyPointerBlock(null, BLOCK), { content: `${BLOCK}\n`, changed: true });
   });
 
+  it("ignores markers quoted inside prose", () => {
+    const prose = `Wrap it in ${POINTERS_BEGIN} and ${POINTERS_END} lines.\nKeep ${POINTERS_BEGIN} in docs.\n`;
+    assert.equal(applyPointerBlock(prose, "").changed, false);
+    assert.equal(applyPointerBlock(prose, BLOCK).content, `${prose}\n${BLOCK}\n`);
+  });
+
   it("refuses an unpaired or nested marker instead of guessing", () => {
     assert.throws(() => applyPointerBlock(`a\n${POINTERS_BEGIN}\nb\n`, BLOCK), /begin marker without end/);
     assert.throws(() => applyPointerBlock(`a\n${POINTERS_END}\nb\n`, BLOCK), /end marker without begin/);
