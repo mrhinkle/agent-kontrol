@@ -257,6 +257,10 @@ const handler = createMcpHandler(
               .int()
               .optional()
               .describe("Optional id of the inbound message you are answering"),
+            idempotency_key: z
+              .string()
+              .optional()
+              .describe("Optional. Scoped by actor and route. The same key and the same arguments return the original reply for 24 hours and do not store a second row during that window. After 24 hours the same key starts a new write. The same key with different arguments is an error."),
           },
         },
         async (args) => guardTool(tool.name, async () => {
@@ -269,6 +273,7 @@ const handler = createMcpHandler(
             in_reply_to: args.in_reply_to,
             created_by: args.agent_id,
             actor: currentActor(),
+            idempotency_key: args.idempotency_key,
           });
           return {
             content: [
@@ -306,13 +311,21 @@ const handler = createMcpHandler(
             .string()
             .optional()
             .describe("Free-text label stored as created_by. It does not set actor_type or actor_id; the server records the authenticated credential."),
+          idempotency_key: z
+            .string()
+            .optional()
+            .describe("Optional. Scoped by actor and route. The same key and the same arguments return the original task for 24 hours and do not queue a second task during that window. After 24 hours the same key starts a new write. The same key with different arguments is an error."),
         },
       },
       async (args) => guardTool("create_task", async () => {
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Demo mode; task not queued." }] };
         }
-        const task = await createTask({ ...args, actor: currentActor() });
+        const task = await createTask({
+          ...args,
+          idempotency_key: args.idempotency_key,
+          actor: currentActor(),
+        });
         return {
           content: [
             { type: "text", text: `Task #${task.id} queued for ${task.platform} (priority ${task.priority}).` },

@@ -175,8 +175,9 @@ Reply to the operator. Replies appear in the Fleet conversation drawer.
 | `agent_id` | string | yes | Your agent id. |
 | `body` | string | yes | The reply, 1-20 lines. |
 | `in_reply_to` | int | no | Id of the inbound message being answered. |
+| `idempotency_key` | string | no | Optional. Scoped by actor and route. The same key and the same arguments return the original reply for 24 hours and do not store a second row during that window. After 24 hours the same key starts a new write. The same key with different arguments is `idempotency_conflict`. `reply_to_mark` accepts the same parameter and shares this route. |
 
-The server records `actor_type` and `actor_id` from the authenticated credential. A label in the request cannot set them.
+The server records `actor_type` and `actor_id` from the authenticated credential. A label in the request cannot set them. The idempotency key is scoped by that actor and the route `reply_to_operator`.
 
 When to call: when you have an answer, a result, or a question for the operator.
 
@@ -194,6 +195,7 @@ Queue a task for the fleet. A dispatcher or another agent claims it and runs it.
 | `priority` | int | no | 1 high, 2 normal (default), 3 low. |
 | `reviewer_platform` | enum | no | `claude-code`, `codex`, or `grok`. A second platform reviews the work before done. |
 | `created_by` | string | no | Free-text label stored on the task. The server records `actor_type` and `actor_id` from the authenticated credential and ignores any actor fields in the request. |
+| `idempotency_key` | string | no | Optional. Scoped by actor and route. The same key and the same arguments return the original task for 24 hours and do not queue a second task during that window. After 24 hours the same key starts a new write. The same key with different arguments is `idempotency_conflict`. |
 
 When to call: when work should be queued for the fleet rather than done by you.
 
@@ -242,9 +244,9 @@ A tool failure returns `isError: true`. The text of the result is JSON with the 
 { "error": "Memory key is invalid.", "code": "memory_key_invalid", "fix": "Use a key of 1 to 200 characters with no control characters, or omit the key.", "retryable": false, "fields": { "key": "Use 1 to 200 characters and no control characters, or omit the key." } }
 ```
 
-`error` is a string. `retryable` is `true` only for `rate_limited` and `internal_error`. A handler that throws is logged on the server and returned as `internal_error` with a generic `error` string. The exception text is not in the result.
+`error` is a string. `retryable` is `true` for `rate_limited`, `internal_error`, and for `idempotency_conflict` when the first attempt may already have committed or when the first request is still inside its 30 second lease. A live lease also returns `retry_after` seconds in the tool JSON. The REST form of that wait is the `Retry-After` header. A retry after the lease takes over a claim that never stored a result and runs the write once. A retry after the resource statement commits returns the stored response and does not insert another row while the claim is inside its 24 hour window. The key is scoped by actor and route. A handler that throws is logged on the server and returned as `internal_error` with a generic `error` string. The exception text is not in the result.
 
-`remember` and `recall` return `memory_key_invalid` when `key` is empty, longer than 200 characters, or contains a control character. Omitting `key` is valid. `update_task` returns `task_not_found` when a database is connected and the id does not exist. Demo mode answers with plain text, not an error. `reply_to_operator` returns `not_found` or `forbidden` when `in_reply_to` does not exist or belongs to another agent.
+`remember` and `recall` return `memory_key_invalid` when `key` is empty, longer than 200 characters, or contains a control character. Omitting `key` is valid. `update_task` returns `task_not_found` when a database is connected and the id does not exist. Demo mode answers with plain text, not an error. `reply_to_operator` returns `not_found` or `forbidden` when `in_reply_to` does not exist or belongs to another agent. `create_task` and `reply_to_operator` return `idempotency_conflict` when `idempotency_key` was already used with different arguments, or when the first request with that key is still inside its 30 second lease. During that lease the same arguments are `retryable: true` and include `retry_after` seconds. After the lease, the same arguments take over a claim that never stored a result and run the write once. A key longer than 200 characters or containing a control character is `validation_failed`. Omitting the key is valid.
 
 `task_not_claimable` is defined so a caller can handle it. No tool returns it. `claim_task` with nothing queued is a normal result whose text says there is no queued task, not an error.
 
@@ -257,11 +259,12 @@ The HTTP `401` for a missing or invalid bearer is unchanged: `WWW-Authenticate` 
 | `unauthorized` | no | Not returned inside a tool result. The HTTP `401` above covers a bad bearer. |
 | `forbidden` | no | `reply_to_operator` when `in_reply_to` belongs to a different agent. |
 | `not_found` | no | `reply_to_operator` when `in_reply_to` does not exist. |
-| `validation_failed` | no | Not returned by a current tool. A privacy refusal on `POST /api/usage/ingest` is this code. Schema failures are the SDK message, not this JSON. |
+| `validation_failed` | no | `create_task` or `reply_to_operator` when `idempotency_key` is longer than 200 characters or contains a control character. A privacy refusal on `POST /api/usage/ingest` is this code. Schema failures are the SDK message, not this JSON. |
 | `invalid_json` | no | Not a tool result. Authenticated `POST /api/mcp` returns HTTP 400 when the body is empty or not JSON. A missing bearer stays HTTP 401 with `WWW-Authenticate`. |
 | `missing_field` | no | Not returned by a tool. The input schema rejects a missing argument first. |
 | `rate_limited` | yes | Not returned by a tool. `POST /api/login` only. The OAuth consent form shares that limiter and answers with HTML, not this JSON. |
 | `conflict` | no | Not returned by a tool. REST settings save with no database. |
+| `idempotency_conflict` | no | `create_task` or `reply_to_operator` reused `idempotency_key` with different arguments, or the first request with that key is still inside its 30 second lease. `reply_to_mark` is the same tool schema and the same key as `reply_to_operator`. The same key, the same actor, the same route, and the same arguments return the original result for 24 hours. Different arguments stay non-retryable. While the first request is inside its 30 second lease, the same arguments are `retryable: true` and the tool JSON includes `retry_after` seconds. The REST form of that wait is the `Retry-After` header. After that lease, the same key and the same arguments take over a claim that never stored a result and run the write once. A claim insert whose result is lost is re-read, and the write runs once when this attempt owns the claim. The resource insert and the stored response commit in one statement, and that insert runs only while this attempt's claim token still matches. A committed write therefore has a stored response. A retry returns that response and does not insert another row while the claim is inside its 24 hour window. A caller that dies before reading the response gets the same row on retry. After that window the same key starts a new write. The key is scoped by actor and route. |
 | `stale` | no | Not returned by a tool. REST settings save with a stale `version`. |
 | `task_not_found` | no | `update_task` when a database is connected and the id does not exist. Demo mode is the text `Demo mode; task not updated.`, not an error. |
 | `task_not_claimable` | no | Defined, not returned. See above. |

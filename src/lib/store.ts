@@ -1,7 +1,9 @@
 import type { Actor } from "./actor";
+import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } from "./idempotency";
 import { writeSessionNote } from "./session-memory";
-import { sql } from "./db";
+import { sql, type SqlTag } from "./db";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
+import { asUnknownWriteOutcome } from "./write-outcome";
 
 export interface ReportInput {
   agent_id: string;
@@ -38,6 +40,13 @@ export function slugify(input: string): string {
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/** Keep a connection loss typed so idempotency does not drop a claim that may have committed. */
+function rethrowStore(e: unknown): never {
+  const unknown = asUnknownWriteOutcome(e);
+  if (unknown) throw unknown;
+  throw new Error(errMsg(e));
 }
 
 export async function report(input: ReportInput): Promise<void> {
@@ -359,52 +368,274 @@ function asTask(row: Record<string, unknown>): Task {
   };
 }
 
-/** Operator → agent. Sets direction=inbound and thread_id = own id when new. */
-export async function enqueueMessage(input: {
+/** The atomic statement returns the jsonb it stored, not the driver row. */
+function responseRow(rows: Record<string, unknown>[]): Record<string, unknown> | null {
+  const value = rows[0]?.response;
+  if (value == null) return null;
+  const parsed = typeof value === "string" ? JSON.parse(value) as unknown : value;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  return parsed as Record<string, unknown>;
+}
+
+type EnqueueInput = {
   agent_id: string;
   body: string;
   created_by?: string;
   /** From the authenticated principal. Never taken from the request body. */
   actor?: Actor | null;
-}): Promise<Message> {
-  const db = sql();
-  const actor = actorFields(input.actor);
+  /** Optional client key. Blank is the same as omitting it. */
+  idempotency_key?: string | null;
+};
+
+/** Operator → agent. Sets direction=inbound and thread_id = own id when new. */
+export async function enqueueMessage(input: EnqueueInput): Promise<Message> {
+  return runIdempotent({
+    actor: input.actor,
+    route: IDEMPOTENCY_ROUTE.enqueueMessage,
+    key: input.idempotency_key,
+    payload: payloadOf(input, ["agent_id", "body", "created_by"]),
+    storesResponse: true,
+    restore: (stored) => asMessage(stored as Record<string, unknown>),
+    execute: (claim) => insertEnqueuedMessage(input, claim),
+  });
+}
+
+type MessageWrite = {
+  agentId: string;
+  body: string;
+  createdBy: string;
+  direction: "inbound" | "outbound";
+  inReplyTo: number | null;
+  /** Null means this row is the thread root, so thread_id is its own id. */
+  threadId: string | null;
+  actorType: string | null;
+  actorId: string | null;
+};
+
+/**
+ * One statement. A new thread sets thread_id to the new id in that statement.
+ * When `claim` is set, the same statement stores the idempotency response and
+ * inserts a row only while that claim token still matches. Neon HTTP
+ * autocommits each call, so a follow-up write is not used.
+ */
+async function insertMessage(
+  db: SqlTag,
+  input: MessageWrite,
+  claim: IdempotencyClaim | null,
+): Promise<Message | null> {
   try {
-    const rows = await db`
-      insert into messages (agent_id, body, created_by, direction, actor_type, actor_id)
-      values (
-        ${slugify(input.agent_id)},
-        ${input.body},
-        ${input.created_by ?? "dashboard"},
-        'inbound',
-        ${actor.actor_type},
-        ${actor.actor_id}
-      )
-      returning *
-    `;
-    if (!rows[0]) throw new Error("messages insert returned no row");
-    const id = Number(rows[0].id);
-    const updated = await db`
-      update messages
-      set thread_id = coalesce(thread_id, ${String(id)})
-      where id = ${id}
-      returning *
-    `;
-    return asMessage((updated[0] ?? rows[0]) as Record<string, unknown>);
+    const rows = claim
+      ? await insertClaimedMessage(db, input, claim)
+      : await insertPlainMessage(db, input);
+    const row = claim ? responseRow(rows as Record<string, unknown>[]) : rows[0] as Record<string, unknown> | undefined;
+    if (!row) {
+      if (claim) return null;
+      throw new Error("messages insert returned no row");
+    }
+    return asMessage(row);
   } catch (e) {
-    throw new Error(errMsg(e));
+    rethrowStore(e);
   }
 }
 
-/** Agent → operator reply. */
-export async function replyFromAgent(input: {
+async function insertPlainMessage(db: SqlTag, input: MessageWrite): Promise<Record<string, unknown>[]> {
+  if (input.threadId == null) {
+    return db`
+      insert into messages (
+        id, agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id
+      )
+      overriding system value
+      select
+        allocated.nid,
+        ${input.agentId},
+        ${input.body},
+        ${input.createdBy},
+        ${input.direction},
+        ${input.inReplyTo},
+        allocated.nid::text,
+        ${input.actorType},
+        ${input.actorId}
+      from (
+        select nextval(pg_get_serial_sequence('messages', 'id')) as nid
+      ) allocated
+      returning *
+    `;
+  }
+  return db`
+    insert into messages (
+      agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id
+    )
+    values (
+      ${input.agentId},
+      ${input.body},
+      ${input.createdBy},
+      ${input.direction},
+      ${input.inReplyTo},
+      ${input.threadId},
+      ${input.actorType},
+      ${input.actorId}
+    )
+    returning *
+  `;
+}
+
+/**
+ * Insert the message and store the claim response in one statement.
+ * `gate` locks the claim. The insert's WHERE repeats the token check, so a
+ * token that was taken over inserts no row. thread_id is set here, not by a
+ * later update.
+ */
+async function insertClaimedMessage(
+  db: SqlTag,
+  input: MessageWrite,
+  claim: IdempotencyClaim,
+): Promise<Record<string, unknown>[]> {
+  if (input.threadId == null) {
+    return db`
+      with gate as (
+        select scope, idempotency_key
+        from idempotency_keys
+        where scope = ${claim.scope}
+          and idempotency_key = ${claim.key}
+          and claim_token = ${claim.token}
+          and response is null
+        for update
+      ),
+      inserted as (
+        insert into messages (
+          id, agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id
+        )
+        overriding system value
+        select
+          allocated.nid,
+          ${input.agentId},
+          ${input.body},
+          ${input.createdBy},
+          ${input.direction},
+          ${input.inReplyTo},
+          allocated.nid::text,
+          ${input.actorType},
+          ${input.actorId}
+        from gate
+        cross join lateral (
+          select nextval(pg_get_serial_sequence('messages', 'id')) as nid
+        ) allocated
+        where exists (
+          select 1
+          from idempotency_keys
+          where scope = ${claim.scope}
+            and idempotency_key = ${claim.key}
+            and claim_token = ${claim.token}
+            and response is null
+        )
+        returning *
+      ),
+      stored as (
+        update idempotency_keys as k
+        set response = (select to_jsonb(i) from inserted i)
+        from gate
+        where k.scope = gate.scope
+          and k.idempotency_key = gate.idempotency_key
+          and k.claim_token = ${claim.token}
+          and exists (select 1 from inserted)
+        returning k.response
+      )
+      select response from stored
+    `;
+  }
+  return db`
+    with gate as (
+      select scope, idempotency_key
+      from idempotency_keys
+      where scope = ${claim.scope}
+        and idempotency_key = ${claim.key}
+        and claim_token = ${claim.token}
+        and response is null
+      for update
+    ),
+    inserted as (
+      insert into messages (
+        agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id
+      )
+      select
+        ${input.agentId},
+        ${input.body},
+        ${input.createdBy},
+        ${input.direction},
+        ${input.inReplyTo},
+        ${input.threadId},
+        ${input.actorType},
+        ${input.actorId}
+      from gate
+      where exists (
+        select 1
+        from idempotency_keys
+        where scope = ${claim.scope}
+          and idempotency_key = ${claim.key}
+          and claim_token = ${claim.token}
+          and response is null
+      )
+      returning *
+    ),
+    stored as (
+      update idempotency_keys as k
+      set response = (select to_jsonb(i) from inserted i)
+      from gate
+      where k.scope = gate.scope
+        and k.idempotency_key = gate.idempotency_key
+        and k.claim_token = ${claim.token}
+        and exists (select 1 from inserted)
+      returning k.response
+    )
+    select response from stored
+  `;
+}
+
+async function insertEnqueuedMessage(
+  input: EnqueueInput,
+  claim: IdempotencyClaim | null,
+): Promise<Message | null> {
+  const actor = actorFields(input.actor);
+  return insertMessage(sql(), {
+    agentId: slugify(input.agent_id),
+    body: input.body,
+    createdBy: input.created_by ?? "dashboard",
+    direction: "inbound",
+    inReplyTo: null,
+    threadId: null,
+    actorType: actor.actor_type,
+    actorId: actor.actor_id,
+  }, claim);
+}
+
+type ReplyInput = {
   agent_id: string;
   body: string;
   in_reply_to?: number;
   created_by?: string;
   /** From the authenticated principal. Never taken from the request body. */
   actor?: Actor | null;
-}): Promise<Message> {
+  /** Optional client key. Blank is the same as omitting it. */
+  idempotency_key?: string | null;
+};
+
+/** Agent → operator reply. */
+export async function replyFromAgent(input: ReplyInput): Promise<Message> {
+  return runIdempotent({
+    actor: input.actor,
+    route: IDEMPOTENCY_ROUTE.reply,
+    key: input.idempotency_key,
+    payload: payloadOf(input, ["agent_id", "body", "in_reply_to", "created_by"]),
+    storesResponse: true,
+    restore: (stored) => asMessage(stored as Record<string, unknown>),
+    execute: (claim) => insertReply(input, claim),
+  });
+}
+
+async function insertReply(
+  input: ReplyInput,
+  claim: IdempotencyClaim | null,
+): Promise<Message | null> {
   const db = sql();
   const agentId = slugify(input.agent_id);
   const actor = actorFields(input.actor);
@@ -421,39 +652,21 @@ export async function replyFromAgent(input: {
       }
       threadId = (parents[0].thread_id as string | null) ?? String(parents[0].id);
     } catch (e) {
+      const unknown = asUnknownWriteOutcome(e);
+      if (unknown) throw unknown;
       throw new Error(errMsg(e));
     }
   }
-  try {
-    const rows = await db`
-      insert into messages (agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id)
-      values (
-        ${agentId},
-        ${input.body},
-        ${input.created_by ?? agentId},
-        'outbound',
-        ${parentId},
-        ${threadId},
-        ${actor.actor_type},
-        ${actor.actor_id}
-      )
-      returning *
-    `;
-    if (!rows[0]) throw new Error("messages insert returned no row");
-    const id = Number(rows[0].id);
-    if (!threadId) {
-      const updated = await db`
-        update messages
-        set thread_id = ${String(id)}
-        where id = ${id}
-        returning *
-      `;
-      return asMessage((updated[0] ?? rows[0]) as Record<string, unknown>);
-    }
-    return asMessage(rows[0] as Record<string, unknown>);
-  } catch (e) {
-    throw new Error(errMsg(e));
-  }
+  return insertMessage(db, {
+    agentId,
+    body: input.body,
+    createdBy: input.created_by ?? agentId,
+    direction: "outbound",
+    inReplyTo: parentId,
+    threadId,
+    actorType: actor.actor_type,
+    actorId: actor.actor_id,
+  }, claim);
 }
 
 /** Fetch an agent's pending inbound (unacked) messages. Ack keeps history. */
@@ -554,7 +767,7 @@ export async function markConversationRead(input: {
 // Tasks — the work queue that turns Agent Kontrol into a harness.
 // ---------------------------------------------------------------------------
 
-export async function createTask(input: {
+type CreateTaskInput = {
   title: string;
   description?: string;
   project?: string;
@@ -565,33 +778,115 @@ export async function createTask(input: {
   created_by?: string;
   /** From the authenticated principal. Never taken from the request body. */
   actor?: Actor | null;
-}): Promise<Task> {
+  /** Optional client key. Blank is the same as omitting it. */
+  idempotency_key?: string | null;
+};
+
+export async function createTask(input: CreateTaskInput): Promise<Task> {
+  return runIdempotent({
+    actor: input.actor,
+    route: IDEMPOTENCY_ROUTE.createTask,
+    key: input.idempotency_key,
+    payload: payloadOf(input, [
+      "title",
+      "description",
+      "project",
+      "platform",
+      "machine",
+      "priority",
+      "reviewer_platform",
+      "created_by",
+    ]),
+    storesResponse: true,
+    restore: (stored) => asTask(stored as Record<string, unknown>),
+    execute: (claim) => insertTask(input, claim),
+  });
+}
+
+async function insertTask(
+  input: CreateTaskInput,
+  claim: IdempotencyClaim | null,
+): Promise<Task | null> {
   const db = sql();
   const actor = actorFields(input.actor);
   try {
-    const rows = await db`
-      insert into tasks (
-        title, description, project, platform, machine,
-        priority, reviewer_platform, created_by, actor_type, actor_id
-      )
-      values (
-        ${input.title},
-        ${input.description ?? null},
-        ${input.project ?? null},
-        ${input.platform ?? "any"},
-        ${input.machine ?? null},
-        ${input.priority ?? 2},
-        ${input.reviewer_platform ?? null},
-        ${input.created_by ?? "dashboard"},
-        ${actor.actor_type},
-        ${actor.actor_id}
-      )
-      returning *
-    `;
-    if (!rows[0]) throw new Error("tasks insert returned no row");
-    return asTask(rows[0] as Record<string, unknown>);
+    const rows = claim
+      ? await db`
+          with gate as (
+            select scope, idempotency_key
+            from idempotency_keys
+            where scope = ${claim.scope}
+              and idempotency_key = ${claim.key}
+              and claim_token = ${claim.token}
+              and response is null
+            for update
+          ),
+          inserted as (
+            insert into tasks (
+              title, description, project, platform, machine,
+              priority, reviewer_platform, created_by, actor_type, actor_id
+            )
+            select
+              ${input.title},
+              ${input.description ?? null},
+              ${input.project ?? null},
+              ${input.platform ?? "any"},
+              ${input.machine ?? null},
+              ${input.priority ?? 2},
+              ${input.reviewer_platform ?? null},
+              ${input.created_by ?? "dashboard"},
+              ${actor.actor_type},
+              ${actor.actor_id}
+            from gate
+            where exists (
+              select 1
+              from idempotency_keys
+              where scope = ${claim.scope}
+                and idempotency_key = ${claim.key}
+                and claim_token = ${claim.token}
+                and response is null
+            )
+            returning *
+          ),
+          stored as (
+            update idempotency_keys as k
+            set response = (select to_jsonb(i) from inserted i)
+            from gate
+            where k.scope = gate.scope
+              and k.idempotency_key = gate.idempotency_key
+              and k.claim_token = ${claim.token}
+              and exists (select 1 from inserted)
+            returning k.response
+          )
+          select response from stored
+        `
+      : await db`
+          insert into tasks (
+            title, description, project, platform, machine,
+            priority, reviewer_platform, created_by, actor_type, actor_id
+          )
+          values (
+            ${input.title},
+            ${input.description ?? null},
+            ${input.project ?? null},
+            ${input.platform ?? "any"},
+            ${input.machine ?? null},
+            ${input.priority ?? 2},
+            ${input.reviewer_platform ?? null},
+            ${input.created_by ?? "dashboard"},
+            ${actor.actor_type},
+            ${actor.actor_id}
+          )
+          returning *
+        `;
+    const row = claim ? responseRow(rows as Record<string, unknown>[]) : rows[0] as Record<string, unknown> | undefined;
+    if (!row) {
+      if (claim) return null;
+      throw new Error("tasks insert returned no row");
+    }
+    return asTask(row);
   } catch (e) {
-    throw new Error(errMsg(e));
+    rethrowStore(e);
   }
 }
 
