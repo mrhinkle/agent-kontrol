@@ -1,0 +1,203 @@
+import type { RuntimeCompatibility, SkillPatch, SkillScope, SkillSummary, Trigger } from "./skills-types";
+
+export const TRIGGER_OPTIONS: { value: Trigger; label: string }[] = [
+  { value: "off", label: "Off" },
+  { value: "on_request", label: "On request" },
+  { value: "auto_inject", label: "Auto-inject" },
+  { value: "scheduled", label: "Scheduled" },
+];
+
+export const RUNTIME_FILTERS = ["all", "claude", "codex", "grok", "hermes", "mini"] as const;
+
+export const RUNTIME_KEYS = ["claude", "codex", "grok", "hermes", "mini"] as const;
+
+const PLATFORM_BY_RUNTIME: Record<string, string> = {
+  claude: "claude-code",
+  codex: "codex",
+  grok: "grok",
+  hermes: "hermes",
+};
+
+const SOURCE_URL_KEYS = ["sourceUrl", "upstreamUrl", "url", "htmlUrl"] as const;
+
+/** True when the only declared runtime is exactly `claude`. */
+export function isClaudeOnly(runtimes: readonly string[]): boolean {
+  return runtimes.length === 1 && runtimes[0] === "claude";
+}
+
+/** Active runtime filter excludes this skill. `all` and blank never exclude. */
+export function excludedByRuntime(runtimes: readonly string[], runtime: string): boolean {
+  const selected = runtime.trim().toLowerCase();
+  if (!selected || selected === "all") return false;
+  return !runtimes.some((item) => item.toLowerCase() === selected);
+}
+
+/**
+ * Flag claude-only skills, and any skill the active runtime filter does not include.
+ * The flag stays on the row; the row is not removed.
+ */
+export function showClaudeOnlyFlag(runtimes: readonly string[], runtime: string): boolean {
+  return isClaudeOnly(runtimes) || excludedByRuntime(runtimes, runtime);
+}
+
+/** Dim when a non-claude runtime filter is on and this skill is hidden from it. */
+export function dimSkillRow(runtimes: readonly string[], runtime: string): boolean {
+  const selected = runtime.trim().toLowerCase();
+  if (!selected || selected === "all" || selected === "claude") return false;
+  return isClaudeOnly(runtimes) || excludedByRuntime(runtimes, runtime);
+}
+
+/** Note beside an unchecked Hermes box when the skill runs on Claude and not Hermes. */
+export function showHermesClaudeOnlyNote(runtimes: RuntimeCompatibility): boolean {
+  return runtimes.claude === true && runtimes.hermes === false;
+}
+
+/** Sorted unique lane names declared on any skill. Blank names are dropped. */
+export function laneOptions(skills: readonly { scope: { lanes: readonly string[] } }[]): string[] {
+  const seen = new Set<string>();
+  for (const skill of skills) {
+    for (const lane of skill.scope.lanes) {
+      const trimmed = lane.trim();
+      if (trimmed) seen.add(trimmed);
+    }
+  }
+  return [...seen].sort((a, b) => a.localeCompare(b));
+}
+
+/** A cron value can be saved only when it has non-whitespace text. Syntax is not checked here. */
+export function isCronNonEmpty(schedule: string | null | undefined): boolean {
+  return typeof schedule === "string" && schedule.trim().length > 0;
+}
+
+export function applyOptimisticSkillPatch(skills: readonly SkillSummary[], id: string, patch: SkillPatch): SkillSummary[] {
+  return skills.map((skill) => {
+    if (skill.id !== id) return skill;
+    const next: SkillSummary = { ...skill };
+    if (patch.trigger !== undefined) next.trigger = patch.trigger;
+    if (patch.schedule !== undefined) next.schedule = patch.schedule;
+    if (patch.scope !== undefined) next.scope = copyScope(patch.scope);
+    return next;
+  });
+}
+
+export function rollbackSkill(skills: readonly SkillSummary[], previous: SkillSummary): SkillSummary[] {
+  let found = false;
+  const next = skills.map((skill) => {
+    if (skill.id !== previous.id) return skill;
+    found = true;
+    return previous;
+  });
+  return found ? next : [...skills];
+}
+
+/**
+ * Keep rows with an in-flight edit or an unsaved schedule draft. A poll must not
+ * replace those with the server copy, and must not drop them if the server omits them.
+ */
+export function mergePolledSkills(
+  current: readonly SkillSummary[],
+  incoming: readonly SkillSummary[],
+  heldIds: ReadonlySet<string>,
+): SkillSummary[] {
+  if (heldIds.size === 0) return [...incoming];
+  const currentById = new Map(current.map((skill) => [skill.id, skill]));
+  const seen = new Set<string>();
+  const merged = incoming.map((skill) => {
+    seen.add(skill.id);
+    if (heldIds.has(skill.id)) return currentById.get(skill.id) ?? skill;
+    return skill;
+  });
+  for (const skill of current) {
+    if (heldIds.has(skill.id) && !seen.has(skill.id)) merged.push(skill);
+  }
+  return merged;
+}
+
+export function filterSkills(skills: readonly SkillSummary[], q: string): SkillSummary[] {
+  const needle = q.trim().toLowerCase();
+  if (!needle) return [...skills];
+  return skills.filter((skill) => {
+    return (
+      skill.name.toLowerCase().includes(needle) ||
+      skill.id.toLowerCase().includes(needle) ||
+      skill.description.toLowerCase().includes(needle)
+    );
+  });
+}
+
+/** `?runtime=&q=` with empty values omitted. `all` is not sent. Runtime comes before q. */
+export function skillsQuery(input: { runtime?: string | null; q?: string | null }): string {
+  const params = new URLSearchParams();
+  const runtime = (input.runtime ?? "").trim();
+  const q = (input.q ?? "").trim();
+  if (runtime && runtime.toLowerCase() !== "all") params.set("runtime", runtime);
+  if (q) params.set("q", q);
+  const text = params.toString();
+  return text ? `?${text}` : "";
+}
+
+export function skillDetailPath(id: string): string {
+  return `/skills/${encodeURIComponent(id)}`;
+}
+
+export function formatVersion(version: string): string {
+  return version.startsWith("v") || version.startsWith("V") ? version : `v${version}`;
+}
+
+export function shortSha(sha: string): string {
+  return sha.slice(0, 7);
+}
+
+export function triggerLabel(trigger: Trigger): string {
+  return TRIGGER_OPTIONS.find((option) => option.value === trigger)?.label ?? trigger;
+}
+
+export function scopeLabel(scope: SkillScope): string {
+  if (scope.mode === "all") return "All lanes";
+  if (scope.lanes.length === 0) return "Selected lanes";
+  return `Selected lanes: ${scope.lanes.join(", ")}`;
+}
+
+/** Platform id for PlatformMark, when this runtime matches a known fleet platform. */
+export function runtimePlatformId(runtime: string): string | null {
+  return PLATFORM_BY_RUNTIME[runtime] ?? null;
+}
+
+export function readApiError(body: unknown, fallback: string): string {
+  if (body && typeof body === "object" && "error" in body) {
+    const error = (body as { error: unknown }).error;
+    if (typeof error === "string" && error.trim()) return error;
+  }
+  return fallback;
+}
+
+export function isSkillSummary(value: unknown): value is SkillSummary {
+  if (!value || typeof value !== "object") return false;
+  const row = value as Record<string, unknown>;
+  if (typeof row.id !== "string" || typeof row.name !== "string") return false;
+  if (!Array.isArray(row.runtimes) || !row.runtimes.every((item) => typeof item === "string")) return false;
+  return row.trigger === "off" || row.trigger === "on_request" || row.trigger === "auto_inject" || row.trigger === "scheduled";
+}
+
+/** First http(s) URL on the skill, if the payload actually carries one. */
+export function skillSourceUrl(skill: object): string | null {
+  const record = skill as Record<string, unknown>;
+  for (const key of SOURCE_URL_KEYS) {
+    const value = record[key];
+    if (typeof value === "string" && isHttpUrl(value)) return value;
+  }
+  return null;
+}
+
+export function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+function copyScope(scope: SkillScope): SkillScope {
+  return { mode: scope.mode, lanes: [...scope.lanes] };
+}
