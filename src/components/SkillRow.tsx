@@ -214,7 +214,7 @@ export function SkillRow({
           )}
         </span>
         <span className="mono">
-          {skill.triggerCount7d} triggers · 7d
+          {skill.triggerCount7d} {skill.triggerCount7d === 1 ? "trigger" : "triggers"} · 7d
         </span>
         <Link href={skillDetailPath(skill.id)} className="ml-auto text-gray-300 hover:text-white">
           Details
