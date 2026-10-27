@@ -2,8 +2,8 @@
 # collect-progress.sh — one collection tick for the Agent Kontrol progress board.
 #
 # Sweeps each configured repo with the GitHub API, then POSTs a single snapshot
-# per repo to /api/progress/ingest. The dashboard never calls GitHub itself; this
-# script owns the entire API budget.
+# per repo to /api/progress/ingest and upserts label-sourced decisions to
+# /api/decisions. The dashboard never calls GitHub itself; this script owns that budget.
 #
 #   ./collect-progress.sh                 # rolling tick (cron, every 15 min)
 #   ./collect-progress.sh --daily         # same sweep, tagged kind=daily
@@ -25,7 +25,7 @@ set -euo pipefail
 # --------------------------------------------------------------------- config
 
 # Watched repos come from progress.config.json at the repo root (one level up
-# from scripts/). Each becomes a "repo|display label|blocked label" entry.
+# from scripts/). Each becomes a "repo|display label|blocked label|short" entry.
 #
 # The blocked label differs per repo and some repos have none, so the field is
 # left empty: the board reports "not tracked" there rather than a false 0%.
@@ -49,7 +49,7 @@ if ! jq empty "$CONFIG_FILE" >/dev/null 2>&1; then
 fi
 
 REPOS=()
-repo_lines="$(jq -r '.repos[]? | [.repo, .label, (.blockedLabel // "")] | join("|")' "$CONFIG_FILE")"
+repo_lines="$(jq -r '.repos[]? | [.repo, .label, (.blockedLabel // ""), (.short // "")] | join("|")' "$CONFIG_FILE")"
 while IFS= read -r line; do
   if [[ -n "$line" ]]; then REPOS+=("$line"); fi
 done <<<"$repo_lines"
@@ -61,6 +61,7 @@ fi
 
 LANE_BOT_PREFIX="$(jq -r '.laneBotPrefix // "agent-lanes-"' "$CONFIG_FILE")"
 SHARED_BOT_PREFIXES_JSON="$(jq -c '.sharedBotPrefixes // []' "$CONFIG_FILE")"
+DECISION_LABELS_JSON="$(jq -c '.brief.decisionLabels // []' "$CONFIG_FILE")"
 
 STALLED_HOURS=24
 
@@ -252,6 +253,117 @@ post_payload() {
   log "ingest ok: $(jq -c . /tmp/mc-progress-resp.json)"
 }
 
+# ------------------------------------------------------------- decisions
+
+# Same label rule as scripts/morning-brief.sh. Age is not computed here: the
+# table stores createdAt as opened_at and first_seen_at, and the API measures
+# age when it builds the brief. A truncated or failed list must not withdraw,
+# or a short page would close decisions that are still open.
+# BEGIN decision-select-jq
+DECISION_SELECT_JQ=$(cat <<'JQ'
+def is_decision_label($n): $decision_labels | any(. as $p | ($p == $n) or (($p|endswith("*")) and ($n|startswith($p[:-1]))));
+[($issues + $prs)[]
+  | select((.labels // []) | any(is_decision_label(.name)))]
+| map({
+    key: ("github:" + $repo + "#" + (.number | tostring)),
+    source: "github-label",
+    repo: $repo,
+    repo_short: $short,
+    number,
+    title,
+    url,
+    why: ([.labels[].name | select(is_decision_label(.))] | join(", ")),
+    labels: [.labels[].name | select(is_decision_label(.))],
+    kind: (if has("isDraft") then "pr" else "issue" end),
+    opened_at: .createdAt,
+    first_seen_at: .createdAt,
+    requested_by: "collector",
+    github_present: true
+  })
+JQ
+)
+# END decision-select-jq
+
+post_decision() {
+  local payload="$1"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf '%s\n' "$payload" | jq -c . >&2
+    return 0
+  fi
+  local code
+  code="$(curl -sS -o /tmp/mc-decision-resp.json -w '%{http_code}' \
+    -X POST "${MC_URL%/}/api/decisions" \
+    -H "Authorization: Bearer $MC_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$payload")"
+  if [[ "$code" != "200" ]]; then
+    log "decision upsert failed: HTTP $code $(cat /tmp/mc-decision-resp.json)"
+    return 1
+  fi
+}
+
+# Upsert every open issue and PR that carries a decision label, then withdraw
+# the ones this repo no longer has. A missing key is an issue that closed or
+# lost the label, so open, deferred, and decided rows become withdrawn. The
+# stored decision text and decided_by stay. An upsert does not reopen a
+# decided or deferred row unless force is set. The same upsert fills a null
+# kind, labels, opened_at, or repo_short left by a row created before those
+# columns existed. opened_at that is already set stays. Until that fill,
+# morning-brief.sh keeps the GitHub sweep for the repo.
+sync_repo_decisions() {
+  local repo="$1" short="$2"
+  if [[ "$(jq 'length' <<<"$DECISION_LABELS_JSON")" -eq 0 ]]; then
+    return 0
+  fi
+  if [[ -z "$short" ]]; then short="${repo#*/}"; fi
+
+  local issues prs
+  if ! issues="$(gh issue list -R "$repo" --state open --limit 2001 --json number,title,createdAt,labels,url 2>/dev/null)"; then
+    log "decisions: issue list failed for $repo; not withdrawing"
+    return 0
+  fi
+  if ! prs="$(gh pr list -R "$repo" --state open --limit 501 --json number,title,createdAt,labels,url,isDraft 2>/dev/null)"; then
+    log "decisions: pr list failed for $repo; not withdrawing"
+    return 0
+  fi
+  if ! jq -e 'type=="array"' >/dev/null 2>&1 <<<"$issues" || ! jq -e 'type=="array"' >/dev/null 2>&1 <<<"$prs"; then
+    log "decisions: non-JSON list for $repo; not withdrawing"
+    return 0
+  fi
+
+  local truncated=0
+  if [[ "$(jq 'length' <<<"$issues")" -gt 2000 || "$(jq 'length' <<<"$prs")" -gt 500 ]]; then
+    truncated=1
+    log "decisions: list truncated for $repo; upserting what we saw, not withdrawing"
+  fi
+
+  local bodies
+  if ! bodies="$(jq -c \
+    --arg repo "$repo" --arg short "$short" \
+    --argjson decision_labels "$DECISION_LABELS_JSON" \
+    --argjson issues "$issues" --argjson prs "$prs" \
+    "$DECISION_SELECT_JQ")"; then
+    log "decisions: filter failed for $repo; not withdrawing"
+    return 0
+  fi
+
+  local seen='[]' failed=0 body key
+  while IFS= read -r body; do
+    [[ -z "$body" ]] && continue
+    if ! post_decision "$body"; then failed=1; fi
+    key="$(jq -r '.key' <<<"$body")"
+    seen="$(jq -c --arg k "$key" '. + [$k]' <<<"$seen")"
+  done < <(jq -c '.[]' <<<"$bodies")
+
+  if [[ "$failed" -eq 1 || "$truncated" -eq 1 ]]; then
+    return 0
+  fi
+  local reconcile
+  reconcile="$(jq -n --arg repo "$repo" --argjson seen "$seen" \
+    '{reconcile:{repo:$repo, source:"github-label", seen_keys:$seen}}')"
+  post_decision "$reconcile" || log "decisions: reconcile failed for $repo"
+}
+
 # ------------------------------------------------------------- one live tick
 
 collect_repo() {
@@ -340,8 +452,9 @@ run_tick() {
   since="$(iso_days_ago 1)"
 
   for entry in "${REPOS[@]}"; do
-    IFS='|' read -r repo label blocked_label <<<"$entry"
+    IFS='|' read -r repo label blocked_label short <<<"$entry"
     payloads+=("$(collect_repo "$repo" "$label" "$blocked_label" "$since")")
+    sync_repo_decisions "$repo" "$short" || log "decisions: sync failed for $repo"
   done
 
   local body
@@ -373,8 +486,8 @@ run_backfill() {
     at="${day}T23:59:00Z"
 
     for entry in "${REPOS[@]}"; do
-      local repo label blocked_label tc tcl tm
-      IFS='|' read -r repo label blocked_label <<<"$entry"
+      local repo label blocked_label short tc tcl tm
+      IFS='|' read -r repo label blocked_label short <<<"$entry"
       tc="$(search_count "repo:$repo is:issue created:<=$day")"
       tcl="$(search_count "repo:$repo is:issue is:closed closed:<=$day")"
       tm="$(search_count "repo:$repo is:pr is:merged merged:<=$day")"
@@ -414,7 +527,7 @@ refresh_repos_from_dashboard() {
   if ! body="$(curl -fsS --max-time 15 -H "Authorization: Bearer $MC_TOKEN" "${MC_URL%/}/api/settings/repos" 2>/dev/null)"; then
     log "repos: dashboard unreachable, using ${#REPOS[@]} from the local config"; return 0
   fi
-  lines="$(jq -r '.repos[]? | [.repo, .label, (.blockedLabel // "")] | join("|")' <<<"$body" 2>/dev/null || true)"
+  lines="$(jq -r '.repos[]? | [.repo, .label, (.blockedLabel // ""), (.short // "")] | join("|")' <<<"$body" 2>/dev/null || true)"
   if [[ -z "$lines" ]]; then
     log "repos: dashboard list was empty, using ${#REPOS[@]} from the local config"; return 0
   fi

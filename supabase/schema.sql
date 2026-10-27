@@ -355,7 +355,10 @@ alter table agent_credentials add column if not exists revoked_at timestamptz;
 alter table agent_credentials add column if not exists last_used_at timestamptz;
 create unique index if not exists agent_credentials_token_hash_idx on agent_credentials (token_hash);
 
--- Decisions queue (see supabase/migrations/20261025_decisions.sql and docs/VELOCITY.md)
+-- Decisions queue (see supabase/migrations/20261025_decisions.sql and docs/VELOCITY.md).
+-- kind, labels, opened_at, repo_short and github_present are nullable additions
+-- so a database that already created the table still upgrades. The brief's
+-- decisions list is computed from these columns; it does not call GitHub again.
 create table if not exists decisions (
   id bigint generated always as identity primary key,
   key text not null unique,
@@ -373,11 +376,21 @@ create table if not exists decisions (
   decided_by text,
   decided_at timestamptz,
   defer_until timestamptz,
+  kind text,
+  labels jsonb,
+  opened_at timestamptz,
+  repo_short text,
+  github_present boolean,
   first_seen_at timestamptz not null default now(),
   last_seen_at timestamptz not null default now(),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+alter table decisions add column if not exists kind text;
+alter table decisions add column if not exists labels jsonb;
+alter table decisions add column if not exists opened_at timestamptz;
+alter table decisions add column if not exists repo_short text;
+alter table decisions add column if not exists github_present boolean;
 create index if not exists decisions_status_first_seen_idx on decisions (status, first_seen_at);
 create index if not exists decisions_repo_number_idx on decisions (repo, number);
 
