@@ -440,13 +440,15 @@ A dispatcher runs this in the target repo before the lane starts. It needs `jq`,
 
 ```bash
 f=AGENTS.md
+if [ -L "$f" ]; then f=$(readlink -f -- "$f") || exit 1; fi
 if [ -e "$f" ]; then req=$(jq -Rs --arg l "$LANE" --arg r "$RUNTIME" '{lane:$l,runtime:$r,agents_md:.}' "$f") || exit 1
 else req=$(jq -n --arg l "$LANE" --arg r "$RUNTIME" '{lane:$l,runtime:$r}'); fi
 res=$(curl -fsS -X POST "$MC_URL/api/skills/pointers" -H "Authorization: Bearer $MC_TOKEN" -H 'Content-Type: application/json' -d "$req") || exit 1
 if [ "$(jq -r '.changed' <<<"$res")" = true ]; then
   tmp=$(mktemp "$(dirname "$f")/.agents-md.XXXXXX") || exit 1
-  jq -j '.content // empty' <<<"$res" > "$tmp" && chmod 644 "$tmp" && mv "$tmp" "$f" || { rm -f "$tmp"; exit 1; }
+  jq -j '.content // empty' <<<"$res" > "$tmp" && cat "$tmp" > "$f" || { rm -f "$tmp"; exit 1; }
+  rm -f "$tmp"
 fi
 ```
 
-The file is written only when `changed` is true, and it is replaced whole by `mv` from a `mktemp` file in the same directory. If the call fails the file is left as it was, so a lane still starts without pointers. Do not commit the result: the block is per-lane and belongs in the working tree.
+The file is written only when `changed` is true, and it is built in a `mktemp` file first and then copied over the target, so a symlink and the file mode are kept. If the call fails the file is left as it was, so a lane still starts without pointers. Do not commit the result: the block is per-lane and belongs in the working tree.

@@ -1335,7 +1335,10 @@ export function openApiDocument(): Json {
             query("format", { type: "string", enum: ["json", "text"] }, "json (default) or text."),
           ],
           responses: {
-            "200": jsonResponse("demo, lane, runtime, empty, and block.", { type: "object" }),
+            "200": {
+              description: "json: demo, lane, runtime, empty, and block. text: the block, or an empty body.",
+              content: { ...jsonResponse("", { type: "object" }).content as Json, ...textResponse("").content as Json },
+            },
             ...flatErrors,
           },
         }),
