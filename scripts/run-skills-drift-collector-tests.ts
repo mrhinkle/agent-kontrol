@@ -225,15 +225,34 @@ async function withServer(
     assert.ok(!lines.join("\n").includes(TOKEN));
   });
 
-  await check("reads MC_URL and MC_TOKEN from the env file when the environment lacks them", async () => {
+  await check("does not read the token from ~/.claude/mission-control.env, and never prints server error text", async () => {
     const a = skillsDir({ "x/SKILL.md": "x" });
-    await withServer(200, async (url, got) => {
-      const envFile = path.join(root, "mc.env");
-      fs.writeFileSync(envFile, `# c\nMC_URL=${url}\nMC_TOKEN="${TOKEN}"\n`);
-      const code = await run([], { HOME: root, MC_ENV_FILE: envFile, AK_MACHINE: "m", AK_SKILL_DRIFT_DIRS: a }, capture().io);
-      assert.equal(code, 0);
-      assert.equal(got[0].auth, `Bearer ${TOKEN}`);
+    const home = skillsDir({});
+    fs.mkdirSync(path.join(home, ".claude"));
+    fs.writeFileSync(path.join(home, ".claude/mission-control.env"), `MC_URL=http://127.0.0.1:1\nMC_TOKEN=${TOKEN}\n`);
+    const { lines, io } = capture();
+    assert.equal(await run([], { HOME: home, AK_MACHINE: "m", AK_SKILL_DRIFT_DIRS: a }, io), 3);
+    assert.ok(lines.join("\n").includes("MC_TOKEN is not set"));
+    const server = http.createServer((_req, res) => {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: `bad bearer ${TOKEN}` }));
     });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    try {
+      const out = capture();
+      const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      assert.equal(await run([], { HOME: root, MC_URL: url, MC_TOKEN: TOKEN, AK_MACHINE: "m", AK_SKILL_DRIFT_DIRS: a }, out.io), 1);
+      assert.ok(!out.lines.join("\n").includes(TOKEN));
+    } finally {
+      server.close();
+    }
+  });
+
+  await check("a dangling SKILL.md symlink fails the dir instead of looking absent", async () => {
+    const dir = skillsDir({ "a/SKILL.md": "a", "b/notes.md": "n" });
+    fs.symlinkSync(path.join(dir, "gone.md"), path.join(dir, "b/SKILL.md"));
+    const r = await scanDir(dir);
+    assert.equal(r.status, "failed");
   });
 
   await check("CLI: exit code and no token in stdout/stderr", () => {

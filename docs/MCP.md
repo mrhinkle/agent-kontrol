@@ -427,20 +427,20 @@ node ~/.mission-control/collect-skills-drift.mjs --dry-run
 MC_URL=https://YOUR-DEPLOY.vercel.app MC_TOKEN=... node ~/.mission-control/collect-skills-drift.mjs
 ```
 
-It reads `<dir>/<name>/SKILL.md` for each directory, follows one level of symlink to a directory, skips names that start with `.` (such as `.system`), hashes the raw bytes with SHA-256, and posts one report per directory. `MC_URL` and `MC_TOKEN` come from the environment, or from `~/.claude/mission-control.env` (`MC_URL=` and `MC_TOKEN=` lines, the file the other collectors use). The token is never taken from arguments and never printed. `MC_URL` must be https, except for localhost. The `host` it reports is `AK_MACHINE`, then `--machine NAME`, then the hostname. The directories are `AK_SKILL_DRIFT_DIRS` (the same variable the server reads), otherwise the two defaults. Each is posted exactly as written, so it must match the server's list.
+It reads `<dir>/<name>/SKILL.md` for each directory, follows one level of symlink to a directory, skips names that start with `.` (such as `.system`), hashes the raw bytes with SHA-256, and posts one report per directory. `MC_URL` and `MC_TOKEN` come from the environment only. The script does not read the token from arguments or from a file, and it never prints it or any server response text. `MC_URL` must be https, except for localhost. The `host` it reports is `AK_MACHINE`, then `--machine NAME`, then the hostname. The directories are `AK_SKILL_DRIFT_DIRS` (the same variable the server reads), otherwise the two defaults. Each is posted as written (spaces around the commas are trimmed), so it must match the server's list.
 
 Exit codes:
 
 | Code | Meaning |
 |---|---|
-| 0 | Every existing directory was read and posted. A directory that does not exist is skipped with a notice. |
+| 0 | Every existing directory was read and posted (with `--dry-run`, read and printed). A directory that does not exist is skipped with a notice. |
 | 1 | A post failed (network error or non-2xx). |
-| 2 | A directory exists but could not be read or enumerated, including one unreadable `SKILL.md`. Nothing is posted for that directory. The other directories are still posted. |
+| 2 | A directory exists but could not be read or enumerated, including one unreadable or dangling `SKILL.md`. Nothing is posted for that directory. The other directories are still posted. |
 | 3 | Configuration error, or every configured directory is missing, so nothing was reported. |
 
 A directory that exists and is readable but holds no skills posts an empty list. A skill whose name the server would reject (not `[A-Za-z0-9][A-Za-z0-9._-]{0,80}`) is skipped with a warning. Running it twice posts identical bodies.
 
-Schedule it with launchd (macOS). Put `MC_URL` and `MC_TOKEN` in `~/.claude/mission-control.env` (mode 600) so the plist holds no secret. Save as `~/Library/LaunchAgents/com.missioncontrol.skills-drift.plist`, then `launchctl bootstrap gui/$(id -u) <that file>`:
+Schedule it with launchd (macOS). Keep `MC_URL` and `MC_TOKEN` in `~/.claude/mission-control.env` (mode 600) and have the job source it, so the plist holds no secret. Save as `~/Library/LaunchAgents/com.missioncontrol.skills-drift.plist`, then `launchctl bootstrap gui/$(id -u) <that file>`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -448,8 +448,9 @@ Schedule it with launchd (macOS). Put `MC_URL` and `MC_TOKEN` in `~/.claude/miss
 <plist version="1.0"><dict>
   <key>Label</key><string>com.missioncontrol.skills-drift</string>
   <key>ProgramArguments</key><array>
-    <string>/usr/local/bin/node</string>
-    <string>/Users/YOU/.mission-control/collect-skills-drift.mjs</string>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>set -a; . "$HOME/.claude/mission-control.env"; exec /opt/homebrew/bin/node "$HOME/.mission-control/collect-skills-drift.mjs"</string>
   </array>
   <key>StartInterval</key><integer>3600</integer>
   <key>StandardErrorPath</key><string>/Users/YOU/Library/Logs/mc-skills-drift.log</string>
@@ -457,7 +458,7 @@ Schedule it with launchd (macOS). Put `MC_URL` and `MC_TOKEN` in `~/.claude/miss
 </dict></plist>
 ```
 
-Use the path `which node` prints (Homebrew on Apple silicon is `/opt/homebrew/bin/node`). From cron, use the same command with absolute paths: `17 * * * * /opt/homebrew/bin/node $HOME/.mission-control/collect-skills-drift.mjs >> $HOME/Library/Logs/mc-skills-drift.log 2>&1`. A non-zero exit is the signal to look at the log.
+Replace the node path with what `which node` prints (`/usr/local/bin/node` on Intel). From cron, use the same sourcing: `17 * * * * set -a; . $HOME/.claude/mission-control.env; /opt/homebrew/bin/node $HOME/.mission-control/collect-skills-drift.mjs >> $HOME/Library/Logs/mc-skills-drift.log 2>&1`. A non-zero exit is the signal to look at the log.
 
 `missing` is in the mirror and not in the report. `extra` is in the report and not in the mirror. `differs` is both, with different content SHAs. The POST response is `{ ok, host, dir, missing, extra, differs, driftCount }`. `driftCount` there is the number of rows in those three lists for this report. `upstream.driftCount` on `GET /api/skills` is the number of distinct skill names that disagree in any stored report. The same name on two hosts counts once.
 

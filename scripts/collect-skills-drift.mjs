@@ -9,8 +9,8 @@
  *   node collect-skills-drift.mjs --dry-run        # prints the reports, posts nothing, needs no token
  *
  * Environment:
- *   MC_URL, MC_TOKEN      Required to post. Never taken from arguments, never printed. If unset, read
- *                         from ~/.claude/mission-control.env (the file the other collectors use).
+ *   MC_URL, MC_TOKEN      Required to post. Environment only: never taken from arguments or files by this
+ *                         script, never printed. Server response text is never printed either.
  *   AK_SKILL_DRIFT_DIRS   Comma-separated dirs, same variable the server reads. Default:
  *                         ~/.codex/skills,~/.agents/skills. Each string is posted verbatim as `dir`
  *                         and must match the server's list; a leading ~ is expanded for reading only.
@@ -34,7 +34,6 @@ import { pathToFileURL } from "node:url";
 export const DEFAULT_DIRS = ["~/.codex/skills", "~/.agents/skills"];
 export const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/;
 export const MAX_SKILLS = 5000;
-const ENV_FILE = "~/.claude/mission-control.env";
 const POST_TIMEOUT_MS = 30_000;
 
 /** SHA-256 hex of the raw bytes. Same as src/lib/skills/sha.ts: no decoding, no newline normalisation. */
@@ -93,7 +92,9 @@ export async function scanDir(configured, home = os.homedir()) {
     try {
       bytes = await fs.readFile(path.join(skillDir, "SKILL.md"));
     } catch (err) {
-      if (err && (err.code === "ENOENT" || err.code === "ENOTDIR")) continue; // directory without SKILL.md
+      if (err && (err.code === "ENOENT" || err.code === "ENOTDIR") && !(await entryExists(path.join(skillDir, "SKILL.md")))) {
+        continue; // directory without SKILL.md
+      }
       // A skill we cannot read must not look like a skill that is absent.
       return { status: "failed", reason: `${name}/SKILL.md: ${errCode(err)}` };
     }
@@ -118,6 +119,16 @@ async function resolveSkillDir(entry) {
   return tl.isDirectory() ? target : null;
 }
 
+/** True for anything at the path, including a dangling symlink. */
+async function entryExists(p) {
+  try {
+    await fs.lstat(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function errCode(err) {
   return err && typeof err.code === "string" ? err.code : "read error";
 }
@@ -130,23 +141,6 @@ export function buildReport(host, dir, skills) {
 export function machineName(env = process.env, flag) {
   const name = (flag || env.AK_MACHINE || os.hostname() || "").trim();
   return name.slice(0, 200);
-}
-
-async function loadEnvFile(env, home = os.homedir()) {
-  let text;
-  try {
-    text = await fs.readFile(expandHome(env.MC_ENV_FILE || ENV_FILE, home), "utf8");
-  } catch {
-    return;
-  }
-  for (let line of text.split("\n")) {
-    line = line.trim();
-    if (!line || line.startsWith("#") || !line.includes("=")) continue;
-    const key = line.slice(0, line.indexOf("="));
-    let value = line.slice(line.indexOf("=") + 1).trim();
-    value = value.replace(/^(["'])(.*)\1$/, "$2");
-    if ((key === "MC_URL" || key === "MC_TOKEN") && !env[key]) env[key] = value;
-  }
 }
 
 function isLoopback(hostname) {
@@ -211,15 +205,13 @@ export async function run(argv, env = process.env, io = { out: console.log, err:
   let baseUrl = "";
   let token = "";
   if (!args.dryRun) {
-    const merged = { ...env };
-    await loadEnvFile(merged, home);
-    token = merged.MC_TOKEN || "";
+    token = env.MC_TOKEN || "";
     if (!token) {
-      io.err("MC_TOKEN is not set (environment or ~/.claude/mission-control.env)");
+      io.err("MC_TOKEN is not set in the environment");
       return 3;
     }
     try {
-      baseUrl = resolveBaseUrl(merged.MC_URL);
+      baseUrl = resolveBaseUrl(env.MC_URL);
     } catch (e) {
       io.err(e.message);
       return 3;
@@ -251,8 +243,7 @@ export async function run(argv, env = process.env, io = { out: console.log, err:
     try {
       const res = await post(baseUrl, token, report);
       if (!res.ok) {
-        const detail = res.body && typeof res.body.error === "string" ? `: ${res.body.error.slice(0, 200)}` : "";
-        io.err(`FAIL ${dir}: server returned HTTP ${res.status}${detail}`);
+        io.err(`FAIL ${dir}: server returned HTTP ${res.status}`);
         if (code === 0) code = 1;
         continue;
       }
