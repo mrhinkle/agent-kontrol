@@ -1,5 +1,7 @@
 import packageJson from "../../package.json";
+import { API_ERRORS } from "@/lib/api-error";
 import { LABEL_MAX } from "@/lib/credentials";
+import { DECISION_STATUSES, LIST_SHAPES, LIST_STATUSES } from "@/lib/decisions";
 import { PROGRESS_INGEST_KINDS } from "@/lib/progress-store";
 import { WINDOWS } from "@/lib/progress-config";
 import { MAX_REPOS } from "@/lib/repo-validation";
@@ -13,12 +15,16 @@ import { USAGE_WINDOWS } from "@/lib/usage-window";
  * OpenAPI 3.1 for the documented REST routes.
  *
  * Request fields come from the same constants and interfaces the handlers
- * use (scopes, repo limit, task statuses, ingest kinds, usage sources).
- * Routes that only check "present" still accept a wider string than the
- * documented enum; the enum is the contract in docs/API.md.
+ * use (scopes, repo limit, task statuses, decision statuses and list shapes,
+ * ingest kinds, usage sources, error codes). Routes that only check
+ * "present" still accept a wider string than the documented enum; the enum
+ * is the contract in docs/API.md.
  *
  * MCP tool names are not listed here. They stay in docs/MCP.md.
  */
+
+/** Keys of API_ERRORS, plus the scope denial that src/lib/scopes.ts returns. */
+const ERROR_CODES = [...new Set([...Object.keys(API_ERRORS), "insufficient_scope"])];
 
 type Json = Record<string, unknown>;
 
@@ -53,6 +59,20 @@ function query(name: string, schema: Json, description: string, opts?: { require
 function pathParam(name: string, description: string, schema: Json = { type: "string" }): Json {
   return { name, in: "path", required: true, schema, description };
 }
+
+const idempotencyHeader: Json = {
+  name: "Idempotency-Key",
+  in: "header",
+  required: false,
+  schema: { type: "string", maxLength: 200 },
+  description:
+    "Optional. A blank value is the same as omitting the header. 1 to 200 characters and no control characters; anything else is 400 validation_failed. The same key, the same actor, the same route, and the same body return the original result for 24 hours and do not insert a second row. After 24 hours the same key starts a new write. A different body is 409 idempotency_conflict and is not retryable. While the first request is inside its 30 second lease, the same body is 409 idempotency_conflict with retryable true, a Retry-After header, and retry_after in the body. The key is scoped by actor and route.",
+};
+
+const idempotencyConflict: Json = jsonResponse(
+  "This Idempotency-Key was reused. code is idempotency_conflict. A different body is not retryable. The same body during the 30 second lease is retryable and includes Retry-After and retry_after.",
+  ref("Error"),
+);
 
 function body(schema: Json): Json {
   return { required: true, content: { "application/json": { schema } } };
@@ -107,6 +127,7 @@ export function openApiDocument(): Json {
     tags: [
       { name: "fleet" },
       { name: "tasks" },
+      { name: "decisions" },
       { name: "messages" },
       { name: "memory" },
       { name: "progress" },
@@ -131,7 +152,12 @@ export function openApiDocument(): Json {
           required: ["error", "code", "fix", "retryable"],
           properties: {
             error: { type: "string" },
-            code: { type: "string" },
+            code: {
+              type: "string",
+              enum: ERROR_CODES,
+              description:
+                "Keys of API_ERRORS in src/lib/api-error.ts. insufficient_scope is the additional code src/lib/scopes.ts returns when an agent credential cannot call the route.",
+            },
             fix: { type: "string" },
             retryable: { type: "boolean" },
             fields: { type: "object", additionalProperties: { type: "string" } },
@@ -454,6 +480,141 @@ export function openApiDocument(): Json {
             note: { type: "string" },
           },
         },
+        Decision: {
+          type: "object",
+          required: [
+            "id",
+            "key",
+            "source",
+            "repo",
+            "repo_short",
+            "number",
+            "url",
+            "title",
+            "why",
+            "options",
+            "recommended",
+            "requested_by",
+            "status",
+            "decision",
+            "decided_by",
+            "decided_at",
+            "defer_until",
+            "kind",
+            "labels",
+            "opened_at",
+            "github_present",
+            "first_seen_at",
+            "last_seen_at",
+            "created_at",
+            "updated_at",
+            "age_days",
+          ],
+          properties: {
+            id: { type: "integer" },
+            key: { type: "string" },
+            source: { type: "string" },
+            repo: { type: ["string", "null"], description: "owner/name. The morning brief joins on this." },
+            repo_short: { type: ["string", "null"], description: "Config short name. Display only." },
+            number: { type: ["integer", "null"] },
+            url: { type: ["string", "null"] },
+            title: { type: "string" },
+            why: { type: ["string", "null"] },
+            options: { description: "JSON value stored with the row. Null when unset." },
+            recommended: { type: ["string", "null"] },
+            requested_by: { type: ["string", "null"] },
+            status: { type: "string", enum: [...DECISION_STATUSES] },
+            decision: { type: ["string", "null"] },
+            decided_by: { type: ["string", "null"] },
+            decided_at: { type: ["string", "null"], format: "date-time" },
+            defer_until: { type: ["string", "null"], format: "date-time" },
+            kind: { type: ["string", "null"], enum: ["issue", "pr", null] },
+            labels: { type: ["array", "null"], items: { type: "string" }, description: "Null when the column was never written. An empty list is a real value." },
+            opened_at: { type: ["string", "null"], format: "date-time" },
+            github_present: { type: ["boolean", "null"] },
+            first_seen_at: { type: "string", format: "date-time" },
+            last_seen_at: { type: "string", format: "date-time" },
+            created_at: { type: "string", format: "date-time" },
+            updated_at: { type: "string", format: "date-time" },
+            age_days: { type: "integer", description: "Whole days from opened_at, else first_seen_at, to now." },
+          },
+        },
+        BriefDecision: {
+          type: "object",
+          required: ["repo", "repo_short", "number", "title", "url", "kind", "age_hours", "age_days", "labels"],
+          properties: {
+            repo: { type: "string", description: "owner/name." },
+            repo_short: { type: "string", description: "Config short name. Display only." },
+            number: { type: "integer" },
+            title: { type: "string" },
+            url: { type: "string" },
+            kind: { type: "string", enum: ["issue", "pr"] },
+            age_hours: { type: "number" },
+            age_days: { type: "integer" },
+            labels: { type: "array", items: { type: "string" } },
+          },
+        },
+        DecisionUpsert: {
+          type: "object",
+          required: ["key", "source", "title"],
+          description:
+            "Upsert by key. A body field status does not decide the row. A new key is open. decided and deferred stay unless force is true. withdrawn returns to open without force. A github-label upsert that omits github_present stores true.",
+          properties: {
+            key: { type: "string", minLength: 1, maxLength: 300 },
+            source: { type: "string", description: "Short lowercase slug." },
+            repo: { type: ["string", "null"], description: "owner/name." },
+            repo_short: { type: ["string", "null"], maxLength: 64 },
+            number: { type: ["integer", "null"], minimum: 1 },
+            url: { type: ["string", "null"] },
+            title: { type: "string", minLength: 1, maxLength: 500 },
+            why: { type: ["string", "null"] },
+            options: { type: ["array", "null"], maxItems: 20 },
+            recommended: { type: ["string", "null"] },
+            requested_by: { type: ["string", "null"] },
+            kind: { type: ["string", "null"], enum: ["issue", "pr", null] },
+            labels: { type: ["array", "null"], maxItems: 30, items: { type: "string", minLength: 1, maxLength: 100 } },
+            opened_at: { type: ["string", "null"], format: "date-time" },
+            first_seen_at: { type: ["string", "null"], format: "date-time" },
+            github_present: { type: ["boolean", "null"] },
+            force: {
+              type: "boolean",
+              description: "When true, reopen a decided or deferred row to open and clear the answer. Omitted is false.",
+            },
+          },
+        },
+        DecisionReconcile: {
+          type: "object",
+          required: ["reconcile"],
+          description: "Withdraw label-sourced rows for one repo that this sweep did not see. Mutually exclusive with a decision upsert.",
+          properties: {
+            reconcile: {
+              type: "object",
+              required: ["repo", "seen_keys"],
+              properties: {
+                repo: { type: "string", description: "owner/name." },
+                source: { type: "string", default: "github-label", description: "Short lowercase slug. Default github-label." },
+                seen_keys: {
+                  type: "array",
+                  maxItems: 5000,
+                  items: { type: "string" },
+                  description: "Keys still present. Each must start with github:<repo>#. Empty withdraws every row for that repo and source.",
+                },
+              },
+            },
+          },
+        },
+        PatchDecision: {
+          type: "object",
+          minProperties: 1,
+          description:
+            "At least one field. status decided requires non-empty decision text and sets decided_at to now. status deferred requires defer_until. status open clears decision, decided_by, decided_at, and defer_until. status withdrawn sets github_present false. decided_by is taken from this body, not from the credential.",
+          properties: {
+            status: { type: "string", enum: [...DECISION_STATUSES] },
+            decision: { type: ["string", "null"] },
+            decided_by: { type: ["string", "null"] },
+            defer_until: { type: ["string", "null"], format: "date-time" },
+          },
+        },
         CreateCredential: {
           type: "object",
           required: ["label", "scopes"],
@@ -608,8 +769,9 @@ export function openApiDocument(): Json {
           tags: ["messages"],
           summary: "Operator enqueues an inbound message.",
           description:
-            "The server sets actor_type and actor_id from the authenticated credential. created_by is a label and does not set those fields. When MC_DASHBOARD_PASSWORD is unset and the request presents no credential, both actor fields are null.",
+            "The server sets actor_type and actor_id from the authenticated credential. created_by is a label and does not set those fields. When MC_DASHBOARD_PASSWORD is unset and the request presents no credential, both actor fields are null. Optional header Idempotency-Key.",
           security: cookieOrBearer,
+          parameters: [idempotencyHeader],
           requestBody: body({
             type: "object",
             required: ["agent_id", "body"],
@@ -631,6 +793,7 @@ export function openApiDocument(): Json {
               },
             }),
             ...flatErrors,
+            "409": idempotencyConflict,
             "503": jsonResponse("The messages table is not set up.", ref("Error")),
           },
         }),
@@ -657,8 +820,9 @@ export function openApiDocument(): Json {
           tags: ["messages"],
           summary: "A non-MCP agent posts a reply.",
           description:
-            "actor_type and actor_id are taken from the bearer, not from created_by. A dashboard session is human / operator. MC_TOKEN is agent / mc-token.",
+            "actor_type and actor_id are taken from the bearer, not from created_by. A dashboard session is human / operator. MC_TOKEN is agent / mc-token. Optional header Idempotency-Key.",
           security: bearerOnly,
+          parameters: [idempotencyHeader],
           requestBody: body({
             type: "object",
             required: ["agent_id", "body"],
@@ -682,6 +846,7 @@ export function openApiDocument(): Json {
             }),
             ...flatErrors,
             "404": jsonResponse("in_reply_to does not exist.", ref("Error")),
+            "409": idempotencyConflict,
             "503": jsonResponse("The messages table is not set up.", ref("Error")),
           },
         }),
@@ -716,11 +881,12 @@ export function openApiDocument(): Json {
           tags: ["tasks"],
           summary: "Create a task.",
           description:
-            "actor_type and actor_id on the returned task come from the authenticated credential. The body cannot set them. created_by is only a label.",
+            "actor_type and actor_id on the returned task come from the authenticated credential. The body cannot set them. created_by is only a label. Optional header Idempotency-Key. The key is not a body field.",
           security: cookieOrBearer,
+          parameters: [idempotencyHeader],
           requestBody: body(ref("CreateTask")),
           responses: {
-            "200": jsonResponse("The task was queued, or dropped in demo mode.", {
+            "200": jsonResponse("The task was queued, replayed for this Idempotency-Key, or dropped in demo mode.", {
               type: "object",
               properties: {
                 ok: { type: "boolean" },
@@ -730,6 +896,7 @@ export function openApiDocument(): Json {
               },
             }),
             ...flatErrors,
+            "409": idempotencyConflict,
           },
         }),
       },
@@ -778,6 +945,155 @@ export function openApiDocument(): Json {
             }),
             ...flatErrors,
             "404": jsonResponse("No task has this id when a database is connected.", ref("Error")),
+          },
+        }),
+      },
+      "/api/decisions": {
+        get: operation({
+          operationId: "listDecisions",
+          tags: ["decisions"],
+          summary: "Decision queue, oldest first.",
+          description:
+            "Dashboard session or MC_TOKEN. An agent credential is denied, including one that holds decisions:write, with 403 and code insufficient_scope. status defaults to open and also returns deferred rows whose defer_until has passed. shape defaults to row. shape=brief ignores status and source: decisions is the morning-brief list from complete github-label rows, and incomplete_repos names owner/name repos whose brief-eligible rows are missing kind, labels, opened_at, or repo_short. A rejected status, shape, repo, source, or limit is 400 validation_failed.",
+          security: cookieOrBearer,
+          parameters: [
+            query(
+              "status",
+              { type: "string", enum: [...LIST_STATUSES], default: "open" },
+              "open, decided, deferred, withdrawn, or all. Default open. Ignored when shape is brief.",
+            ),
+            query(
+              "shape",
+              { type: "string", enum: [...LIST_SHAPES], default: "row" },
+              "row is the queue. brief is the morning-brief decisions list plus incomplete_repos. Default row.",
+            ),
+            query("repo", { type: "string" }, "owner/name. Applies to row and brief."),
+            query("source", { type: "string" }, "Source slug. Ignored when shape is brief."),
+            query(
+              "limit",
+              { type: "integer", minimum: 1, maximum: 1000, default: 500 },
+              "Maximum rows. Default 500. Maximum 1000.",
+            ),
+          ],
+          responses: {
+            "200": jsonResponse("Queue rows, the morning-brief list, or an empty demo list.", {
+              oneOf: [
+                {
+                  type: "object",
+                  required: ["demo", "decisions"],
+                  description: "No database. shape is ignored.",
+                  properties: {
+                    demo: { type: "boolean", const: true },
+                    decisions: { type: "array", maxItems: 0, items: ref("Decision") },
+                  },
+                },
+                {
+                  type: "object",
+                  required: ["demo", "decisions"],
+                  description: "shape=row.",
+                  properties: {
+                    demo: { type: "boolean", const: false },
+                    decisions: { type: "array", items: ref("Decision") },
+                  },
+                },
+                {
+                  type: "object",
+                  required: ["demo", "decisions", "incomplete_repos"],
+                  description: "shape=brief.",
+                  properties: {
+                    demo: { type: "boolean", const: false },
+                    decisions: { type: "array", items: ref("BriefDecision") },
+                    incomplete_repos: { type: "array", items: { type: "string" } },
+                  },
+                },
+              ],
+            }),
+            ...flatErrors,
+          },
+        }),
+        post: operation({
+          operationId: "upsertDecision",
+          tags: ["decisions"],
+          summary: "Upsert one decision, or reconcile a collector sweep.",
+          description:
+            "Dashboard session or MC_TOKEN. An agent credential is denied, including one that holds decisions:write, with 403 and code insufficient_scope. Send either a decision (key, source, title) or { reconcile }, not both. A non-JSON body is 400 invalid_json. A missing key, source, or title is 400 missing_field. Any other rejected field is 400 validation_failed. With no database the response is ok, demo, and note, and the row is dropped.",
+          security: cookieOrBearer,
+          requestBody: body({ oneOf: [ref("DecisionUpsert"), ref("DecisionReconcile")] }),
+          responses: {
+            "200": jsonResponse("The stored row, the reconcile counts, or a demo acknowledgement.", {
+              oneOf: [
+                {
+                  type: "object",
+                  required: ["ok", "demo", "note"],
+                  properties: {
+                    ok: { type: "boolean", const: true },
+                    demo: { type: "boolean", const: true },
+                    note: { type: "string" },
+                  },
+                },
+                {
+                  type: "object",
+                  required: ["ok", "decision", "status_held"],
+                  properties: {
+                    ok: { type: "boolean", const: true },
+                    decision: ref("Decision"),
+                    status_held: {
+                      type: "boolean",
+                      description: "True when a decided or deferred row kept its status because force was not set.",
+                    },
+                  },
+                },
+                {
+                  type: "object",
+                  required: ["ok", "reconciled", "withdrawn"],
+                  properties: {
+                    ok: { type: "boolean", const: true },
+                    reconciled: { type: "integer" },
+                    withdrawn: { type: "integer" },
+                  },
+                },
+              ],
+            }),
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/decisions/{id}": {
+        patch: operation({
+          operationId: "patchDecision",
+          tags: ["decisions"],
+          summary: "Record a decision, a deferral, or a withdrawal.",
+          description:
+            "Dashboard session, MC_TOKEN, or an agent credential with decisions:write. An agent credential without that scope is 403 insufficient_scope. decided_by comes from the body, not from the credential. This records the row only. It does not comment on the GitHub issue or remove the label. A non-integer id is 400 validation_failed. A non-JSON body is 400 invalid_json. A body with none of status, decision, decided_by, or defer_until is 400 missing_field. An unknown id, when a database is connected, is 404 not_found and error stays Decision not found. Demo mode does not look the id up.",
+          security: cookieOrBearer,
+          parameters: [pathParam("id", "Decision id.", { type: "integer", minimum: 1 })],
+          requestBody: body(ref("PatchDecision")),
+          responses: {
+            "200": jsonResponse("The updated row, or a demo acknowledgement.", {
+              oneOf: [
+                {
+                  type: "object",
+                  required: ["ok", "demo"],
+                  properties: {
+                    ok: { type: "boolean", const: true },
+                    demo: { type: "boolean", const: true },
+                  },
+                },
+                {
+                  type: "object",
+                  required: ["ok", "decision"],
+                  properties: {
+                    ok: { type: "boolean", const: true },
+                    decision: ref("Decision"),
+                  },
+                },
+              ],
+            }),
+            ...flatErrors,
+            "404": jsonResponse(
+              "No decision has this id when a database is connected. code is not_found and error is Decision not found.",
+              ref("Error"),
+            ),
           },
         }),
       },

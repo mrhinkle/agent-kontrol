@@ -2,7 +2,9 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { API_ERRORS } from "../../src/lib/api-error";
 import { LABEL_MAX } from "../../src/lib/credentials";
+import { LIST_SHAPES, LIST_STATUSES } from "../../src/lib/decisions";
 import { PROGRESS_INGEST_KINDS } from "../../src/lib/progress-store";
 import { WINDOWS } from "../../src/lib/progress-config";
 import { MAX_REPOS } from "../../src/lib/repo-validation";
@@ -293,5 +295,54 @@ describe("OpenAPI document", () => {
 
     const ingest = schemaOf(doc, "ProgressIngest");
     assert.deepEqual((ingest.properties?.kind as { enum: string[] }).enum, [...PROGRESS_INGEST_KINDS]);
+  });
+
+  it("covers the decisions routes, decisions:write, and the api-error codes", () => {
+    const doc = openApiDocument();
+    const paths = doc.paths as Record<string, {
+      get?: { description?: string; parameters?: { name: string; schema: { enum?: string[] } }[] };
+      post?: { description?: string; requestBody?: { content: { "application/json": { schema: { oneOf?: { $ref?: string }[] } } } } };
+      patch?: { description?: string; requestBody?: { content: { "application/json": { schema: { $ref?: string } } } } };
+    }>;
+    const list = paths["/api/decisions"]?.get;
+    assert.ok(list, "GET /api/decisions is in the document");
+    assert.deepEqual(list.parameters?.find((item) => item.name === "status")?.schema.enum, [...LIST_STATUSES]);
+    assert.deepEqual(list.parameters?.find((item) => item.name === "shape")?.schema.enum, [...LIST_SHAPES]);
+    assert.match(list.description ?? "", /decisions:write/);
+
+    const post = paths["/api/decisions"]?.post;
+    const postRefs = post?.requestBody?.content["application/json"].schema.oneOf?.map((item) => item.$ref);
+    assert.deepEqual(postRefs, ["#/components/schemas/DecisionUpsert", "#/components/schemas/DecisionReconcile"]);
+    assert.match(post?.description ?? "", /decisions:write/);
+
+    const patch = paths["/api/decisions/{id}"]?.patch;
+    assert.equal(patch?.requestBody?.content["application/json"].schema.$ref, "#/components/schemas/PatchDecision");
+    assert.match(patch?.description ?? "", /decisions:write/);
+    assert.equal((schemaOf(doc, "PatchDecision").properties?.status as { enum: string[] }).enum.includes("decided"), true);
+
+    const decisions = fs.readFileSync("src/lib/decisions.ts", "utf8");
+    for (const name of ["Decision", "BriefDecision"]) {
+      const schema = schemaOf(doc, name);
+      const fields = interfaceFields(decisions, name);
+      assert.deepEqual(Object.keys(schema.properties ?? {}).sort(), fields.map((field) => field.name).sort());
+      assert.deepEqual(schema.required, fields.filter((field) => !field.optional).map((field) => field.name));
+    }
+
+    const code = schemaOf(doc, "Error").properties?.code as { enum: string[] };
+    assert.deepEqual(code.enum, [...new Set([...Object.keys(API_ERRORS), "insufficient_scope"])]);
+    assert.ok(code.enum.includes("not_found"));
+    assert.ok(code.enum.includes("validation_failed"));
+    assert.ok(code.enum.includes("idempotency_conflict"));
+
+    const writes = doc.paths as Record<string, { post?: { parameters?: { name: string; in: string }[]; responses?: Record<string, unknown> } }>;
+    for (const path of ["/api/tasks", "/api/messages", "/api/messages/reply"]) {
+      const params = writes[path]?.post?.parameters ?? [];
+      assert.equal(params.some((item) => item.in === "header" && item.name === "Idempotency-Key"), true, path);
+      assert.ok(writes[path]?.post?.responses?.["409"], `${path} documents the idempotency conflict`);
+    }
+    assert.equal(
+      (schemaOf(doc, "CreateCredential").properties?.scopes as { items: { enum: string[] } }).items.enum.includes("decisions:write"),
+      true,
+    );
   });
 });
