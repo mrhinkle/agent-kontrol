@@ -111,6 +111,8 @@ export function fingerprint(skill: {
   body: string;
   references: SkillReference[];
   runtimes: RuntimeFlags;
+  category?: string | null;
+  tags?: string[];
   frontmatter?: Record<string, unknown>;
 }): string {
   const refs = [...skill.references]
@@ -126,6 +128,8 @@ export function fingerprint(skill: {
     body: skill.body,
     refs,
     runtimes: skill.runtimes,
+    category: skill.category ?? null,
+    tags: skill.tags ?? [],
     frontmatter: skill.frontmatter ?? {},
   }));
 }

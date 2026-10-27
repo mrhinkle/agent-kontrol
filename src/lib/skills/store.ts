@@ -74,6 +74,23 @@ function asGlobs(value: unknown): string[] {
   return list.filter((item): item is string => typeof item === "string");
 }
 
+function asCategory(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function asTags(value: unknown): string[] {
+  const list = Array.isArray(value) ? value : typeof value === "string" ? safeArray(value) : [];
+  const tags: string[] = [];
+  for (const item of list) {
+    if (typeof item !== "string") continue;
+    const trimmed = item.trim();
+    if (trimmed) tags.push(trimmed);
+  }
+  return tags;
+}
+
 export async function listSources(): Promise<SkillSourceRow[]> {
   const rows = await db()`
     /* sk:list-sources */
@@ -97,7 +114,7 @@ export async function listSkillRows(): Promise<SkillRecord[]> {
   const rows = await db()`
     /* sk:list-skills */
     select id, source_id, path, name, description, version, sha, commit_sha, body,
-      "references" as references, runtimes, frontmatter, removed_at, synced_at
+      "references" as references, runtimes, frontmatter, category, tags, removed_at, synced_at
     from skills
   `;
   return rows.map(mapSkill);
@@ -116,6 +133,8 @@ export function mapSkill(row: Record<string, unknown>): SkillRecord {
     body: String(row.body ?? ""),
     references: asRefs(row.references),
     runtimes: asRuntimes(row.runtimes),
+    category: asCategory(row.category),
+    tags: asTags(row.tags),
     frontmatter: asObject(row.frontmatter),
     removed_at: iso(row.removed_at),
     synced_at: iso(row.synced_at) ?? new Date(0).toISOString(),
@@ -127,13 +146,15 @@ export async function upsertSkill(row: SkillRecord): Promise<void> {
     /* sk:upsert-skill */
     insert into skills (
       id, source_id, path, name, description, version, sha, commit_sha, body,
-      "references", runtimes, frontmatter, removed_at, synced_at
+      "references", runtimes, frontmatter, category, tags, removed_at, synced_at
     ) values (
       ${row.id}, ${row.source_id}, ${row.path}, ${row.name}, ${row.description}, ${row.version},
       ${row.sha}, ${row.commit_sha}, ${row.body},
       ${JSON.stringify(row.references)}::jsonb,
       ${JSON.stringify(row.runtimes)}::jsonb,
       ${JSON.stringify(row.frontmatter)}::jsonb,
+      ${row.category},
+      ${JSON.stringify(row.tags)}::jsonb,
       null, ${row.synced_at}::timestamptz
     )
     on conflict (id) do update set
@@ -148,6 +169,8 @@ export async function upsertSkill(row: SkillRecord): Promise<void> {
       "references" = excluded."references",
       runtimes = excluded.runtimes,
       frontmatter = excluded.frontmatter,
+      category = excluded.category,
+      tags = excluded.tags,
       removed_at = null,
       synced_at = excluded.synced_at
   `;

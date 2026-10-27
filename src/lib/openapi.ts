@@ -1308,14 +1308,15 @@ export function openApiDocument(): Json {
           tags: ["skills"],
           summary: "List mirrored skills.",
           description:
-            "Agent credentials need skills:read. runtime filters to skills compatible with that runtime. An unknown runtime is 400 validation_failed. q matches name and description, case-insensitive. Removed skills are omitted. With no database the body is demo true and a fixture list.",
+            "Agent credentials need skills:read. runtime filters to skills compatible with that runtime. An unknown runtime is 400 validation_failed. q matches name and description, case-insensitive. category is an exact case-insensitive match on the stored category. The value uncategorized matches a null category. The taxonomy is not enforced. Each skill includes category (string or null) and tags (string array). Removed skills are omitted. With no database the body is demo true and a fixture list.",
           security: cookieOrBearer,
           parameters: [
             query("runtime", { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] }, "Compatible runtime. Omit to return every skill."),
             query("q", { type: "string" }, "Case-insensitive match on name and description."),
+            query("category", { type: "string" }, "Exact category, case-insensitive. uncategorized matches a null category."),
           ],
           responses: {
-            "200": jsonResponse("demo, upstream, and skills. List runtimes is an array of names.", { type: "object" }),
+            "200": jsonResponse("demo, upstream, and skills. List runtimes is an array of names. Each skill has category and tags.", { type: "object" }),
             ...flatErrors,
           },
         }),
@@ -1374,7 +1375,7 @@ export function openApiDocument(): Json {
           tags: ["skills"],
           summary: "One skill, its body, and recent runs.",
           description:
-            "Agent credentials need skills:read. runtimes is an object of booleans, not the array used by the list. triggers status is done when the run ended, running inside the stall window, and stalled after it. outcome carries done or failed. Unknown id is 404.",
+            "Agent credentials need skills:read. runtimes is an object of booleans, not the array used by the list. category is a string or null. tags is an array of strings. Both come from SKILL.md and are not checked against a vocabulary. triggers status is done when the run ended, running inside the stall window, and stalled after it. outcome carries done or failed. Unknown id is 404.",
           security: cookieOrBearer,
           parameters: [pathParam("id", "Skill id. The directory slug.")],
           responses: {

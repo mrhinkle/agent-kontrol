@@ -29,6 +29,8 @@ function skill(partial: Partial<MemSkill> & Pick<MemSkill, "id">): MemSkill {
     body: partial.body ?? "Follow these steps.",
     references: partial.references ?? [{ path: "notes.md", content: "note body" }],
     runtimes: partial.runtimes ?? { claude: true, codex: true, grok: true, hermes: true, mini: true },
+    category: partial.category ?? null,
+    tags: partial.tags ?? [],
     frontmatter: {},
     removed_at: partial.removed_at ?? null,
     synced_at: NOW,
@@ -62,6 +64,32 @@ describe("skill MCP tools", { concurrency: false }, () => {
     setSkillNowForTests(null);
     if (savedDb === undefined) delete env.DATABASE_URL;
     else env.DATABASE_URL = savedDb;
+  });
+
+  it("filters by category, treats uncategorized as null, and prints tags", async () => {
+    skillsMemory.skills.push(skill({
+      id: "labeled",
+      description: "Labeled skill",
+      category: "Engineering Tools",
+      tags: ["fleet"],
+    }));
+    skillsMemory.settings.push({
+      skill_id: "labeled",
+      trigger: "on_request",
+      scope: { mode: "all", lanes: [] },
+      schedule: null,
+      updated_by: null,
+      updated_at: NOW,
+    });
+    const hit = textOf(await listSkillsTool({ category: "engineering tools" }));
+    assert.match(hit, /category filter: engineering tools/);
+    assert.match(hit, /category: Engineering Tools; tags: fleet/);
+    assert.equal(hit.includes("- open"), false);
+
+    const none = textOf(await listSkillsTool({ category: "uncategorized" }));
+    assert.match(none, /- open /);
+    assert.match(none, /category: uncategorized; tags: none/);
+    assert.equal(none.includes("labeled"), false);
   });
 
   it("hides off, removed, wrong runtime, and selected skills with no lane", async () => {

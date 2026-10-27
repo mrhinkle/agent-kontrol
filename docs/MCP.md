@@ -247,8 +247,9 @@ List skills the caller is allowed to see. Trigger `off` is omitted. There is no 
 | `runtime` | enum | no | `claude`, `codex`, `grok`, `hermes`, or `mini`. When omitted, the result says the runtime filter is off and does not hide incompatible skills. The server cannot infer a runtime from `agent_id`. |
 | `lane` | string | no | When omitted, skills whose scope is `selected` are hidden. `all` admits every lane. |
 | `query` | string | no | Case-insensitive match on the skill id and the description. |
+| `category` | string | no | Exact category, compared case-insensitively after trimming. The value `uncategorized` matches a skill whose category is null, and a skill whose category is that word. Any other value does not match a null category. The master-skills taxonomy is not enforced. |
 
-The text lists id, description, version, the first 7 hex characters of the content SHA, and the trigger.
+The text lists id, description, version, the first 7 hex characters of the content SHA, the trigger, the category (`uncategorized` when null), and the tags (`none` when the list is empty).
 
 ### get_skill
 
@@ -357,7 +358,15 @@ Reference files are text only. A file over 256 KB, or a file that would push the
 
 `GET /api/skills` and `GET /api/skills/:id` require `skills:read` for an agent credential. `PATCH /api/skills/:id`, `POST /api/skills/sync`, and `POST /api/skills/drift` are not in the agent scope table. A dashboard session or `MC_TOKEN` can call them. An agent credential cannot, including one that holds `skills:write`.
 
-`GET /api/skills?runtime=&q=` returns `{ demo, upstream, skills }`. Each skill's `runtimes` is an array of names. `GET /api/skills/:id` returns that same skill with `runtimes` as an object of booleans, plus `body`, `references` (paths only), `schedule`, and `triggers` (newest first, at most 50). An unknown runtime is HTTP 400. An unknown id is HTTP 404.
+`GET /api/skills?runtime=&q=&category=` returns `{ demo, upstream, skills }`. Each skill's `runtimes` is an array of names. Each skill also has `category` (string or null) and `tags` (array of strings), copied from SKILL.md frontmatter. `category` is one trimmed string. `tags` is a list of trimmed strings. A missing key is null or `[]`. Declared text is stored as written. It is not checked against the 16-value list in master-skills `TAXONOMY.md`. `category` on the query string is an exact case-insensitive match. The value `uncategorized` matches a null category. `GET /api/skills/:id` returns that same skill with `runtimes` as an object of booleans, plus `body`, `references` (paths only), `schedule`, and `triggers` (newest first, at most 50). An unknown runtime is HTTP 400. An unknown id is HTTP 404.
+
+### How a skill's runtimes are chosen
+
+`runtimes` is optional in SKILL.md. Of the 161 skills in the default sources, 3 declare `runtimes`. Inference is the common path.
+
+An explicit `runtimes` list in the SKILL.md frontmatter wins. The same key in `skill.json` or `manifest.json` is used only when the frontmatter has no `runtimes` key. The names are `claude`, `codex`, `grok`, `hermes`, and `mini`. An unknown name is ignored and does not add the other runtimes. A value that is not a list of names, or frontmatter that cannot be parsed, is stored as Claude-only. That is a failure of evaluation. It is not a decision that the skill runs on every runtime.
+
+With no list, a skill is Claude-only when the frontmatter has `allowed-tools`, or when the body contains `mcp__`, `AskUserQuestion`, `TodoWrite`, `Skill tool`, `Agent tool`, or `ExitPlanMode`. Anything else is compatible with all five runtimes.
 
 `PATCH` accepts `trigger`, `scope`, and `schedule`. Unknown keys are HTTP 400. `trigger` is `off`, `on_request`, `auto_inject`, or `scheduled`. `scope.mode` `all` stores `lanes` as `[]`. `selected` requires at least one lane. `scheduled` requires a five-field cron (`*`, numbers, ranges, lists, and steps; no names). Any other trigger clears `schedule`. A present non-null `schedule` that is not a five-field cron is HTTP 400. `dry_run` is rejected. The task dry-run helper does not apply to skill settings. Saving a skill whose runtimes are all false is allowed and adds `warnings`.
 

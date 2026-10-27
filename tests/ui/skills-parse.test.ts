@@ -155,6 +155,44 @@ describe("skill frontmatter and runtimes", () => {
     assert.equal(decision.problem, null);
   });
 
+  it("stores a trimmed category and tags list and does not enforce a taxonomy", () => {
+    const parsed = parseSkillMarkdown(
+      [
+        "---",
+        "name: labeled",
+        'category: " Engineering Tools "',
+        "tags:",
+        "  - fleet",
+        '  - " voice "',
+        '  - ""',
+        "---",
+        "Body",
+        "",
+      ].join("\n"),
+      "labeled",
+    );
+    assert.equal(parsed.parseProblem, null);
+    assert.equal(parsed.category, "Engineering Tools");
+    assert.deepEqual(parsed.tags, ["fleet", "voice"]);
+
+    const custom = parseSkillMarkdown(
+      "---\ncategory: Not In The Sixteen\ntags: [custom-tag, another]\n---\nBody\n",
+      "custom",
+    );
+    assert.equal(custom.parseProblem, null);
+    assert.equal(custom.category, "Not In The Sixteen");
+    assert.deepEqual(custom.tags, ["custom-tag", "another"]);
+
+    const absent = parseSkillMarkdown("---\nname: plain\n---\nBody\n", "plain");
+    assert.equal(absent.category, null);
+    assert.deepEqual(absent.tags, []);
+
+    const wrongShape = parseSkillMarkdown("---\ncategory:\n  - one\n  - two\ntags: 4\n---\nBody\n", "shaped");
+    assert.equal(wrongShape.parseProblem, null);
+    assert.equal(wrongShape.category, null);
+    assert.deepEqual(wrongShape.tags, []);
+  });
+
   it("hashes the raw SKILL.md bytes and does not normalise a trailing newline", () => {
     const raw = "---\nname: verify-gibson\n---\nBody\n";
     const expected = createHash("sha256").update(Buffer.from(raw, "utf8")).digest("hex");

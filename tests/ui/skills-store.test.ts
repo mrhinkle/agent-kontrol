@@ -171,6 +171,30 @@ describe("skill sync", { concurrency: false }, () => {
     assert.match(result.errors.map((item) => item.message).join("\n"), /tabs/);
   });
 
+  it("stores a trimmed category and a tags list from frontmatter", async () => {
+    const result = await syncSkills({
+      trigger: "manual",
+      fetcher: fetcher({
+        "master-skills": {
+          ...emptySnap("d".repeat(40)),
+          files: [{
+            path: "skills/labeled/SKILL.md",
+            content: "---\nname: labeled\ncategory: \" Writing \"\ntags:\n  - voice\n  - fleet\n---\nBody\n",
+          }],
+        },
+      }),
+    });
+    assert.equal(result.status, "ok");
+    const row = skillsMemory.skills.find((item) => item.id === "labeled");
+    assert.equal(row?.category, "Writing");
+    assert.deepEqual(row?.tags, ["voice", "fleet"]);
+    const listed = await listSkillViews({ category: "writing" });
+    assert.deepEqual(listed.skills.map((item) => item.id), ["labeled"]);
+    assert.deepEqual(listed.skills[0]?.tags, ["voice", "fleet"]);
+    const open = await listSkillViews({ category: "uncategorized" });
+    assert.deepEqual(open.skills, []);
+  });
+
   it("returns busy when a sync lease is already running", async () => {
     skillsMemory.syncRuns.push({
       id: "11111111-1111-4111-8111-111111111111",

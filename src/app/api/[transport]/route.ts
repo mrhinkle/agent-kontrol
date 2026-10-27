@@ -431,11 +431,12 @@ const handler = createMcpHandler(
       {
         title: "List skills",
         description:
-          "List skills whose trigger is not off, whose scope admits the lane, and which are compatible with runtime when runtime is passed. With no runtime, incompatible skills are not hidden. With no lane, selected-lane skills are hidden. Trigger off is omitted.",
+          "List skills whose trigger is not off, whose scope admits the lane, and which are compatible with runtime when runtime is passed. With no runtime, incompatible skills are not hidden. With no lane, selected-lane skills are hidden. Trigger off is omitted. category is an exact case-insensitive match. Pass uncategorized for skills with no category. Each line includes category and tags.",
         inputSchema: {
           runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional().describe("Caller runtime. Omit to skip the runtime filter."),
           lane: z.string().optional().describe("Lane name. Required to see skills limited to selected lanes."),
           query: z.string().optional().describe("Case-insensitive match on id and description."),
+          category: z.string().optional().describe("Exact category, case-insensitive. Pass uncategorized to list skills with no category."),
         },
       },
       async (args) => guardTool("list_skills", () => listSkillsTool(args)),

@@ -19,6 +19,8 @@ export interface AssembledSkill {
   body: string;
   references: SkillReference[];
   runtimes: RuntimeFlags;
+  category: string | null;
+  tags: string[];
   frontmatter: Record<string, unknown>;
   problems: string[];
 }
@@ -115,6 +117,8 @@ export function assembleSkills(input: {
       body: parsed.body,
       references,
       runtimes: decision.flags,
+      category: parsed.category,
+      tags: parsed.tags,
       frontmatter: parsed.frontmatter,
       problems,
     });

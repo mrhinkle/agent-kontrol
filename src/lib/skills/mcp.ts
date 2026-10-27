@@ -30,6 +30,7 @@ export async function listSkillsTool(args: {
   runtime?: string;
   lane?: string;
   query?: string;
+  category?: string;
 }): Promise<McpToolResult> {
   if (args.runtime && !isRuntime(args.runtime)) {
     return mcpToolError("validation_failed", { message: "runtime must be claude, codex, grok, hermes, or mini." });
@@ -38,16 +39,21 @@ export async function listSkillsTool(args: {
     ? `runtime filter: ${args.runtime}`
     : "runtime filter: none (caller did not pass runtime).";
   const laneLine = args.lane ? `Lane filter: ${args.lane}` : "Lane filter: none (selected-lane skills are hidden)";
+  const categoryLine = args.category?.trim()
+    ? `category filter: ${args.category.trim()}`
+    : "category filter: none";
   const skills = isConfigured() ? await liveList(args) : demoVisible(args);
   const q = args.query?.trim().toLowerCase() ?? "";
   const filtered = skills.filter(
     (skill) => !q || skill.id.toLowerCase().includes(q) || skill.description.toLowerCase().includes(q),
   );
-  const lines = filtered.map(
-    (skill) => `- ${skill.id} (${skill.version ?? "unversioned"}, ${shortSha(skill.sha)}) [${skill.trigger}] ${skill.description}`,
-  );
-  const body = lines.length ? lines.join("\n") : "No skills are visible for this runtime and lane.";
-  return text([runtimeLine, laneLine, "", body].join("\n"));
+  const lines = filtered.map((skill) => {
+    const tags = skill.tags.length ? skill.tags.join(", ") : "none";
+    const category = skill.category ?? "uncategorized";
+    return `- ${skill.id} (${skill.version ?? "unversioned"}, ${shortSha(skill.sha)}) [${skill.trigger}] category: ${category}; tags: ${tags} ${skill.description}`;
+  });
+  const body = lines.length ? lines.join("\n") : "No skills are visible for this runtime, lane, and category.";
+  return text([runtimeLine, laneLine, categoryLine, "", body].join("\n"));
 }
 
 export async function getSkillTool(args: {
@@ -112,15 +118,21 @@ export async function runSkillTool(args: {
   return text(started.text);
 }
 
-async function liveList(args: { runtime?: string; lane?: string }): Promise<{
+async function liveList(args: { runtime?: string; lane?: string; category?: string }): Promise<{
   id: string;
   version: string | null;
   sha: string;
   trigger: string;
   description: string;
+  category: string | null;
+  tags: string[];
 }[]> {
   const { listSkillViews } = await import("./query");
-  const listed = await listSkillViews({ runtime: args.runtime ?? null, q: null });
+  const listed = await listSkillViews({
+    runtime: args.runtime ?? null,
+    q: null,
+    category: args.category ?? null,
+  });
   return listed.skills.filter((skill) => {
     if (skill.trigger === "off") return false;
     if (skill.scope.mode === "selected" && !args.lane) return false;
@@ -129,8 +141,8 @@ async function liveList(args: { runtime?: string; lane?: string }): Promise<{
   });
 }
 
-function demoVisible(args: { runtime?: string; lane?: string }) {
-  return demoList({ runtime: args.runtime ?? null, q: null }).filter((skill) => {
+function demoVisible(args: { runtime?: string; lane?: string; category?: string }) {
+  return demoList({ runtime: args.runtime ?? null, q: null, category: args.category ?? null }).filter((skill) => {
     if (skill.trigger === "off") return false;
     if (skill.scope.mode === "selected" && !args.lane) return false;
     return scopeAdmits(skill.scope, args.lane);

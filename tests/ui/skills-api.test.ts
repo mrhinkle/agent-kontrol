@@ -48,6 +48,8 @@ function skill(partial: Partial<MemSkill> & Pick<MemSkill, "id">): MemSkill {
     synced_at: partial.synced_at ?? NOW,
     ...partial,
     id: partial.id,
+    category: partial.category ?? null,
+    tags: partial.tags ?? [],
   };
 }
 
@@ -101,6 +103,17 @@ describe("skills routes", { concurrency: false }, () => {
       const codex = await GET(new Request("http://localhost/api/skills?runtime=codex"));
       const codexIds = ((await codex.json()) as { skills: { id: string }[] }).skills.map((row) => row.id);
       assert.deepEqual(codexIds, ["verify-gibson", "spec-writer"]);
+
+      const writing = await GET(new Request("http://localhost/api/skills?category=WRITING"));
+      const writingSkills = ((await writing.json()) as { skills: { id: string; category: string | null; tags: string[] }[] }).skills;
+      assert.deepEqual(writingSkills.map((row) => row.id), ["operator-voice"]);
+      assert.equal(writingSkills[0]?.category, "Writing");
+      assert.deepEqual(writingSkills[0]?.tags, ["voice"]);
+      const uncategorized = await GET(new Request("http://localhost/api/skills?category=uncategorized"));
+      assert.deepEqual(
+        ((await uncategorized.json()) as { skills: { id: string }[] }).skills.map((row) => row.id),
+        ["verify-gibson"],
+      );
 
       const detail = await GET_ID(new Request("http://localhost/api/skills/verify-gibson"), {
         params: Promise.resolve({ id: "verify-gibson" }),
@@ -227,6 +240,34 @@ describe("skills routes", { concurrency: false }, () => {
       env.DATABASE_URL = "postgres://skills:skills@127.0.0.1:9/skills_test";
       env.MC_TOKEN = "test-mc-token";
       env.AK_SKILL_STALL_MINUTES = "60";
+    });
+
+    it("filters by category, including uncategorized, and returns tags on the detail", async () => {
+      const { GET } = await import("../../src/app/api/skills/route");
+      const { GET: GET_ID } = await import("../../src/app/api/skills/[id]/route");
+      skillsMemory.skills.push(
+        skill({ id: "labeled", description: "Has a category", category: "Engineering Tools", tags: ["fleet", "voice"] }),
+        skill({ id: "plain", description: "No category" }),
+        skill({ id: "same-word", description: "The word itself", category: "Uncategorized", tags: ["meta"] }),
+      );
+      const engineering = await GET(new Request("http://localhost/api/skills?category=engineering%20tools"));
+      const engineeringSkills = ((await engineering.json()) as { skills: { id: string; category: string | null; tags: string[] }[] }).skills;
+      assert.deepEqual(engineeringSkills.map((row) => row.id), ["labeled"]);
+      assert.equal(engineeringSkills[0]?.category, "Engineering Tools");
+      assert.deepEqual(engineeringSkills[0]?.tags, ["fleet", "voice"]);
+
+      const open = await GET(new Request("http://localhost/api/skills?category=uncategorized"));
+      assert.deepEqual(
+        ((await open.json()) as { skills: { id: string }[] }).skills.map((row) => row.id),
+        ["plain", "same-word"],
+      );
+
+      const detail = await GET_ID(new Request("http://localhost/api/skills/labeled"), {
+        params: Promise.resolve({ id: "labeled" }),
+      });
+      const item = await detail.json() as { category: string | null; tags: string[] };
+      assert.equal(item.category, "Engineering Tools");
+      assert.deepEqual(item.tags, ["fleet", "voice"]);
     });
 
     it("filters by runtime and query, and counts runs in one grouped query", async () => {
@@ -437,5 +478,15 @@ describe("skills contract files", () => {
     assert.match(docs, /does not store prompts/);
     assert.match(docs, /DATABASE_URL not set; skill run not stored/);
     assert.match(docs, /events\.agent_id/);
+    assert.match(docs, /3 declare `runtimes`/);
+    assert.match(docs, /uncategorized/);
+    assert.match(schema, /category text/);
+    assert.match(schema, /tags jsonb not null default '\[\]'::jsonb/);
+    assert.match(schema, /add column if not exists category text/);
+    const labels = fs.readFileSync("supabase/migrations/20261027_skills_labels.sql", "utf8");
+    assert.match(labels, /add column if not exists category text/);
+    assert.match(labels, /add column if not exists tags jsonb/);
+    const list = doc.paths["/api/skills"]?.get as { parameters?: { name?: string }[] };
+    assert.equal(list.parameters?.some((param) => param.name === "category"), true);
   });
 });

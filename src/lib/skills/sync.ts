@@ -179,6 +179,8 @@ async function runSync(options: SyncOptions, started: Date): Promise<Applied> {
       body: skill.body,
       references: skill.references,
       runtimes: skill.runtimes,
+      category: skill.category,
+      tags: skill.tags,
       frontmatter: skill.frontmatter,
       removed_at: null,
       synced_at: syncedAt,

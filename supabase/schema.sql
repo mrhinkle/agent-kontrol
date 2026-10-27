@@ -454,9 +454,13 @@ create table if not exists skills (
   "references" jsonb not null default '[]'::jsonb,
   runtimes jsonb not null,
   frontmatter jsonb not null default '{}'::jsonb,
+  category text,
+  tags jsonb not null default '[]'::jsonb,
   removed_at timestamptz,
   synced_at timestamptz not null default now()
 );
+alter table skills add column if not exists category text;
+alter table skills add column if not exists tags jsonb not null default '[]'::jsonb;
 
 create table if not exists skill_settings (
   skill_id text primary key references skills (id),

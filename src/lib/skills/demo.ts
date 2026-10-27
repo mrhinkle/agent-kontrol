@@ -3,6 +3,7 @@ import type { TimeWindow } from "../progress-config";
 import { skillContentSha, shortSha } from "./sha";
 import {
   emptyRuntimes,
+  matchesCategory,
   runtimeList,
   type Runtime,
   type RuntimeMap,
@@ -26,6 +27,8 @@ interface DemoSkill {
   runtimes: RuntimeMap;
   trigger: Trigger;
   scope: SkillListItem["scope"];
+  category: string | null;
+  tags: string[];
   schedule: string | null;
   references: { path: string; content: string }[];
 }
@@ -75,6 +78,8 @@ const DEMO_SKILLS: DemoSkill[] = [
     runtimes: allOn(),
     trigger: "on_request",
     scope: { mode: "all", lanes: [] },
+    category: null,
+    tags: [],
     schedule: null,
     references: [
       { path: "playbook.md", content: "Run the checks. Record what failed.\n" },
@@ -90,6 +95,8 @@ const DEMO_SKILLS: DemoSkill[] = [
     runtimes: only(["claude", "codex"]),
     trigger: "auto_inject",
     scope: { mode: "selected", lanes: ["conference-os", "chatterbuilt"] },
+    category: "Engineering",
+    tags: ["spec", "fleet"],
     schedule: null,
     references: [],
   },
@@ -102,6 +109,8 @@ const DEMO_SKILLS: DemoSkill[] = [
     runtimes: only(["claude"]),
     trigger: "on_request",
     scope: { mode: "all", lanes: [] },
+    category: "Writing",
+    tags: ["voice"],
     schedule: null,
     references: [],
   },
@@ -118,9 +127,10 @@ export function demoSkillRows(): DemoSkill[] {
   return DEMO_SKILLS;
 }
 
-export function demoList(filter: { runtime?: string | null; q?: string | null }): SkillListItem[] {
+export function demoList(filter: { runtime?: string | null; q?: string | null; category?: string | null }): SkillListItem[] {
   const q = filter.q?.trim().toLowerCase() ?? "";
   return DEMO_SKILLS.filter((skill) => !filter.runtime || skill.runtimes[filter.runtime as Runtime] === true)
+    .filter((skill) => matchesCategory(skill.category, filter.category))
     .filter((skill) => !q || skill.id.includes(q) || skill.description.toLowerCase().includes(q))
     .map((skill) => ({
       id: skill.id,
@@ -129,6 +139,8 @@ export function demoList(filter: { runtime?: string | null; q?: string | null })
       version: skill.version,
       sha: skillContentSha(skill.raw),
       runtimes: runtimeList(skill.runtimes),
+      category: skill.category,
+      tags: skill.tags,
       trigger: skill.trigger,
       scope: skill.scope,
       triggerCount7d: skill.id === "verify-gibson" ? 2 : 0,

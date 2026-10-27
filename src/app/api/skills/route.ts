@@ -9,9 +9,10 @@ import { isRuntime } from "@/lib/skills/types";
 export const dynamic = "force-dynamic";
 
 /**
- * GET /api/skills?runtime=&q=
+ * GET /api/skills?runtime=&q=&category=
  * Auth: enforceApi. Agent credentials need skills:read.
  * PATCH, sync, and drift are separate routes and are not in the agent scope table.
+ * category is an exact case-insensitive match. The value uncategorized matches null.
  */
 export async function GET(req: Request) {
   const denied = await enforceApi(req);
@@ -19,6 +20,7 @@ export async function GET(req: Request) {
   const url = new URL(req.url);
   const runtime = url.searchParams.get("runtime");
   const q = url.searchParams.get("q");
+  const category = url.searchParams.get("category");
   if (runtime != null && !isRuntime(runtime)) {
     return apiError("validation_failed", {
       message: "invalid runtime",
@@ -26,10 +28,10 @@ export async function GET(req: Request) {
     });
   }
   if (!isConfigured()) {
-    return NextResponse.json({ demo: true, upstream: demoUpstream(), skills: demoList({ runtime, q }) });
+    return NextResponse.json({ demo: true, upstream: demoUpstream(), skills: demoList({ runtime, q, category }) });
   }
   try {
-    const listed = await listSkillViews({ runtime, q });
+    const listed = await listSkillViews({ runtime, q, category });
     return NextResponse.json({ demo: false, upstream: listed.upstream, skills: listed.skills });
   } catch (err) {
     return publicError("[skills] list failed", err);

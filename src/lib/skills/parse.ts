@@ -8,11 +8,17 @@ export interface ParsedSkillFile {
   name: string;
   description: string;
   version: string | null;
+  /** Trimmed frontmatter `category`. Absent, blank, or not a single string is null. */
+  category: string | null;
+  /** Trimmed frontmatter `tags`. Absent or not a list of strings is []. */
+  tags: string[];
   frontmatter: Record<string, unknown>;
   body: string;
   /** Set when the frontmatter could not be read. The body may still be present. */
   parseProblem: string | null;
 }
+
+const NO_LABELS = { category: null, tags: [] as string[] };
 
 const SLUG = /^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$/;
 
@@ -29,6 +35,7 @@ export function parseSkillMarkdown(raw: string, directoryName: string): ParsedSk
       name: directoryName,
       description: "",
       version: null,
+      ...NO_LABELS,
       frontmatter: {},
       body: split.body,
       parseProblem: split.error,
@@ -39,6 +46,7 @@ export function parseSkillMarkdown(raw: string, directoryName: string): ParsedSk
       name: directoryName,
       description: "",
       version: null,
+      ...NO_LABELS,
       frontmatter: {},
       body: split.body,
       parseProblem: null,
@@ -50,20 +58,54 @@ export function parseSkillMarkdown(raw: string, directoryName: string): ParsedSk
       name: directoryName,
       description: "",
       version: null,
+      ...NO_LABELS,
       frontmatter: {},
       body: split.body,
       parseProblem: parsed.error,
     };
   }
   const display = typeof parsed.data.name === "string" && parsed.data.name.trim() ? parsed.data.name.trim() : directoryName;
+  const labels = labelsFromFrontmatter(parsed.data);
   return {
     name: display,
     description: typeof parsed.data.description === "string" ? parsed.data.description : "",
     version: versionFrom(parsed.data),
+    category: labels.category,
+    tags: labels.tags,
     frontmatter: parsed.data,
     body: split.body,
     parseProblem: null,
   };
+}
+
+/**
+ * `category` is one trimmed string. `tags` is a list of trimmed strings.
+ * A missing key is null or []. The master-skills taxonomy is not checked:
+ * any declared string is stored. A value that is not that shape is ignored,
+ * and the rest of the file still parses.
+ */
+export function labelsFromFrontmatter(data: Record<string, unknown>): { category: string | null; tags: string[] } {
+  return {
+    category: categoryFrom(data.category),
+    tags: tagsFrom(data.tags),
+  };
+}
+
+function categoryFrom(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function tagsFrom(value: unknown): string[] {
+  const items = Array.isArray(value) ? value : typeof value === "string" ? [value] : [];
+  const tags: string[] = [];
+  for (const item of items) {
+    if (typeof item !== "string") continue;
+    const trimmed = item.trim();
+    if (trimmed) tags.push(trimmed);
+  }
+  return tags;
 }
 
 function versionFrom(data: Record<string, unknown>): string | null {

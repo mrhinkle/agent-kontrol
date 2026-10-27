@@ -18,6 +18,8 @@ export interface MemSkill {
   body: string;
   references: { path: string; content: string }[];
   runtimes: Record<string, boolean>;
+  category: string | null;
+  tags: string[];
   frontmatter: Record<string, unknown>;
   removed_at: string | null;
   synced_at: string;
@@ -278,8 +280,10 @@ function upsertSkill(values: unknown[]): Row[] {
     references: json(values[9], []),
     runtimes: json(values[10], {}),
     frontmatter: json(values[11], {}),
+    category: values[12] == null || String(values[12]).trim() === "" ? null : String(values[12]),
+    tags: json<string[]>(values[13], []),
     removed_at: null,
-    synced_at: String(values[12]),
+    synced_at: String(values[14]),
   };
   const index = skillsMemory.skills.findIndex((skill) => skill.id === row.id);
   if (index >= 0) skillsMemory.skills[index] = row;

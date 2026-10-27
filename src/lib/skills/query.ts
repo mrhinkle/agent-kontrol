@@ -16,6 +16,7 @@ import {
 import {
   DEFAULT_SCOPE,
   DEFAULT_TRIGGER,
+  matchesCategory,
   runtimeList,
   type SettingsRecord,
   type SkillDetail,
@@ -56,7 +57,11 @@ export async function readUpstream(): Promise<UpstreamInfo> {
   };
 }
 
-export async function listSkillViews(filter: { runtime?: string | null; q?: string | null }): Promise<{
+export async function listSkillViews(filter: {
+  runtime?: string | null;
+  q?: string | null;
+  category?: string | null;
+}): Promise<{
   upstream: UpstreamInfo;
   skills: SkillListItem[];
 }> {
@@ -74,6 +79,7 @@ export async function listSkillViews(filter: { runtime?: string | null; q?: stri
   const skills = rows
     .filter((row) => !row.removed_at)
     .filter((row) => !filter.runtime || row.runtimes[filter.runtime as keyof typeof row.runtimes] === true)
+    .filter((row) => matchesCategory(row.category, filter.category))
     .filter((row) => {
       if (!q) return true;
       return row.name.toLowerCase().includes(q) || row.description.toLowerCase().includes(q);
@@ -147,6 +153,8 @@ function toListItem(
     version: row.version,
     sha: row.sha,
     runtimes: runtimeList(row.runtimes),
+    category: row.category,
+    tags: row.tags,
     trigger: setting?.trigger ?? DEFAULT_TRIGGER,
     scope: setting?.scope ?? DEFAULT_SCOPE,
     triggerCount7d: stat?.triggers_7d ?? 0,

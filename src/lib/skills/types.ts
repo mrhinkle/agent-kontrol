@@ -58,6 +58,10 @@ export interface SkillRecord {
   body: string;
   references: SkillReference[];
   runtimes: RuntimeFlags;
+  /** Trimmed SKILL.md `category`. Null when the file does not declare one. */
+  category: string | null;
+  /** Trimmed SKILL.md `tags`. Empty when the file does not declare any. */
+  tags: string[];
   frontmatter: Record<string, unknown>;
   removed_at: string | null;
   synced_at: string;
@@ -182,6 +186,21 @@ export function runtimeNames(flags: RuntimeFlags): Runtime[] {
   return RUNTIMES.filter((name) => flags[name]);
 }
 
+/**
+ * Exact match, case-insensitive, after trim.
+ * A blank filter matches every skill.
+ * The filter `uncategorized` matches a null or blank category, and a category
+ * whose text is that word. Any other filter does not match a null category.
+ */
+export function matchesCategory(category: string | null | undefined, filter: string | null | undefined): boolean {
+  if (filter == null) return true;
+  const wanted = filter.trim().toLowerCase();
+  if (!wanted) return true;
+  const stored = (category ?? "").trim().toLowerCase();
+  if (wanted === "uncategorized") return stored === "" || stored === "uncategorized";
+  return stored === wanted;
+}
+
 /** List and pointer text use this name. Same function as `runtimeNames`. */
 export const runtimeList = runtimeNames;
 
@@ -208,6 +227,8 @@ export interface SkillListItem {
   sha: string;
   /** Compatible runtime names. The detail object uses flags instead. */
   runtimes: Runtime[];
+  category: string | null;
+  tags: string[];
   trigger: Trigger;
   scope: SkillScope;
   triggerCount7d: number;
