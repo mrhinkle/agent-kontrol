@@ -426,4 +426,20 @@ Limits:
 
 `AK_SKILL_STALL_MINUTES` is the stall window. The default is 60. A non-integer, a value below 1, or a value above 10080 falls back to 60, so a bad setting does not hide stalls. More than three stalled runs roll into one `skillStalled` alert. The id starts with `skill-stalled:`.
 
-`renderLaneSkillPointers` builds the AGENTS.md block for skills whose trigger is `auto_inject`, which match the runtime, and whose scope admits the lane. Dispatch is not wired to it. The block is ordered by id and wrapped in `<!-- ak-skills:begin -->` and `<!-- ak-skills:end -->`. No matching skill returns an empty string, with no markers.
+`renderLaneSkillPointers` builds the AGENTS.md block for skills whose trigger is `auto_inject`, which match the runtime, and whose scope admits the lane. The block is ordered by id and wrapped in `<!-- ak-skills:begin -->` and `<!-- ak-skills:end -->`. No matching skill returns an empty string, with no markers.
+
+#### Dispatch and AGENTS.md
+
+What is wired: two read routes and a pure helper. What is not: no Agent Kontrol process opens a repo or writes an AGENTS.md. `agents/dispatcher/mc_dispatcher.py` does not call these routes. The Grok and Codex lane dispatcher lives outside this repo, so it has to make the call.
+
+- `GET /api/skills/pointers?lane=&runtime=&format=json|text` returns the block. `lane` and `runtime` are required. JSON is `{ demo, lane, runtime, empty, block }`. `format=text` returns the block as `text/plain`, or an empty body when nothing matches. Agent credentials need `skills:read`.
+- `POST /api/skills/pointers` takes `{ lane, runtime, agents_md }` and returns `{ demo, lane, runtime, empty, changed, content }`. `content` is the file text with the block inserted at the end, replaced in place, or removed when `empty` is true. Text outside the markers is untouched, CRLF files stay CRLF, and a second run reports `changed: false`. Duplicate blocks collapse into one. `agents_md` omitted or null means the file does not exist: `content` is null when there is nothing to write. A begin marker without an end, an end without a begin, or a nested begin is HTTP 400. The route stores nothing and writes no file. The same needs `skills:read`.
+- `applyPointerBlock(content, block)` in `src/lib/skills/agents-md.ts` is the helper behind POST.
+
+One line for a dispatcher, run in the target repo before the lane starts. It needs `jq`, `curl`, and `MC_URL`/`MC_TOKEN`. Use the lane name the skill scopes use and the runtime that will read the file:
+
+```bash
+f=AGENTS.md; r=$( { [ -f "$f" ] && jq -Rs --arg l "$LANE" --arg r "$RUNTIME" '{lane:$l,runtime:$r,agents_md:.}' "$f" || jq -n --arg l "$LANE" --arg r "$RUNTIME" '{lane:$l,runtime:$r}'; } | curl -fsS -X POST "$MC_URL/api/skills/pointers" -H "Authorization: Bearer $MC_TOKEN" -H 'Content-Type: application/json' --data-binary @- ) && [ "$(jq -r .changed <<<"$r")" = true ] && jq -j '.content // empty' <<<"$r" > "$f"
+```
+
+It writes the file only when `changed` is true and the content is not null. If the call fails the file is left as it was, so a lane still starts without pointers. Do not commit the result: the block is per-lane and belongs in the working tree.

@@ -1321,6 +1321,46 @@ export function openApiDocument(): Json {
           },
         }),
       },
+      "/api/skills/pointers": {
+        get: operation({
+          operationId: "getSkillPointers",
+          tags: ["skills"],
+          summary: "The AGENTS.md pointer block for a lane.",
+          description:
+            "Agent credentials need skills:read. Returns the block between <!-- ak-skills:begin --> and <!-- ak-skills:end --> for skills whose trigger is auto_inject, which match runtime, and whose scope admits lane. lane and runtime are required; a bad value is 400 validation_failed. empty is true and block is \"\" when nothing matches. format=text returns the block as text/plain, or an empty body.",
+          security: cookieOrBearer,
+          parameters: [
+            query("lane", { type: "string" }, "Lane name. Selected-scope skills match only an exact lane.", { required: true }),
+            query("runtime", { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] }, "Runtime that will read the file.", { required: true }),
+            query("format", { type: "string", enum: ["json", "text"] }, "json (default) or text."),
+          ],
+          responses: {
+            "200": jsonResponse("demo, lane, runtime, empty, and block.", { type: "object" }),
+            ...flatErrors,
+          },
+        }),
+        post: operation({
+          operationId: "applySkillPointers",
+          tags: ["skills"],
+          summary: "Apply the pointer block to an AGENTS.md text.",
+          description:
+            "Agent credentials need skills:read. Nothing is stored and no file is written. The block is inserted at the end, replaced in place, or removed when empty. Text outside the markers is preserved, CRLF is kept, and a second run changes nothing. agents_md omitted or null means the file does not exist: content is null when there is nothing to write. An unpaired or nested marker in agents_md is 400 validation_failed.",
+          security: cookieOrBearer,
+          requestBody: body({
+            type: "object",
+            required: ["lane", "runtime"],
+            properties: {
+              lane: { type: "string" },
+              runtime: { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] },
+              agents_md: { type: ["string", "null"] },
+            },
+          }),
+          responses: {
+            "200": jsonResponse("demo, lane, runtime, empty, changed, and content (string or null).", { type: "object" }),
+            ...flatErrors,
+          },
+        }),
+      },
       "/api/skills/sync": {
         post: operation({
           operationId: "syncSkills",
