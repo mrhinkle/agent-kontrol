@@ -230,7 +230,7 @@ function dispatch(marker: string, values: unknown[]): Row[] {
     case "sk:latest-sync":
       return skillsMemory.syncRuns
         .map((row, index) => ({ row, index }))
-        .filter(({ row }) => row.status === "ok" && row.finished_at)
+        .filter(({ row }) => row.finished_at && recordedCommit(row.summary))
         .sort((a, b) => {
           const time = String(b.row.finished_at).localeCompare(String(a.row.finished_at));
           return time !== 0 ? time : b.index - a.index;
@@ -248,12 +248,14 @@ function dispatch(marker: string, values: unknown[]): Row[] {
       return recentRuns(String(values[0]), Number(values[1]));
     case "sk:insert-run":
       return insertRun(values);
-    case "sk:get-run":
-      return skillsMemory.runs.filter((row) => row.run_id === String(values[0])).map((row) => ({ ...row }));
+    case "sk:get-run": {
+      const runId = uuidOrThrow(values[0]);
+      return skillsMemory.runs.filter((row) => row.run_id === runId).map((row) => ({ ...row }));
+    }
     case "sk:complete-run":
       return completeRun(values);
     case "sk:delete-run":
-      skillsMemory.runs = skillsMemory.runs.filter((row) => row.run_id !== String(values[0]));
+      skillsMemory.runs = skillsMemory.runs.filter((row) => row.run_id !== uuidOrThrow(values[0]));
       return [];
     case "sk:list-drift":
       return skillsMemory.drift.map((row) => ({ ...row, entries: row.entries }));
@@ -266,37 +268,56 @@ function dispatch(marker: string, values: unknown[]): Row[] {
   }
 }
 
+function recordedCommit(summary: unknown): boolean {
+  if (!summary || typeof summary !== "object") return false;
+  const sources = (summary as { sources?: unknown }).sources;
+  if (!Array.isArray(sources)) return false;
+  return sources.some((item) => {
+    if (!item || typeof item !== "object") return false;
+    const sha = (item as { commit_sha?: unknown }).commit_sha;
+    return typeof sha === "string" && sha !== "";
+  });
+}
+
+function syncStillRunning(runId: string): boolean {
+  return skillsMemory.syncRuns.some((row) => row.id === runId && row.status === "running");
+}
+
 function upsertSkill(values: unknown[]): Row[] {
+  const runId = String(values[0]);
+  if (!syncStillRunning(runId)) return [{ owned: 0, wrote: 0 }];
   const row: MemSkill = {
-    id: String(values[0]),
-    source_id: String(values[1]),
-    path: String(values[2]),
-    name: String(values[3]),
-    description: String(values[4]),
-    version: values[5] == null ? null : String(values[5]),
-    sha: String(values[6]),
-    commit_sha: values[7] == null ? null : String(values[7]),
-    body: String(values[8]),
-    references: json(values[9], []),
-    runtimes: json(values[10], {}),
-    frontmatter: json(values[11], {}),
-    category: values[12] == null || String(values[12]).trim() === "" ? null : String(values[12]),
-    tags: json<string[]>(values[13], []),
+    id: String(values[1]),
+    source_id: String(values[2]),
+    path: String(values[3]),
+    name: String(values[4]),
+    description: String(values[5]),
+    version: values[6] == null ? null : String(values[6]),
+    sha: String(values[7]),
+    commit_sha: values[8] == null ? null : String(values[8]),
+    body: String(values[9]),
+    references: json(values[10], []),
+    runtimes: json(values[11], {}),
+    frontmatter: json(values[12], {}),
+    category: values[13] == null || String(values[13]).trim() === "" ? null : String(values[13]),
+    tags: json<string[]>(values[14], []),
     removed_at: null,
-    synced_at: String(values[14]),
+    synced_at: String(values[15]),
   };
   const index = skillsMemory.skills.findIndex((skill) => skill.id === row.id);
   if (index >= 0) skillsMemory.skills[index] = row;
   else skillsMemory.skills.push(row);
-  return [];
+  return [{ owned: 1, wrote: 1 }];
 }
 
 function removeSkill(values: unknown[]): Row[] {
-  const at = String(values[0]);
-  const id = String(values[1]);
+  const runId = String(values[0]);
+  if (!syncStillRunning(runId)) return [{ owned: 0, wrote: 0 }];
+  const at = String(values[1]);
+  const id = String(values[2]);
   const row = skillsMemory.skills.find((skill) => skill.id === id && skill.removed_at == null);
   if (row) row.removed_at = at;
-  return [];
+  return [{ owned: 1, wrote: row ? 1 : 0 }];
 }
 
 function expireSync(values: unknown[]): Row[] {
@@ -337,7 +358,7 @@ function finishSync(values: unknown[]): Row[] {
   row.status = String(values[1]);
   row.summary = json(values[2], null);
   row.error = values[3] == null ? null : String(values[3]);
-  return [];
+  return [{ id: row.id }];
 }
 
 function insertSync(values: unknown[]): Row[] {
@@ -414,11 +435,19 @@ function insertRun(values: unknown[]): Row[] {
   return [];
 }
 
+function uuidOrThrow(value: unknown): string {
+  const text = String(value ?? "");
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(text)) {
+    throw Object.assign(new Error(`invalid input syntax for type uuid: "${text}"`), { code: "22P02" });
+  }
+  return text;
+}
+
 function completeRun(values: unknown[]): Row[] {
   const endedAt = String(values[0]);
   const status = String(values[1]);
   const note = values[2] == null ? null : String(values[2]);
-  const runId = String(values[3]);
+  const runId = uuidOrThrow(values[3]);
   const actorType = String(values[4]);
   const actorId = String(values[5]);
   const row = skillsMemory.runs.find(

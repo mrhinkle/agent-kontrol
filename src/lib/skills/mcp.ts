@@ -4,6 +4,7 @@ import { demoDetail, demoList, demoReference, demoSkillRows } from "./demo";
 import { scopeAdmits } from "./settings";
 import { skillContentSha, shortSha } from "./sha";
 import { finishSkillRun, gateSkill, renderReferenceText, renderSkillText, startSkillRun } from "./runs";
+import { isUuid } from "./store";
 import { isRuntime, type Runtime } from "./types";
 
 /**
@@ -75,7 +76,7 @@ export async function getSkillTool(args: {
 }
 
 export async function runSkillTool(args: {
-  id: string;
+  id?: string;
   agent_id?: string;
   runtime?: string;
   lane?: string;
@@ -91,16 +92,20 @@ export async function runSkillTool(args: {
     return mcpToolError("validation_failed", { message: "complete:true requires run_id." });
   }
   if (args.complete === true && args.run_id) {
-    if (!isConfigured()) {
-      const gated = await demoGate(args.id, args.runtime, args.lane);
-      if (!gated.ok) return fromFail(gated);
-      return text(DEMO_RUN_NOTE);
+    // Demo mode stores no run, so there is no row to derive the skill from.
+    if (!isUuid(args.run_id) || !isConfigured()) {
+      return mcpToolError("not_found", { message: "Skill run not found." });
     }
-    const finished = await finishSkillRun({ runId: args.run_id, status: args.status, note: args.note });
+    const finished = await finishSkillRun({
+      runId: args.run_id,
+      skillId: args.id,
+      status: args.status,
+      note: args.note,
+    });
     if (!finished.ok) return fromFail(finished);
     return text(finished.text);
   }
-  if (!args.agent_id || !args.runtime) {
+  if (!args.id || !args.agent_id || !args.runtime) {
     return mcpToolError("validation_failed", { message: "A start requires id, agent_id, and runtime." });
   }
   if (!isConfigured()) {

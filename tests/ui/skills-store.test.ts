@@ -151,7 +151,7 @@ describe("skill sync", { concurrency: false }, () => {
     assert.equal(failed.upstream.sha, "a".repeat(40));
   });
 
-  it("keeps the earlier source on an id collision and stores malformed frontmatter as claude-only", async () => {
+  it("keeps the earlier source on an id collision and does not store malformed frontmatter", async () => {
     const broken = "---\nname: broken\n\tdescription: tabs\n---\nbody\n";
     const result = await syncSkills({
       trigger: "manual",
@@ -165,9 +165,8 @@ describe("skill sync", { concurrency: false }, () => {
     assert.equal(shared?.source_id, "master-skills");
     assert.match(shared?.body ?? "", /from master/);
     assert.equal(result.conflicts.some((item) => item.id === "shared" && item.kept_source === "master-skills"), true);
-    const row = skillsMemory.skills.find((item) => item.id === "broken");
-    assert.equal(row?.runtimes.claude, true);
-    assert.equal(row?.runtimes.codex, false);
+    assert.equal(skillsMemory.skills.find((item) => item.id === "broken"), undefined);
+    assert.equal(result.added.some((item) => item.id === "broken"), false);
     assert.match(result.errors.map((item) => item.message).join("\n"), /tabs/);
   });
 

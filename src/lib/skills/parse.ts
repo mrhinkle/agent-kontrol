@@ -10,7 +10,7 @@ export interface ParsedSkillFile {
   version: string | null;
   /** Trimmed frontmatter `category`. Absent, blank, or not a single string is null. */
   category: string | null;
-  /** Trimmed frontmatter `tags`. Absent or not a list of strings is []. */
+  /** Trimmed frontmatter `tags`. A scalar string is a one-element list. Absent, blank, or any other shape is []. */
   tags: string[];
   frontmatter: Record<string, unknown>;
   body: string;
@@ -80,9 +80,10 @@ export function parseSkillMarkdown(raw: string, directoryName: string): ParsedSk
 
 /**
  * `category` is one trimmed string. `tags` is a list of trimmed strings.
- * A missing key is null or []. The master-skills taxonomy is not checked:
- * any declared string is stored. A value that is not that shape is ignored,
- * and the rest of the file still parses.
+ * A scalar string tag is kept as a one-element list. Absent, blank, or any
+ * other shape is []. The master-skills taxonomy is not checked: any declared
+ * string is stored. A value that is not that shape is ignored, and the rest
+ * of the file still parses.
  */
 export function labelsFromFrontmatter(data: Record<string, unknown>): { category: string | null; tags: string[] } {
   return {

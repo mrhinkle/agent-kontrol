@@ -187,6 +187,9 @@ describe("skill frontmatter and runtimes", () => {
     assert.equal(absent.category, null);
     assert.deepEqual(absent.tags, []);
 
+    const scalar = parseSkillMarkdown("---\nname: plain\ntags: voice\n---\nBody\n", "plain");
+    assert.deepEqual(scalar.tags, ["voice"]);
+
     const wrongShape = parseSkillMarkdown("---\ncategory:\n  - one\n  - two\ntags: 4\n---\nBody\n", "shaped");
     assert.equal(wrongShape.parseProblem, null);
     assert.equal(wrongShape.category, null);

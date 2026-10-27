@@ -1,5 +1,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { runWithActor } from "../../src/lib/actor";
 import { setSqlForTests } from "../../src/lib/db";
 import { setSkillNowForTests } from "../../src/lib/skills/clock";
@@ -14,6 +16,21 @@ const savedDb = env.DATABASE_URL;
 
 function textOf(result: { content?: { text?: string }[]; isError?: boolean }): string {
   return result.content?.[0]?.text ?? "";
+}
+
+function activeHandles(): { unref?: () => void }[] {
+  const get = (process as unknown as { _getActiveHandles?: () => { unref?: () => void }[] })._getActiveHandles;
+  return get ? get() : [];
+}
+
+function toolPayload(raw: string): { isError: boolean; text: string } {
+  const line = raw.split("\n").find((item) => item.startsWith("data: "));
+  if (!line) throw new Error(raw.slice(0, 600));
+  const msg = JSON.parse(line.slice("data: ".length)) as {
+    result?: { isError?: boolean; content?: { text?: string }[] };
+  };
+  if (!msg.result) throw new Error(raw.slice(0, 600));
+  return { isError: msg.result.isError === true, text: msg.result.content?.[0]?.text ?? "" };
 }
 
 function skill(partial: Partial<MemSkill> & Pick<MemSkill, "id">): MemSkill {
@@ -263,6 +280,85 @@ describe("skill MCP tools", { concurrency: false }, () => {
     });
     const listed = textOf(await listSkillsTool({ lane: "conference-os" }));
     assert.equal(listed.includes("- open"), false);
+  });
+
+  it("returns not_found for a run_id that is not a uuid and does not query", async () => {
+    const before = callsOf("sk:get-run");
+    const result = await runWithActor(actorA, () => finishSkillRun({ runId: "not-a-uuid" }));
+    assert.equal(result.ok, false);
+    if (!result.ok) assert.equal(result.code, "not_found");
+    assert.equal(callsOf("sk:get-run"), before);
+    assert.equal(callsOf("sk:complete-run"), 0);
+  });
+
+  it("accepts a completion that omits id on the registered run_skill schema", async () => {
+    const savedToken = env.MC_TOKEN;
+    env.MC_TOKEN = "skills-mcp-token";
+    const before = new Set(activeHandles());
+    const origInterval = global.setInterval;
+    global.setInterval = ((fn: TimerHandler, ms?: number) => {
+      const timer = origInterval(fn, ms);
+      (timer as { unref?: () => void }).unref?.();
+      return timer;
+    }) as typeof setInterval;
+    try {
+      const { POST } = await import(pathToFileURL(path.join(process.cwd(), "src/app/api/[transport]/route.ts")).href);
+      const call = (args: Record<string, unknown>) =>
+        POST(new Request("http://localhost/api/mcp", {
+          method: "POST",
+          headers: {
+            authorization: "Bearer skills-mcp-token",
+            "content-type": "application/json",
+            accept: "application/json, text/event-stream",
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: { name: "run_skill", arguments: args },
+          }),
+        }));
+
+      const missingId = toolPayload(await (await call({ agent_id: "g", runtime: "grok" })).text());
+      assert.equal(missingId.isError, true);
+      assert.match(missingId.text, /"code":"validation_failed"/);
+      assert.match(missingId.text, /id, agent_id, and runtime/);
+      assert.equal(missingId.text.includes("Required"), false);
+
+      const started = toolPayload(await (await call({ id: "open", agent_id: "g", runtime: "grok" })).text());
+      assert.notEqual(started.isError, true, started.text.slice(0, 400));
+      assert.match(started.text, /Omit id/);
+      const runId = started.text.match(/run_id: ([0-9a-f-]{36})/)?.[1];
+      assert.ok(runId);
+
+      const queriesBefore = callsOf("sk:get-run");
+      const badUuid = toolPayload(await (await call({ run_id: "not-a-uuid", complete: true })).text());
+      assert.equal(badUuid.isError, true);
+      assert.match(badUuid.text, /"code":"not_found"/);
+      assert.equal(badUuid.text.includes("invalid input syntax"), false);
+      assert.equal(callsOf("sk:get-run"), queriesBefore);
+
+      const mismatch = toolPayload(await (await call({ id: "picked", run_id: runId, complete: true })).text());
+      assert.equal(mismatch.isError, true);
+      assert.match(mismatch.text, /"code":"validation_failed"/);
+      assert.match(mismatch.text, /does not match/);
+      assert.equal(skillsMemory.runs[0]?.ended_at, null);
+      assert.equal(skillsMemory.runs[0]?.skill_id, "open");
+
+      const done = toolPayload(await (await call({ run_id: runId, complete: true })).text());
+      assert.notEqual(done.isError, true, done.text.slice(0, 400));
+      assert.match(done.text, /status: done/);
+      assert.equal(done.text.includes("Required"), false);
+      assert.equal(skillsMemory.runs[0]?.status, "done");
+      assert.equal(skillsMemory.runs[0]?.skill_id, "open");
+    } finally {
+      global.setInterval = origInterval;
+      if (savedToken === undefined) delete env.MC_TOKEN;
+      else env.MC_TOKEN = savedToken;
+      for (const handle of activeHandles()) {
+        if (!before.has(handle)) handle.unref?.();
+      }
+    }
   });
 
   it("does not store a demo run and still rejects an incompatible runtime", async () => {

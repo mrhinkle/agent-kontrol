@@ -1,5 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { setSqlForTests } from "../../src/lib/db";
 import { setSkillNowForTests } from "../../src/lib/skills/clock";
 import { syncSkills } from "../../src/lib/skills/sync";
@@ -173,7 +174,7 @@ describe("skill sync", { concurrency: false }, () => {
     assert.equal(result.conflicts[0]?.path, "skills/dup/SKILL.md");
   });
 
-  it("stores a parse problem as claude-only and marks the sync failed", async () => {
+  it("skips a new skill with a parse problem and marks the sync failed", async () => {
     const result = await syncSkills({
       trigger: "manual",
       fetcher: fetcher({
@@ -184,12 +185,9 @@ describe("skill sync", { concurrency: false }, () => {
       }),
     });
     assert.equal(result.status, "failed");
-    assert.equal(result.added[0]?.id, "bad");
-    assert.equal(skillsMemory.skills[0]?.runtimes.claude, true);
-    assert.equal(skillsMemory.skills[0]?.runtimes.codex, false);
-    assert.equal(skillsMemory.skills[0]?.runtimes.grok, false);
-    assert.equal(skillsMemory.skills[0]?.runtimes.hermes, false);
-    assert.equal(skillsMemory.skills[0]?.runtimes.mini, false);
+    assert.equal(result.added.some((row) => row.id === "bad"), false);
+    assert.equal(skillsMemory.skills.some((row) => row.id === "bad"), false);
+    assert.match(result.errors.map((item) => item.message).join("\n"), /tabs/);
   });
 
   it("records an unknown runtime name without failing the sync", async () => {
@@ -280,6 +278,209 @@ describe("skill sync", { concurrency: false }, () => {
     assert.equal(expired?.status, "failed");
     assert.equal(expired?.error, "sync lease expired");
     assert.equal(result.added[0]?.id, "alpha");
+  });
+
+  it("does not upsert a parse problem over an existing skill", async () => {
+    await syncSkills({
+      trigger: "manual",
+      fetcher: fetcher({
+        "master-skills": { commit_sha: "a".repeat(40), files: [md("skills/alpha", "stay")] },
+      }),
+    });
+    skillsMemory.settings.push({
+      skill_id: "alpha",
+      trigger: "scheduled",
+      scope: { mode: "selected", lanes: ["conference-os"] },
+      schedule: "15 * * * *",
+      updated_by: "human:operator",
+      updated_at: NOW,
+    });
+    const before = structuredClone(skillsMemory.skills.find((row) => row.id === "alpha"));
+    const settings = structuredClone(skillsMemory.settings);
+    const upserts = callsOf("sk:upsert-skill");
+    const result = await syncSkills({
+      trigger: "manual",
+      fetcher: fetcher({
+        "master-skills": {
+          commit_sha: "b".repeat(40),
+          files: [
+            { path: "skills/alpha/SKILL.md", content: "---\nname: alpha\n\tdescription: tabs\n---\nreplaced\n" },
+            md("skills/beta", "new"),
+          ],
+        },
+      }),
+    });
+    assert.equal(result.status, "failed");
+    assert.match(result.errors.map((item) => item.message).join("\n"), /tabs/);
+    assert.deepEqual(skillsMemory.skills.find((row) => row.id === "alpha"), before);
+    assert.deepEqual(skillsMemory.settings, settings);
+    assert.equal(result.changed.some((row) => row.id === "alpha"), false);
+    assert.equal(result.added.some((row) => row.id === "alpha"), false);
+    assert.equal(result.removed.includes("alpha"), false);
+    assert.equal(skillsMemory.skills.find((row) => row.id === "beta")?.body.includes("new"), true);
+    assert.equal(callsOf("sk:upsert-skill"), upserts + 1);
+  });
+
+  it("rejects writes after a newer sync takes the expired lease", async () => {
+    await syncSkills({
+      trigger: "manual",
+      fetcher: fetcher({
+        "master-skills": { commit_sha: "a".repeat(40), files: [md("skills/alpha", "seed"), md("skills/beta", "seed")] },
+      }),
+    });
+    let release: () => void = () => {};
+    let entered: () => void = () => {};
+    const enteredP = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const releaseP = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    setSkillNowForTests(() => new Date("2026-10-27T12:00:00.000Z"));
+    let paused = false;
+    const pending = syncSkills({
+      trigger: "manual",
+      fetcher: {
+        async fetch(source) {
+          if (!paused) {
+            paused = true;
+            entered();
+            await releaseP;
+          }
+          if (source.id !== "master-skills") {
+            return { commit_sha: "0".repeat(40), files: [], skipped: [], preserved_dirs: [] };
+          }
+          return {
+            commit_sha: "b".repeat(40),
+            files: [md("skills/alpha", "from A")],
+            skipped: [],
+            preserved_dirs: [],
+          };
+        },
+      },
+    });
+    await enteredP;
+    setSkillNowForTests(() => new Date("2026-10-27T12:11:00.000Z"));
+    const taken = await syncSkills({
+      trigger: "manual",
+      fetcher: fetcher({
+        "master-skills": {
+          commit_sha: "c".repeat(40),
+          files: [md("skills/alpha", "from B"), md("skills/beta", "from B")],
+        },
+      }),
+    });
+    assert.equal(taken.status, "ok");
+    release();
+    const stalled = await pending;
+    assert.equal(stalled.status, "busy");
+    assert.match(stalled.errors.map((item) => item.message).join(" "), /sync lease lost/);
+    assert.deepEqual(stalled.added, []);
+    assert.deepEqual(stalled.changed, []);
+    assert.deepEqual(stalled.removed, []);
+    const alpha = skillsMemory.skills.find((row) => row.id === "alpha");
+    const beta = skillsMemory.skills.find((row) => row.id === "beta");
+    assert.match(alpha?.body ?? "", /from B/);
+    assert.match(beta?.body ?? "", /from B/);
+    assert.equal(alpha?.removed_at, null);
+    assert.equal(beta?.removed_at, null);
+    const expired = skillsMemory.syncRuns.filter((row) => row.error === "sync lease expired");
+    assert.equal(expired.length, 1);
+    assert.equal(expired[0]?.status, "failed");
+    assert.equal(skillsMemory.syncRuns.filter((row) => row.status === "running").length, 0);
+  });
+
+  it("does not let a fenced sync finish after the lease moved", async () => {
+    await syncSkills({
+      trigger: "manual",
+      fetcher: fetcher({
+        "master-skills": { commit_sha: "a".repeat(40), files: [md("skills/alpha", "same")] },
+      }),
+    });
+    let release: () => void = () => {};
+    let entered: () => void = () => {};
+    const enteredP = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const releaseP = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    setSkillNowForTests(() => new Date("2026-10-27T12:00:00.000Z"));
+    let paused = false;
+    const pending = syncSkills({
+      trigger: "manual",
+      fetcher: {
+        async fetch(source) {
+          if (!paused) {
+            paused = true;
+            entered();
+            await releaseP;
+          }
+          if (source.id !== "master-skills") {
+            return { commit_sha: "0".repeat(40), files: [], skipped: [], preserved_dirs: [] };
+          }
+          return { commit_sha: "b".repeat(40), files: [md("skills/alpha", "same")], skipped: [], preserved_dirs: [] };
+        },
+      },
+    });
+    await enteredP;
+    setSkillNowForTests(() => new Date("2026-10-27T12:11:00.000Z"));
+    const taken = await syncSkills({
+      trigger: "manual",
+      fetcher: fetcher({
+        "master-skills": { commit_sha: "c".repeat(40), files: [md("skills/alpha", "same")] },
+      }),
+    });
+    assert.equal(taken.status, "ok");
+    assert.equal(taken.upstream.sha, "c".repeat(40));
+    release();
+    const stalled = await pending;
+    assert.equal(stalled.status, "busy");
+    const expired = skillsMemory.syncRuns.filter((row) => row.error === "sync lease expired");
+    assert.equal(expired.length, 1);
+    assert.equal(expired[0]?.status, "failed");
+    assert.match(skillsMemory.skills.find((row) => row.id === "alpha")?.body ?? "", /same/);
+  });
+
+  it("takes sha and syncedAt from the latest finished sync that recorded a commit, including a failed one", async () => {
+    const src = fs.readFileSync("src/lib/skills/store.ts", "utf8");
+    const sql = src.slice(src.indexOf("/* sk:latest-sync */"), src.indexOf("/* sk:list-settings */"));
+    assert.equal(sql.includes("status = 'ok'"), false);
+    assert.match(sql, /commit_sha/);
+    assert.match(sql, /finished_at is not null/);
+
+    setSkillNowForTests(() => new Date("2026-10-27T12:00:00.000Z"));
+    const ok = await syncSkills({
+      trigger: "manual",
+      fetcher: fetcher({
+        "master-skills": { commit_sha: "a".repeat(40), files: [md("skills/alpha", "one")] },
+      }),
+    });
+    assert.equal(ok.upstream.sha, "a".repeat(40));
+    assert.equal(ok.upstream.syncedAt, "2026-10-27T12:00:00.000Z");
+
+    setSkillNowForTests(() => new Date("2026-10-27T12:05:00.000Z"));
+    const failed = await syncSkills({
+      trigger: "manual",
+      fetcher: fetcher({
+        "master-skills": {
+          commit_sha: "b".repeat(40),
+          files: [{ path: "skills/alpha/SKILL.md", content: "---\nname: alpha\n\tdescription: tabs\n---\nnope\n" }],
+        },
+      }),
+    });
+    assert.equal(failed.status, "failed");
+    assert.equal(failed.upstream.sha, "b".repeat(40));
+    assert.equal(failed.upstream.syncedAt, "2026-10-27T12:05:00.000Z");
+
+    setSkillNowForTests(() => new Date("2026-10-27T12:10:00.000Z"));
+    const fetched = await syncSkills({
+      trigger: "manual",
+      fetcher: fetcher({ "master-skills": new Error("GitHub 503") }),
+    });
+    assert.equal(fetched.status, "failed");
+    assert.equal(fetched.upstream.sha, "b".repeat(40));
+    assert.equal(fetched.upstream.syncedAt, "2026-10-27T12:05:00.000Z");
   });
 
   it("brings a removed skill back as added", async () => {

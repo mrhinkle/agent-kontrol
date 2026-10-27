@@ -289,4 +289,17 @@ describe("MCP client against demo mode", { concurrency: 1 }, () => {
     const wrongText = (wrong as { content?: { text?: string }[] }).content?.[0]?.text ?? "";
     assert.match(wrongText, /not compatible/);
   });
+
+  it("accepts run_skill completion without id through the registered schema", async () => {
+    const result = await client.callTool({
+      name: "run_skill",
+      arguments: { run_id: "00000000-0000-4000-8000-000000000001", complete: true },
+    });
+    const record = result as { isError?: boolean; content?: { text?: string }[] };
+    const text = record.content?.[0]?.text ?? "";
+    assert.equal(record.isError, true, text);
+    assert.match(text, /"code":"not_found"/);
+    assert.equal(text.includes("Required"), false);
+    assert.equal(/invalid_type/.test(text), false);
+  });
 });

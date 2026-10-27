@@ -270,18 +270,18 @@ Start a skill run, or finish one. This is one tool on purpose. A second `report_
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
-| `id` | string | yes on start | Skill id. |
+| `id` | string | yes on start | Skill id. Required on start. Omit it on completion. If you pass it then, it must match the skill on the run. |
 | `agent_id` | string | yes on start | Agent id stored on the run and on the span. |
 | `runtime` | enum | yes on start | The runtime the instructions are rendered for. |
 | `lane` | string | no | Required when the skill's scope is `selected`. |
-| `run_id` | string | yes on completion | The id returned by the start call. |
+| `run_id` | string | yes on completion | The id returned by the start call. A value that is not a canonical UUID is `not_found`. |
 | `complete` | boolean | yes on completion | Must be `true` to finish. `run_id` without `complete: true` is `validation_failed`. `complete: true` without `run_id` is `validation_failed`. |
 | `status` | enum | no | `done` or `failed`. Omitted means `done`. |
 | `note` | string | no | At most 500 characters. Not a prompt and not tool input or output. |
 
-A start checks trigger, runtime, and lane, inserts `skill_runs`, and writes a `spans` row (`trace_id` is the run id without hyphens, `kind` is `tool`, `name` is `skill:<id>`). The text includes the instructions, the `run_id`, and the line `Call run_skill again with this run_id and complete:true when you finish.` Completing twice returns the first completion unchanged. An unknown `run_id` is `not_found`. Only the actor that started the run can finish it. A request with no actor cannot start a run. The fleet event feed is not written: `events.agent_id` references `agents`, and a skill run does not create an agent row. The span is the record that carries the agent id.
+A start checks trigger, runtime, and lane, inserts `skill_runs`, and writes a `spans` row (`trace_id` is the run id without hyphens, `kind` is `tool`, `name` is `skill:<id>`). The text includes the instructions, the `run_id`, and the lines `Call run_skill again with this run_id and complete:true when you finish.` and `Omit id. The run already names the skill. If you pass id, it must match.` Completing twice returns the first completion unchanged. An unknown `run_id`, including one that is not a canonical UUID, is `not_found`. Passing `id` on completion when it does not match the skill on the run is `validation_failed`. Only the actor that started the run can finish it. A request with no actor cannot start a run. The fleet event feed is not written: `events.agent_id` references `agents`, and a skill run does not create an agent row. The span is the record that carries the agent id.
 
-Demo mode, with no database, still applies the trigger, runtime, and lane gates. A start or a completion that passes them returns exactly `DATABASE_URL not set; skill run not stored.` and does not invent a run id.
+Demo mode, with no database, still applies the trigger, runtime, and lane gates on a start. A start that passes them returns exactly `DATABASE_URL not set; skill run not stored.` and does not invent a run id. A completion in demo mode is `not_found`, because no run row exists.
 
 ## Errors
 
@@ -305,8 +305,8 @@ The HTTP `401` for a missing or invalid bearer is unchanged: `WWW-Authenticate` 
 | --- | --- | --- |
 | `unauthorized` | no | Not returned inside a tool result. The HTTP `401` above covers a bad bearer. |
 | `forbidden` | no | `reply_to_operator` when `in_reply_to` belongs to a different agent. `get_skill` or `run_skill` when the runtime is incompatible or the lane is outside the skill's scope. `run_skill` when a different actor finishes a run, or when the caller has no actor. |
-| `not_found` | no | `reply_to_operator` when `in_reply_to` does not exist. `get_skill` or `run_skill` when the skill is missing, removed, or trigger `off`. `run_skill` when `run_id` does not exist. |
-| `validation_failed` | no | `create_task` or `reply_to_operator` when `idempotency_key` is longer than 200 characters or contains a control character. `run_skill` when a start omits `agent_id` or `runtime`, when `complete` is true without `run_id`, when `run_id` is set without `complete: true`, or when `note` is longer than 500 characters. A privacy refusal on `POST /api/usage/ingest` is this code. Schema failures are the SDK message, not this JSON. |
+| `not_found` | no | `reply_to_operator` when `in_reply_to` does not exist. `get_skill` or `run_skill` when the skill is missing, removed, or trigger `off`. `run_skill` when `run_id` does not exist or is not a canonical UUID. |
+| `validation_failed` | no | `create_task` or `reply_to_operator` when `idempotency_key` is longer than 200 characters or contains a control character. `run_skill` when a start omits `id`, `agent_id`, or `runtime`, when `complete` is true without `run_id`, when `run_id` is set without `complete: true`, when `id` on completion does not match the skill on the run, or when `note` is longer than 500 characters. A privacy refusal on `POST /api/usage/ingest` is this code. Schema failures are the SDK message, not this JSON. |
 | `invalid_json` | no | Not a tool result. Authenticated `POST /api/mcp` returns HTTP 400 when the body is empty or not JSON. A missing bearer stays HTTP 401 with `WWW-Authenticate`. |
 | `missing_field` | no | Not returned by a tool. The input schema rejects a missing argument first. |
 | `rate_limited` | yes | Not returned by a tool. `POST /api/login` only. The OAuth consent form shares that limiter and answers with HTML, not this JSON. |
@@ -337,7 +337,7 @@ Paste this block into an agent's standing instructions:
 - Before starting new work, call get_fleet_status to see what every other agent is doing, and pick work that is not already covered.
 - At the start of a session and periodically while working, call check_inbox with your agent_id. Act on operator messages and answer them with reply_to_operator.
 - Call remember for durable handoffs: decisions, gotchas, and facts another agent or a future session will need. Call recall before re-deriving something that may already be written down.
-- Call list_skills, then get_skill, then run_skill. Finish with the same run_id and complete true. A skill read from disk is not a run Agent Kontrol can see.
+- Call list_skills, then get_skill, then run_skill. Finish with the same run_id and complete true, and omit id. A skill read from disk is not a run Agent Kontrol can see.
 ```
 
 ## Skills mirror
@@ -350,7 +350,7 @@ Fleet skills live in git. The default sources are `mrhinkle/master-skills` at `s
 
 The content SHA is SHA-256 hex over the raw SKILL.md bytes, UTF-8, with no newline normalisation. A collector hashes the file as stored, including the frontmatter. Lists and the AGENTS.md pointer use the first 7 hex characters. That is not the git commit.
 
-`sha` on a skill row is that content hash. `commit_sha` is the upstream commit at which the content last changed. `upstream.sha` on the list is the commit recorded by the latest finished sync for the first enabled source, which can be newer than `commit_sha` when a sync found nothing to write.
+`sha` on a skill row is that content hash. `commit_sha` is the upstream commit at which the content last changed. `upstream.sha` and `upstream.syncedAt` come from the latest finished sync that recorded a non-empty source commit, of any status. A failed sync that still recorded the commit it fetched, including one failed by a parse problem, is the source of that sha. A failed fetch that recorded no commit does not replace an older one. That sha can be newer than a skill's `commit_sha` when a sync found nothing to write.
 
 Reference files are text only. A file over 256 KB, or a file that would push the skill's references over 1 MB, is skipped. A binary file is skipped. Those skips are listed in the sync `errors` and do not by themselves mark the sync failed. A SKILL.md over 1 MB, or a SKILL.md that is not UTF-8 text, marks the sync failed and keeps the stored row. A failed fetch does the same for that source: the rows stay, and they are not reported as removed.
 
@@ -358,13 +358,13 @@ Reference files are text only. A file over 256 KB, or a file that would push the
 
 `GET /api/skills` and `GET /api/skills/:id` require `skills:read` for an agent credential. `PATCH /api/skills/:id`, `POST /api/skills/sync`, and `POST /api/skills/drift` are not in the agent scope table. A dashboard session or `MC_TOKEN` can call them. An agent credential cannot, including one that holds `skills:write`.
 
-`GET /api/skills?runtime=&q=&category=` returns `{ demo, upstream, skills }`. Each skill's `runtimes` is an array of names. Each skill also has `category` (string or null) and `tags` (array of strings), copied from SKILL.md frontmatter. `category` is one trimmed string. `tags` is a list of trimmed strings. A missing key is null or `[]`. Declared text is stored as written. It is not checked against the 16-value list in master-skills `TAXONOMY.md`. `category` on the query string is an exact case-insensitive match. The value `uncategorized` matches a null category. `GET /api/skills/:id` returns that same skill with `runtimes` as an object of booleans, plus `body`, `references` (paths only), `schedule`, and `triggers` (newest first, at most 50). An unknown runtime is HTTP 400. An unknown id is HTTP 404.
+`GET /api/skills?runtime=&q=&category=` returns `{ demo, upstream, skills }`. Each skill's `runtimes` is an array of names. Each skill also has `category` (string or null) and `tags` (array of strings), copied from SKILL.md frontmatter. `category` is one trimmed string. `tags` is a list of trimmed strings. A scalar string tag is kept as a one-element list. A missing key, a blank string, or any other shape is null or `[]`. Declared text is stored as written. It is not checked against the 16-value list in master-skills `TAXONOMY.md`. `category` on the query string is an exact case-insensitive match. The value `uncategorized` matches a null category. `GET /api/skills/:id` returns that same skill with `runtimes` as an object of booleans, plus `body`, `references` (paths only), `schedule`, and `triggers` (newest first, at most 50). An unknown runtime is HTTP 400. An unknown id is HTTP 404.
 
 ### How a skill's runtimes are chosen
 
 `runtimes` is optional in SKILL.md. Of the 161 skills in the default sources, 3 declare `runtimes`. Inference is the common path.
 
-An explicit `runtimes` list in the SKILL.md frontmatter wins. The same key in `skill.json` or `manifest.json` is used only when the frontmatter has no `runtimes` key. The names are `claude`, `codex`, `grok`, `hermes`, and `mini`. An unknown name is ignored and does not add the other runtimes. A value that is not a list of names, or frontmatter that cannot be parsed, is stored as Claude-only. That is a failure of evaluation. It is not a decision that the skill runs on every runtime.
+An explicit `runtimes` list in the SKILL.md frontmatter wins. The same key in `skill.json` or `manifest.json` is used only when the frontmatter has no `runtimes` key. The names are `claude`, `codex`, `grok`, `hermes`, and `mini`. An unknown name is ignored and does not add the other runtimes. A value that is not a list of names is stored as Claude-only. That is a failure of evaluation. It is not a decision that the skill runs on every runtime. Frontmatter that cannot be parsed is not stored. An existing skill row and its settings stay. A skill that was not stored yet is skipped. The sync is failed.
 
 With no list, a skill is Claude-only when the frontmatter has `allowed-tools`, or when the body contains `mcp__`, `AskUserQuestion`, `TodoWrite`, `Skill tool`, `Agent tool`, or `ExitPlanMode`. Anything else is compatible with all five runtimes.
 
@@ -385,11 +385,11 @@ curl -s -X POST https://YOUR-DEPLOY.vercel.app/api/skills/sync \
 
 The GitHub token is `GH_TOKEN`, otherwise `GITHUB_TOKEN`. Those are the names the `gh` CLI already uses. A public repository can be read with no token. HTTP 401, 403, 404, a truncated tree, or any other fetch failure keeps that source's rows. The body `status` is `failed`. It is not a removal.
 
-One sync at a time. The lease is a `skill_sync_runs` row with `status` `running`, guarded by a partial unique index. A second sync returns `status: "busy"` and does not fetch. A running row older than 10 minutes is marked failed so a crashed sync does not wedge the mirror. When nothing changed, `added`, `changed`, and `removed` are empty and no skill row is written. The sync run still records the commit that was fetched.
+One sync at a time. The lease is a `skill_sync_runs` row with `status` `running`, guarded by a partial unique index. A second sync returns `status: "busy"` and does not fetch. A running row older than 10 minutes is marked failed so a crashed sync does not wedge the mirror. The old process can still be alive. Every skill write and the finish update run only while that sync's row is still `status` `running`. If a newer sync has taken the lease, the old one stops, returns `status: "busy"` with error `sync lease lost`, and its writes do not land. When nothing changed, `added`, `changed`, and `removed` are empty and no skill row is written. The sync run still records the commit that was fetched.
 
 An id that appears in more than one source is kept by the earlier source (`position` ascending). The other is listed in `conflicts` and is not stored. The same source producing the same id twice keeps the first path.
 
-`status: "failed"` means a source was not fetched, a SKILL.md could not be parsed, or a SKILL.md could not be read. Rows that were written are still listed in `added` and `changed`. A conflict, a skipped reference, or an ignored runtime name does not by itself fail the run. Unreadable frontmatter is stored as Claude-only. It is not treated as compatible with every runtime.
+`status: "failed"` means a source was not fetched, a SKILL.md could not be parsed, or a SKILL.md could not be read. Rows that were written are still listed in `added` and `changed`. A parse problem is not a written row: the existing skill stays out of `added`, `changed`, and `removed`, and a new skill is absent. A conflict, a skipped reference, or an ignored runtime name does not by itself fail the run. Unreadable frontmatter is not stored and is not treated as compatible with every runtime.
 
 `trigger: "scheduled"` stores the cron expression. Nothing in this change runs that cron. An external scheduler has to call the sync route, and a skill schedule is not a sync.
 

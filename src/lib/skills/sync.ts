@@ -4,7 +4,7 @@ import { SYNC_LEASE_MS, skillNow } from "./clock";
 import { planSync } from "./plan";
 import { readUpstream } from "./query";
 import { createGitHubFetcher, type SkillSnapshotFetcher } from "./source";
-import { beginSyncRun, finishSyncRun, listSkillRows, listSources, markSkillRemoved, upsertSkill } from "./store";
+import { beginSyncRun, finishSyncRun, listSkillRows, listSources, markSkillRemoved, SyncLeaseLost, upsertSkill } from "./store";
 import type { SkillRecord, SyncConflict, SyncError, SyncResult, SyncSkillRef, SyncTrigger } from "./types";
 
 export interface SyncOptions {
@@ -20,10 +20,16 @@ export interface SyncOptions {
  * returns busy and writes nothing. When nothing changed, no skill row is written.
  * The sync run row still records the commit that was fetched.
  *
+ * A SKILL.md that cannot be parsed is not written. An existing row and its
+ * settings stay. A skill that was not stored yet is skipped. The run is failed.
+ *
  * status is failed when a source was not fetched, a SKILL.md could not be
  * parsed, or a SKILL.md was too large to read. A reported id conflict, a
  * skipped reference, or an ignored runtime name does not by itself fail the run.
  * Failed still lists the rows that were written. It is not "nothing happened".
+ *
+ * Skill writes and the finish update run only while this sync's row is still
+ * running. If a newer sync took the lease, this one stops and returns busy.
  */
 export async function syncSkills(options: SyncOptions): Promise<SyncResult> {
   const id = randomUUID();
@@ -40,9 +46,9 @@ export async function syncSkills(options: SyncOptions): Promise<SyncResult> {
     return { status: "busy", added: [], changed: [], removed: [], conflicts: [], errors: [], upstream };
   }
   try {
-    const applied = await runSync(options, started);
+    const applied = await runSync(options, started, id);
     const error = applied.errors.length ? applied.errors.map((item) => `${item.source}: ${item.message}`).join("; ") : null;
-    await finishSyncRun({
+    const closed = await finishSyncRun({
       id,
       status: applied.status,
       summary: {
@@ -55,9 +61,11 @@ export async function syncSkills(options: SyncOptions): Promise<SyncResult> {
       error,
       finishedAt: skillNow().toISOString(),
     });
+    if (!closed) return leaseLost();
     const upstream = await readUpstream();
     return { ...applied, upstream };
   } catch (err) {
+    if (err instanceof SyncLeaseLost) return leaseLost();
     const message = err instanceof Error ? err.message : "sync failed";
     const errors: SyncError[] = [{ source: "sync", message }];
     try {
@@ -86,7 +94,20 @@ interface Applied {
   sourceCommits: { id: string; commit_sha: string }[];
 }
 
-async function runSync(options: SyncOptions, started: Date): Promise<Applied> {
+async function leaseLost(): Promise<SyncResult> {
+  const upstream = await readUpstream().catch(() => emptyUpstream());
+  return {
+    status: "busy",
+    added: [],
+    changed: [],
+    removed: [],
+    conflicts: [],
+    errors: [{ source: "sync", message: "sync lease lost" }],
+    upstream,
+  };
+}
+
+async function runSync(options: SyncOptions, started: Date, runId: string): Promise<Applied> {
   const fetcher = options.fetcher ?? createGitHubFetcher();
   const sources = await listSources();
   const existing = await listSkillRows();
@@ -185,13 +206,13 @@ async function runSync(options: SyncOptions, started: Date): Promise<Applied> {
       removed_at: null,
       synced_at: syncedAt,
     };
-    await upsertSkill(next);
+    await upsertSkill(next, runId);
     const ref = { id: next.id, version: next.version, sha: next.sha };
     if (!prior || prior.removed_at) added.push(ref);
     else changed.push(ref);
   }
   for (const row of plan.removals) {
-    await markSkillRemoved(row.id, syncedAt);
+    await markSkillRemoved(row.id, syncedAt, runId);
     removed.push(row.id);
   }
 

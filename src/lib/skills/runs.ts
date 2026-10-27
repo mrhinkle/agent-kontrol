@@ -125,6 +125,7 @@ export async function startSkillRun(input: StartInput): Promise<{ ok: true; text
     "",
     `run_id: ${runId}`,
     "Call run_skill again with this run_id and complete:true when you finish.",
+    "Omit id. The run already names the skill. If you pass id, it must match.",
     'Pass status "done" or "failed" and an optional note of at most 500 characters.',
   ].join("\n");
   return { ok: true, text, runId };
@@ -132,6 +133,8 @@ export async function startSkillRun(input: StartInput): Promise<{ ok: true; text
 
 export async function finishSkillRun(input: {
   runId: string;
+  /** When set, must be the skill stored on the run. Omit it to use that row. */
+  skillId?: string | null;
   status?: "done" | "failed" | null;
   note?: string | null;
 }): Promise<{ ok: true; text: string } | RunFail> {
@@ -139,6 +142,9 @@ export async function finishSkillRun(input: {
   if (!actor) return { ok: false, code: "forbidden", message: "This request has no actor." };
   const existing = await getRun(input.runId);
   if (!existing) return { ok: false, code: "not_found", message: "Skill run not found." };
+  if (input.skillId != null && input.skillId !== existing.skill_id) {
+    return { ok: false, code: "validation_failed", message: "id does not match the skill on this run." };
+  }
   if (existing.actor_type !== actor.actor_type || existing.actor_id !== actor.actor_id) {
     return { ok: false, code: "forbidden", message: "Only the actor that started this run can complete it." };
   }

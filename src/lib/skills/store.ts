@@ -141,47 +141,95 @@ export function mapSkill(row: Record<string, unknown>): SkillRecord {
   };
 }
 
-export async function upsertSkill(row: SkillRecord): Promise<void> {
-  await db()`
-    /* sk:upsert-skill */
-    insert into skills (
-      id, source_id, path, name, description, version, sha, commit_sha, body,
-      "references", runtimes, frontmatter, category, tags, removed_at, synced_at
-    ) values (
-      ${row.id}, ${row.source_id}, ${row.path}, ${row.name}, ${row.description}, ${row.version},
-      ${row.sha}, ${row.commit_sha}, ${row.body},
-      ${JSON.stringify(row.references)}::jsonb,
-      ${JSON.stringify(row.runtimes)}::jsonb,
-      ${JSON.stringify(row.frontmatter)}::jsonb,
-      ${row.category},
-      ${JSON.stringify(row.tags)}::jsonb,
-      null, ${row.synced_at}::timestamptz
-    )
-    on conflict (id) do update set
-      source_id = excluded.source_id,
-      path = excluded.path,
-      name = excluded.name,
-      description = excluded.description,
-      version = excluded.version,
-      sha = excluded.sha,
-      commit_sha = excluded.commit_sha,
-      body = excluded.body,
-      "references" = excluded."references",
-      runtimes = excluded.runtimes,
-      frontmatter = excluded.frontmatter,
-      category = excluded.category,
-      tags = excluded.tags,
-      removed_at = null,
-      synced_at = excluded.synced_at
-  `;
+/** Thrown when this sync's row is no longer the running lease. Callers stop. */
+export class SyncLeaseLost extends Error {
+  constructor() {
+    super("sync lease lost");
+    this.name = "SyncLeaseLost";
+  }
 }
 
-export async function markSkillRemoved(id: string, at: string): Promise<void> {
-  await db()`
-    /* sk:remove-skill */
-    update skills set removed_at = ${at}::timestamptz
-    where id = ${id} and removed_at is null
+const UUID_TEXT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Canonical 8-4-4-4-12 text. Anything else must not be cast to uuid. */
+export function isUuid(value: string): boolean {
+  return UUID_TEXT.test(value);
+}
+
+/**
+ * Insert or replace one skill only while `runId` is still the running sync.
+ * The owner check is in the same statement as the write. Zero owned rows
+ * means a newer sync took the lease; the caller must stop.
+ */
+export async function upsertSkill(row: SkillRecord, runId: string): Promise<void> {
+  const rows = await db()`
+    /* sk:upsert-skill */
+    with owner as (
+      select 1 as ok
+      from skill_sync_runs
+      where id = ${runId}::uuid and status = 'running'
+    ),
+    written as (
+      insert into skills (
+        id, source_id, path, name, description, version, sha, commit_sha, body,
+        "references", runtimes, frontmatter, category, tags, removed_at, synced_at
+      )
+      select
+        ${row.id}, ${row.source_id}, ${row.path}, ${row.name}, ${row.description}, ${row.version},
+        ${row.sha}, ${row.commit_sha}, ${row.body},
+        ${JSON.stringify(row.references)}::jsonb,
+        ${JSON.stringify(row.runtimes)}::jsonb,
+        ${JSON.stringify(row.frontmatter)}::jsonb,
+        ${row.category},
+        ${JSON.stringify(row.tags)}::jsonb,
+        null, ${row.synced_at}::timestamptz
+      from owner
+      on conflict (id) do update set
+        source_id = excluded.source_id,
+        path = excluded.path,
+        name = excluded.name,
+        description = excluded.description,
+        version = excluded.version,
+        sha = excluded.sha,
+        commit_sha = excluded.commit_sha,
+        body = excluded.body,
+        "references" = excluded."references",
+        runtimes = excluded.runtimes,
+        frontmatter = excluded.frontmatter,
+        category = excluded.category,
+        tags = excluded.tags,
+        removed_at = null,
+        synced_at = excluded.synced_at
+      returning id
+    )
+    select
+      (select count(*)::int from owner) as owned,
+      (select count(*)::int from written) as wrote
   `;
+  if (Number(rows[0]?.owned ?? 0) < 1) throw new SyncLeaseLost();
+}
+
+/** Mark one skill removed only while `runId` is still the running sync. */
+export async function markSkillRemoved(id: string, at: string, runId: string): Promise<void> {
+  const rows = await db()`
+    /* sk:remove-skill */
+    with owner as (
+      select 1 as ok
+      from skill_sync_runs
+      where id = ${runId}::uuid and status = 'running'
+    ),
+    written as (
+      update skills set removed_at = ${at}::timestamptz
+      where id = ${id}
+        and removed_at is null
+        and exists (select 1 from owner)
+      returning id
+    )
+    select
+      (select count(*)::int from owner) as owned,
+      (select count(*)::int from written) as wrote
+  `;
+  if (Number(rows[0]?.owned ?? 0) < 1) throw new SyncLeaseLost();
 }
 
 function isUniqueViolation(err: unknown): boolean {
@@ -195,7 +243,9 @@ function isUniqueViolation(err: unknown): boolean {
 /**
  * Take the one-running lease. A unique violation means another sync holds it.
  * A running row older than the lease is marked failed first, so a crashed sync
- * does not wedge the mirror. This does not delete skill rows.
+ * does not wedge the mirror. Expiring that row does not by itself stop the old
+ * process: upsertSkill, markSkillRemoved, and finishSyncRun each write only
+ * while this id is still status running. This does not delete skill rows.
  */
 export async function beginSyncRun(input: {
   id: string;
@@ -224,15 +274,18 @@ export async function beginSyncRun(input: {
   }
 }
 
-/** Close the lease row this sync inserted. A row that is no longer running is left alone. */
+/**
+ * Close the lease row this sync inserted. A row that is no longer running is
+ * left alone. False means this sync no longer owns the lease.
+ */
 export async function finishSyncRun(input: {
   id: string;
   status: string;
   summary: unknown;
   error: string | null;
   finishedAt: string;
-}): Promise<void> {
-  await db()`
+}): Promise<boolean> {
+  const rows = await db()`
     /* sk:finish-sync */
     update skill_sync_runs
     set finished_at = ${input.finishedAt}::timestamptz,
@@ -240,7 +293,9 @@ export async function finishSyncRun(input: {
       summary = ${JSON.stringify(input.summary)}::jsonb,
       error = ${input.error}
     where id = ${input.id}::uuid and status = 'running'
+    returning id
   `;
+  return rows.length > 0;
 }
 
 export interface SyncRunRow {
@@ -277,7 +332,13 @@ export async function latestSyncRuns(): Promise<SyncRunRow[]> {
     /* sk:latest-sync */
     select summary, finished_at, status, trigger
     from skill_sync_runs
-    where status = 'ok' and finished_at is not null
+    where finished_at is not null
+      and jsonb_typeof(summary->'sources') = 'array'
+      and exists (
+        select 1
+        from jsonb_array_elements(summary->'sources') as source
+        where coalesce(source->>'commit_sha', '') <> ''
+      )
     order by finished_at desc
     limit 5
   `;
@@ -400,6 +461,7 @@ export async function insertRun(row: RunRecord): Promise<void> {
 }
 
 export async function getRun(runId: string): Promise<RunRecord | null> {
+  if (!isUuid(runId)) return null;
   const rows = await db()`
     /* sk:get-run */
     select run_id, skill_id, skill_sha, agent_id, lane, runtime, started_at, ended_at,
@@ -419,6 +481,7 @@ export async function completeRun(input: {
   note: string | null;
   endedAt: string;
 }): Promise<RunRecord | null> {
+  if (!isUuid(input.runId)) return null;
   const rows = await db()`
     /* sk:complete-run */
     update skill_runs
@@ -434,6 +497,7 @@ export async function completeRun(input: {
 }
 
 export async function deleteRun(runId: string): Promise<void> {
+  if (!isUuid(runId)) return;
   await db()`
     /* sk:delete-run */
     delete from skill_runs where run_id = ${runId}::uuid

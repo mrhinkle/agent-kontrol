@@ -463,9 +463,9 @@ const handler = createMcpHandler(
       {
         title: "Run skill",
         description:
-          "Start or finish a skill run. The agent executes the instructions. Agent Kontrol only stores the start, the end, and an optional note. Omit run_id to start. Call again with that run_id and complete true to finish. Only the actor that started the run can finish it.",
+          "Start or finish a skill run. The agent executes the instructions. Agent Kontrol only stores the start, the end, and an optional note. Omit run_id to start; id, agent_id, and runtime are required then. Call again with that run_id and complete true to finish, and omit id. If you pass id on completion, it must match the skill on the run. Only the actor that started the run can finish it.",
         inputSchema: {
-          id: z.string().describe("Skill id."),
+          id: z.string().optional().describe("Skill id. Required on start. Omit it on completion. If you pass it then, it must match the skill on the run."),
           agent_id: z.string().optional().describe("Required on start."),
           runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional().describe("Required on start."),
           lane: z.string().optional(),

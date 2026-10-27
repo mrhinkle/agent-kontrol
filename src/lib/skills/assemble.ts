@@ -49,6 +49,8 @@ interface InputFile {
 /**
  * Turn a snapshot's files into skill rows.
  * A SKILL.md that is present but unreadable is preserved, not removed.
+ * A SKILL.md whose frontmatter cannot be parsed is not a row: an existing
+ * skill stays, and a new one is not stored. The error is on `errors`.
  * Binary files and files over the reference cap are skipped.
  */
 export function assembleSkills(input: {
@@ -91,6 +93,11 @@ export function assembleSkills(input: {
     if (!id) {
       preserved.push({ id: directoryName, source_id: input.source_id, position: input.position, path: dir });
       errors.push({ path: skillFile.path, message: "skill id is not a slug; existing row kept" });
+      continue;
+    }
+    if (parsed.parseProblem) {
+      preserved.push({ id, source_id: input.source_id, position: input.position, path: dir });
+      errors.push({ path: skillFile.path, message: parsed.parseProblem });
       continue;
     }
     const sibling = readSibling(files, dir);
