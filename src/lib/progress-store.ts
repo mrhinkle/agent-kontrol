@@ -1,5 +1,7 @@
 import { sql } from "./db";
 import { REPOS, THRESHOLDS, windowDays, type TimeWindow } from "./progress-config";
+import type { SkillsDigest } from "./progress-types";
+import { stallMinutes } from "./skills/clock";
 import { getWatchedRepos } from "./watched-repos";
 import type {
   Alert,
@@ -211,7 +213,22 @@ function mergeLaneMix(target: Record<string, number>, add?: Record<string, numbe
 
 /* ---------------------------------------------------------------- alerts */
 
-export function buildAlerts(repos: RepoProgress[], history: HistoryPoint[]): Alert[] {
+export interface StalledSkillAlert {
+  run_id: string;
+  skill_id: string;
+  agent: string;
+  at: string;
+}
+
+/**
+ * `stalledSkills` is optional so existing callers keep the same alerts.
+ * More than three stalled runs roll into one alert. The id starts with skill-stalled:.
+ */
+export function buildAlerts(
+  repos: RepoProgress[],
+  history: HistoryPoint[],
+  stalledSkills: StalledSkillAlert[] = [],
+): Alert[] {
   const alerts: Alert[] = [];
 
   for (const r of repos) {
@@ -283,6 +300,26 @@ export function buildAlerts(repos: RepoProgress[], history: HistoryPoint[]): Ale
         repo: cfg.repo,
         rule: "backlogGrowingDays",
         message: `${cfg.label} backlog has grown ${need} days running (+${grew} net)`,
+      });
+    }
+  }
+
+  if (stalledSkills.length > 3) {
+    alerts.push({
+      id: `skill-stalled:${stalledSkills.length}`,
+      level: "warn",
+      repo: null,
+      rule: "skillStalled",
+      message: `${stalledSkills.length} skill runs have no end after ${stallMinutes()} minutes.`,
+    });
+  } else {
+    for (const run of stalledSkills) {
+      alerts.push({
+        id: `skill-stalled:${run.run_id}`,
+        level: "warn",
+        repo: null,
+        rule: "skillStalled",
+        message: `Skill ${run.skill_id} run ${run.run_id} started by ${run.agent} has no end.`,
       });
     }
   }
@@ -391,6 +428,15 @@ export async function progress(window: TimeWindow): Promise<Omit<ProgressRespons
     lane_mix: laneMix,
   };
 
+  let skills: SkillsDigest | undefined;
+  try {
+    const { skillsDigest } = await import("./skills/digest");
+    skills = await skillsDigest(window);
+  } catch (err) {
+    if (!skillsTableMissing(err)) throw err;
+    console.error("[progress] skills digest omitted; skill tables are not installed");
+  }
+
   return {
     window,
     last_sync: lastSync,
@@ -400,10 +446,20 @@ export async function progress(window: TimeWindow): Promise<Omit<ProgressRespons
     repos,
     totals,
     history,
-    alerts: buildAlerts(repos, history),
+    alerts: buildAlerts(repos, history, skills?.stalled ?? []),
+    ...(skills ? { skills } : {}),
   };
 }
 
 /* --------------------------------------------------------------- helpers */
+
+/** Installed databases that predate the skills migration have no skill tables. */
+function skillsTableMissing(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const code = "code" in err ? String((err as { code: unknown }).code) : "";
+  if (code === "42P01") return true;
+  const message = err instanceof Error ? err.message : "";
+  return message.includes("does not exist");
+}
 
 export type { StalledPr };
