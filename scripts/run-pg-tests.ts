@@ -24,7 +24,9 @@ import {
   upsertDecision,
   type UpsertInput,
 } from "../src/lib/decisions";
-import { finishSyncRun, markSkillRemoved, SyncLeaseLost, upsertSkill } from "../src/lib/skills/store";
+import { finishSyncRun, markSkillRemoved, SyncLeaseLost, upsertSettings, upsertSkill } from "../src/lib/skills/store";
+import { runScheduleTick, type TickResult } from "../src/lib/skills/schedule";
+import { listLastScheduledTasks, listOpenScheduledTasks } from "../src/lib/skills/schedule-store";
 import type { SkillRecord } from "../src/lib/skills/types";
 
 async function main() {
@@ -248,6 +250,7 @@ async function main() {
 
   await testDecisions(tag);
   await testSkillLeaseFence(tag);
+  await testSkillSchedule(tag);
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
 }
@@ -546,6 +549,74 @@ async function testDecisions(tag: string) {
     assert.equal(afterFill.incomplete_repos.includes(repo), false);
   } finally {
     await sql()`delete from decisions where repo = ${repo}`;
+  }
+}
+
+/** The scheduler against real tasks and idempotency_keys rows. Only this skill's rows are touched. */
+async function testSkillSchedule(tag: string): Promise<void> {
+  const skillId = `sched-${tag}`.replace(/[^a-z0-9-]/gi, "").slice(0, 48);
+  const title = `Run scheduled skill ${skillId}`;
+  const cleanup = async () => {
+    await sql()`delete from tasks where title = ${title}`;
+    await sql()`delete from idempotency_keys where idempotency_key like ${`skill-schedule:${skillId}:%`}`;
+    await sql()`delete from skill_settings where skill_id = ${skillId}`;
+    await sql()`delete from skills where id = ${skillId}`;
+  };
+  await cleanup();
+  try {
+    const seeded = skillRecord(skillId, "scheduled body");
+    await sql()`
+      insert into skills (
+        id, source_id, path, name, description, version, sha, commit_sha, body,
+        "references", runtimes, frontmatter, category, tags, removed_at, synced_at
+      ) values (
+        ${skillId}, 'master-skills', ${seeded.path}, ${skillId}, 'scheduled', '1.0.0',
+        ${seeded.sha}, ${seeded.commit_sha}, ${seeded.body},
+        '[]'::jsonb, ${JSON.stringify(seeded.runtimes)}::jsonb, '{}'::jsonb, null, '[]'::jsonb, null, now()
+      )
+    `;
+    await upsertSettings({
+      skill_id: skillId,
+      trigger: "scheduled",
+      scope: { mode: "all", lanes: [] },
+      schedule: "*/5 * * * *",
+      updated_by: null,
+      updated_at: "2026-10-27T12:00:00.000Z",
+    });
+    const mine = (r: TickResult) => r.items.filter((i) => i.skill_id === skillId);
+
+    const first = await runScheduleTick({ now: new Date("2026-10-27T12:10:30Z") });
+    const queued = mine(first);
+    assert.equal(queued.length, 1);
+    assert.equal(queued[0].outcome, "queued");
+    const rows = await sql()`select platform, status, actor_type, actor_id, created_by, description from tasks where title = ${title}`;
+    assert.equal(rows.length, 1);
+    assert.equal(String(rows[0].platform), "claude-code", "one compatible runtime pins the platform");
+    assert.equal(String(rows[0].actor_id), "skill-scheduler");
+    assert.match(String(rows[0].description), /Scheduled slot: 2026-10-27T12:10Z/);
+
+    const again = mine(await runScheduleTick({ now: new Date("2026-10-27T12:10:50Z") }));
+    assert.deepEqual(again.map((i) => [i.outcome, i.reason]), [["skipped", "already_scheduled"]]);
+
+    const blocked = mine(await runScheduleTick({ now: new Date("2026-10-27T12:15:00Z") }));
+    assert.deepEqual(blocked.map((i) => i.reason), ["previous_open"]);
+    assert.equal((await listOpenScheduledTasks()).filter((t) => t.skill_id === skillId).length, 1);
+
+    await sql()`update tasks set status = 'done' where title = ${title}`;
+    const next = mine(await runScheduleTick({ now: new Date("2026-10-27T12:20:00Z") }));
+    assert.equal(next[0].outcome, "queued");
+    assert.equal(next[0].missed, 1, "the 12:15 tick was skipped while the task was open");
+    const last = (await listLastScheduledTasks()).filter((t) => t.skill_id === skillId);
+    assert.equal(last.length, 1);
+    assert.match(last[0].description, /Scheduled slot: 2026-10-27T12:20Z/);
+
+    // A task an agent creates with the same title and created_by does not count: the actor differs.
+    await sql()`delete from tasks where title = ${title}`;
+    await sql()`insert into tasks (title, created_by, actor_type, actor_id) values (${title}, 'skill-scheduler', 'agent', 'someone-else')`;
+    const spoof = mine(await runScheduleTick({ now: new Date("2026-10-27T12:25:00Z") }));
+    assert.equal(spoof[0].outcome, "queued");
+  } finally {
+    await cleanup();
   }
 }
 

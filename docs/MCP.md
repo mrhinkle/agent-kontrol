@@ -383,7 +383,7 @@ With no database, GET returns `demo: true` and a fixture list. PATCH, sync, and 
 
 ### Sync
 
-`POST /api/skills/sync` with an empty body, or `{"trigger":"manual"}`, runs a manual sync. A scheduler uses the same route. This repository does not register a Vercel cron for it.
+`POST /api/skills/sync` with an empty body, or `{"trigger":"manual"}`, runs a manual sync. A scheduler uses the same route. This repository does not register a Vercel cron for it. Scheduled skills have their own tick; see Scheduled skills below.
 
 ```sh
 curl -s -X POST https://YOUR-DEPLOY.vercel.app/api/skills/sync \
@@ -400,7 +400,34 @@ An id that appears in more than one source is kept by the earlier source (`posit
 
 `status: "failed"` means a source was not fetched, a SKILL.md could not be parsed, or a SKILL.md could not be read. Rows that were written are still listed in `added` and `changed`. A parse problem is not a written row: the existing skill stays out of `added`, `changed`, and `removed`, and a new skill is absent. A conflict, a skipped reference, or an ignored runtime name does not by itself fail the run. Unreadable frontmatter is not stored and is not treated as compatible with every runtime.
 
-`trigger: "scheduled"` stores the cron expression. Nothing in this change runs that cron. An external scheduler has to call the sync route, and a skill schedule is not a sync.
+### Scheduled skills
+
+`trigger: "scheduled"` stores a five-field cron, read in UTC. Agent Kontrol does not run the skill. It queues a task, and a connected agent claims that task and calls `run_skill` as usual.
+
+`POST /api/skills/schedule/tick` is the tick. It is an operator route: `MC_TOKEN` or the dashboard session, never an agent credential, and `skills:write` does not help. The body is ignored. This repository deploys on Fly and registers no Vercel cron, so an external scheduler calls the route every minute, the same way it calls the sync route:
+
+```bash
+curl -s -X POST https://YOUR-DEPLOY.example/api/skills/schedule/tick \
+  -H "Authorization: Bearer $MC_TOKEN"
+```
+
+On each tick, for every skill whose trigger is `scheduled`, whose skill row is not removed, and whose cron has a due minute in the last `AK_SKILL_SCHEDULE_CATCHUP_MINUTES` minutes (default 10, allowed 1 to 1440), it queues one task:
+
+- Title `Run scheduled skill <id>`. The description names the skill, the scope (all lanes, or the selected lanes), the due slot (`Scheduled slot: 2026-10-27T12:10Z`), the compatible runtimes, and the three `run_skill` steps. The task is created by the actor `skill-scheduler`, not by the caller of the route.
+- Routing follows the skill's runtime flags. A skill compatible with exactly one of `claude`, `codex`, `grok`, or `hermes` gets that platform (`claude-code`, `codex`, `grok`, `hermes`). Any other skill gets platform `any`, and the description lists the runtimes so a worker that is not listed leaves it. A skill compatible with only `mini` is also platform `any`, and is pinned to the machine in `AK_SKILL_MINI_MACHINE` when that is set. A skill with no compatible runtime is skipped as `no_runtime`.
+- The task carries the idempotency key `skill-schedule:<id>:<slot>`, so two ticks for the same minute, from any caller, make one task.
+
+A tick queues nothing for a skill when:
+
+- `previous_open`: its previous scheduled task is still `queued`, `claimed`, `running`, or `review`. A task that never finishes blocks the skill until someone cancels or completes it.
+- `already_scheduled`: the newest scheduled task is for this slot or a later one, whatever its status.
+- `duplicate`: a concurrent tick holds the key for this slot.
+
+Due minutes that no task covers are not queued one by one. The next task covers them, says how many there were, and the tick reports the count as `missed`. A due minute older than the catch-up window is not replayed. There is no table for this: the slot in the task description is the record, and the scheduler matches only tasks written by the `skill-scheduler` actor, so an agent cannot block or fake a slot by creating a task with the same title.
+
+The response is `{ ok, now, scheduled, queued, skipped, items }`. `scheduled` counts skills with a valid cron. Each item is `{ skill_id, slot, outcome: "queued" | "skipped", reason?, task_id?, missed? }`. A skill that is not due has no item. With no database the response is `{ ok: true, demo: true, note }` and nothing is queued.
+
+`GET /api/skills` and `GET /api/skills/:id` carry two additional fields on each skill, both ISO strings or `null`: `lastScheduledAt`, the newest slot the scheduler queued, and `nextDueAt`, the next due minute for a scheduled skill. Existing fields are unchanged. Run history stays in `lastRun` and `triggers`; a scheduled run appears there only after an agent calls `run_skill`.
 
 ### Drift
 
