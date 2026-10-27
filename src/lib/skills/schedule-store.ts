@@ -9,6 +9,7 @@ import { sql } from "../db";
  */
 
 export const SCHEDULER_ACTOR_ID = "skill-scheduler";
+export const ONE_OPEN_INDEX = "tasks_skill_schedule_one_open_idx";
 export const SCHEDULED_TITLE_PREFIX = "Run scheduled skill ";
 const OPEN_STATUSES = ["queued", "claimed", "running", "review"];
 
@@ -55,4 +56,10 @@ export async function listLastScheduledTasks(): Promise<ScheduledTaskRow[]> {
     order by title, created_at desc, id desc
   `;
   return (rows as Record<string, unknown>[]).map(mapRow).filter((r): r is ScheduledTaskRow => r !== null);
+}
+
+/** True when a task insert lost to the one-open-task-per-skill unique index. */
+export function isOneOpenViolation(err: unknown): boolean {
+  const text = err instanceof Error ? err.message : String(err);
+  return text.includes(ONE_OPEN_INDEX);
 }

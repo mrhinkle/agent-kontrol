@@ -71,7 +71,6 @@ function taskRow(id: string, slot: string, status = "queued", taskId = 1): Sched
 interface Harness {
   deps: Partial<TickDeps>;
   created: Parameters<TickDeps["create"]>[0][];
-  cancelled: number[];
 }
 
 function harness(opts: {
@@ -82,18 +81,13 @@ function harness(opts: {
   createError?: Error;
 }): Harness {
   const created: Harness["created"] = [];
-  const cancelled: number[] = [];
   return {
     created,
-    cancelled,
     deps: {
       skills: async () => opts.skills,
       settings: async () => opts.settings,
       open: async () => opts.open ?? [],
       last: async () => opts.last ?? [],
-      cancel: async (id) => {
-        cancelled.push(id);
-      },
       create: async (input) => {
         if (opts.createError) throw opts.createError;
         created.push(input);
@@ -237,14 +231,10 @@ describe("runScheduleTick", () => {
     await assert.rejects(runScheduleTick({ now: at("2026-10-27T12:10:00Z"), deps: broken.deps, env: {} }), /db down/);
   });
 
-  it("cancels its own task when a racing tick already queued an earlier one", async () => {
-    const h = harness({ skills: [skill("alpha")], settings: [setting("alpha")] });
-    let calls = 0;
-    const open = h.deps.open!;
-    h.deps.open = async () => (++calls === 1 ? open() : [taskRow("alpha", "2026-10-27T12:09Z", "queued", 50), taskRow("alpha", "2026-10-27T12:10Z", "queued", 101)]);
+  it("reports a lost race on the one-open-task index as a duplicate", async () => {
+    const h = harness({ skills: [skill("alpha")], settings: [setting("alpha")], createError: new Error('duplicate key value violates unique constraint "tasks_skill_schedule_one_open_idx"') });
     const result = await runScheduleTick({ now: at("2026-10-27T12:10:00Z"), deps: h.deps, env: {} });
     assert.deepEqual(result.items.map((i) => [i.outcome, i.reason]), [["skipped", "duplicate"]]);
-    assert.deepEqual(h.cancelled, [101]);
   });
 
   it("uses the same key for two ticks inside one minute", async () => {

@@ -421,7 +421,7 @@ A tick queues nothing for a skill when:
 
 - `previous_open`: its previous scheduled task is still `queued`, `claimed`, `running`, or `review`. A task that never finishes blocks the skill until someone cancels or completes it.
 - `already_scheduled`: the newest scheduled task is for this slot or a later one, whatever its status.
-- `duplicate`: a concurrent tick holds the key for this slot, or queued a task for the same skill at a different slot first. In the second case the later task cancels itself after the insert and the lowest open task id wins.
+- `duplicate`: a concurrent tick holds the key for this slot, or queued a task for the same skill at a different slot first. The unique index `tasks_skill_schedule_one_open_idx` allows one open scheduler task per skill, so a racing insert fails and nothing is queued twice.
 
 Due minutes since the skill's previous scheduled task that no task covers are not queued one by one. A skill's first task has no previous task, so it reports none. The next task covers them, says how many there were, and the tick reports the count as `missed`. `missed` counts at most the last 7 days. A due minute older than the catch-up window is not replayed. There is no table for this: the slot in the task description is the record, and the scheduler matches only tasks written by the `skill-scheduler` actor, so an agent cannot block or fake a slot by creating a task with the same title.
 

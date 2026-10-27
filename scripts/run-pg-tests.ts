@@ -610,6 +610,14 @@ async function testSkillSchedule(tag: string): Promise<void> {
     assert.equal(last.length, 1);
     assert.match(last[0].description, /Scheduled slot: 2026-10-27T12:20Z/);
 
+    // The index, not the tick's read, is what stops two open tasks for one skill.
+    await sql()`update tasks set status = 'done' where title = ${title}`;
+    await sql()`insert into tasks (title, actor_type, actor_id, status) values (${title}, 'agent', 'skill-scheduler', 'queued')`;
+    await assert.rejects(
+      sql()`insert into tasks (title, actor_type, actor_id, status) values (${title}, 'agent', 'skill-scheduler', 'running')`,
+      /tasks_skill_schedule_one_open_idx/,
+    );
+
     // A task an agent creates with the same title and created_by does not count: the actor differs.
     await sql()`delete from tasks where title = ${title}`;
     await sql()`insert into tasks (title, created_by, actor_type, actor_id) values (${title}, 'skill-scheduler', 'agent', 'someone-else')`;

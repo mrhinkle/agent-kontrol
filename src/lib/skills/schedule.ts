@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Actor } from "../actor";
 import { IdempotencyConflict } from "../idempotency";
-import { createTask, updateTask } from "../store";
+import { createTask } from "../store";
 import { skillNow } from "./clock";
 import {
   compileCron,
@@ -14,6 +14,7 @@ import {
 } from "./schedule-cron";
 import {
   listLastScheduledTasks,
+  isOneOpenViolation,
   listOpenScheduledTasks,
   SCHEDULED_TITLE_PREFIX,
   SCHEDULER_ACTOR_ID,
@@ -74,7 +75,6 @@ export interface TickDeps {
   settings: () => Promise<SettingsRecord[]>;
   open: () => Promise<ScheduledTaskRow[]>;
   last: () => Promise<ScheduledTaskRow[]>;
-  cancel: (id: number, why: string) => Promise<void>;
   create: (input: {
     title: string;
     description: string;
@@ -89,9 +89,6 @@ const defaultDeps: TickDeps = {
   settings: listSettings,
   open: listOpenScheduledTasks,
   last: listLastScheduledTasks,
-  cancel: async (id, why) => {
-    await updateTask({ id, status: "cancelled", result: why });
-  },
   create: (input) =>
     createTask({
       ...input,
@@ -215,18 +212,11 @@ export async function runScheduleTick(
         machine: route.machine,
         idempotency_key: idempotencyKeyFor(skill.id, slot),
       });
-      // Two ticks for different slots can both pass the open check above. After the
-      // insert the lowest open task id wins and any later one cancels itself.
-      const winner = Math.min(...(await deps.open()).filter((t) => t.skill_id === skill.id).map((t) => t.id), task.id);
-      if (winner !== task.id) {
-        await deps.cancel(task.id, "Cancelled: another scheduled task for this skill was queued first.");
-        items.push({ skill_id: skill.id, slot, outcome: "skipped", reason: "duplicate" });
-        continue;
-      }
       items.push({ skill_id: skill.id, slot, outcome: "queued", task_id: task.id, ...(missed ? { missed } : {}) });
     } catch (err) {
-      // Same slot key from a concurrent tick: that tick owns the task.
-      if (err instanceof IdempotencyConflict) {
+      // A concurrent tick owns the slot key, or queued this skill's task first
+      // (tasks_skill_schedule_one_open_idx makes that check atomic).
+      if (err instanceof IdempotencyConflict || isOneOpenViolation(err)) {
         items.push({ skill_id: skill.id, slot, outcome: "skipped", reason: "duplicate" });
         continue;
       }
