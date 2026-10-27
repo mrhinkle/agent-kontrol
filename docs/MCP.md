@@ -436,10 +436,14 @@ What is wired: two read routes and a pure helper. What is not: no Agent Kontrol 
 - `POST /api/skills/pointers` takes `{ lane, runtime, agents_md }` and returns `{ demo, lane, runtime, empty, changed, content }`. `content` is the file text with the block inserted at the end, replaced in place, or removed when `empty` is true. Text outside the markers is untouched, CRLF files stay CRLF, and a second run reports `changed: false`. Duplicate blocks collapse into one. `agents_md` omitted or null means the file does not exist: `content` is null when there is nothing to write. A begin marker without an end, an end without a begin, or a nested begin is HTTP 400. The route stores nothing and writes no file. The same needs `skills:read`.
 - `applyPointerBlock(content, block)` in `src/lib/skills/agents-md.ts` is the helper behind POST.
 
-One line for a dispatcher, run in the target repo before the lane starts. It needs `jq`, `curl`, and `MC_URL`/`MC_TOKEN`. Use the lane name the skill scopes use and the runtime that will read the file:
+A dispatcher runs this in the target repo before the lane starts. It needs `jq`, `curl`, and `MC_URL`/`MC_TOKEN`. Use the lane name the skill scopes use and the runtime that will read the file. It stops without touching the file if the file exists and cannot be read, if the call fails, or if the server answers with an error:
 
 ```bash
-f=AGENTS.md; r=$( { [ -f "$f" ] && jq -Rs --arg l "$LANE" --arg r "$RUNTIME" '{lane:$l,runtime:$r,agents_md:.}' "$f" || jq -n --arg l "$LANE" --arg r "$RUNTIME" '{lane:$l,runtime:$r}'; } | curl -fsS -X POST "$MC_URL/api/skills/pointers" -H "Authorization: Bearer $MC_TOKEN" -H 'Content-Type: application/json' --data-binary @- ) && [ "$(jq -r .changed <<<"$r")" = true ] && jq -j '.content // empty' <<<"$r" > "$f"
+f=AGENTS.md
+if [ -e "$f" ]; then req=$(jq -Rs --arg l "$LANE" --arg r "$RUNTIME" '{lane:$l,runtime:$r,agents_md:.}' "$f") || exit 1
+else req=$(jq -n --arg l "$LANE" --arg r "$RUNTIME" '{lane:$l,runtime:$r}'); fi
+res=$(curl -fsS -X POST "$MC_URL/api/skills/pointers" -H "Authorization: Bearer $MC_TOKEN" -H 'Content-Type: application/json' -d "$req") || exit 1
+[ "$(jq -r '.changed' <<<"$res")" = true ] && jq -j '.content // empty' <<<"$res" > "$f.tmp" && mv "$f.tmp" "$f"
 ```
 
-It writes the file only when `changed` is true and the content is not null. If the call fails the file is left as it was, so a lane still starts without pointers. Do not commit the result: the block is per-lane and belongs in the working tree.
+The file is written only when `changed` is true, and it is replaced whole by `mv`. If the call fails the file is left as it was, so a lane still starts without pointers. Do not commit the result: the block is per-lane and belongs in the working tree.
