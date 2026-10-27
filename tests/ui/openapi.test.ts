@@ -219,6 +219,41 @@ describe("OpenAPI document", () => {
     assert.equal(params.find((item) => item.name === "conversation")?.required, false);
   });
 
+  it("covers POST /api/memory, dry_run, and server-set actor fields", () => {
+    const doc = openApiDocument();
+    const paths = doc.paths as Record<string, {
+      post?: { requestBody?: { content: { "application/json": { schema: { $ref?: string } } } } };
+      put?: { requestBody?: { content: { "application/json": { schema: { $ref?: string } } } } };
+      patch?: { requestBody?: { content: { "application/json": { schema: { $ref?: string } } } } };
+    }>;
+    assert.equal(
+      paths["/api/memory"]?.post?.requestBody?.content["application/json"].schema.$ref,
+      "#/components/schemas/RememberInput",
+    );
+
+    const remember = schemaOf(doc, "RememberInput");
+    assert.deepEqual(remember.required, ["content"]);
+    assert.equal((remember.properties?.dry_run as { type: string }).type, "boolean");
+    assert.equal((schemaOf(doc, "PatchTask").properties?.dry_run as { type: string }).type, "boolean");
+    assert.equal((schemaOf(doc, "RepoList").properties?.dry_run as { type: string }).type, "boolean");
+    assert.equal(paths["/api/tasks/{id}"]?.patch?.requestBody?.content["application/json"].schema.$ref, "#/components/schemas/PatchTask");
+    assert.equal(paths["/api/settings/repos"]?.put?.requestBody?.content["application/json"].schema.$ref, "#/components/schemas/RepoList");
+
+    const types = fs.readFileSync("src/lib/types.ts", "utf8");
+    for (const name of ["Task", "Message"]) {
+      const schema = schemaOf(doc, name);
+      const fields = interfaceFields(types, name);
+      assert.deepEqual(Object.keys(schema.properties ?? {}).sort(), fields.map((field) => field.name).sort());
+      assert.deepEqual(schema.required, fields.filter((field) => !field.optional).map((field) => field.name));
+      assert.deepEqual((schema.properties?.actor_type as { enum: unknown[] }).enum, ["human", "agent", null]);
+      assert.ok(schema.properties?.actor_id);
+    }
+
+    const create = schemaOf(doc, "CreateTask");
+    assert.equal(create.properties?.actor_type, undefined);
+    assert.equal(create.properties?.actor_id, undefined);
+  });
+
   it("builds request schemas from the constants and interfaces the routes use", () => {
     const doc = openApiDocument();
     const report = schemaOf(doc, "ReportInput");

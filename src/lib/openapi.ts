@@ -62,6 +62,26 @@ const cookieOrBearer = [{ cookieAuth: [] }, { bearerAuth: [] }];
 const bearerOnly = [{ bearerAuth: [] }];
 const sessionOnly = [{ cookieAuth: [] }];
 
+/** Server-set. A request body cannot write these. */
+const actorType: Json = {
+  type: ["string", "null"],
+  enum: ["human", "agent", null],
+  description:
+    "Set by the server from the authenticated credential. human for a dashboard session (actor_id operator). agent for an agent credential, MC_TOKEN (actor_id mc-token), or an OAuth client. Null on older rows, and null when MC_DASHBOARD_PASSWORD is unset and the request presented no credential.",
+};
+
+const actorId: Json = {
+  type: ["string", "null"],
+  description:
+    "Credential id, mc-token, the OAuth client id, or operator. Null in the same cases as actor_type.",
+};
+
+const dryRunFlag: Json = {
+  type: "boolean",
+  description:
+    "When true, return what would change and write nothing. Omitted or false applies the write. Any other JSON type is 400 and writes nothing.",
+};
+
 const flatErrors: Json = {
   "400": jsonResponse("The body is not JSON, a required field is missing, or a field failed validation.", ref("Error")),
   "401": jsonResponse("The credential is missing or not valid.", ref("Error")),
@@ -154,13 +174,25 @@ export function openApiDocument(): Json {
           type: "object",
           required: ["repos"],
           properties: {
-            version: { type: "string" },
+            version: { type: "string", description: "Version from the last GET. A mismatch is 409 stale and writes nothing." },
+            dry_run: dryRunFlag,
             repos: {
               type: "array",
               minItems: 1,
               maxItems: MAX_REPOS,
               items: ref("RepoInput"),
             },
+          },
+        },
+        WatchedRepos: {
+          type: "object",
+          required: ["source", "writable", "max", "version", "repos"],
+          properties: {
+            source: { type: "string", enum: ["database", "file"] },
+            writable: { type: "boolean" },
+            max: { type: "integer", const: MAX_REPOS },
+            version: { type: "string" },
+            repos: { type: "array", items: ref("RepoInput") },
           },
         },
         UsageFact: {
@@ -257,7 +289,10 @@ export function openApiDocument(): Json {
             machine: { type: "string" },
             priority: { type: "integer", minimum: 1, maximum: 3 },
             reviewer_platform: { type: "string", enum: [...REVIEWER_PLATFORMS] },
-            created_by: { type: "string" },
+            created_by: {
+              type: "string",
+              description: "Free-text label stored on the task. It does not set actor_type or actor_id.",
+            },
           },
         },
         ClaimTask: {
@@ -278,6 +313,145 @@ export function openApiDocument(): Json {
             session_id: { type: "string" },
             assigned_agent: { type: "string" },
             agent_id: { type: "string" },
+            dry_run: dryRunFlag,
+          },
+        },
+        Task: {
+          type: "object",
+          required: [
+            "id",
+            "title",
+            "description",
+            "project",
+            "platform",
+            "machine",
+            "priority",
+            "status",
+            "reviewer_platform",
+            "assigned_agent",
+            "session_id",
+            "result",
+            "cost_usd",
+            "created_by",
+            "actor_type",
+            "actor_id",
+            "created_at",
+            "claimed_at",
+            "updated_at",
+            "completed_at",
+          ],
+          properties: {
+            id: { type: "integer" },
+            title: { type: "string" },
+            description: { type: ["string", "null"] },
+            project: { type: ["string", "null"] },
+            platform: { type: "string", enum: [...TASK_PLATFORMS] },
+            machine: { type: ["string", "null"] },
+            priority: { type: "integer" },
+            status: { type: "string", enum: [...TASK_STATUSES] },
+            reviewer_platform: { type: ["string", "null"], enum: [...REVIEWER_PLATFORMS, null] },
+            assigned_agent: { type: ["string", "null"] },
+            session_id: { type: ["string", "null"] },
+            result: { type: ["string", "null"] },
+            cost_usd: { type: ["number", "null"] },
+            created_by: { type: ["string", "null"] },
+            actor_type: actorType,
+            actor_id: actorId,
+            created_at: { type: "string", format: "date-time" },
+            claimed_at: { type: ["string", "null"], format: "date-time" },
+            updated_at: { type: "string", format: "date-time" },
+            completed_at: { type: ["string", "null"], format: "date-time" },
+          },
+        },
+        Message: {
+          type: "object",
+          required: [
+            "id",
+            "agent_id",
+            "body",
+            "created_by",
+            "actor_type",
+            "actor_id",
+            "created_at",
+            "delivered_at",
+            "acked_at",
+            "direction",
+            "in_reply_to",
+            "thread_id",
+            "read_by_dashboard_at",
+          ],
+          properties: {
+            id: { type: "integer" },
+            agent_id: { type: "string" },
+            body: { type: "string" },
+            created_by: {
+              type: ["string", "null"],
+              description: "Free-text label. It does not set actor_type or actor_id.",
+            },
+            actor_type: actorType,
+            actor_id: actorId,
+            created_at: { type: "string", format: "date-time" },
+            delivered_at: { type: ["string", "null"], format: "date-time" },
+            acked_at: { type: ["string", "null"], format: "date-time" },
+            direction: { type: "string", enum: ["inbound", "outbound"] },
+            in_reply_to: { type: ["integer", "null"] },
+            thread_id: { type: ["string", "null"] },
+            read_by_dashboard_at: { type: ["string", "null"], format: "date-time" },
+          },
+        },
+        MemoryItem: {
+          type: "object",
+          required: ["id", "key", "content", "tags", "agent_id", "created_at", "updated_at"],
+          properties: {
+            id: { type: "integer" },
+            key: { type: ["string", "null"] },
+            content: { type: "string" },
+            tags: { type: "array", items: { type: "string" } },
+            agent_id: { type: ["string", "null"] },
+            created_at: { type: "string", format: "date-time" },
+            updated_at: { type: "string", format: "date-time" },
+          },
+        },
+        RememberInput: {
+          type: "object",
+          required: ["content"],
+          properties: {
+            content: { type: "string" },
+            key: {
+              type: "string",
+              minLength: 1,
+              maxLength: 200,
+              description: "1 to 200 characters and no control characters. Omit it to insert a note with no key. Null is treated as omitted.",
+            },
+            tags: { type: "array", items: { type: "string" } },
+            agent_id: { type: ["string", "null"] },
+            dry_run: dryRunFlag,
+          },
+        },
+        DryRunChange: {
+          type: "object",
+          required: ["op", "summary", "before", "after"],
+          properties: {
+            op: { type: "string", enum: ["add", "remove", "update", "reorder", "overwrite", "insert"] },
+            summary: { type: "string" },
+            before: { type: ["object", "null"], additionalProperties: true },
+            after: { type: ["object", "null"], additionalProperties: true },
+          },
+        },
+        DryRunResult: {
+          type: "object",
+          required: ["dry_run", "applied", "would_write", "action", "changes", "affected"],
+          properties: {
+            dry_run: { type: "boolean", const: true },
+            applied: { type: "boolean", const: false },
+            would_write: { type: "boolean" },
+            action: {
+              type: "string",
+              enum: ["replace_repos", "cancel_task", "update_task", "overwrite_memory", "insert_memory"],
+            },
+            changes: { type: "array", items: ref("DryRunChange") },
+            affected: { type: "array", items: { type: "object", additionalProperties: true } },
+            note: { type: "string" },
           },
         },
         CreateCredential: {
@@ -367,7 +541,41 @@ export function openApiDocument(): Json {
             query("limit", { type: "integer", default: 50 }, "Maximum notes. Default 50."),
           ],
           responses: {
-            "200": jsonResponse("Matching notes, newest update first.", { type: "object" }),
+            "200": jsonResponse("Matching notes, newest update first.", {
+              type: "object",
+              properties: {
+                demo: { type: "boolean" },
+                items: { type: "array", items: ref("MemoryItem") },
+              },
+            }),
+            ...flatErrors,
+          },
+        }),
+        post: operation({
+          operationId: "remember",
+          tags: ["memory"],
+          summary: "Store a note, or preview the write.",
+          description:
+            "The REST twin of MCP remember. An agent credential needs memory:write. dry_run true returns the insert or the key overwrite and writes nothing. action is overwrite_memory when the key already exists, otherwise insert_memory. A non-boolean dry_run is 400 and writes nothing. With no database, a dry run still describes the note and sets would_write to false.",
+          security: cookieOrBearer,
+          requestBody: body(ref("RememberInput")),
+          responses: {
+            "200": jsonResponse("The stored note, or a preview that writes nothing.", {
+              oneOf: [
+                {
+                  type: "object",
+                  required: ["ok", "applied"],
+                  properties: {
+                    ok: { type: "boolean" },
+                    applied: { type: "boolean" },
+                    demo: { type: "boolean" },
+                    note: { type: "string" },
+                    item: ref("MemoryItem"),
+                  },
+                },
+                ref("DryRunResult"),
+              ],
+            }),
             ...flatErrors,
           },
         }),
@@ -384,7 +592,13 @@ export function openApiDocument(): Json {
             query("conversation", { type: "boolean" }, "When true, return the full history."),
           ],
           responses: {
-            "200": jsonResponse("Messages for the agent.", { type: "object" }),
+            "200": jsonResponse("Messages for the agent. Each message carries server-set actor_type and actor_id.", {
+              type: "object",
+              properties: {
+                demo: { type: "boolean" },
+                messages: { type: "array", items: ref("Message") },
+              },
+            }),
             ...flatErrors,
             "503": jsonResponse("The messages table is not set up.", ref("Error")),
           },
@@ -393,6 +607,8 @@ export function openApiDocument(): Json {
           operationId: "enqueueMessage",
           tags: ["messages"],
           summary: "Operator enqueues an inbound message.",
+          description:
+            "The server sets actor_type and actor_id from the authenticated credential. created_by is a label and does not set those fields. When MC_DASHBOARD_PASSWORD is unset and the request presents no credential, both actor fields are null.",
           security: cookieOrBearer,
           requestBody: body({
             type: "object",
@@ -404,7 +620,16 @@ export function openApiDocument(): Json {
             },
           }),
           responses: {
-            "200": jsonResponse("The message was stored.", { type: "object" }),
+            "200": jsonResponse("The message was stored. actor_type and actor_id are on message.", {
+              type: "object",
+              properties: {
+                ok: { type: "boolean" },
+                id: { type: "integer" },
+                demo: { type: "boolean" },
+                note: { type: "string" },
+                message: ref("Message"),
+              },
+            }),
             ...flatErrors,
             "503": jsonResponse("The messages table is not set up.", ref("Error")),
           },
@@ -431,6 +656,8 @@ export function openApiDocument(): Json {
           operationId: "replyToOperator",
           tags: ["messages"],
           summary: "A non-MCP agent posts a reply.",
+          description:
+            "actor_type and actor_id are taken from the bearer, not from created_by. A dashboard session is human / operator. MC_TOKEN is agent / mc-token.",
           security: bearerOnly,
           requestBody: body({
             type: "object",
@@ -443,7 +670,16 @@ export function openApiDocument(): Json {
             },
           }),
           responses: {
-            "200": jsonResponse("The reply was stored.", { type: "object" }),
+            "200": jsonResponse("The reply was stored. actor_type and actor_id are on message.", {
+              type: "object",
+              properties: {
+                ok: { type: "boolean" },
+                id: { type: "integer" },
+                demo: { type: "boolean" },
+                note: { type: "string" },
+                message: ref("Message"),
+              },
+            }),
             ...flatErrors,
             "404": jsonResponse("in_reply_to does not exist.", ref("Error")),
             "503": jsonResponse("The messages table is not set up.", ref("Error")),
@@ -465,7 +701,13 @@ export function openApiDocument(): Json {
             query("limit", { type: "integer" }, "Maximum rows."),
           ],
           responses: {
-            "200": jsonResponse("Tasks.", { type: "object" }),
+            "200": jsonResponse("Tasks. actor_type and actor_id are server-set.", {
+              type: "object",
+              properties: {
+                demo: { type: "boolean" },
+                tasks: { type: "array", items: ref("Task") },
+              },
+            }),
             ...flatErrors,
           },
         }),
@@ -473,10 +715,20 @@ export function openApiDocument(): Json {
           operationId: "createTask",
           tags: ["tasks"],
           summary: "Create a task.",
+          description:
+            "actor_type and actor_id on the returned task come from the authenticated credential. The body cannot set them. created_by is only a label.",
           security: cookieOrBearer,
           requestBody: body(ref("CreateTask")),
           responses: {
-            "200": jsonResponse("The task was queued, or dropped in demo mode.", { type: "object" }),
+            "200": jsonResponse("The task was queued, or dropped in demo mode.", {
+              type: "object",
+              properties: {
+                ok: { type: "boolean" },
+                demo: { type: "boolean" },
+                note: { type: "string" },
+                task: ref("Task"),
+              },
+            }),
             ...flatErrors,
           },
         }),
@@ -491,7 +743,9 @@ export function openApiDocument(): Json {
           responses: {
             "200": jsonResponse("The claimed task, or task null when none is queued.", {
               type: "object",
-              properties: { task: { type: ["object", "null"] } },
+              properties: {
+                task: { oneOf: [ref("Task"), { type: "null" }] },
+              },
             }),
             ...flatErrors,
           },
@@ -501,12 +755,27 @@ export function openApiDocument(): Json {
         patch: operation({
           operationId: "updateTask",
           tags: ["tasks"],
-          summary: "Report progress or cancel a task.",
+          summary: "Report progress, cancel a task, or preview that write.",
+          description:
+            "dry_run true returns the affected task and the field diff and writes nothing. action is cancel_task when status is cancelled, otherwise update_task. A missing id is still 404. A non-boolean dry_run is 400 and writes nothing. With no database, a dry run returns would_write false.",
           security: cookieOrBearer,
           parameters: [pathParam("id", "Task id.", { type: "integer" })],
           requestBody: body(ref("PatchTask")),
           responses: {
-            "200": jsonResponse("The updated task, or demo mode.", { type: "object" }),
+            "200": jsonResponse("The updated task, a demo acknowledgement, or a preview that writes nothing.", {
+              oneOf: [
+                {
+                  type: "object",
+                  required: ["ok"],
+                  properties: {
+                    ok: { type: "boolean" },
+                    demo: { type: "boolean" },
+                    task: ref("Task"),
+                  },
+                },
+                ref("DryRunResult"),
+              ],
+            }),
             ...flatErrors,
             "404": jsonResponse("No task has this id when a database is connected.", ref("Error")),
           },
@@ -562,27 +831,22 @@ export function openApiDocument(): Json {
           summary: "Repos the progress board watches.",
           security: cookieOrBearer,
           responses: {
-            "200": jsonResponse("The current list and its version.", {
-              type: "object",
-              properties: {
-                source: { type: "string", enum: ["database", "file"] },
-                writable: { type: "boolean" },
-                max: { type: "integer", const: MAX_REPOS },
-                version: { type: "string" },
-                repos: { type: "array", items: ref("RepoInput") },
-              },
-            }),
+            "200": jsonResponse("The current list and its version.", ref("WatchedRepos")),
             ...flatErrors,
           },
         }),
         put: operation({
           operationId: "putWatchedRepos",
           tags: ["settings"],
-          summary: "Replace the watched-repo list.",
+          summary: "Replace the watched-repo list, or preview that replace.",
+          description:
+            "dry_run true returns the diff against the list GET would show (adds, removes, updates, reorders) and writes nothing. A stale version is still 409. With no database, a dry run returns that diff with would_write false instead of 409. A non-boolean dry_run is 400 and writes nothing.",
           security: cookieOrBearer,
           requestBody: body(ref("RepoList")),
           responses: {
-            "200": jsonResponse("The stored list.", { type: "object" }),
+            "200": jsonResponse("The stored list, or a preview that writes nothing.", {
+              oneOf: [ref("WatchedRepos"), ref("DryRunResult")],
+            }),
             "400": jsonResponse("The list failed validation. errors is unchanged.", {
               allOf: [ref("Error"), { type: "object", properties: { errors: { type: "array" } } }],
             }),
