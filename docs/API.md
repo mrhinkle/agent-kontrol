@@ -17,6 +17,8 @@ The `agent_credentials` table stores the label, the first 8 characters of the to
 | Route group | Accepted credentials |
 | --- | --- |
 | Dashboard UI and data routes (default) | Session cookie `mc_auth`, or `Authorization: Bearer <MC_TOKEN>` |
+| `GET` and `POST /api/decisions` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `decisions:write` |
+| `PATCH /api/decisions/:id` | Session cookie, `MC_TOKEN`, or an agent credential with `decisions:write` |
 | Ingest routes: `POST /api/v1/traces`, `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, `POST /api/usage/ingest` | `Authorization: Bearer <MC_TOKEN>`, or an agent credential whose scope covers the route (`status:write` for `POST /api/ingest`, `messages:write` for `POST /api/messages/reply`); the other ingest routes take `MC_TOKEN` only |
 | MCP transport: `/api/mcp` | `Authorization: Bearer <MC_TOKEN>`, an agent credential, or an OAuth access token (JWT) issued by this server |
 | Credential management: `GET`/`POST`/`DELETE /api/settings/credentials` | Dashboard session only |
@@ -50,6 +52,9 @@ If `MC_DASHBOARD_PASSWORD` is unset, the gate is open in local development and o
 | GET | `/api/progress` | Cookie or bearer | Everything the progress board needs |
 | GET | `/api/progress/digest` | Cookie or bearer | The board as plain text, for schedulers and terminals. A failure is the JSON error body, not plain text. |
 | POST | `/api/progress/ingest` | Bearer | One collection tick from `scripts/collect-progress.sh` |
+| GET | `/api/decisions` | Cookie or bearer | Decision queue, oldest first, each row with `age_days`. `shape=brief` is the morning-brief `.decisions` list |
+| POST | `/api/decisions` | Cookie or bearer | Upsert one decision, or reconcile a collector sweep |
+| PATCH | `/api/decisions/:id` | Cookie, bearer, or `decisions:write` | Record a decision, a deferral, or a withdrawal |
 | GET | `/api/settings/repos` | Cookie or bearer | The repos the progress board watches |
 | PUT | `/api/settings/repos` | Cookie or bearer | Replace the watched repos |
 | GET | `/api/settings/credentials` | Session only | List agent credentials. No token and no hash |
@@ -173,6 +178,32 @@ Each entry in `repos`:
 | `no_verdict_rate` | number | no | No-verdict rate. |
 | `detail` | object | no | `{lane_mix?, stalled_prs?, notes?}`. |
 
+### Decisions
+
+The morning brief's decisions list comes from this table when every brief-eligible row for that repo has `kind`, `labels`, `opened_at`, and `repo_short`. Those rows are `source` `github-label`, `status` not `withdrawn`, and `github_present` not `false` (a null `github_present` still counts as present). `repo` is `owner/name`. `repo_short` is the config short name and is display only. The brief joins a row onto a watched repo by `owner/name`, so two repos that share a short name do not both receive the row. `age_hours` drops fractional seconds before `Z`, subtracts the unix times, and divides by 3600. `age_days` is `floor(age_hours / 24)` from `opened_at` (GitHub `createdAt`). GitHub `createdAt` is stored as `opened_at` and, on insert only, as `first_seen_at`.
+
+A row created before those columns existed has them null. `shape=brief` does not treat that row as authoritative: it does not invent `kind: "issue"`, `labels: []`, an age from `first_seen_at`, or a `repo_short` from the repo basename. The response field `incomplete_repos` lists each `owner/name` with at least one such row. `scripts/morning-brief.sh` keeps the GitHub label sweep for those repos and still replaces every other watched repo from `decisions`. The collector's next upsert fills the null `kind`, `labels`, and `repo_short`, and fills a null `opened_at`. After that fill, the table replaces the sweep for that repo.
+
+`GET /api/decisions?status=open&repo=&source=&limit=&shape=row` lists rows oldest-first by `first_seen_at`. `status` defaults to `open`. `open` also includes `deferred` rows whose `defer_until` is at or before now. `all` or one of `open`, `decided`, `deferred`, `withdrawn` is allowed. `limit` defaults to 500 and maxes at 1000. Each row includes `age_days`. `shape` defaults to `row`. `shape=brief` ignores `status` and `source`. `decisions` is the morning-brief list from complete rows only: `source` `github-label`, `status` not `withdrawn`, `github_present` not `false`, `number` set, and `kind`, `labels`, `opened_at`, and `repo_short` all set, oldest first. `incomplete_repos` is the repos with a brief-eligible row missing any of those four. `repo` and `limit` still apply to both. `scripts/morning-brief.sh` calls `GET /api/decisions?shape=brief&limit=1000` when `MC_URL` and `MC_TOKEN` are set. It replaces a watched repo's decisions from `decisions`, including when that repo's list is empty, and leaves a repo in `incomplete_repos` on the GitHub sweep. A failed call keeps the GitHub sweep for every repo. With a database the body is `{ "demo": false, "decisions": [...], "incomplete_repos": [...] }`.
+
+`POST /api/decisions` upserts by `key`. Required: `key`, `source`, `title`. Optional: `repo` (`owner/name`), `repo_short`, `number`, `url`, `why`, `options`, `recommended`, `requested_by`, `kind` (`issue` or `pr`), `labels`, `opened_at`, `first_seen_at`, `github_present`, `force`. A later upsert refreshes `title` and `last_seen_at`. It fills a null `kind`, `labels`, or `repo_short`, and fills a null `opened_at`. It does not overwrite an `opened_at` or `first_seen_at` that is already set, or an existing `requested_by`. A `github-label` upsert that omits `github_present` stores `true`.
+
+Status on that upsert:
+
+- A new key is `open`.
+- `decided` and `deferred` stay as they are. The answer text is left in place. The response includes `status_held: true`.
+- `force: true` reopens a `decided` or `deferred` row to `open` and clears `decision`, `decided_by`, `decided_at`, and `defer_until`.
+- `withdrawn` returns to `open` on an ordinary upsert, without `force`.
+- A body field `status` is not how a row becomes `decided`. That is `PATCH`.
+
+The other POST shape is `{ "reconcile": { "repo", "source", "seen_keys" } }`. It is mutually exclusive with `key`. `source` defaults to `github-label`. `seen_keys` may be empty and each key must start with `github:<repo>#`. For that repo and source, keys absent from `seen_keys` are updated and `last_seen_at` is not bumped. An absent key is an issue or PR that closed or lost the label. `open`, `deferred`, and `decided` become `withdrawn`. `defer_until` is cleared on `open` and `deferred`. `decision`, `decided_by`, and `decided_at` stay on a decided row. `github_present` becomes false. A row already `withdrawn` with `github_present` false is left alone. The response is `{ "ok": true, "reconciled", "withdrawn" }`.
+
+`scripts/collect-progress.sh` POSTs one row per open issue or PR that carries a label in `brief.decisionLabels` (`key` `github:<repo>#<n>`, `source` `github-label`, `why` the matching labels joined with `", "`, `kind` `pr` when `gh` returned `isDraft`, `labels` the matching names, `opened_at` GitHub `createdAt`, `repo_short` the config short name). That POST is what backfills a legacy null `kind`, `labels`, `opened_at`, or `repo_short`. It then reconciles. It does not reconcile when `decisionLabels` is empty, when `gh` fails, when the issue list is longer than 2000 or the PR list is longer than 500, or when any upsert failed. `--backfill` does not sync decisions. `--dry-run` prints the decision JSON to stderr and does not POST, so stdout stays the progress payload.
+
+`PATCH /api/decisions/:id` body is `{ "status"?, "decision"?, "decided_by"?, "defer_until"? }` with at least one of those fields. `id` is a positive integer. `status` is one of the four. `decided` requires non-empty `decision` text and sets `decided_at` to now. `deferred` requires `defer_until` as an ISO timestamp. `open` clears `decision`, `decided_by`, `decided_at`, and `defer_until`. `withdrawn` sets `github_present` false. `decided_by` is a body field. The route does not take it from the credential. An unknown id, when a database is connected, is `404` `not_found` with `error` `Decision not found`. This PATCH only records the row. Commenting on the GitHub issue and removing the label is issue #65, not this route.
+
+Demo mode (no `DATABASE_URL`), after the body validates: `GET` returns `{ "demo": true, "decisions": [] }`. `POST` returns `{ "ok": true, "demo": true, "note": "DATABASE_URL not set; decision dropped" }`. `PATCH` returns `{ "ok": true, "demo": true }`.
+
 ### Settings
 
 - `GET /api/settings/repos` returns `{ "source": "database" | "file", "writable": true, "max": 25, "version": "...", "repos": [{ "repo", "label", "short", "color", "blockedLabel" }] }`. `source` is `file` when no list has been saved yet, or when there is no database; `repos` is then the default from `progress.config.json`. The collector calls this on every tick.
@@ -231,8 +262,8 @@ OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this sha
 | `insufficient_scope` | 403 | no | An agent credential is valid but lacks the scope for the tool or route. |
 | `credential_store_unavailable` | 503 | yes | An `akc_` credential was presented and the credential store could not be read. Not a revocation; retry. Its body is `{ "error": "credential_store_unavailable" }` only. |
 | `forbidden` | 403 | no | `POST /api/messages/reply` when `in_reply_to` names a message that belongs to a different agent. |
-| `not_found` | 404 | no | Unknown trace id on `GET /api/traces/:traceId` when a database is connected (demo mode returns 200 and an empty `spans` list), or `POST /api/messages/reply` when `in_reply_to` names a message that does not exist. |
-| `validation_failed` | 400 | no | A field is present but not usable: a bad `before` on `GET /api/traces`, a bad `since` and `until` pair on `GET /api/usage` (a `since` without `until` is ignored), a bad `collected_at` on usage or progress ingest, a bad task or trace id, a privacy refusal, or an OTLP body the parser rejected. |
+| `not_found` | 404 | no | Unknown trace id on `GET /api/traces/:traceId` when a database is connected (demo mode returns 200 and an empty `spans` list), `POST /api/messages/reply` when `in_reply_to` names a message that does not exist, or `PATCH /api/decisions/:id` when a database is connected and that id does not exist (`error` stays `Decision not found`). Demo mode does not look the decision id up. |
+| `validation_failed` | 400 | no | A field is present but not usable: a bad `before` on `GET /api/traces`, a bad `since` and `until` pair on `GET /api/usage` (a `since` without `until` is ignored), a bad `collected_at` on usage or progress ingest, a bad task, trace, or decision id, a decision body or `status` the parser rejected, a privacy refusal, or an OTLP body the parser rejected. |
 | `invalid_json` | 400 | no | The body is not JSON. On `POST /api/login` the `error` string stays `invalid request`. On `POST /api/mcp` an empty or non-JSON body uses this code and `error` `invalid JSON`. A missing bearer on that route is still `401` with `WWW-Authenticate`. |
 | `missing_field` | 400 | no | A required field is absent. `fields` names it. |
 | `rate_limited` | 429 | yes | More than 5 `POST /api/login` attempts in 10 minutes from one client IP. `Retry-After` is seconds. The OAuth consent form shares this limiter and answers with HTML, not this JSON. |
@@ -254,8 +285,8 @@ OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this sha
 With no `DATABASE_URL` set (demo mode):
 
 - The auth gate is open.
-- GET routes return demo data, usually with `demo: true` in the response.
-- Ingest routes answer `{"ok": true, "demo": true}` and drop the data.
+- GET routes return demo data, usually with `demo: true` in the response. `GET /api/decisions` returns `{ "demo": true, "decisions": [] }`.
+- Ingest routes answer `{"ok": true, "demo": true}` and drop the data. `POST /api/decisions` does the same and adds `note`. `PATCH /api/decisions/:id` answers `{ "ok": true, "demo": true }` and does not look the id up.
 
 ## Versioning
 
