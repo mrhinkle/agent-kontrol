@@ -129,6 +129,12 @@ describe("schedule cron maths", () => {
     assert.equal(countMatchesBetween(cron, at("2026-10-27T12:00:00Z"), at("2026-10-27T12:20:00Z")), 3);
     assert.equal(nextDueSlot(cron, at("2026-10-27T12:10:00Z"))!.toISOString(), "2026-10-27T12:15:00.000Z");
     assert.equal(nextDueSlot(compileCron("0 0 31 2 *")!, at("2026-10-27T12:10:00Z")), null);
+    assert.equal(nextDueSlot(compileCron("0 0 29 2 *")!, at("2026-10-27T12:10:00Z"))!.toISOString(), "2028-02-29T00:00:00.000Z");
+    assert.equal(nextDueSlot(compileCron("30 14 * * *")!, at("2026-10-27T14:30:00Z"))!.toISOString(), "2026-10-28T14:30:00.000Z");
+    assert.equal(nextDueSlot(compileCron("30 14 * * *")!, at("2026-10-27T14:29:20Z"))!.toISOString(), "2026-10-27T14:30:00.000Z");
+    // Vixie cron: `*/2` starts with `*`, so day-of-week stays unrestricted and ANDs with day-of-month.
+    assert.equal(cronMatches(compileCron("0 0 1 * */2")!, at("2027-01-01T00:00:00Z")), false); // a Friday, not in */2
+
   });
 });
 

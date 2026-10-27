@@ -423,11 +423,11 @@ A tick queues nothing for a skill when:
 - `already_scheduled`: the newest scheduled task is for this slot or a later one, whatever its status.
 - `duplicate`: a concurrent tick holds the key for this slot.
 
-Due minutes that no task covers are not queued one by one. The next task covers them, says how many there were, and the tick reports the count as `missed`. A due minute older than the catch-up window is not replayed. There is no table for this: the slot in the task description is the record, and the scheduler matches only tasks written by the `skill-scheduler` actor, so an agent cannot block or fake a slot by creating a task with the same title.
+Due minutes since the skill's previous scheduled task that no task covers are not queued one by one. A skill's first task has no previous task, so it reports none. The next task covers them, says how many there were, and the tick reports the count as `missed`. A due minute older than the catch-up window is not replayed. There is no table for this: the slot in the task description is the record, and the scheduler matches only tasks written by the `skill-scheduler` actor, so an agent cannot block or fake a slot by creating a task with the same title.
 
 The response is `{ ok, now, scheduled, queued, skipped, items }`. `scheduled` counts skills with a valid cron. Each item is `{ skill_id, slot, outcome: "queued" | "skipped", reason?, task_id?, missed? }`. A skill that is not due has no item. With no database the response is `{ ok: true, demo: true, note }` and nothing is queued.
 
-`GET /api/skills` and `GET /api/skills/:id` carry two additional fields on each skill, both ISO strings or `null`: `lastScheduledAt`, the newest slot the scheduler queued, and `nextDueAt`, the next due minute for a scheduled skill. Existing fields are unchanged. Run history stays in `lastRun` and `triggers`; a scheduled run appears there only after an agent calls `run_skill`.
+`GET /api/skills` and `GET /api/skills/:id` carry two additional fields on each skill, both ISO strings or `null`: `lastScheduledAt`, the newest slot the scheduler queued, and `nextDueAt`, the next due minute for a scheduled skill (null if the cron never matches, such as `0 0 31 2 *`; the search looks 8 years ahead). Existing fields are unchanged. Run history stays in `lastRun` and `triggers`; a scheduled run appears there only after an agent calls `run_skill`.
 
 ### Drift
 

@@ -62,7 +62,7 @@ export function compileCron(expr: string): CompiledCron | null {
   };
 }
 
-/** True when the UTC minute containing `at` matches. Day-of-month and day-of-week are ORed when both are restricted, as in Vixie cron. */
+/** True when the UTC minute containing `at` matches. Day-of-month and day-of-week are ORed when both are restricted. As in Vixie cron, a field that starts with `*` (including a stepped star) counts as unrestricted. */
 export function cronMatches(cron: CompiledCron, at: Date): boolean {
   if (!cron.minute.has(at.getUTCMinutes()) || !cron.hour.has(at.getUTCHours())) return false;
   if (!cron.month.has(at.getUTCMonth() + 1)) return false;
@@ -110,13 +110,24 @@ export function countMatchesBetween(cron: CompiledCron, from: Date, to: Date, ca
   return n;
 }
 
-/** First matching minute strictly after `now`, searching up to a year. Null when none (for example 0 0 31 2 *). */
+/** First matching minute strictly after `now`. Walks days, then hours and minutes, so 0 0 29 2 * finds the next leap day up to 8 years out. Null when none (0 0 31 2 *). */
 export function nextDueSlot(cron: CompiledCron, now: Date): Date | null {
   const start = floorToMinute(now).getTime() + MINUTE_MS;
-  const limit = 366 * 24 * 60;
-  for (let i = 0; i < limit; i += 1) {
-    const at = new Date(start + i * MINUTE_MS);
-    if (cronMatches(cron, at)) return at;
+  const firstDay = Math.floor(start / DAY_MS) * DAY_MS;
+  for (let d = 0; d < 8 * 366; d += 1) {
+    const day = firstDay + d * DAY_MS;
+    if (!cronMatches({ ...cron, minute: ALL, hour: ALL }, new Date(day))) continue;
+    for (let h = 0; h < 24; h += 1) {
+      if (!cron.hour.has(h)) continue;
+      for (let m = 0; m < 60; m += 1) {
+        if (!cron.minute.has(m)) continue;
+        const at = day + h * 3_600_000 + m * MINUTE_MS;
+        if (at >= start) return new Date(at);
+      }
+    }
   }
   return null;
 }
+
+const DAY_MS = 86_400_000;
+const ALL = new Set(Array.from({ length: 60 }, (_, i) => i));
