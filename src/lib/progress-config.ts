@@ -144,6 +144,8 @@ export const THRESHOLDS = {
   reviewRounds: 3.0,
   /** share of review rounds that returned no parseable verdict */
   noVerdictRate: 0.15,
+  /** a skill run with no end is stalled after this many minutes, unless AK_SKILL_STALL_MINUTES overrides it */
+  skillStallMinutes: 60,
 } as const;
 
 export const WINDOWS = ["24h", "7d", "30d", "90d"] as const;

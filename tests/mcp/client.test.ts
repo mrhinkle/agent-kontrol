@@ -21,7 +21,7 @@ if (!baseUrl || !token) {
   throw new Error("AK_MCP_BASE_URL and AK_MCP_TOKEN are required; run npm run test:mcp");
 }
 
-/** The 11 tools in docs/MCP.md. Names are stable for the 1.x line. */
+/** The 14 tools in docs/MCP.md. Names are stable for the 1.x line. */
 const DOCUMENTED_TOOLS = [
   "report_status",
   "get_fleet_status",
@@ -34,11 +34,14 @@ const DOCUMENTED_TOOLS = [
   "get_task_queue",
   "claim_task",
   "update_task",
+  "list_skills",
+  "get_skill",
+  "run_skill",
 ] as const;
 
 /**
  * The server still registers this deprecated alias (docs/MCP.md). The live
- * list is the 11 documented names plus this one alias, and nothing else.
+ * list is the 14 documented names plus this one alias, and nothing else.
  */
 const DEPRECATED_ALIAS = "reply_to_mark";
 
@@ -154,7 +157,7 @@ describe("MCP client against demo mode", { concurrency: 1 }, () => {
     }
   });
 
-  it("lists exactly the 11 documented tools plus the reply_to_mark alias", async () => {
+  it("lists exactly the 14 documented tools plus the reply_to_mark alias", async () => {
     const listed = await client.listTools();
     const nextCursor = (listed as { nextCursor?: unknown }).nextCursor;
     assert.equal(
@@ -174,7 +177,7 @@ describe("MCP client against demo mode", { concurrency: 1 }, () => {
     for (const name of expected) {
       assert.equal(counts.get(name), 1, `${name} should appear once`);
     }
-    assert.equal(names.length, 12);
+    assert.equal(names.length, 15);
   });
 
   it("report_status then get_fleet_status does not show the reported agent in demo mode", async () => {
@@ -243,5 +246,60 @@ describe("MCP client against demo mode", { concurrency: 1 }, () => {
     assert.equal(recalled.includes(note), false, "recall returned the note remember just sent");
     assert.equal(stored, DEMO.remember);
     assert.equal(recalled, DEMO.recall);
+  });
+
+  it("list_skills in demo mode hides selected skills when no lane is passed", async () => {
+    const listed = toolText(await client.callTool({ name: "list_skills", arguments: {} }), "list_skills");
+    assert.match(listed, /runtime filter: none \(caller did not pass runtime\)\./);
+    assert.match(listed, /verify-gibson/);
+    assert.equal(listed.includes("spec-writer"), false);
+    assert.equal(listed.includes(probe), false);
+  });
+
+  it("get_skill in demo mode returns the fixture body and the pinned sha", async () => {
+    const body = toolText(
+      await client.callTool({ name: "get_skill", arguments: { id: "verify-gibson", runtime: "grok" } }),
+      "get_skill",
+    );
+    assert.match(body, /^# verify-gibson/);
+    assert.match(body, /Pinned SHA: [0-9a-f]{64}/);
+    assert.match(body, /Prove the change against the lane's checks/);
+  });
+
+  it("run_skill in demo mode does not store a run or echo the note", async () => {
+    const started = toolText(
+      await client.callTool({
+        name: "run_skill",
+        arguments: {
+          id: "verify-gibson",
+          agent_id: agentId,
+          runtime: "grok",
+          note: `${probe}-skill-note`,
+        },
+      }),
+      "run_skill",
+    );
+    assert.equal(started, "DATABASE_URL not set; skill run not stored.");
+    assert.equal(started.includes(probe), false);
+    const wrong = await client.callTool({
+      name: "run_skill",
+      arguments: { id: "operator-voice", agent_id: agentId, runtime: "grok" },
+    });
+    assert.equal((wrong as { isError?: boolean }).isError, true);
+    const wrongText = (wrong as { content?: { text?: string }[] }).content?.[0]?.text ?? "";
+    assert.match(wrongText, /not compatible/);
+  });
+
+  it("accepts run_skill completion without id through the registered schema", async () => {
+    const result = await client.callTool({
+      name: "run_skill",
+      arguments: { run_id: "00000000-0000-4000-8000-000000000001", complete: true },
+    });
+    const record = result as { isError?: boolean; content?: { text?: string }[] };
+    const text = record.content?.[0]?.text ?? "";
+    assert.equal(record.isError, true, text);
+    assert.match(text, /"code":"not_found"/);
+    assert.equal(text.includes("Required"), false);
+    assert.equal(/invalid_type/.test(text), false);
   });
 });
