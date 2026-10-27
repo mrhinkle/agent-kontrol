@@ -443,7 +443,10 @@ f=AGENTS.md
 if [ -e "$f" ]; then req=$(jq -Rs --arg l "$LANE" --arg r "$RUNTIME" '{lane:$l,runtime:$r,agents_md:.}' "$f") || exit 1
 else req=$(jq -n --arg l "$LANE" --arg r "$RUNTIME" '{lane:$l,runtime:$r}'); fi
 res=$(curl -fsS -X POST "$MC_URL/api/skills/pointers" -H "Authorization: Bearer $MC_TOKEN" -H 'Content-Type: application/json' -d "$req") || exit 1
-[ "$(jq -r '.changed' <<<"$res")" = true ] && jq -j '.content // empty' <<<"$res" > "$f.tmp" && mv "$f.tmp" "$f"
+if [ "$(jq -r '.changed' <<<"$res")" = true ]; then
+  tmp=$(mktemp "$(dirname "$f")/.agents-md.XXXXXX") || exit 1
+  jq -j '.content // empty' <<<"$res" > "$tmp" && chmod 644 "$tmp" && mv "$tmp" "$f" || { rm -f "$tmp"; exit 1; }
+fi
 ```
 
-The file is written only when `changed` is true, and it is replaced whole by `mv`. If the call fails the file is left as it was, so a lane still starts without pointers. Do not commit the result: the block is per-lane and belongs in the working tree.
+The file is written only when `changed` is true, and it is replaced whole by `mv` from a `mktemp` file in the same directory. If the call fails the file is left as it was, so a lane still starts without pointers. Do not commit the result: the block is per-lane and belongs in the working tree.
