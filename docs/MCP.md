@@ -427,7 +427,7 @@ node ~/.mission-control/collect-skills-drift.mjs --dry-run
 MC_URL=https://YOUR-DEPLOY.vercel.app MC_TOKEN=... node ~/.mission-control/collect-skills-drift.mjs
 ```
 
-It reads `<dir>/<name>/SKILL.md` for each directory, follows one level of symlink to a directory, skips names that start with `.` (such as `.system`), hashes the raw bytes with SHA-256, and posts one report per directory. `MC_URL` and `MC_TOKEN` come from the environment only. The script does not read the token from arguments or from a file, and it never prints it or any server response text. `MC_URL` must be https, except for localhost. The `host` it reports is `AK_MACHINE`, then `--machine NAME`, then the hostname. The directories are `AK_SKILL_DRIFT_DIRS` (the same variable the server reads), otherwise the two defaults. Each is posted as written (spaces around the commas are trimmed), so it must match the server's list.
+It reads `<dir>/<name>/SKILL.md` for each directory, follows one level of symlink to a directory, skips names that start with `.` (such as `.system`), hashes the raw bytes with SHA-256, and posts one report per directory. `MC_URL` and `MC_TOKEN` come from the environment only. The script does not read the token from arguments or from a file, and it never prints it or any server response text. `MC_URL` must be https, except for localhost. The `host` it reports is `--machine NAME`, then `AK_MACHINE`, then the hostname. The directories are `AK_SKILL_DRIFT_DIRS` (the same variable the server reads), otherwise the two defaults. Each is posted as written (spaces around the commas are trimmed), so it must match the server's list.
 
 Exit codes:
 

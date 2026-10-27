@@ -235,7 +235,7 @@ async function withServer(
     assert.ok(lines.join("\n").includes("MC_TOKEN is not set"));
     const server = http.createServer((_req, res) => {
       res.writeHead(500, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: `bad bearer ${TOKEN}` }));
+      res.end(JSON.stringify({ error: `bad bearer ${TOKEN}`, driftCount: TOKEN }));
     });
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
     try {
@@ -246,6 +246,30 @@ async function withServer(
     } finally {
       server.close();
     }
+  });
+
+  await check("a 2xx response that echoes the token is not printed", async () => {
+    const a = skillsDir({ "x/SKILL.md": "x" });
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, driftCount: TOKEN }));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    try {
+      const out = capture();
+      const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      assert.equal(await run([], { HOME: root, MC_URL: url, MC_TOKEN: TOKEN, AK_MACHINE: "m", AK_SKILL_DRIFT_DIRS: a }, out.io), 0);
+      assert.ok(!out.lines.join("\n").includes(TOKEN));
+    } finally {
+      server.close();
+    }
+  });
+
+  await check("an invalid skill name is skipped even if its SKILL.md is unreadable", async () => {
+    const dir = skillsDir({ "ok/SKILL.md": "o", "bad name/SKILL.md": "b" });
+    const r = await scanDir(dir);
+    assert.equal(r.status, "ok");
+    assert.deepEqual(r.skills.map((s: any) => s.name), ["ok"]);
   });
 
   await check("a dangling SKILL.md symlink fails the dir instead of looking absent", async () => {

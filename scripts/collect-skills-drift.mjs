@@ -77,6 +77,10 @@ export async function scanDir(configured, home = os.homedir()) {
     if (name.startsWith(".")) continue;
     const entry = path.join(dir, name);
     let skillDir;
+    if (!NAME_RE.test(name)) {
+      warnings.push(`${name}: not a valid skill id, skipped`);
+      continue;
+    }
     try {
       skillDir = await resolveSkillDir(entry);
     } catch (err) {
@@ -97,10 +101,6 @@ export async function scanDir(configured, home = os.homedir()) {
       }
       // A skill we cannot read must not look like a skill that is absent.
       return { status: "failed", reason: `${name}/SKILL.md: ${errCode(err)}` };
-    }
-    if (!NAME_RE.test(name)) {
-      warnings.push(`${name}: not a valid skill id, skipped`);
-      continue;
     }
     skills.push({ name, sha: sha256Hex(bytes) });
   }
@@ -252,7 +252,7 @@ export async function run(argv, env = process.env, io = { out: console.log, err:
       io.out(
         b.demo
           ? `ok ${dir}: ${result.skills.length} skills sent; server is in demo mode and stored nothing`
-          : `ok ${dir}: ${result.skills.length} skills, drift ${b.driftCount ?? "?"}`,
+          : `ok ${dir}: ${result.skills.length} skills, drift ${Number.isInteger(b.driftCount) ? b.driftCount : "?"}`,
       );
     } catch (e) {
       // Only the error class is printed: a fetch error can carry the URL, never the token.
