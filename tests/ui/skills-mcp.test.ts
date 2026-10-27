@@ -164,7 +164,7 @@ describe("skill MCP tools", { concurrency: false }, () => {
   it("starts a run, writes a span, and lets only that actor finish it once", async () => {
     const started = await runWithActor(actorA, () => startSkillRun({
       id: "open",
-      agentId: "grok-lane-1",
+      agentId: actorA.actor_id,
       runtime: "grok",
       lane: "conference-os",
     }));
@@ -179,7 +179,8 @@ describe("skill MCP tools", { concurrency: false }, () => {
     assert.equal(span?.status, "unset");
     assert.equal(span?.trace_id, started.runId.replace(/-/g, ""));
     assert.equal(span?.span_id, span?.trace_id.slice(0, 16));
-    assert.equal(span?.agent_id, "grok-lane-1");
+    assert.equal(span?.agent_id, actorA.actor_id);
+    assert.equal(skillsMemory.runs[0]?.agent_id, actorA.actor_id);
     assert.equal(span?.attributes.skill_id, "open");
     assert.equal(skillsMemory.runs[0]?.status, "running");
 
@@ -218,7 +219,7 @@ describe("skill MCP tools", { concurrency: false }, () => {
     skillsMemory.throwOnSpan = true;
     await assert.rejects(() => runWithActor(actorA, () => startSkillRun({
       id: "open",
-      agentId: "grok-lane-1",
+      agentId: actorA.actor_id,
       runtime: "grok",
     })));
     assert.equal(skillsMemory.runs.length, 0);
@@ -230,7 +231,7 @@ describe("skill MCP tools", { concurrency: false }, () => {
     assert.match(textOf(partial), /complete:true/);
     const noId = await runSkillTool({ id: "open", complete: true });
     assert.equal(noId.isError, true);
-    const long = await runWithActor(actorA, () => startSkillRun({ id: "open", agentId: "a", runtime: "grok" }));
+    const long = await runWithActor(actorA, () => startSkillRun({ id: "open", agentId: actorA.actor_id, runtime: "grok" }));
     assert.equal(long.ok, true);
     if (!long.ok) return;
     const tooLong = await runWithActor(actorA, () => finishSkillRun({ runId: long.runId, note: "x".repeat(501) }));
@@ -248,7 +249,7 @@ describe("skill MCP tools", { concurrency: false }, () => {
     assert.equal(picked.isError, true);
     const started = await runWithActor(actorA, () => runSkillTool({
       id: "picked",
-      agent_id: "g",
+      agent_id: actorA.actor_id,
       runtime: "grok",
       lane: "conference-os",
     }));
@@ -322,7 +323,7 @@ describe("skill MCP tools", { concurrency: false }, () => {
       const missingId = toolPayload(await (await call({ agent_id: "g", runtime: "grok" })).text());
       assert.equal(missingId.isError, true);
       assert.match(missingId.text, /"code":"validation_failed"/);
-      assert.match(missingId.text, /id, agent_id, and runtime/);
+      assert.match(missingId.text, /A start requires id and runtime/);
       assert.equal(missingId.text.includes("Required"), false);
 
       const started = toolPayload(await (await call({ id: "open", agent_id: "g", runtime: "grok" })).text());

@@ -291,7 +291,7 @@ describe("skill list, detail, and settings", { concurrency: false }, () => {
   it("maps a run to running, stalled, or done from the stall window", async () => {
     await seed();
     await runWithActor(ACTOR, () => patchSkillSettings("alpha", { trigger: "on_request" }));
-    await runWithActor(ACTOR, () => startSkillRun({ id: "alpha", agentId: "grok-lane", runtime: "grok", lane: "conference-os" }));
+    await runWithActor(ACTOR, () => startSkillRun({ id: "alpha", agentId: ACTOR.actor_id, runtime: "grok", lane: "conference-os" }));
     setSkillNowForTests(() => new Date("2026-10-27T12:30:00.000Z"));
     const running = await getSkillDetail("alpha");
     assert.equal(running?.triggers[0]?.status, "running");
@@ -307,7 +307,7 @@ describe("skill list, detail, and settings", { concurrency: false }, () => {
     assert.equal(ended?.triggers[0]?.status, "done");
     assert.equal(ended?.triggers[0]?.outcome, "failed");
     assert.equal(ended?.triggerCount7d, 1);
-    assert.equal(ended?.lastRun?.agent, "grok-lane");
+    assert.equal(ended?.lastRun?.agent, ACTOR.actor_id);
   });
 
   it("rejects a bad patch and records the actor on a good one", async () => {
@@ -374,7 +374,7 @@ describe("skill runs and MCP gates", { concurrency: false }, () => {
   it("starts a span, completes once, and refuses a different actor", async () => {
     await seedOnRequest();
     const started = await runWithActor(ACTOR, () =>
-      startSkillRun({ id: "alpha", agentId: "grok-lane", runtime: "grok" }),
+      startSkillRun({ id: "alpha", agentId: ACTOR.actor_id, runtime: "grok" }),
     );
     assert.equal(started.ok, true);
     if (!started.ok) return;
@@ -413,7 +413,7 @@ describe("skill runs and MCP gates", { concurrency: false }, () => {
 
   it("rejects a note over 500 characters before the run is closed", async () => {
     await seedOnRequest();
-    const started = await runWithActor(ACTOR, () => startSkillRun({ id: "alpha", agentId: "grok-lane", runtime: "grok" }));
+    const started = await runWithActor(ACTOR, () => startSkillRun({ id: "alpha", agentId: ACTOR.actor_id, runtime: "grok" }));
     assert.equal(started.ok, true);
     if (!started.ok) return;
     const tooLong = await runWithActor(ACTOR, () => finishSkillRun({ runId: started.runId, note: "x".repeat(501) }));
@@ -471,7 +471,7 @@ describe("skill drift, digest, pointers, and HTTP", { concurrency: false }, () =
     await runWithActor(ACTOR, () => patchSkillSettings("alpha", { trigger: "on_request" }));
     await runWithActor(ACTOR, () => patchSkillSettings("alpha", { trigger: "auto_inject", scope: { mode: "selected", lanes: ["other-lane"] } }));
     setSkillNowForTests(() => new Date("2026-10-19T12:00:00.000Z"));
-    await runWithActor(ACTOR, () => startSkillRun({ id: "alpha", agentId: "old-lane", runtime: "grok", lane: "other-lane" }));
+    await runWithActor(ACTOR, () => startSkillRun({ id: "alpha", agentId: ACTOR.actor_id, runtime: "grok", lane: "other-lane" }));
     setSkillNowForTests(() => new Date(NOW));
     const digest = await skillsDigest("7d");
     assert.equal(digest.note, "Only triggers routed through Agent Kontrol are counted.");

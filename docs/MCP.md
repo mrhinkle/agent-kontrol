@@ -271,15 +271,23 @@ Start a skill run, or finish one. This is one tool on purpose. A second `report_
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `id` | string | yes on start | Skill id. Required on start. Omit it on completion. If you pass it then, it must match the skill on the run. |
-| `agent_id` | string | yes on start | Agent id stored on the run and on the span. |
-| `runtime` | enum | yes on start | The runtime the instructions are rendered for. |
-| `lane` | string | no | Required when the skill's scope is `selected`. |
+| `agent_id` | string | no | Optional. The recorded agent id is the authenticated principal, not this field. Omit it. An agent credential or an OAuth client may pass only its own id. A different id is `identity_mismatch` and writes nothing. `MC_TOKEN` and a dashboard session cannot authenticate this field. |
+| `runtime` | enum | yes on start | Caller hint. The runtime the instructions are rendered for. It is not an identity. |
+| `lane` | string | no | Caller hint. Required when the skill's scope is `selected`. It is not an identity. |
 | `run_id` | string | yes on completion | The id returned by the start call. A value that is not a canonical UUID is `not_found`. |
 | `complete` | boolean | yes on completion | Must be `true` to finish. `run_id` without `complete: true` is `validation_failed`. `complete: true` without `run_id` is `validation_failed`. |
 | `status` | enum | no | `done` or `failed`. Omitted means `done`. |
 | `note` | string | no | At most 500 characters. Not a prompt and not tool input or output. |
 
-A start checks trigger, runtime, and lane, inserts `skill_runs`, and writes a `spans` row (`trace_id` is the run id without hyphens, `kind` is `tool`, `name` is `skill:<id>`). The text includes the instructions, the `run_id`, and the lines `Call run_skill again with this run_id and complete:true when you finish.` and `Omit id. The run already names the skill. If you pass id, it must match.` Completing twice returns the first completion unchanged. An unknown `run_id`, including one that is not a canonical UUID, is `not_found`. Passing `id` on completion when it does not match the skill on the run is `validation_failed`. Only the actor that started the run can finish it. A request with no actor cannot start a run. The fleet event feed is not written: `events.agent_id` references `agents`, and a skill run does not create an agent row. The span is the record that carries the agent id.
+A start checks trigger, runtime, and lane, inserts `skill_runs`, and writes a `spans` row (`trace_id` is the run id without hyphens, `kind` is `tool`, `name` is `skill:<id>`). The text includes the instructions, the `run_id`, and the lines `Call run_skill again with this run_id and complete:true when you finish.` and `Omit id. The run already names the skill. If you pass id, it must match.` Completing twice returns the first completion unchanged. An unknown `run_id`, including one that is not a canonical UUID, is `not_found`. Passing `id` on completion when it does not match the skill on the run is `validation_failed`. Only the actor that started the run can finish it. Passing another actor's `agent_id` does not transfer the run. A request with no actor cannot start a run. The fleet event feed is not written: `events.agent_id` references `agents`, and a skill run does not create an agent row. The span is the record that carries the agent id.
+
+The agent id on `skill_runs.agent_id`, on the span's `agent_id`, and on everything read from those rows (triggers, `lastRun.agent`, and the progress digest) is the authenticated principal. An agent credential records that credential's id. An OAuth access token records the client id, or the subject when the client id is empty. `MC_TOKEN` records `mc-token`. A dashboard session records `operator`. The request does not choose this id.
+
+Omit `agent_id` and the start uses that authenticated id. Passing the same id is accepted. Passing a different id from an agent credential or an OAuth client is `identity_mismatch`. The message names the authenticated id and says `agent_id` must match that id or be omitted. The call writes no run and no span. The server does not replace the supplied id and continue.
+
+`MC_TOKEN` and the dashboard session are one shared secret used by many agents. A supplied `agent_id` on those two principals cannot be checked, so it is not authenticated. The run's `agent_id` and the span's `agent_id` stay `mc-token` or `operator`. The supplied value is copied to the span attribute `reported_agent_id` and nowhere else. It is not the run's agent id, and it is not used to allow the start, to allow the completion, or to attribute the trigger. A caller that needs a per-agent identity has to use an agent credential or OAuth.
+
+`runtime` and `lane` stay caller-supplied hints. `runtime` chooses the preamble and rejects a skill that does not list it. `lane` is how a selected scope admits the call. Neither one is authenticated, and neither one is the agent id.
 
 Demo mode, with no database, still applies the trigger, runtime, and lane gates on a start. A start that passes them returns exactly `DATABASE_URL not set; skill run not stored.` and does not invent a run id. A completion in demo mode is `not_found`, because no run row exists.
 
@@ -305,8 +313,9 @@ The HTTP `401` for a missing or invalid bearer is unchanged: `WWW-Authenticate` 
 | --- | --- | --- |
 | `unauthorized` | no | Not returned inside a tool result. The HTTP `401` above covers a bad bearer. |
 | `forbidden` | no | `reply_to_operator` when `in_reply_to` belongs to a different agent. `get_skill` or `run_skill` when the runtime is incompatible or the lane is outside the skill's scope. `run_skill` when a different actor finishes a run, or when the caller has no actor. |
+| `identity_mismatch` | no | `run_skill` when an agent credential or an OAuth client passes an `agent_id` other than the authenticated id. The message names that id. Omit `agent_id`, or pass the same id. The call writes no run and no span. `MC_TOKEN` and a dashboard session do not return this code: a supplied `agent_id` there is the span attribute `reported_agent_id` only. |
 | `not_found` | no | `reply_to_operator` when `in_reply_to` does not exist. `get_skill` or `run_skill` when the skill is missing, removed, or trigger `off`. `run_skill` when `run_id` does not exist or is not a canonical UUID. |
-| `validation_failed` | no | `create_task` or `reply_to_operator` when `idempotency_key` is longer than 200 characters or contains a control character. `run_skill` when a start omits `id`, `agent_id`, or `runtime`, when `complete` is true without `run_id`, when `run_id` is set without `complete: true`, when `id` on completion does not match the skill on the run, or when `note` is longer than 500 characters. A privacy refusal on `POST /api/usage/ingest` is this code. Schema failures are the SDK message, not this JSON. |
+| `validation_failed` | no | `create_task` or `reply_to_operator` when `idempotency_key` is longer than 200 characters or contains a control character. `run_skill` when a start omits `id` or `runtime`, when `complete` is true without `run_id`, when `run_id` is set without `complete: true`, when `id` on completion does not match the skill on the run, or when `note` is longer than 500 characters. A privacy refusal on `POST /api/usage/ingest` is this code. Schema failures are the SDK message, not this JSON. |
 | `invalid_json` | no | Not a tool result. Authenticated `POST /api/mcp` returns HTTP 400 when the body is empty or not JSON. A missing bearer stays HTTP 401 with `WWW-Authenticate`. |
 | `missing_field` | no | Not returned by a tool. The input schema rejects a missing argument first. |
 | `rate_limited` | yes | Not returned by a tool. `POST /api/login` only. The OAuth consent form shares that limiter and answers with HTML, not this JSON. |
@@ -346,7 +355,7 @@ Fleet skills live in git. The default sources are `mrhinkle/master-skills` at `s
 
 ### What is stored
 
-`skill_runs` stores the run id, the skill id, the content SHA, the agent id, the lane, the runtime, the start, the end, the status (`running`, `done`, or `failed`), an optional note of at most 500 characters, and the actor. It does not store prompts or tool input or output. The displayed status is `done` when the run has ended (`outcome` is `done` or `failed`), `running` while it is inside the stall window, and `stalled` after that. The stored status stays `running` until the end is recorded.
+`skill_runs` stores the run id, the skill id, the content SHA, the agent id (the authenticated principal, not a request field), the lane, the runtime, the start, the end, the status (`running`, `done`, or `failed`), an optional note of at most 500 characters, and the actor. It does not store prompts or tool input or output. A self-reported `agent_id` from `MC_TOKEN` or a dashboard session is not a column on this row. It is the span attribute `reported_agent_id`. The displayed status is `done` when the run has ended (`outcome` is `done` or `failed`), `running` while it is inside the stall window, and `stalled` after that. The stored status stays `running` until the end is recorded.
 
 The content SHA is SHA-256 hex over the raw SKILL.md bytes, UTF-8, with no newline normalisation. A collector hashes the file as stored, including the frontmatter. Lists and the AGENTS.md pointer use the first 7 hex characters. That is not the git commit.
 
@@ -408,6 +417,12 @@ The server cannot read the operator's machine. A collector posts:
 ### Runs, the brief, and pointers
 
 `triggerCount7d` and `lastRun` come from `skill_runs` in one grouped query. The progress digest's optional `skills` field counts runs whose start is inside the digest window. `stalled` lists every current stalled run, including one that started before the window. `enabled_never_used` is an enabled skill with no run inside the window. The note on that object is the limit: only triggers routed through `run_skill` are counted. An agent that reads a skill from disk is invisible.
+
+Limits:
+
+- The agent id on a run is the authenticated principal. A request field cannot name a different agent. See `run_skill` above.
+- `MC_TOKEN` and the dashboard session share one secret. A supplied `agent_id` is only the span attribute `reported_agent_id`. It is not the run's agent and it authorizes nothing.
+- `runtime` and `lane` are advisory caller hints. They are not an identity.
 
 `AK_SKILL_STALL_MINUTES` is the stall window. The default is 60. A non-integer, a value below 1, or a value above 10080 falls back to 60, so a bad setting does not hide stalls. More than three stalled runs roll into one `skillStalled` alert. The id starts with `skill-stalled:`.
 

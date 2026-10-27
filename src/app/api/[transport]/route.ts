@@ -463,12 +463,12 @@ const handler = createMcpHandler(
       {
         title: "Run skill",
         description:
-          "Start or finish a skill run. The agent executes the instructions. Agent Kontrol only stores the start, the end, and an optional note. Omit run_id to start; id, agent_id, and runtime are required then. Call again with that run_id and complete true to finish, and omit id. If you pass id on completion, it must match the skill on the run. Only the actor that started the run can finish it.",
+          "Start or finish a skill run. The agent executes the instructions. Agent Kontrol only stores the start, the end, and an optional note. Omit run_id to start. id and runtime are required then. agent_id is optional: the recorded agent is the authenticated caller. Call again with that run_id and complete true to finish, and omit id. If you pass id on completion, it must match the skill on the run. Only the actor that started the run can finish it.",
         inputSchema: {
           id: z.string().optional().describe("Skill id. Required on start. Omit it on completion. If you pass it then, it must match the skill on the run."),
-          agent_id: z.string().optional().describe("Required on start."),
-          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional().describe("Required on start."),
-          lane: z.string().optional(),
+          agent_id: z.string().optional().describe("Omit to use the authenticated caller. An agent credential or OAuth client may pass only that same id."),
+          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional().describe("Required on start. Caller hint for the rendered instructions, not an identity."),
+          lane: z.string().optional().describe("Caller hint. Required when the skill's scope is selected. Not an identity."),
           run_id: z.string().optional().describe("Set with complete true to finish the run you started."),
           complete: z.boolean().optional().describe("True finishes the run. Requires run_id."),
           status: z.enum(["done", "failed"]).optional().describe("Completion outcome. Defaults to done."),

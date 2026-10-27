@@ -23,7 +23,10 @@ function text(value: string): McpToolResult {
   return { content: [{ type: "text", text: value }] };
 }
 
-function fromFail(fail: { code: "not_found" | "forbidden" | "validation_failed"; message: string }): McpToolResult {
+function fromFail(fail: {
+  code: "not_found" | "forbidden" | "validation_failed" | "identity_mismatch";
+  message: string;
+}): McpToolResult {
   return mcpToolError(fail.code, { message: fail.message });
 }
 
@@ -105,8 +108,8 @@ export async function runSkillTool(args: {
     if (!finished.ok) return fromFail(finished);
     return text(finished.text);
   }
-  if (!args.id || !args.agent_id || !args.runtime) {
-    return mcpToolError("validation_failed", { message: "A start requires id, agent_id, and runtime." });
+  if (!args.id || !args.runtime) {
+    return mcpToolError("validation_failed", { message: "A start requires id and runtime." });
   }
   if (!isConfigured()) {
     const gated = await demoGate(args.id, args.runtime, args.lane);

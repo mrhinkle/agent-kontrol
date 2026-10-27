@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { currentActor } from "../actor";
+import { currentActor, DASHBOARD_ACTOR_ID, LEGACY_ACTOR_ID, type Actor } from "../actor";
 import { upsertSpans } from "../trace-store";
 import type { SpanInput } from "../traces";
 import { skillNow } from "./clock";
@@ -14,7 +14,11 @@ import {
   type SkillRecord,
 } from "./types";
 
-export type RunFail = { ok: false; code: "not_found" | "forbidden" | "validation_failed"; message: string };
+export type RunFail = {
+  ok: false;
+  code: "not_found" | "forbidden" | "validation_failed" | "identity_mismatch";
+  message: string;
+};
 
 const PREAMBLE: Record<Runtime, string> = {
   claude: "You are Claude. Follow this skill in your own session. Agent Kontrol does not execute it.",
@@ -82,10 +86,33 @@ export function renderReferenceText(skill: SkillRecord, path: string): { ok: tru
 
 export interface StartInput {
   id: string;
-  agentId: string;
+  /**
+   * Caller-supplied label. The recorded agent id is currentActor().actor_id.
+   * Omit this, or pass that same id. A different id is identity_mismatch for
+   * an agent credential or an OAuth principal.
+   */
+  agentId?: string | null;
   runtime: string;
   lane?: string | null;
   note?: string | null;
+}
+
+function suppliedAgentId(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
+ * MC_TOKEN and the dashboard session each use one secret for many agents.
+ * A supplied agent_id on those two cannot be authenticated. Any other actor
+ * is an agent credential or an OAuth principal, and the id has to match.
+ */
+function sharedSecretActor(actor: Actor): boolean {
+  return (
+    (actor.actor_type === "agent" && actor.actor_id === LEGACY_ACTOR_ID) ||
+    (actor.actor_type === "human" && actor.actor_id === DASHBOARD_ACTOR_ID)
+  );
 }
 
 export async function startSkillRun(input: StartInput): Promise<{ ok: true; text: string; runId: string } | RunFail> {
@@ -96,13 +123,25 @@ export async function startSkillRun(input: StartInput): Promise<{ ok: true; text
   if (!gated.ok) return gated;
   const actor = currentActor();
   if (!actor) return { ok: false, code: "forbidden", message: "This request has no actor, so the run cannot be completed later." };
+  const supplied = suppliedAgentId(input.agentId);
+  let reportedAgentId: string | null = null;
+  if (sharedSecretActor(actor)) {
+    // The label is not the run's agent_id and is not an authorization input.
+    reportedAgentId = supplied;
+  } else if (supplied !== null && supplied !== actor.actor_id) {
+    return {
+      ok: false,
+      code: "identity_mismatch",
+      message: `Authenticated as ${actor.actor_id}. agent_id must match that id or be omitted.`,
+    };
+  }
   const runId = randomUUID();
   const now = skillNow().toISOString();
   const row: RunRecord = {
     run_id: runId,
     skill_id: gated.skill.id,
     skill_sha: gated.skill.sha,
-    agent_id: input.agentId,
+    agent_id: actor.actor_id,
     lane: input.lane ?? null,
     runtime: input.runtime,
     started_at: now,
@@ -114,7 +153,7 @@ export async function startSkillRun(input: StartInput): Promise<{ ok: true; text
   };
   await insertRun(row);
   try {
-    await upsertSpans([spanFor(row, null, "unset")]);
+    await upsertSpans([spanFor(row, null, "unset", reportedAgentId)]);
   } catch (err) {
     await deleteRun(runId).catch(() => undefined);
     throw err;
@@ -178,7 +217,12 @@ export function completionText(row: RunRecord): string {
   return lines.join("\n");
 }
 
-function spanFor(row: RunRecord, endedAt: string | null, status: "ok" | "error" | "unset"): SpanInput {
+function spanFor(
+  row: RunRecord,
+  endedAt: string | null,
+  status: "ok" | "error" | "unset",
+  reportedAgentId: string | null = null,
+): SpanInput {
   const traceId = row.run_id.replace(/-/g, "");
   const attributes: Record<string, string> = {
     skill_id: row.skill_id,
@@ -186,6 +230,7 @@ function spanFor(row: RunRecord, endedAt: string | null, status: "ok" | "error" 
     runtime: row.runtime,
   };
   if (row.lane) attributes.lane = row.lane;
+  if (reportedAgentId) attributes.reported_agent_id = reportedAgentId;
   return {
     trace_id: traceId,
     span_id: traceId.slice(0, 16),
