@@ -64,7 +64,10 @@ export function assembleSkills(input: {
   const notices: { path: string; message: string }[] = [];
   const byDir = new Map<string, InputFile[]>();
   for (const file of input.files) {
-    const dir = file.path.endsWith("/SKILL.md") ? parentDir(file.path) : directoryOf(file.path, input.globs);
+    const parent = file.path.endsWith("/SKILL.md") ? parentDir(file.path) : null;
+    const dir = parent && input.globs.some((glob) => matches(parent, glob))
+      ? parent
+      : directoryOf(file.path, input.globs);
     if (!dir) continue;
     const list = byDir.get(dir) ?? [];
     list.push(file);

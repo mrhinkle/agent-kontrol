@@ -4,7 +4,7 @@ import { upsertSpans } from "../trace-store";
 import type { SpanInput } from "../traces";
 import { skillNow } from "./clock";
 import { scopeAdmits } from "./settings";
-import { completeRun, deleteRun, getRun, insertRun, listSettings, listSkillRows } from "./store";
+import { completeRun, deleteRun, getRun, getSkillRow, insertRun, listSettings } from "./store";
 import {
   NOTE_MAX,
   isRuntime,
@@ -25,8 +25,7 @@ const PREAMBLE: Record<Runtime, string> = {
 };
 
 export async function loadVisibleSkill(id: string): Promise<SkillRecord | null> {
-  const rows = await listSkillRows();
-  return rows.find((skill) => skill.id === id && !skill.removed_at) ?? null;
+  return getSkillRow(id);
 }
 
 export async function gateSkill(input: {

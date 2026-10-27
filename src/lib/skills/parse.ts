@@ -126,15 +126,16 @@ function scalarString(value: unknown): string | null {
 }
 
 function splitFrontmatter(raw: string): { frontmatterText: string | null; body: string; error: string | null } {
-  if (!raw.startsWith("---")) return { frontmatterText: null, body: raw, error: null };
-  const nl = raw.indexOf("\n");
-  if (nl < 0) return { frontmatterText: null, body: raw, error: "unclosed frontmatter" };
-  const opener = raw.slice(0, nl).replace(/\r$/, "").trim();
-  if (opener !== "---") return { frontmatterText: null, body: raw, error: "malformed frontmatter opener" };
-  const rest = raw.slice(nl + 1);
+  const text = raw.startsWith("\uFEFF") ? raw.slice(1) : raw;
+  if (!text.startsWith("---")) return { frontmatterText: null, body: text, error: null };
+  const nl = text.indexOf("\n");
+  if (nl < 0) return { frontmatterText: null, body: text, error: "unclosed frontmatter" };
+  const opener = text.slice(0, nl).replace(/\r$/, "").trim();
+  if (opener !== "---") return { frontmatterText: null, body: text, error: "malformed frontmatter opener" };
+  const rest = text.slice(nl + 1);
   const match = rest.match(/^---[ \t]*\r?$/m);
   if (!match || match.index === undefined) {
-    return { frontmatterText: null, body: raw, error: "unclosed frontmatter" };
+    return { frontmatterText: null, body: text, error: "unclosed frontmatter" };
   }
   const frontmatterText = rest.slice(0, match.index).replace(/\r\n/g, "\n");
   const body = rest.slice(match.index + match[0].length).replace(/^\n/, "");
@@ -143,7 +144,7 @@ function splitFrontmatter(raw: string): { frontmatterText: string | null; body: 
 
 type Frame =
   | { indent: number; kind: "map"; container: Record<string, unknown> }
-  | { indent: number; kind: "list"; container: unknown[] };
+  | { indent: number; kind: "list"; container: unknown[]; compact?: boolean };
 
 function parseYamlMap(text: string): { ok: true; data: Record<string, unknown> } | { ok: false; error: string } {
   const root: Record<string, unknown> = {};
@@ -159,7 +160,13 @@ function parseYamlMap(text: string): { ok: true; data: Record<string, unknown> }
     if (rawLine.includes("\t")) return { ok: false, error: "tabs are not allowed in frontmatter" };
     const indent = rawLine.match(/^ */)?.[0].length ?? 0;
     const trimmed = rawLine.trim();
-    while (stack.length > 1 && indent <= stack[stack.length - 1].indent) stack.pop();
+    const isItem = trimmed.startsWith("- ");
+    while (stack.length > 1) {
+      const top = stack[stack.length - 1];
+      const keepCompact = top.kind === "list" && top.compact === true && isItem && indent === top.indent;
+      if (indent <= top.indent && !keepCompact) stack.pop();
+      else break;
+    }
     const parent = stack[stack.length - 1];
 
     if (trimmed.startsWith("- ")) {
@@ -214,6 +221,13 @@ function parseYamlMap(text: string): { ok: true; data: Record<string, unknown> }
       const nextLine = lines[nextIdx];
       const nextIndent = nextLine.match(/^ */)?.[0].length ?? 0;
       const nextTrim = nextLine.trim();
+      if (nextIndent === indent && nextTrim.startsWith("- ")) {
+        const list: unknown[] = [];
+        map[key] = list;
+        stack.push({ indent, kind: "list", container: list, compact: true });
+        i += 1;
+        continue;
+      }
       if (nextIndent <= indent) {
         map[key] = null;
         i += 1;

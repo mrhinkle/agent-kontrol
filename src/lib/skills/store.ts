@@ -120,6 +120,19 @@ export async function listSkillRows(): Promise<SkillRecord[]> {
   return rows.map(mapSkill);
 }
 
+/** One visible skill. Removed rows are absent. get_skill and run_skill use this. */
+export async function getSkillRow(id: string): Promise<SkillRecord | null> {
+  const rows = await db()`
+    /* sk:get-skill */
+    select id, source_id, path, name, description, version, sha, commit_sha, body,
+      "references" as references, runtimes, frontmatter, category, tags, removed_at, synced_at
+    from skills
+    where id = ${id} and removed_at is null
+  `;
+  const row = rows[0];
+  return row ? mapSkill(row) : null;
+}
+
 export function mapSkill(row: Record<string, unknown>): SkillRecord {
   return {
     id: String(row.id),
@@ -317,28 +330,6 @@ export interface SyncRunRow {
   finished_at: string | null;
   status: string;
   trigger: string;
-}
-
-export async function insertSyncRun(input: {
-  trigger: "manual" | "scheduled";
-  status: string;
-  summary: unknown;
-  error: string | null;
-  startedAt: string;
-  finishedAt: string;
-}): Promise<void> {
-  await db()`
-    /* sk:insert-sync-run */
-    insert into skill_sync_runs (started_at, finished_at, trigger, status, summary, error)
-    values (
-      ${input.startedAt}::timestamptz,
-      ${input.finishedAt}::timestamptz,
-      ${input.trigger},
-      ${input.status},
-      ${JSON.stringify(input.summary)}::jsonb,
-      ${input.error}
-    )
-  `;
 }
 
 export async function latestSyncRuns(): Promise<SyncRunRow[]> {

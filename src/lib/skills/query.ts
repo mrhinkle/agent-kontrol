@@ -4,6 +4,7 @@ import { driftNameCount } from "./drift";
 import { presentRun } from "./present";
 import { parseSettingsPatch } from "./settings";
 import {
+  getSkillRow,
   latestSyncRuns,
   listDrift,
   listSettings,
@@ -82,7 +83,11 @@ export async function listSkillViews(filter: {
     .filter((row) => matchesCategory(row.category, filter.category))
     .filter((row) => {
       if (!q) return true;
-      return row.name.toLowerCase().includes(q) || row.description.toLowerCase().includes(q);
+      return (
+        row.id.toLowerCase().includes(q) ||
+        row.name.toLowerCase().includes(q) ||
+        row.description.toLowerCase().includes(q)
+      );
     })
     .map((row) => toListItem(row, settingsById.get(row.id), statsById.get(row.id)))
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
@@ -90,8 +95,7 @@ export async function listSkillViews(filter: {
 }
 
 export async function getSkillDetail(id: string): Promise<SkillDetail | null> {
-  const rows = await listSkillRows();
-  const row = rows.find((skill) => skill.id === id && !skill.removed_at);
+  const row = await getSkillRow(id);
   if (!row) return null;
   const [settings, stats, triggers] = await Promise.all([
     listSettings(),
@@ -116,8 +120,7 @@ export async function patchSkillSettings(
   id: string,
   body: unknown,
 ): Promise<{ ok: true; detail: SkillDetail } | { ok: false; status: number; code: "not_found" | "validation_failed" | "missing_field"; message: string; fields?: Record<string, string> }> {
-  const rows = await listSkillRows();
-  const row = rows.find((skill) => skill.id === id && !skill.removed_at);
+  const row = await getSkillRow(id);
   if (!row) return { ok: false, status: 404, code: "not_found", message: "Skill not found" };
   const settings = await listSettings();
   const current = settings.find((item) => item.skill_id === id) ?? null;

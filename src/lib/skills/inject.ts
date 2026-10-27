@@ -25,9 +25,19 @@ export function renderPointers(skills: PointerSkill[], opts: { runtime: string; 
   const lines = ordered.map((skill) => {
     const version = skill.version ?? "unversioned";
     const run = JSON.stringify({ id: skill.id, runtime: opts.runtime, lane: opts.lane });
-    return `- ${skill.id} (${version}, ${shortSha(skill.sha)}) — ${skill.description}. Fetch: get_skill {"id":"${skill.id}"}; run: run_skill ${run}`;
+    const description = pointerDescription(skill.description);
+    return `- ${skill.id} (${version}, ${shortSha(skill.sha)}) — ${description}. Fetch: get_skill {"id":"${skill.id}"}; run: run_skill ${run}`;
   });
   return ["<!-- ak-skills:begin -->", ...lines, "<!-- ak-skills:end -->"].join("\n");
+}
+
+/** One line, no comment delimiters, and no period of its own. The renderer adds the period. */
+function pointerDescription(description: string): string {
+  return description
+    .replace(/<!--|-->/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\.+$/, "");
 }
 
 export async function renderLaneSkillPointers(input: { lane: string; runtime: string }): Promise<string> {

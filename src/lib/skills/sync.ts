@@ -62,7 +62,7 @@ export async function syncSkills(options: SyncOptions): Promise<SyncResult> {
       finishedAt: skillNow().toISOString(),
     });
     if (!closed) return leaseLost();
-    const upstream = await readUpstream();
+    const upstream = await readUpstream().catch(() => emptyUpstream());
     return { ...applied, upstream };
   } catch (err) {
     if (err instanceof SyncLeaseLost) return leaseLost();

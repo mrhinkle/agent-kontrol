@@ -254,9 +254,38 @@ describe("skill list, detail, and settings", { concurrency: false }, () => {
     assert.deepEqual(byName.skills.map((row) => row.id), ["beta"]);
     const byIdOnly = await listSkillViews({ runtime: null, q: "beta" });
     assert.deepEqual(byIdOnly.skills.map((row) => row.id), ["beta"]);
+    skillsMemory.skills.push({
+      ...skillsMemory.skills[0],
+      id: "verify-gibson",
+      name: "Verify Gibson",
+      description: "Checks the gates.",
+      removed_at: null,
+    });
+    const bySlug = await listSkillViews({ runtime: null, q: "verify-gibson" });
+    assert.deepEqual(bySlug.skills.map((row) => row.id), ["verify-gibson"]);
     const miss = await listSkillViews({ runtime: null, q: "not-the-name" });
     assert.equal(miss.skills.some((row) => row.id === "gone"), false);
     assert.equal(miss.skills.some((row) => row.id === "alpha"), false);
+  });
+
+  it("loads one visible skill row by id", async () => {
+    await seed();
+    await runWithActor(ACTOR, () => patchSkillSettings("alpha", { trigger: "on_request" }));
+    skillsMemory.skills.push({
+      ...skillsMemory.skills[0],
+      id: "gone",
+      name: "gone",
+      removed_at: NOW,
+    });
+    const beforeList = callsOf("sk:list-skills");
+    const beforeGet = callsOf("sk:get-skill");
+    const result = await getSkillTool({ id: "alpha", runtime: "grok" });
+    assert.equal(callsOf("sk:get-skill"), beforeGet + 1);
+    assert.equal(callsOf("sk:list-skills"), beforeList);
+    assert.match(result.content[0]?.text ?? "", /Alpha body/);
+    const hidden = await getSkillTool({ id: "gone" });
+    assert.match(hidden.content[0]?.text ?? "", /not_found/);
+    assert.equal(callsOf("sk:list-skills"), beforeList);
   });
 
   it("maps a run to running, stalled, or done from the stall window", async () => {

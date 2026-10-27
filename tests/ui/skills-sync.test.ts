@@ -442,6 +442,32 @@ describe("skill sync", { concurrency: false }, () => {
     assert.match(skillsMemory.skills.find((row) => row.id === "alpha")?.body ?? "", /same/);
   });
 
+  it("reports a finished sync as ok when the upstream read throws", async () => {
+    skillsMemory.failMarker = "sk:list-drift";
+    const result = await syncSkills({
+      trigger: "manual",
+      fetcher: fetcher({
+        "master-skills": { commit_sha: "a".repeat(40), files: [md("skills/alpha", "one")] },
+      }),
+    });
+    assert.equal(result.status, "ok");
+    assert.deepEqual(result.added.map((item) => item.id), ["alpha"]);
+    assert.deepEqual(result.upstream, { source: "", sha: null, syncedAt: null, driftCount: 0 });
+    assert.equal(skillsMemory.syncRuns.at(-1)?.status, "ok");
+    assert.match(skillsMemory.skills.find((row) => row.id === "alpha")?.body ?? "", /one/);
+  });
+
+  it("names the id column on every skill_sync_runs insert", () => {
+    const src = fs.readFileSync("src/lib/skills/store.ts", "utf8");
+    const inserts = [...src.matchAll(/insert into skill_sync_runs \(([^)]*)\)/g)].map((match) => match[1]);
+    assert.ok(inserts.length >= 1);
+    for (const columns of inserts) assert.match(columns, /\bid\b/);
+    const migration = fs.readFileSync("supabase/migrations/20261027_skills.sql", "utf8");
+    const table = migration.slice(migration.indexOf("create table if not exists skill_sync_runs"));
+    const idLine = table.split("\n").find((line) => line.trim().startsWith("id uuid"));
+    assert.equal(idLine?.includes("default"), false);
+  });
+
   it("locks the sync lease row inside every sync write", () => {
     const src = fs.readFileSync("src/lib/skills/store.ts", "utf8");
     const markers = ["/* sk:upsert-skill */", "/* sk:remove-skill */", "/* sk:finish-sync */"];

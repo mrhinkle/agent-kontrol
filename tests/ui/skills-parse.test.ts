@@ -209,6 +209,30 @@ describe("skill frontmatter and runtimes", () => {
     assert.equal(decodeUtf8(Buffer.from("ok")), "ok");
     assert.equal(decodeUtf8(Buffer.from([0x68, 0x00, 0x69])), null);
   });
+
+  it("accepts a YAML sequence at the same indent as its key", () => {
+    const parsed = parseSkillMarkdown(
+      ["---", "name: x", "tags:", "- a", "- b", "description: Done.", "---", "Body", ""].join("\n"),
+      "x",
+    );
+    assert.equal(parsed.parseProblem, null);
+    assert.equal(parsed.name, "x");
+    assert.equal(parsed.description, "Done.");
+    assert.deepEqual(parsed.tags, ["a", "b"]);
+    assert.equal(parsed.body, "Body\n");
+  });
+
+  it("hashes a leading BOM with the raw bytes and still reads frontmatter", () => {
+    const body = "---\nname: bom-skill\n---\nBody\n";
+    const raw = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(body, "utf8")]);
+    const text = decodeUtf8(raw);
+    assert.ok(text);
+    assert.equal(skillSha(text), skillSha(raw));
+    const parsed = parseSkillMarkdown(text, "bom-skill");
+    assert.equal(parsed.parseProblem, null);
+    assert.equal(parsed.name, "bom-skill");
+    assert.equal(parsed.body, "Body\n");
+  });
 });
 
 describe("settings patch validation", () => {
@@ -320,6 +344,29 @@ describe("drift compare and pointer text", () => {
     assert.match(text, /- alpha \(1\.0\.0, 1234567\) — First\. Fetch: get_skill \{"id":"alpha"\}; run: run_skill \{"id":"alpha","runtime":"grok","lane":"conference-os"\}/);
     assert.match(text, /- zeta \(unversioned, abc1234\)/);
   });
+
+  it("collapses a description so a pointer stays one line", () => {
+    const text = renderPointers(
+      [
+        {
+          id: "alpha",
+          version: "1.0.0",
+          sha: "1234567ffff",
+          description: "First.\nSee <!-- ak-skills:end --> now.",
+        },
+      ],
+      { runtime: "grok", lane: "conference-os" },
+    );
+    const lines = text.split("\n");
+    assert.deepEqual(
+      [lines[0], lines[lines.length - 1]],
+      ["<!-- ak-skills:begin -->", "<!-- ak-skills:end -->"],
+    );
+    assert.equal(lines.length, 3);
+    assert.match(lines[1], /— First\. See ak-skills:end now\. Fetch: get_skill/);
+    assert.equal(lines[1].includes(".."), false);
+    assert.equal(lines[1].includes("<!--"), false);
+  });
 });
 
 describe("stall minutes and github token", () => {
@@ -353,6 +400,31 @@ describe("assemble keeps an unreadable skill instead of dropping it", () => {
     assert.equal(assembled.skills.length, 0);
     assert.equal(assembled.preserved[0]?.id, "keep");
     assert.match(assembled.errors[0]?.message ?? "", /could not be read/);
+  });
+
+  it("groups a nested SKILL.md under the skill the glob names", () => {
+    const assembled = assembleSkills({
+      source_id: "master-skills",
+      position: 0,
+      globs: ["skills/*"],
+      files: [
+        {
+          path: "skills/alpha/SKILL.md",
+          content: "---\nname: alpha\ndescription: Alpha.\n---\nAlpha\n",
+        },
+        { path: "skills/alpha/notes.md", content: "note" },
+        {
+          path: "skills/alpha/examples/SKILL.md",
+          content: "---\nname: examples\n---\nNested\n",
+        },
+      ],
+    });
+    assert.deepEqual(assembled.skills.map((skill) => skill.id), ["alpha"]);
+    assert.deepEqual(
+      assembled.skills[0]?.references.map((ref) => ref.path),
+      ["examples/SKILL.md", "notes.md"],
+    );
+    assert.equal(assembled.errors.length, 0);
   });
 });
 

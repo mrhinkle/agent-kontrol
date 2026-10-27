@@ -216,7 +216,7 @@ export function matchesGlob(path: string, glob: string): boolean {
 export function decodeUtf8(bytes: Buffer): string | null {
   if (bytes.includes(0)) return null;
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch {
     return null;
   }

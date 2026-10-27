@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { setSqlForTests, type Row, type SqlTag } from "../../src/lib/db";
 
 /**
@@ -94,6 +93,8 @@ export interface SkillsMemory {
   spans: MemSpan[];
   calls: string[];
   throwOnSpan: boolean;
+  /** When set, the next SQL marker with this name throws. Sync tests use it. */
+  failMarker: string | null;
 }
 
 export const skillsMemory: SkillsMemory = emptyMemory();
@@ -109,6 +110,7 @@ function emptyMemory(): SkillsMemory {
     spans: [],
     calls: [],
     throwOnSpan: false,
+    failMarker: null,
   };
 }
 
@@ -146,6 +148,7 @@ export function resetSkillsMemory(): void {
   skillsMemory.spans = next.spans;
   skillsMemory.calls = next.calls;
   skillsMemory.throwOnSpan = false;
+  skillsMemory.failMarker = null;
 }
 
 export function installSkillsSql(): void {
@@ -207,6 +210,7 @@ function spans(values: unknown[]): Row[] {
 }
 
 function dispatch(marker: string, values: unknown[]): Row[] {
+  if (skillsMemory.failMarker === marker) throw new Error(`injected failure: ${marker}`);
   switch (marker) {
     case "sk:list-sources":
       return skillsMemory.sources
@@ -215,6 +219,12 @@ function dispatch(marker: string, values: unknown[]): Row[] {
         .map((row) => ({ ...row }));
     case "sk:list-skills":
       return skillsMemory.skills.map((row) => ({ ...row, references: row.references }));
+    case "sk:get-skill": {
+      const id = String(values[0]);
+      return skillsMemory.skills
+        .filter((row) => row.id === id && row.removed_at == null)
+        .map((row) => ({ ...row, references: row.references }));
+    }
     case "sk:upsert-skill":
       return upsertSkill(values);
     case "sk:remove-skill":
@@ -225,8 +235,6 @@ function dispatch(marker: string, values: unknown[]): Row[] {
       return beginSync(values);
     case "sk:finish-sync":
       return finishSync(values);
-    case "sk:insert-sync-run":
-      return insertSync(values);
     case "sk:latest-sync":
       return skillsMemory.syncRuns
         .map((row, index) => ({ row, index }))
@@ -359,19 +367,6 @@ function finishSync(values: unknown[]): Row[] {
   row.summary = json(values[2], null);
   row.error = values[3] == null ? null : String(values[3]);
   return [{ id: row.id }];
-}
-
-function insertSync(values: unknown[]): Row[] {
-  skillsMemory.syncRuns.push({
-    id: randomUUID(),
-    started_at: String(values[0]),
-    finished_at: String(values[1]),
-    trigger: String(values[2]),
-    status: String(values[3]),
-    summary: json(values[4], null),
-    error: values[5] == null ? null : String(values[5]),
-  });
-  return [];
 }
 
 function upsertSettings(values: unknown[]): Row[] {
