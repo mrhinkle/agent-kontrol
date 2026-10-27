@@ -12,6 +12,7 @@ import { progress } from "@/lib/progress-store";
 import { formatDigest } from "@/lib/progress-digest";
 import { OPERATOR } from "@/lib/operator";
 import { demoProgress } from "@/lib/demo-progress";
+import { getSkillTool, listSkillsTool, runSkillTool } from "@/lib/skills/mcp";
 
 export const maxDuration = 60;
 
@@ -420,6 +421,60 @@ const handler = createMcpHandler(
         },
       },
       async (args) => guardTool("update_task", () => updateTaskForTool(args)),
+    );
+
+    // Skills tools. Keep this block contiguous and after update_task.
+    // run_skill is one tool with two phases. A second report_skill_done name
+    // would be the same row and the same actor check.
+    server.registerTool(
+      "list_skills",
+      {
+        title: "List skills",
+        description:
+          "List skills whose trigger is not off, whose scope admits the lane, and which are compatible with runtime when runtime is passed. With no runtime, incompatible skills are not hidden. With no lane, selected-lane skills are hidden. Trigger off is omitted.",
+        inputSchema: {
+          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional().describe("Caller runtime. Omit to skip the runtime filter."),
+          lane: z.string().optional().describe("Lane name. Required to see skills limited to selected lanes."),
+          query: z.string().optional().describe("Case-insensitive match on id and description."),
+        },
+      },
+      async (args) => guardTool("list_skills", () => listSkillsTool(args)),
+    );
+
+    server.registerTool(
+      "get_skill",
+      {
+        title: "Get skill",
+        description:
+          "Return the mirrored SKILL.md pinned to its content SHA, or one reference file when path is set. Never fetches the upstream repository. A skill whose trigger is off is not served.",
+        inputSchema: {
+          id: z.string().describe("Skill id."),
+          path: z.string().optional().describe("Reference path relative to the skill directory. Omit for SKILL.md."),
+          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional(),
+          lane: z.string().optional(),
+        },
+      },
+      async (args) => guardTool("get_skill", () => getSkillTool(args)),
+    );
+
+    server.registerTool(
+      "run_skill",
+      {
+        title: "Run skill",
+        description:
+          "Start or finish a skill run. The agent executes the instructions. Agent Kontrol only stores the start, the end, and an optional note. Omit run_id to start. Call again with that run_id and complete true to finish. Only the actor that started the run can finish it.",
+        inputSchema: {
+          id: z.string().describe("Skill id."),
+          agent_id: z.string().optional().describe("Required on start."),
+          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional().describe("Required on start."),
+          lane: z.string().optional(),
+          run_id: z.string().optional().describe("Set with complete true to finish the run you started."),
+          complete: z.boolean().optional().describe("True finishes the run. Requires run_id."),
+          status: z.enum(["done", "failed"]).optional().describe("Completion outcome. Defaults to done."),
+          note: z.string().optional().describe("Optional note, at most 500 characters. Not a prompt or a tool log."),
+        },
+      },
+      async (args) => guardTool("run_skill", () => runSkillTool(args)),
     );
   },
   {},
