@@ -134,6 +134,7 @@ export function openApiDocument(): Json {
       { name: "settings" },
       { name: "usage" },
       { name: "traces" },
+      { name: "skills" },
       { name: "auth" },
       { name: "mcp" },
     ],
@@ -1298,6 +1299,110 @@ export function openApiDocument(): Json {
             "413": jsonResponse("The body is over 2 MB.", ref("Error")),
             "415": jsonResponse("The body is not JSON.", ref("Error")),
             "500": flatErrors["500"],
+          },
+        }),
+      },
+      "/api/skills": {
+        get: operation({
+          operationId: "listSkills",
+          tags: ["skills"],
+          summary: "List mirrored skills.",
+          description:
+            "Agent credentials need skills:read. runtime filters to skills compatible with that runtime. An unknown runtime is 400 validation_failed. q matches name and description, case-insensitive. Removed skills are omitted. With no database the body is demo true and a fixture list.",
+          security: cookieOrBearer,
+          parameters: [
+            query("runtime", { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] }, "Compatible runtime. Omit to return every skill."),
+            query("q", { type: "string" }, "Case-insensitive match on name and description."),
+          ],
+          responses: {
+            "200": jsonResponse("demo, upstream, and skills. List runtimes is an array of names.", { type: "object" }),
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/skills/sync": {
+        post: operation({
+          operationId: "syncSkills",
+          tags: ["skills"],
+          summary: "Mirror skill sources from GitHub.",
+          description:
+            "Operator route. An agent credential is denied. Omit the body, or send {trigger:manual}, for a manual run. A scheduler sends {trigger:scheduled} with MC_TOKEN. status in the body is ok, failed, or busy. failed means a source or a SKILL.md could not be evaluated. It is not a deletion. busy writes nothing. With no database the body is a no-op note and no sync is claimed.",
+          security: cookieOrBearer,
+          requestBody: body({
+            type: "object",
+            properties: { trigger: { type: "string", enum: ["manual", "scheduled"] } },
+          }),
+          responses: {
+            "200": jsonResponse("Sync result, or a demo no-op.", { type: "object" }),
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/skills/drift": {
+        post: operation({
+          operationId: "reportSkillDrift",
+          tags: ["skills"],
+          summary: "Report skills present on a machine.",
+          description:
+            "Operator route. An agent credential is denied. The server does not read the machine. sha is the SHA-256 hex of the SKILL.md bytes. An empty skills array means the directory was read and was empty.",
+          security: cookieOrBearer,
+          requestBody: body({
+            type: "object",
+            required: ["host", "dir", "skills"],
+            properties: {
+              host: { type: "string" },
+              dir: { type: "string" },
+              skills: {
+                type: "array",
+                items: {
+                  type: "object",
+                  required: ["name", "sha"],
+                  properties: { name: { type: "string" }, sha: { type: "string" } },
+                },
+              },
+            },
+          }),
+          responses: {
+            "200": jsonResponse("This report compared with the mirror. driftCount is the finding count for this host and dir.", { type: "object" }),
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/skills/{id}": {
+        get: operation({
+          operationId: "getSkill",
+          tags: ["skills"],
+          summary: "One skill, its body, and recent runs.",
+          description:
+            "Agent credentials need skills:read. runtimes is an object of booleans, not the array used by the list. triggers status is done when the run ended, running inside the stall window, and stalled after it. outcome carries done or failed. Unknown id is 404.",
+          security: cookieOrBearer,
+          parameters: [pathParam("id", "Skill id. The directory slug.")],
+          responses: {
+            "200": jsonResponse("The skill. Demo mode returns the fixture or 404.", { type: "object" }),
+            ...flatErrors,
+            "404": jsonResponse("Unknown or removed skill.", ref("Error")),
+          },
+        }),
+        patch: operation({
+          operationId: "patchSkillSettings",
+          tags: ["skills"],
+          summary: "Set trigger, scope, and schedule.",
+          description:
+            "Operator route. An agent credential is denied. trigger is off, on_request, auto_inject, or scheduled. scope.mode all stores lanes as an empty array. selected requires at least one lane. scheduled requires a five-field cron. Any other trigger clears schedule. Unknown keys are 400. dry_run is not accepted. With no database the body is a no-op note and the id is not looked up.",
+          security: cookieOrBearer,
+          parameters: [pathParam("id", "Skill id.")],
+          requestBody: body({
+            type: "object",
+            properties: {
+              trigger: { type: "string", enum: ["off", "on_request", "auto_inject", "scheduled"] },
+              scope: { type: "object" },
+              schedule: { type: ["string", "null"] },
+            },
+          }),
+          responses: {
+            "200": jsonResponse("The updated skill, or a demo no-op.", { type: "object" }),
+            ...flatErrors,
+            "404": jsonResponse("Unknown or removed skill when a database is connected.", ref("Error")),
           },
         }),
       },
