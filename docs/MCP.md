@@ -36,10 +36,11 @@ A tool that is not in the table below is denied for every caller, including `MC_
 | `messages:read` | `check_inbox` | `GET /api/messages` |
 | `messages:write` | `reply_to_operator`, `reply_to_mark` | `POST /api/messages/reply` |
 | `progress:read` | `get_progress_digest` | `GET /api/progress`, `GET /api/progress/digest` |
+| `decisions:write` | — (no MCP tool yet) | `PATCH /api/decisions/:id` |
 
 `reply_to_mark` is the deprecated alias of `reply_to_operator` and requires the same scope.
 
-Collector and operator routes are not in this table. An agent credential cannot call them. `MC_TOKEN` and the dashboard session still can. That set is `POST /api/progress/ingest`, `POST /api/usage/ingest`, `GET /api/usage`, `POST /api/v1/traces`, `GET /api/traces`, `GET /api/traces/:traceId`, `POST /api/messages`, `PATCH /api/messages`, and `GET`/`PUT /api/settings/repos`. `GET`/`POST`/`DELETE /api/settings/credentials` accepts only the dashboard session.
+Collector and operator routes are not in this table. An agent credential cannot call them. `MC_TOKEN` and the dashboard session still can. That set is `POST /api/progress/ingest`, `POST /api/usage/ingest`, `GET /api/usage`, `POST /api/v1/traces`, `GET /api/traces`, `GET /api/traces/:traceId`, `POST /api/messages`, `PATCH /api/messages`, `GET /api/decisions`, `POST /api/decisions`, and `GET`/`PUT /api/settings/repos`. `GET`/`POST`/`DELETE /api/settings/credentials` accepts only the dashboard session. `PATCH /api/decisions/:id` is the `decisions:write` row above. There is no MCP tool for decisions yet.
 
 `check_inbox` and `GET /api/messages?ack=true` can mark inbox rows delivered. That side effect is part of `messages:read`, which is how the inbox already worked.
 
