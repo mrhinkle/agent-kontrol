@@ -37,6 +37,8 @@ If `MC_DASHBOARD_PASSWORD` is unset, the gate is open in local development and o
 
 ## Routes
 
+Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI 3.1). It covers the routes in this document. Adding a route under `src/app/api` without an entry fails `npm run test:ui`.
+
 "Cookie or bearer" below means the `mc_auth` session cookie or `Authorization: Bearer <MC_TOKEN>`.
 
 | Method | Path | Auth | Purpose |

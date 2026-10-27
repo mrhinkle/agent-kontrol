@@ -31,6 +31,9 @@ export interface SnapshotInput {
   detail?: SnapshotDetail;
 }
 
+/** Documented `kind` values for POST /api/progress/ingest. The route stores any string. */
+export const PROGRESS_INGEST_KINDS = ["tick", "daily", "backfill"] as const;
+
 export interface IngestInput {
   collected_at?: string;
   kind?: string;

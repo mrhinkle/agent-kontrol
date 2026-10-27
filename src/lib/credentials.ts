@@ -119,7 +119,7 @@ function rowFromDb(row: Record<string, unknown>): StoredCredential {
   };
 }
 
-const LABEL_MAX = 80;
+export const LABEL_MAX = 80;
 
 export function validateCredentialInput(input: {
   label: unknown;
