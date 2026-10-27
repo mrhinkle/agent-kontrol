@@ -158,8 +158,11 @@ export function isUuid(value: string): boolean {
 
 /**
  * Insert or replace one skill only while `runId` is still the running sync.
- * The owner check is in the same statement as the write. Zero owned rows
- * means a newer sync took the lease; the caller must stop.
+ * `for share` locks the lease row in this same statement. Without the lock,
+ * beginSyncRun's expiry UPDATE can commit while this statement still sees
+ * status running on its snapshot, and a sync that lost the lease still
+ * writes. Neon HTTP cannot hold that lock across statements. Zero owned
+ * rows means the caller must stop.
  */
 export async function upsertSkill(row: SkillRecord, runId: string): Promise<void> {
   const rows = await db()`
@@ -168,6 +171,7 @@ export async function upsertSkill(row: SkillRecord, runId: string): Promise<void
       select 1 as ok
       from skill_sync_runs
       where id = ${runId}::uuid and status = 'running'
+      for share
     ),
     written as (
       insert into skills (
@@ -209,7 +213,7 @@ export async function upsertSkill(row: SkillRecord, runId: string): Promise<void
   if (Number(rows[0]?.owned ?? 0) < 1) throw new SyncLeaseLost();
 }
 
-/** Mark one skill removed only while `runId` is still the running sync. */
+/** Mark one skill removed only while `runId` is still the running sync. Same lease-row lock as upsertSkill. */
 export async function markSkillRemoved(id: string, at: string, runId: string): Promise<void> {
   const rows = await db()`
     /* sk:remove-skill */
@@ -217,6 +221,7 @@ export async function markSkillRemoved(id: string, at: string, runId: string): P
       select 1 as ok
       from skill_sync_runs
       where id = ${runId}::uuid and status = 'running'
+      for share
     ),
     written as (
       update skills set removed_at = ${at}::timestamptz
@@ -244,8 +249,9 @@ function isUniqueViolation(err: unknown): boolean {
  * Take the one-running lease. A unique violation means another sync holds it.
  * A running row older than the lease is marked failed first, so a crashed sync
  * does not wedge the mirror. Expiring that row does not by itself stop the old
- * process: upsertSkill, markSkillRemoved, and finishSyncRun each write only
- * while this id is still status running. This does not delete skill rows.
+ * process: upsertSkill, markSkillRemoved, and finishSyncRun each lock this
+ * row and write only while this id is still status running. This does not
+ * delete skill rows.
  */
 export async function beginSyncRun(input: {
   id: string;
@@ -275,8 +281,10 @@ export async function beginSyncRun(input: {
 }
 
 /**
- * Close the lease row this sync inserted. A row that is no longer running is
- * left alone. False means this sync no longer owns the lease.
+ * Close the lease row this sync inserted. `for update` locks that row in
+ * this statement, same fence as upsertSkill: expiry either waits or this
+ * update matches nothing after it commits. A row that is no longer running
+ * is left alone. False means this sync no longer owns the lease.
  */
 export async function finishSyncRun(input: {
   id: string;
@@ -287,13 +295,19 @@ export async function finishSyncRun(input: {
 }): Promise<boolean> {
   const rows = await db()`
     /* sk:finish-sync */
-    update skill_sync_runs
+    update skill_sync_runs as target
     set finished_at = ${input.finishedAt}::timestamptz,
       status = ${input.status},
       summary = ${JSON.stringify(input.summary)}::jsonb,
       error = ${input.error}
-    where id = ${input.id}::uuid and status = 'running'
-    returning id
+    from (
+      select id
+      from skill_sync_runs
+      where id = ${input.id}::uuid and status = 'running'
+      for update
+    ) as owner
+    where target.id = owner.id
+    returning target.id
   `;
   return rows.length > 0;
 }

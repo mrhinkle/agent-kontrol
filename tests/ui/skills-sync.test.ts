@@ -442,6 +442,21 @@ describe("skill sync", { concurrency: false }, () => {
     assert.match(skillsMemory.skills.find((row) => row.id === "alpha")?.body ?? "", /same/);
   });
 
+  it("locks the sync lease row inside every sync write", () => {
+    const src = fs.readFileSync("src/lib/skills/store.ts", "utf8");
+    const markers = ["/* sk:upsert-skill */", "/* sk:remove-skill */", "/* sk:finish-sync */"];
+    for (const marker of markers) {
+      const start = src.indexOf(marker);
+      assert.ok(start >= 0, marker);
+      const nextAt = src.indexOf("/* sk:", start + marker.length);
+      const sql = src.slice(start, nextAt === -1 ? undefined : nextAt);
+      const code = sql.replace(/\/\*[\s\S]*?\*\//g, "").replace(/--.*$/gm, "");
+      assert.match(code, /skill_sync_runs/, marker);
+      assert.match(code, /status\s*=\s*'running'/, marker);
+      assert.match(code, /for\s+(share|update)\b/i, `${marker} must lock the lease row`);
+    }
+  });
+
   it("takes sha and syncedAt from the latest finished sync that recorded a commit, including a failed one", async () => {
     const src = fs.readFileSync("src/lib/skills/store.ts", "utf8");
     const sql = src.slice(src.indexOf("/* sk:latest-sync */"), src.indexOf("/* sk:list-settings */"));
