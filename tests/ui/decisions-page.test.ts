@@ -89,4 +89,22 @@ describe("decisions page", () => {
     if (!loaded.ok) return;
     assert.deepEqual(loaded.decisions.map((item) => item.id), [1, 2]);
   });
+
+  it("shows an error when the pending write-back request fails", async () => {
+    const mod = await import("../../src/lib/decision-page");
+    const open = [row({ id: 2, title: "Still open", status: "open" })];
+    const loaded = await mod.loadDecisionPage(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("status=open")) {
+        return new Response(JSON.stringify({ decisions: open }), { status: 200 });
+      }
+      if (url.includes("writeback=not_written")) {
+        return new Response(JSON.stringify({ error: "database unavailable" }), { status: 503 });
+      }
+      return new Response("no", { status: 500 });
+    });
+    assert.equal(loaded.ok, false);
+    if (loaded.ok) return;
+    assert.match(loaded.error, /database unavailable/);
+  });
 });

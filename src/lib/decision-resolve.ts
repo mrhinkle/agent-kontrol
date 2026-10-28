@@ -12,14 +12,13 @@ import type { Actor } from "./actor";
 import { currentActor } from "./actor";
 import { mcpToolError, type McpToolResult } from "./api-error";
 import { parseDeferInstant, readOptions } from "./decision-format";
-import { writeDecisionBack } from "./decision-writeback";
+import { writeDecisionBack, type WritebackOutcome } from "./decision-writeback";
 import {
   decisionPersistenceOn,
   getDecision,
   isDecisionStatus,
   parseListQuery,
   patchDecision,
-  setDecisionWriteback,
   listDecisions,
   upsertDecision,
   type Decision,
@@ -221,13 +220,30 @@ export async function resolveDecision(input: ResolveBody & { id: number; actor: 
     return notFound();
   }
   if (updated.status !== "decided") return { ok: true, decision: updated };
+  return afterWrite(updated, await writeDecisionBack(updated));
+}
 
-  const write = await writeDecisionBack(updated);
-  if (write.status === "no_target") return { ok: true, decision: updated };
-  const stamp = write.status === "written" ? "written" : "not_written";
-  const stamped = await setDecisionWriteback(updated.id, stamp);
-  if (stamped) return { ok: true, decision: stamped };
-  return { ok: true, decision: { ...updated, writeback: stamp } };
+/**
+ * Read the row after write-back. The stamp lives inside writeDecisionBack
+ * and only lands when that decided revision is still current, so the response
+ * is the stored row rather than a stamp applied in memory.
+ * One follow handles a retry that lost the race to a failed stamp and still
+ * needs to post. A reopen is not followed.
+ */
+async function afterWrite(row: Decision, write: WritebackOutcome, follows = 0): Promise<ResolveOutcome> {
+  const current = await getDecision(row.id);
+  const visible = current ?? row;
+  if (write.status === "no_target") return { ok: true, decision: visible };
+  if (
+    write.status === "superseded"
+    && follows < 1
+    && visible.status === "decided"
+    && visible.writeback !== "written"
+    && !sameInstant(visible.updated_at, row.updated_at)
+  ) {
+    return afterWrite(visible, await writeDecisionBack(visible), follows + 1);
+  }
+  return { ok: true, decision: visible };
 }
 
 /** Retry a failed GitHub write-back. Does not decide the row again. */
@@ -243,12 +259,7 @@ export async function retryDecisionWriteback(id: number, expectedUpdatedAt: stri
       fields: { status: "Only a decided row can be written back." },
     };
   }
-  const write = await writeDecisionBack(row);
-  if (write.status === "no_target") return { ok: true, decision: row };
-  const stamp = write.status === "written" ? "written" : "not_written";
-  const stamped = await setDecisionWriteback(row.id, stamp);
-  if (stamped) return { ok: true, decision: stamped };
-  return { ok: true, decision: { ...row, writeback: stamp } };
+  return afterWrite(row, await writeDecisionBack(row));
 }
 
 function text(value: string): McpToolResult {

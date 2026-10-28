@@ -1,4 +1,4 @@
-import type { DecisionStore, ListStatus, PatchInput, UpsertInput } from "../../src/lib/decisions";
+import { WRITEBACK_LOCK_LEASE_SECONDS, type DecisionStore, type ListStatus, type PatchInput, type UpsertInput } from "../../src/lib/decisions";
 
 /** In-memory queue with the same hold, stale, and terminal rules as the SQL. */
 export function createMemoryDecisionStore(): DecisionStore & {
@@ -21,6 +21,19 @@ export function createMemoryDecisionStore(): DecisionStore & {
 
   function copy(row: Record<string, unknown>): Record<string, unknown> {
     return { ...row };
+  }
+
+  function sameRevision(left: unknown, right: string): boolean {
+    const a = Date.parse(String(left ?? ""));
+    const b = Date.parse(right);
+    return !Number.isNaN(a) && a === b;
+  }
+
+  function lockHeld(row: Record<string, unknown>, now = Date.now()): boolean {
+    if (row.writeback_lock == null || row.writeback_lock === "") return false;
+    const at = Date.parse(String(row.writeback_lock_at ?? ""));
+    if (Number.isNaN(at)) return true;
+    return now - at < WRITEBACK_LOCK_LEASE_SECONDS * 1000;
   }
 
   return {
@@ -137,6 +150,9 @@ export function createMemoryDecisionStore(): DecisionStore & {
         && input.status !== "open"
         && (row.status === "decided" || row.status === "withdrawn")
       ) return null;
+      // An in-flight write-back owns this decided revision. Reopening it
+      // would let that writer publish a decision the row no longer stores.
+      if (input.status === "open" && lockHeld(row)) return null;
       const status = input.status ?? (row.status as PatchInput["status"]);
       const now = stamp(row.updated_at);
       if (input.status) row.status = input.status;
@@ -149,6 +165,8 @@ export function createMemoryDecisionStore(): DecisionStore & {
         row.actor_id = null;
         row.chosen_option = null;
         row.writeback = null;
+        row.writeback_lock = null;
+        row.writeback_lock_at = null;
       } else {
         if (input.setDecision) row.decision = input.decision ?? null;
         if (input.setDecidedBy) row.decided_by = input.decided_by ?? null;
@@ -166,12 +184,37 @@ export function createMemoryDecisionStore(): DecisionStore & {
       row.updated_at = now;
       return copy(row);
     },
-    async setWriteback(id, writeback) {
+    async setWriteback(id, writeback, revision) {
       const row = rows.find((item) => item.id === id);
       if (!row) return null;
+      if (row.status !== "decided") return null;
+      if (!sameRevision(row.updated_at, revision)) return null;
       row.writeback = writeback;
       row.updated_at = stamp(row.updated_at);
       return copy(row);
+    },
+    async claimWriteback(id, revision) {
+      const row = rows.find((item) => item.id === id);
+      if (!row) return null;
+      if (row.status !== "decided") return null;
+      if (!sameRevision(row.updated_at, revision)) return null;
+      if (lockHeld(row)) return null;
+      const token = crypto.randomUUID();
+      row.writeback_lock = token;
+      row.writeback_lock_at = new Date().toISOString();
+      return token;
+    },
+    async releaseWriteback(id, token) {
+      const row = rows.find((item) => item.id === id);
+      if (!row || row.writeback_lock !== token) return;
+      row.writeback_lock = null;
+      row.writeback_lock_at = null;
+    },
+    async writebackClaimHeld(id, token, revision) {
+      const row = rows.find((item) => item.id === id);
+      if (!row || row.writeback_lock !== token) return false;
+      if (row.status !== "decided") return false;
+      return sameRevision(row.updated_at, revision);
     },
   };
 }

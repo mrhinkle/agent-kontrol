@@ -17,13 +17,24 @@ export function decisionsForPage(openRows: Decision[], decidedRows: Decision[]):
 export async function loadDecisionPage(
   fetchImpl: typeof fetch = globalThis.fetch,
 ): Promise<{ ok: true; decisions: Decision[] } | { ok: false; error: string }> {
-  const [openRes, pendingRes] = await Promise.all([
-    fetchImpl("/api/decisions?status=open"),
-    fetchImpl("/api/decisions?status=decided&writeback=not_written&limit=100"),
-  ]);
+  let openRes: Response;
+  let pendingRes: Response;
+  try {
+    [openRes, pendingRes] = await Promise.all([
+      fetchImpl("/api/decisions?status=open"),
+      fetchImpl("/api/decisions?status=decided&writeback=not_written&limit=100"),
+    ]);
+  } catch {
+    return { ok: false, error: "Failed to load decisions." };
+  }
   const openBody = (await openRes.json().catch(() => ({}))) as { decisions?: Decision[]; error?: string };
   if (!openRes.ok) return { ok: false, error: openBody.error ?? "Failed to load decisions." };
-  const pendingBody = (await pendingRes.json().catch(() => ({}))) as { decisions?: Decision[] };
-  const pending = pendingRes.ok && Array.isArray(pendingBody.decisions) ? pendingBody.decisions : [];
+  const pendingBody = (await pendingRes.json().catch(() => ({}))) as { decisions?: Decision[]; error?: string };
+  // A failed pending load must not look like an empty retry queue. The page
+  // shows this error instead of hiding decided rows that still need write-back.
+  if (!pendingRes.ok) {
+    return { ok: false, error: pendingBody.error ?? "Failed to load decisions that still need write-back." };
+  }
+  const pending = Array.isArray(pendingBody.decisions) ? pendingBody.decisions : [];
   return { ok: true, decisions: decisionsForPage(openBody.decisions ?? [], pending) };
 }

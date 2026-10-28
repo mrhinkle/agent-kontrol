@@ -19,6 +19,13 @@ import { isConfigured, sql } from "./db";
  */
 
 export const DECISION_STATUSES = ["open", "decided", "deferred", "withdrawn"] as const;
+
+/**
+ * How long a write-back may hold `writeback_lock`. Neon HTTP cannot keep a
+ * session advisory lock across queries, so the claim is one UPDATE and the
+ * lease is how a crashed writer gives the row back.
+ */
+export const WRITEBACK_LOCK_LEASE_SECONDS = 45;
 export type DecisionStatus = (typeof DECISION_STATUSES)[number];
 
 export const LIST_STATUSES = [...DECISION_STATUSES, "all"] as const;
@@ -150,7 +157,15 @@ export interface DecisionStore {
   }): Promise<Record<string, unknown>[]>;
   upsert(input: UpsertInput): Promise<{ row: Record<string, unknown>; previous_status: string | null }>;
   patch(id: number, input: PatchInput): Promise<Record<string, unknown> | null>;
-  setWriteback(id: number, writeback: "written" | "not_written"): Promise<Record<string, unknown> | null>;
+  /**
+   * Stamp writeback only when the row is still `decided` at `revision`.
+   * A reopen that won the race leaves the row unchanged.
+   */
+  setWriteback(id: number, writeback: "written" | "not_written", revision: string): Promise<Record<string, unknown> | null>;
+  /** Claim this decided revision. Null when the row changed or the lock is held. */
+  claimWriteback(id: number, revision: string): Promise<string | null>;
+  releaseWriteback(id: number, token: string): Promise<void>;
+  writebackClaimHeld(id: number, token: string, revision: string): Promise<boolean>;
 }
 
 let testStore: DecisionStore | null = null;
@@ -671,13 +686,71 @@ export async function getDecision(id: number): Promise<Decision | null> {
   return rows[0] ? presentDecision(rows[0], now) : null;
 }
 
+/**
+ * Claim the decided revision write-back is about to publish. The claim is
+ * the fence: an explicit reopen matches zero rows while it is held, and a
+ * writer whose revision is no longer decided does not contact GitHub.
+ * Returns the lock token, or null when the row changed or another claim is live.
+ */
+export async function claimDecisionWriteback(id: number, revision: string): Promise<string | null> {
+  if (!revision) return null;
+  if (testStore) return testStore.claimWriteback(id, revision);
+  const db = sql();
+  const token = crypto.randomUUID();
+  const rows = await db`
+    update decisions
+    set writeback_lock = ${token}, writeback_lock_at = now()
+    where id = ${id}
+      and status = 'decided'
+      and updated_at = ${revision}::timestamptz
+      and (
+        writeback_lock is null
+        or writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+      )
+    returning id
+  `;
+  return rows[0] ? token : null;
+}
+
+export async function releaseDecisionWriteback(id: number, token: string): Promise<void> {
+  if (testStore) {
+    await testStore.releaseWriteback(id, token);
+    return;
+  }
+  const db = sql();
+  await db`
+    update decisions
+    set writeback_lock = null, writeback_lock_at = null
+    where id = ${id} and writeback_lock = ${token}
+  `;
+}
+
+/**
+ * True while this token still owns that decided revision.
+ * An expired lease does not drop the holder. It only lets someone else claim.
+ * A new claim, or a reopen, changes the token or the status and this returns false.
+ */
+export async function decisionWritebackClaimHeld(id: number, token: string, revision: string): Promise<boolean> {
+  if (testStore) return testStore.writebackClaimHeld(id, token, revision);
+  const db = sql();
+  const rows = await db`
+    select id from decisions
+    where id = ${id}
+      and writeback_lock = ${token}
+      and status = 'decided'
+      and updated_at = ${revision}::timestamptz
+  `;
+  return Boolean(rows[0]);
+}
+
 export async function setDecisionWriteback(
   id: number,
   writeback: "written" | "not_written",
+  revision: string,
 ): Promise<Decision | null> {
   const now = nowIso();
   if (testStore) {
-    const row = await testStore.setWriteback(id, writeback);
+    const row = await testStore.setWriteback(id, writeback, revision);
     return row ? presentDecision(row, now) : null;
   }
   const db = sql();
@@ -685,6 +758,8 @@ export async function setDecisionWriteback(
     update decisions
     set writeback = ${writeback}, updated_at = now()
     where id = ${id}
+      and status = 'decided'
+      and updated_at = ${revision}::timestamptz
     returning *
   `;
   return rows[0] ? presentDecision(rows[0], now) : null;
@@ -950,6 +1025,14 @@ export async function patchDecision(id: number, input: PatchInput): Promise<Deci
         when ${status} in ('open', 'decided', 'deferred', 'withdrawn') then null
         else writeback
       end,
+      writeback_lock = case
+        when ${status} = 'open' then null
+        else writeback_lock
+      end,
+      writeback_lock_at = case
+        when ${status} = 'open' then null
+        else writeback_lock_at
+      end,
       updated_at = now()
     where id = ${id}
       and (
@@ -960,6 +1043,11 @@ export async function patchDecision(id: number, input: PatchInput): Promise<Deci
         ${guardTerminal} is not true
         or ${status} = 'open'
         or status not in ('decided', 'withdrawn')
+      )
+      and (
+        ${status} is distinct from 'open'
+        or writeback_lock is null
+        or writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
       )
     returning *
   `;

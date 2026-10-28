@@ -6,9 +6,16 @@
  * Tests inject a client. With no GH_TOKEN or GITHUB_TOKEN, no request is made.
  */
 
-import { isConfigured, sql } from "./db";
-import { isDecisionLabel } from "./decisions";
-import type { Decision } from "./decisions";
+import {
+  claimDecisionWriteback,
+  decisionWritebackClaimHeld,
+  getDecision,
+  isDecisionLabel,
+  releaseDecisionWriteback,
+  setDecisionWriteback,
+  WRITEBACK_LOCK_LEASE_SECONDS,
+  type Decision,
+} from "./decisions";
 import {
   buildDecisionComment,
   commentRecordsThisDecision,
@@ -16,8 +23,9 @@ import {
 } from "./decision-format";
 import { DECISION_LABEL_PATTERNS } from "./progress-config";
 
+export { WRITEBACK_LOCK_LEASE_SECONDS };
+
 /** A crashed writer keeps the lock only this long, so a retry can finish label removal. */
-export const WRITEBACK_LOCK_LEASE_SECONDS = 45;
 const WRITEBACK_LOCK_WAIT_MS = 20_000;
 
 export class GitHubWriteError extends Error {
@@ -49,7 +57,8 @@ export interface GitHubWriteClient {
 export type WritebackOutcome =
   | { status: "written"; commented: boolean; labels_removed: string[] }
   | { status: "not_written"; reason: string }
-  | { status: "no_target" };
+  | { status: "no_target" }
+  | { status: "superseded" };
 
 let clientOverride: { client: GitHubWriteClient | null } | null = null;
 
@@ -179,56 +188,43 @@ function withLocalLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
-/**
- * Cross-instance lock. The claim is one UPDATE, so two Neon or Postgres
- * sessions cannot both pass the comment lookup. The lease lets a retry
- * through after a crash that posted the comment and died before the unlock.
- * Label removal still runs on that retry because the canonical comment is
- * already on the issue.
- */
-async function withDbLock<T>(id: number, fn: () => Promise<T>): Promise<T> {
-  const db = sql();
-  const token = crypto.randomUUID();
-  const deadline = Date.now() + WRITEBACK_LOCK_WAIT_MS;
-  let claimed = false;
-  while (Date.now() < deadline) {
-    const rows = await db`
-      update decisions
-      set writeback_lock = ${token}, writeback_lock_at = now()
-      where id = ${id}
-        and (
-          writeback_lock is null
-          or writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
-        )
-      returning id
-    `;
-    if (rows[0]) {
-      claimed = true;
-      break;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  if (!claimed) throw new GitHubWriteError("write-back busy");
-  try {
-    return await fn();
-  } finally {
-    await db`
-      update decisions
-      set writeback_lock = null, writeback_lock_at = null
-      where id = ${id} and writeback_lock = ${token}
-    `;
-  }
+function sameRevision(left: string, right: string): boolean {
+  const a = Date.parse(left);
+  const b = Date.parse(right);
+  return !Number.isNaN(a) && a === b;
 }
 
-function withDecisionWriteLock<T>(key: string, id: number, fn: () => Promise<T>): Promise<T> {
-  if (!isConfigured() || !Number.isSafeInteger(id) || id <= 0) return withLocalLock(key, fn);
-  return withDbLock(id, fn);
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Claim one decided revision. Wait only while that same revision is still
+ * decided and another writer holds the lock. A reopen, or any other revision
+ * change, returns superseded so the caller does not contact GitHub.
+ */
+async function claimRevision(
+  id: number,
+  revision: string,
+): Promise<{ ok: true; token: string } | { ok: false; outcome: WritebackOutcome }> {
+  const deadline = Date.now() + WRITEBACK_LOCK_WAIT_MS;
+  while (Date.now() < deadline) {
+    const token = await claimDecisionWriteback(id, revision);
+    if (token) return { ok: true, token };
+    const current = await getDecision(id);
+    if (!current || current.status !== "decided" || !sameRevision(current.updated_at, revision)) {
+      return { ok: false, outcome: { status: "superseded" } };
+    }
+    await delay(25);
+  }
+  return { ok: false, outcome: { status: "not_written", reason: "write-back busy" } };
 }
 
 async function postDecision(
   client: GitHubWriteClient,
   row: Pick<Decision, "actor_id" | "decided_at" | "decision">,
   target: { repo: string; number: number },
+  stillHeld: () => Promise<boolean>,
 ): Promise<WritebackOutcome> {
   try {
     const issue = await client.getIssue(target.repo, target.number);
@@ -248,13 +244,18 @@ async function postDecision(
     }
     const comments = await client.listComments(target.repo, target.number);
     const already = comments.some((comment) => commentRecordsThisDecision(comment, expected, viewer));
-    if (!already) await client.createComment(target.repo, target.number, expected);
+    if (!already) {
+      if (!(await stillHeld())) return { status: "superseded" };
+      await client.createComment(target.repo, target.number, expected);
+    }
     const labels = issue.labels
       .map((label) => label.name)
       .filter((name) => isDecisionLabel(name, DECISION_LABEL_PATTERNS));
     for (const name of labels) {
+      if (!(await stillHeld())) return { status: "superseded" };
       await client.removeLabel(target.repo, target.number, name);
     }
+    if (!(await stillHeld())) return { status: "superseded" };
     return { status: "written", commented: !already, labels_removed: labels };
   } catch (err) {
     const reason = err instanceof GitHubWriteError ? err.reason : "network error";
@@ -265,21 +266,45 @@ async function postDecision(
 /**
  * Comment and unlabel the issue named by `row.key`. A closed issue is not
  * commented. A comment counts as already posted only when it contains the
- * canonical decision text. The marker alone does not. Lookup and create run
- * under a per-row lock. Label removal runs after the comment, so a retry
- * that fails on labels does not post a second comment.
+ * canonical decision text. The marker alone does not.
+ *
+ * The writer claims `row.updated_at` while the row is still decided, before
+ * any GitHub call. Reopening conflicts until that claim is released. The
+ * writeback stamp matches the same revision and `status = 'decided'`, and it
+ * runs before the claim is released. A row that was reopened is not posted
+ * and is not stamped.
  */
 export async function writeDecisionBack(
-  row: Pick<Decision, "id" | "key" | "actor_id" | "decided_at" | "decision">,
+  row: Pick<Decision, "id" | "key" | "actor_id" | "decided_at" | "decision" | "updated_at">,
 ): Promise<WritebackOutcome> {
   const target = githubTargetFromKey(row.key);
   if (!target) return { status: "no_target" };
   const client = activeClient();
-  if (!client) return { status: "not_written", reason: "no token" };
+  const revision = row.updated_at;
+  if (!client) return publish(row.id, revision, null, target, row);
+  return withLocalLock(row.key, () => publish(row.id, revision, client, target, row));
+}
+
+async function publish(
+  id: number,
+  revision: string,
+  client: GitHubWriteClient | null,
+  target: { repo: string; number: number },
+  row: Pick<Decision, "actor_id" | "decided_at" | "decision">,
+): Promise<WritebackOutcome> {
+  const claimed = await claimRevision(id, revision);
+  if (!claimed.ok) return claimed.outcome;
+  const token = claimed.token;
   try {
-    return await withDecisionWriteLock(row.key, row.id, () => postDecision(client, row, target));
-  } catch (err) {
-    const reason = err instanceof GitHubWriteError ? err.reason : "write-back lock failed";
-    return { status: "not_written", reason };
+    const outcome = client
+      ? await postDecision(client, row, target, () => decisionWritebackClaimHeld(id, token, revision))
+      : { status: "not_written" as const, reason: "no token" };
+    if (outcome.status === "superseded") return outcome;
+    const stamp = outcome.status === "written" ? "written" : "not_written";
+    const stamped = await setDecisionWriteback(id, stamp, revision);
+    if (!stamped) return { status: "superseded" };
+    return outcome;
+  } finally {
+    await releaseDecisionWriteback(id, token);
   }
 }
