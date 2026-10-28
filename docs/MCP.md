@@ -440,7 +440,7 @@ Exit codes:
 
 A directory that exists and is readable but holds no skills posts an empty list. A skill whose name the server would reject (not `[A-Za-z0-9][A-Za-z0-9._-]{0,80}`) is skipped with a warning. Running it twice posts identical bodies.
 
-Schedule it with launchd (macOS). Keep `MC_URL` and `MC_TOKEN` in `~/.claude/mission-control.env` (mode 600) and have the job source it, so the plist holds no secret. Save as `~/Library/LaunchAgents/com.missioncontrol.skills-drift.plist`, then `launchctl bootstrap gui/$(id -u) <that file>`:
+On macOS, `scripts/install-skills-drift.sh` does the setup below for you: it copies the collector to `~/.mission-control/`, adds `MC_URL` and `MC_TOKEN` to `~/.claude/mission-control.env` if they are missing (mode 600, other lines kept), writes the launchd plist, and loads it. `AK_MACHINE` and `AK_SKILL_DRIFT_DIRS` set when you run it are written to the plist. `--uninstall` removes the job. To set it up by hand, schedule it with launchd. Keep `MC_URL` and `MC_TOKEN` in `~/.claude/mission-control.env` (mode 600) and have the job source it, so the plist holds no secret. Save as `~/Library/LaunchAgents/com.missioncontrol.skills-drift.plist`, then `launchctl bootstrap gui/$(id -u) <that file>`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
