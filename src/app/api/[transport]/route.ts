@@ -452,6 +452,7 @@ const handler = createMcpHandler(
       "list_skills",
       {
         title: "List skills",
+        annotations: READ_ONLY,
         description:
           "List skills whose trigger is not off, whose scope admits the lane, and which are compatible with runtime when runtime is passed. With no runtime, incompatible skills are not hidden. With no lane, selected-lane skills are hidden. Trigger off is omitted. category is an exact case-insensitive match. Pass uncategorized for skills with no category. Each line includes category and tags.",
         inputSchema: {
@@ -468,6 +469,7 @@ const handler = createMcpHandler(
       "get_skill",
       {
         title: "Get skill",
+        annotations: READ_ONLY,
         description:
           "Return the mirrored SKILL.md pinned to its content SHA, or one reference file when path is set. Never fetches the upstream repository. A skill whose trigger is off is not served.",
         inputSchema: {
@@ -484,6 +486,7 @@ const handler = createMcpHandler(
       "run_skill",
       {
         title: "Run skill",
+        annotations: WRITE,
         description:
           "Start or finish a skill run. The agent executes the instructions. Agent Kontrol only stores the start, the end, and an optional note. Omit run_id to start. id and runtime are required then. agent_id is optional: the recorded agent is the authenticated caller. Call again with that run_id and complete true to finish, and omit id. If you pass id on completion, it must match the skill on the run. Only the actor that started the run can finish it.",
         inputSchema: {
