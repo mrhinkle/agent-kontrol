@@ -1,11 +1,21 @@
-import { fixtureSnapshot, queries, resetSpy, setFixture, setRejectWrites, writes } from "./dry-run-harness";
+import { appliedWrites, fixtureSnapshot, queries, resetSpy, setFixture, setRejectWrites, writes } from "./dry-run-harness";
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { PUT as putRepos } from "../../src/app/api/settings/repos/route";
 import { PATCH as patchTask } from "../../src/app/api/tasks/[id]/route";
 import { POST as postMemory } from "../../src/app/api/memory/route";
-import { DEMO_BANNER, demoStoreSize, resetDemoStoreForTests } from "../../src/lib/demo-store";
+import {
+  DEMO_BANNER,
+  demoCreateTask,
+  demoFindMemoryByKey,
+  demoGetTask,
+  demoRemember,
+  demoStoreSize,
+  demoUpdateTask,
+  resetDemoStoreForTests,
+  setDemoClockForTests,
+} from "../../src/lib/demo-store";
 import { rememberForTool, updateTaskForTool } from "../../src/lib/dry-run-actions";
 import {
   changeDetails,
@@ -719,6 +729,455 @@ describe("dry run wiring", () => {
       const src = fs.readFileSync(file, "utf8");
       assert.match(src, /dry_run: true/, file);
       assert.match(src, /PreviewDialog/, file);
+    }
+    const memoryPage = fs.readFileSync("src/app/memory/page.tsx", "utf8");
+    const tasksPage = fs.readFileSync("src/app/tasks/page.tsx", "utf8");
+    assert.match(memoryPage, /expected_revision/);
+    assert.match(memoryPage, /stale_write/);
+    assert.match(memoryPage, /Review the new preview before overwriting/);
+    assert.match(tasksPage, /expected_revision/);
+    assert.match(tasksPage, /stale_write/);
+    assert.match(tasksPage, /Review the new preview before cancelling/);
+  });
+
+  it("keeps each preview hash expression identical to its compare-and-write predicate", () => {
+    const src = fs.readFileSync("src/lib/store.ts", "utf8");
+    function bodies(needle: string): string[] {
+      const found: string[] = [];
+      const token = "md5(";
+      let from = 0;
+      while (from < src.length) {
+        const start = src.indexOf(token, from);
+        if (start < 0) break;
+        let depth = 1;
+        let index = start + token.length;
+        for (; index < src.length && depth > 0; index++) {
+          if (src[index] === "(") depth += 1;
+          else if (src[index] === ")") depth -= 1;
+        }
+        const body = src.slice(start + token.length, index - 1);
+        if (body.includes(needle)) {
+          found.push(
+            body
+              .split("\n")
+              .map((line) => line.trim())
+              .filter(Boolean)
+              .join("\n"),
+          );
+        }
+        from = index;
+      }
+      return found;
+    }
+    const memory = bodies("array_to_string");
+    assert.equal(memory.length, 2);
+    assert.equal(memory[0], memory[1]);
+    const tasks = bodies("reviewer_platform");
+    assert.equal(tasks.length, 2);
+    assert.equal(tasks[0], tasks[1]);
+  });
+});
+
+function taskParams(id: string) {
+  return { params: Promise.resolve({ id }) };
+}
+
+function storedMemory(): { key: string; content: string; updated_at: string | null } | undefined {
+  const snapshot = JSON.parse(fixtureSnapshot()) as {
+    memory: { key: string; content: string; updated_at: string | null }[];
+  };
+  return snapshot.memory.find((row) => row.key === "project/status");
+}
+
+function storedTask(): { id: number; status: string; updated_at: string | null } | undefined {
+  const snapshot = JSON.parse(fixtureSnapshot()) as {
+    tasks: { id: number; status: string; updated_at: string | null }[];
+  };
+  return snapshot.tasks.find((row) => row.id === 7);
+}
+
+describe("stale preview confirmations", () => {
+  it("F1 rejects a memory confirm after another writer commits the same key", async () => {
+    const previewRes = await postMemory(
+      authed(
+        "http://x/api/memory",
+        { content: "from the preview", key: "project/status", tags: ["ops"], dry_run: true },
+        "POST",
+      ),
+    );
+    const preview = await previewRes.json();
+    assert.equal(previewRes.status, 200);
+    assert.equal(preview.expected_revision, NOTE.updated_at);
+    assert.equal(preview.would_write, true);
+    const seen = preview.expected_revision as string;
+
+    resetSpy();
+    const other = await postMemory(
+      authed(
+        "http://x/api/memory",
+        { content: "newer note", key: "project/status", expected_revision: seen },
+        "POST",
+      ),
+    );
+    assert.equal(other.status, 200);
+    assert.equal(storedMemory()?.content, "newer note");
+    assert.notEqual(storedMemory()?.updated_at, seen);
+    const current = storedMemory()?.updated_at;
+
+    resetSpy();
+    const before = fixtureSnapshot();
+    const stale = await postMemory(
+      authed(
+        "http://x/api/memory",
+        { content: "stale confirm", key: "project/status", expected_revision: seen },
+        "POST",
+      ),
+    );
+    const body = await stale.json();
+    assert.equal(stale.status, 409);
+    assert.equal(body.error, "stale_write");
+    assert.equal(body.code, "stale_write");
+    assert.equal(body.current_revision, current);
+    assert.equal(storedMemory()?.content, "newer note");
+    assert.equal(fixtureSnapshot(), before);
+    assert.equal(appliedWrites(), 0);
+    assert.equal(queries[0]?.includes("select"), false);
+    assert.match(queries.find((sql) => /update\s+memory/i.test(sql)) ?? "", /updated_at\s*=\s*\$\d+::timestamptz/);
+    assert.equal(writes.some((sql) => /insert\s+into\s+memory/i.test(sql)), false);
+  });
+
+  it("F2 rejects a cancel confirm after the task is already done", async () => {
+    const previewRes = await patchTask(
+      authed("http://x/api/tasks/7", { status: "cancelled", dry_run: true }, "PATCH"),
+      taskParams("7"),
+    );
+    const preview = await previewRes.json();
+    assert.equal(previewRes.status, 200);
+    assert.equal(preview.action, "cancel_task");
+    assert.equal(preview.expected_revision, TASK.updated_at);
+    const seen = preview.expected_revision as string;
+
+    resetSpy();
+    const done = await patchTask(
+      authed("http://x/api/tasks/7", { status: "done", agent_id: "other-writer", expected_revision: seen }, "PATCH"),
+      taskParams("7"),
+    );
+    assert.equal(done.status, 200);
+    assert.equal(storedTask()?.status, "done");
+
+    resetSpy();
+    const before = fixtureSnapshot();
+    const stale = await patchTask(
+      authed("http://x/api/tasks/7", { status: "cancelled", agent_id: "dashboard", expected_revision: seen }, "PATCH"),
+      taskParams("7"),
+    );
+    const body = await stale.json();
+    assert.equal(stale.status, 409);
+    assert.equal(body.error, "stale_write");
+    assert.equal(body.code, "stale_write");
+    assert.equal(body.current_revision, storedTask()?.updated_at);
+    assert.equal(storedTask()?.status, "done");
+    assert.equal(fixtureSnapshot(), before);
+    assert.equal(appliedWrites(), 0);
+    assert.equal(writes.some((sql) => /insert\s+into\s+agents/i.test(sql)), false);
+    assert.match(queries.find((sql) => /update\s+tasks/i.test(sql)) ?? "", /updated_at\s*=\s*\$\d+::timestamptz/);
+  });
+
+  it("F3 keeps the old response shape when expected_revision is omitted", async () => {
+    const memory = await postMemory(
+      authed("http://x/api/memory", { content: "new note", key: "project/status", agent_id: "grok" }, "POST"),
+    );
+    const memoryBody = await memory.json();
+    assert.equal(memory.status, 200);
+    assert.deepEqual(Object.keys(memoryBody).sort(), ["applied", "item", "ok"]);
+    assert.equal(memoryBody.ok, true);
+    assert.equal(memoryBody.applied, true);
+    assert.equal(memoryBody.current_revision, undefined);
+    assert.equal(memoryBody.error, undefined);
+    const upsert = writes.find((sql) => /insert\s+into\s+memory/i.test(sql)) ?? "";
+    assert.match(upsert, /on conflict \(key\) do update set/);
+    assert.doesNotMatch(upsert, /updated_at\s*=\s*\$\d+::timestamptz/);
+    assert.equal(upsert.includes("hash-revision"), false);
+
+    resetSpy();
+    const task = await patchTask(
+      authed("http://x/api/tasks/7", { status: "cancelled", agent_id: "dashboard" }, "PATCH"),
+      taskParams("7"),
+    );
+    const taskBody = await task.json();
+    assert.equal(task.status, 200);
+    assert.deepEqual(Object.keys(taskBody).sort(), ["ok", "task"]);
+    assert.equal(taskBody.ok, true);
+    assert.equal(taskBody.current_revision, undefined);
+    const update = writes.find((sql) => /update\s+tasks/i.test(sql)) ?? "";
+    assert.match(update, /where\s+id\s*=\s*\$\d+/);
+    assert.doesNotMatch(update, /updated_at\s*=\s*\$\d+::timestamptz/);
+    assert.equal(update.includes("hash-revision"), false);
+  });
+
+  it("F4 lets exactly one of two racing confirms apply", async () => {
+    const previewRes = await patchTask(
+      authed("http://x/api/tasks/7", { status: "cancelled", dry_run: true }, "PATCH"),
+      taskParams("7"),
+    );
+    const seen = (await previewRes.json()).expected_revision as string;
+    assert.equal(seen, TASK.updated_at);
+    resetSpy();
+
+    const responses = await Promise.all([
+      patchTask(
+        authed("http://x/api/tasks/7", { status: "cancelled", agent_id: "dashboard", expected_revision: seen }, "PATCH"),
+        taskParams("7"),
+      ),
+      patchTask(
+        authed("http://x/api/tasks/7", { status: "cancelled", agent_id: "dashboard", expected_revision: seen }, "PATCH"),
+        taskParams("7"),
+      ),
+    ]);
+    const bodies = await Promise.all(responses.map((res) => res.json()));
+    const statuses = responses.map((res) => res.status).sort();
+    assert.deepEqual(statuses, [200, 409]);
+    assert.equal(bodies.filter((body) => body.ok === true).length, 1);
+    const loser = bodies.find((body) => body.error === "stale_write");
+    assert.ok(loser);
+    assert.equal(loser.code, "stale_write");
+    assert.equal(loser.current_revision, storedTask()?.updated_at);
+    assert.equal(storedTask()?.status, "cancelled");
+    assert.equal(appliedWrites(), 1);
+    assert.equal(writes.filter((sql) => /insert\s+into\s+agents/i.test(sql)).length, 1);
+    const updates = writes.filter((sql) => /update\s+tasks/i.test(sql));
+    assert.equal(updates.length, 2);
+    for (const sql of updates) assert.match(sql, /updated_at\s*=\s*\$\d+::timestamptz/);
+
+    resetSpy();
+    setFixture({ repos: [{ ...STORED_ROW }], tasks: [{ ...TASK }], memory: [{ ...NOTE }] });
+    const memoryPreview = await postMemory(
+      authed("http://x/api/memory", { content: "racing", key: "project/status", dry_run: true }, "POST"),
+    );
+    const memorySeen = (await memoryPreview.json()).expected_revision as string;
+    resetSpy();
+    const memoryResponses = await Promise.all([
+      postMemory(
+        authed("http://x/api/memory", { content: "race-a", key: "project/status", expected_revision: memorySeen }, "POST"),
+      ),
+      postMemory(
+        authed("http://x/api/memory", { content: "race-b", key: "project/status", expected_revision: memorySeen }, "POST"),
+      ),
+    ]);
+    const memoryBodies = await Promise.all(memoryResponses.map((res) => res.json()));
+    assert.deepEqual(memoryResponses.map((res) => res.status).sort(), [200, 409]);
+    assert.equal(memoryBodies.filter((body) => body.error === "stale_write").length, 1);
+    assert.equal(appliedWrites(), 1);
+    const winner = memoryBodies.find((body) => body.ok === true);
+    assert.equal(storedMemory()?.content, winner.item.content);
+  });
+
+  it("F5 returns not-found for a deleted memory key or a missing task and does not insert", async () => {
+    const memoryPreview = await postMemory(
+      authed("http://x/api/memory", { content: "gone", key: "project/status", dry_run: true }, "POST"),
+    );
+    const memorySeen = (await memoryPreview.json()).expected_revision as string;
+    setFixture({ memory: [] });
+    resetSpy();
+    const memory = await postMemory(
+      authed(
+        "http://x/api/memory",
+        { content: "resurrect", key: "project/status", expected_revision: memorySeen },
+        "POST",
+      ),
+    );
+    const memoryBody = await memory.json();
+    assert.equal(memory.status, 404);
+    assert.equal(memoryBody.code, "not_found");
+    assert.equal(memoryBody.error, "not found");
+    assert.equal(JSON.parse(fixtureSnapshot()).memory.length, 0);
+    assert.equal(writes.some((sql) => /insert\s+into\s+memory/i.test(sql)), false);
+    assert.equal(appliedWrites(), 0);
+
+    const taskPreview = await patchTask(
+      authed("http://x/api/tasks/7", { status: "cancelled", dry_run: true }, "PATCH"),
+      taskParams("7"),
+    );
+    const taskSeen = (await taskPreview.json()).expected_revision as string;
+    setFixture({ tasks: [] });
+    resetSpy();
+    const task = await patchTask(
+      authed("http://x/api/tasks/7", { status: "cancelled", expected_revision: taskSeen }, "PATCH"),
+      taskParams("7"),
+    );
+    const taskBody = await task.json();
+    assert.equal(task.status, 404);
+    assert.equal(taskBody.code, "task_not_found");
+    assert.equal(taskBody.error, "Task not found");
+    assert.equal(JSON.parse(fixtureSnapshot()).tasks.length, 0);
+    assert.equal(writes.some((sql) => /insert\s+into\s+tasks/i.test(sql)), false);
+    assert.equal(appliedWrites(), 0);
+  });
+
+  it("F6 rejects a malformed expected_revision before any query", async () => {
+    const samples: unknown[] = [1, { rev: "x" }, ["x"], true, null, "", "x".repeat(201), "x".repeat(10000), "bad\nrev"];
+    for (const expected_revision of samples) {
+      resetSpy();
+      const before = fixtureSnapshot();
+      const memory = await postMemory(
+        authed("http://x/api/memory", { content: "nope", key: "project/status", expected_revision }, "POST"),
+      );
+      const memoryBody = await memory.json();
+      assert.equal(memory.status, 400, JSON.stringify(expected_revision));
+      assert.equal(memoryBody.code, "validation_failed");
+      assert.equal(memoryBody.fields.expected_revision, "Send the revision from the preview, or omit it.");
+      assert.equal(queries.length, 0);
+      assert.equal(writes.length, 0);
+      assert.equal(fixtureSnapshot(), before);
+
+      resetSpy();
+      const task = await patchTask(
+        authed("http://x/api/tasks/7", { status: "cancelled", expected_revision }, "PATCH"),
+        taskParams("7"),
+      );
+      const taskBody = await task.json();
+      assert.equal(task.status, 400, JSON.stringify(expected_revision));
+      assert.equal(taskBody.code, "validation_failed");
+      assert.equal(queries.length, 0);
+      assert.equal(fixtureSnapshot(), before);
+    }
+  });
+
+  it("rejects a hash revision after the underlying value changes", async () => {
+    setFixture({
+      memory: [{ ...NOTE, updated_at: null }],
+      tasks: [{ ...TASK, updated_at: null }],
+    });
+    const memoryPreview = await postMemory(
+      authed("http://x/api/memory", { content: "hash note", key: "project/status", dry_run: true }, "POST"),
+    );
+    const memorySeen = (await memoryPreview.json()).expected_revision as string;
+    assert.match(memorySeen, /^rev:[0-9a-f]{32}$/);
+    setFixture({ memory: [{ ...NOTE, content: "other writer", updated_at: null }] });
+    resetSpy();
+    const memory = await postMemory(
+      authed(
+        "http://x/api/memory",
+        { content: "stale hash", key: "project/status", expected_revision: memorySeen },
+        "POST",
+      ),
+    );
+    const memoryBody = await memory.json();
+    assert.equal(memory.status, 409);
+    assert.equal(memoryBody.error, "stale_write");
+    assert.match(memoryBody.current_revision, /^rev:[0-9a-f]{32}$/);
+    assert.notEqual(memoryBody.current_revision, memorySeen);
+    assert.equal(storedMemory()?.content, "other writer");
+    assert.match(writes.find((sql) => /update\s+memory/i.test(sql)) ?? "", /hash-revision/);
+    assert.equal(appliedWrites(), 0);
+
+    const taskPreview = await patchTask(
+      authed("http://x/api/tasks/7", { status: "cancelled", dry_run: true }, "PATCH"),
+      taskParams("7"),
+    );
+    const taskSeen = (await taskPreview.json()).expected_revision as string;
+    assert.match(taskSeen, /^rev:[0-9a-f]{32}$/);
+    setFixture({ tasks: [{ ...TASK, status: "done", updated_at: null }] });
+    resetSpy();
+    const task = await patchTask(
+      authed("http://x/api/tasks/7", { status: "cancelled", expected_revision: taskSeen }, "PATCH"),
+      taskParams("7"),
+    );
+    const taskBody = await task.json();
+    assert.equal(task.status, 409);
+    assert.equal(taskBody.error, "stale_write");
+    assert.equal(storedTask()?.status, "done");
+    assert.match(writes.find((sql) => /update\s+tasks/i.test(sql)) ?? "", /hash-revision/);
+    assert.equal(appliedWrites(), 0);
+  });
+
+  it("F7 applies the same stale guard in demo mode and leaves an omitted revision unchanged", async () => {
+    const previous = process.env.DATABASE_URL;
+    delete process.env.DATABASE_URL;
+    let clock = Date.parse("2026-10-28T12:00:00.000Z");
+    setDemoClockForTests(() => clock);
+    try {
+      resetDemoStoreForTests();
+      resetSpy();
+      const seeded = await demoRemember({ content: "old note", key: "project/status", tags: ["ops"], agent_id: "grok" });
+      const memoryPreview = await postMemory(
+        authed("http://x/api/memory", { content: "from the preview", key: "project/status", dry_run: true }, "POST"),
+      );
+      const memoryPreviewBody = await memoryPreview.json();
+      assert.equal(memoryPreview.status, 200);
+      assert.equal(memoryPreviewBody.would_write, false);
+      assert.equal(memoryPreviewBody.note, "DATABASE_URL not set; note not stored.");
+      assert.equal(memoryPreviewBody.expected_revision, seeded.updated_at);
+      clock += 5000;
+      const newer = await demoRemember({ content: "newer note", key: "project/status" });
+      assert.notEqual(newer.updated_at, seeded.updated_at);
+      const staleMemory = await postMemory(
+        authed(
+          "http://x/api/memory",
+          { content: "stale confirm", key: "project/status", expected_revision: seeded.updated_at },
+          "POST",
+        ),
+      );
+      const staleMemoryBody = await staleMemory.json();
+      assert.equal(staleMemory.status, 409);
+      assert.equal(staleMemoryBody.error, "stale_write");
+      assert.equal(staleMemoryBody.code, "stale_write");
+      assert.equal(staleMemoryBody.current_revision, newer.updated_at);
+      assert.equal((await demoFindMemoryByKey("project/status"))?.content, "newer note");
+
+      clock += 5000;
+      const created = await demoCreateTask({ title: "Fix the form", platform: "grok" });
+      const taskPreview = await patchTask(
+        authed(`http://x/api/tasks/${created.id}`, { status: "cancelled", dry_run: true }, "PATCH"),
+        taskParams(String(created.id)),
+      );
+      const taskPreviewBody = await taskPreview.json();
+      assert.equal(taskPreview.status, 200);
+      assert.equal(taskPreviewBody.would_write, false);
+      assert.equal(taskPreviewBody.note, "DATABASE_URL not set; nothing would be written.");
+      assert.equal(taskPreviewBody.expected_revision, created.updated_at);
+      clock += 5000;
+      await demoUpdateTask({ id: created.id, status: "done" });
+      const staleTask = await patchTask(
+        authed(
+          `http://x/api/tasks/${created.id}`,
+          { status: "cancelled", expected_revision: created.updated_at },
+          "PATCH",
+        ),
+        taskParams(String(created.id)),
+      );
+      const staleTaskBody = await staleTask.json();
+      assert.equal(staleTask.status, 409);
+      assert.equal(staleTaskBody.error, "stale_write");
+      assert.equal(staleTaskBody.current_revision, (await demoGetTask(created.id))?.updated_at);
+      assert.equal((await demoGetTask(created.id))?.status, "done");
+
+      const notesBefore = demoStoreSize().notes;
+      const tasksBefore = demoStoreSize().tasks;
+      const dropped = await postMemory(
+        authed("http://x/api/memory", { content: "dropped", key: "project/fresh" }, "POST"),
+      );
+      assert.deepEqual(await dropped.json(), {
+        ok: true,
+        demo: true,
+        applied: false,
+        note: "DATABASE_URL not set; note not stored.",
+      });
+      const droppedTask = await patchTask(
+        authed(`http://x/api/tasks/${created.id}`, { status: "cancelled" }, "PATCH"),
+        taskParams(String(created.id)),
+      );
+      assert.deepEqual(await droppedTask.json(), { ok: true, demo: true });
+      assert.equal(demoStoreSize().notes, notesBefore);
+      assert.equal(demoStoreSize().tasks, tasksBefore);
+      assert.equal((await demoGetTask(created.id))?.status, "done");
+      assert.equal(queries.length, 0);
+      assert.equal(writes.length, 0);
+    } finally {
+      setDemoClockForTests(null);
+      resetDemoStoreForTests();
+      if (previous === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = previous;
     }
   });
 });

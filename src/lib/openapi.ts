@@ -102,6 +102,32 @@ const dryRunFlag: Json = {
     "When true, return what would change and write nothing. Omitted or false applies the write. Any other JSON type is 400 and writes nothing.",
 };
 
+const expectedRevision: Json = {
+  type: "string",
+  minLength: 1,
+  maxLength: 200,
+  description:
+    "Optional token from the dry-run preview. It is the row's updated_at, or a rev: hash when that column is missing. When it no longer matches, the route answers 409 stale_write with current_revision and writes nothing. Omit it to keep the previous unconditional write. An empty string, a non-string, or a value longer than 200 characters is 400 and writes nothing.",
+};
+
+const staleWrite: Json = jsonResponse(
+  "expected_revision does not match the current row. error and code are stale_write. current_revision is the token a new preview would return. Nothing was written.",
+  {
+    allOf: [
+      ref("Error"),
+      {
+        type: "object",
+        required: ["current_revision"],
+        properties: {
+          error: { type: "string", const: "stale_write" },
+          code: { type: "string", const: "stale_write" },
+          current_revision: { type: "string" },
+        },
+      },
+    ],
+  },
+);
+
 const flatErrors: Json = {
   "400": jsonResponse("The body is not JSON, a required field is missing, or a field failed validation.", ref("Error")),
   "401": jsonResponse("The credential is missing or not valid.", ref("Error")),
@@ -341,6 +367,7 @@ export function openApiDocument(): Json {
             assigned_agent: { type: "string" },
             agent_id: { type: "string" },
             dry_run: dryRunFlag,
+            expected_revision: expectedRevision,
           },
         },
         Task: {
@@ -453,6 +480,7 @@ export function openApiDocument(): Json {
             tags: { type: "array", items: { type: "string" } },
             agent_id: { type: ["string", "null"] },
             dry_run: dryRunFlag,
+            expected_revision: expectedRevision,
           },
         },
         DryRunChange: {
@@ -478,6 +506,11 @@ export function openApiDocument(): Json {
             },
             changes: { type: "array", items: ref("DryRunChange") },
             affected: { type: "array", items: { type: "object", additionalProperties: true } },
+            expected_revision: {
+              type: "string",
+              description:
+                "Token to send back as expected_revision. The row's updated_at, or a rev: hash when that column is missing. Omitted when the preview has no row revision.",
+            },
             note: { type: "string" },
           },
         },
@@ -718,7 +751,7 @@ export function openApiDocument(): Json {
           tags: ["memory"],
           summary: "Store a note, or preview the write.",
           description:
-            "The REST twin of MCP remember. An agent credential needs memory:write. dry_run true returns the insert or the key overwrite and writes nothing. action is overwrite_memory when the key already exists, otherwise insert_memory. A non-boolean dry_run is 400 and writes nothing. With no database, a dry run still describes the note and sets would_write to false.",
+            "The REST twin of MCP remember. An agent credential needs memory:write. dry_run true returns the insert or the key overwrite and writes nothing. action is overwrite_memory when the key already exists, otherwise insert_memory. The preview includes expected_revision. Sending that token makes the write conditional: a mismatch is 409 stale_write with current_revision and writes nothing. Omitting expected_revision keeps the unconditional write. A non-boolean dry_run, or an expected_revision that is empty, non-string, or longer than 200 characters, is 400 and writes nothing. With no database, a dry run still describes the note and sets would_write to false. A confirm that omits expected_revision still answers the demo acknowledgement and does not store the note.",
           security: cookieOrBearer,
           requestBody: body(ref("RememberInput")),
           responses: {
@@ -739,6 +772,7 @@ export function openApiDocument(): Json {
               ],
             }),
             ...flatErrors,
+            "409": staleWrite,
           },
         }),
       },
@@ -925,7 +959,7 @@ export function openApiDocument(): Json {
           tags: ["tasks"],
           summary: "Report progress, cancel a task, or preview that write.",
           description:
-            "dry_run true returns the affected task and the field diff and writes nothing. action is cancel_task when status is cancelled, otherwise update_task. A missing id is still 404. A non-boolean dry_run is 400 and writes nothing. With no database, a dry run returns would_write false.",
+            "dry_run true returns the affected task and the field diff and writes nothing. action is cancel_task when status is cancelled, otherwise update_task. The preview includes expected_revision. Sending that token makes the update conditional: a mismatch is 409 stale_write with current_revision and writes nothing, including no activity event. Omitting expected_revision keeps the unconditional update. A missing id is still 404. A non-boolean dry_run, or an expected_revision that is empty, non-string, or longer than 200 characters, is 400 and writes nothing. With no database, a dry run returns would_write false. A confirm that omits expected_revision still answers the demo acknowledgement and does not update a task.",
           security: cookieOrBearer,
           parameters: [pathParam("id", "Task id.", { type: "integer" })],
           requestBody: body(ref("PatchTask")),
@@ -945,7 +979,8 @@ export function openApiDocument(): Json {
               ],
             }),
             ...flatErrors,
-            "404": jsonResponse("No task has this id when a database is connected.", ref("Error")),
+            "404": jsonResponse("No task has this id when a database is connected. Also when expected_revision is present and the id is already gone.", ref("Error")),
+            "409": staleWrite,
           },
         }),
       },

@@ -13,19 +13,19 @@ import {
   type TaskPatch,
 } from "./dry-run";
 import { demoRememberTool, demoUpdateTaskTool } from "./demo-store";
-import { findMemoryByKey, getTask, remember, report, updateTask } from "./store";
+import { findMemoryByKey, getTask, memoryPreviewRevision, remember, report, taskPreviewRevision, updateTask } from "./store";
 import type { TaskStatus } from "./types";
 
 export async function previewTaskChange(id: number, patch: TaskPatch): Promise<DryRunResult | null> {
   const task = await getTask(id);
   if (!task) return null;
-  return diffTaskUpdate(task, patch);
+  return diffTaskUpdate(task, patch, await taskPreviewRevision(task));
 }
 
 export async function previewMemoryWrite(input: MemoryWriteInput): Promise<DryRunResult> {
   const key = input.key ?? null;
   const existing = key ? ((await findMemoryByKey(key)) as StoredMemory | null) : null;
-  return diffMemoryWrite(existing, input);
+  return diffMemoryWrite(existing, input, await memoryPreviewRevision(key));
 }
 
 export async function rememberForTool(args: {

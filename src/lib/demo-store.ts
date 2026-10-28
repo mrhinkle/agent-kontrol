@@ -14,6 +14,7 @@
 import type { Actor } from "./actor";
 import { mcpToolError, memoryKeyError, type McpToolResult } from "./api-error";
 import { diffMemoryWrite, diffTaskUpdate, readDryRun, type MemoryWriteInput } from "./dry-run";
+import { StaleWrite, absentRevision, memoryRevision, taskRevision } from "./revision";
 import {
   IDEMPOTENCY_ROUTE,
   IDEMPOTENCY_TTL_MS,
@@ -448,6 +449,38 @@ export function demoRemember(input: DemoRememberInput): Promise<MemoryItem> {
   return enqueue(async () => rememberUnlocked(input));
 }
 
+/**
+ * Compare-and-write for a demo confirm. The check and the write stay in one
+ * turn of the queue with no await between them, so a second caller sees the
+ * first write. A mismatch throws and leaves the note as it was.
+ */
+export function demoRememberGuarded(
+  input: DemoRememberInput & { expected_revision: string },
+): Promise<MemoryItem> {
+  return enqueue(async () => {
+    const key = input.key ?? null;
+    const expected = input.expected_revision;
+    if (!key) {
+      if (expected !== absentRevision()) throw new StaleWrite(absentRevision());
+      return rememberUnlocked(input);
+    }
+    const existing = notes.find((note) => note.key === key);
+    if (!existing) {
+      if (expected === absentRevision()) return rememberUnlocked(input);
+      throw new Error("Memory not found");
+    }
+    const current = memoryRevision(existing);
+    if (current !== expected) throw new StaleWrite(current);
+    return rememberUnlocked(input);
+  });
+}
+
+/** Test hook. Production has no memory delete route. */
+export function demoDeleteMemoryForTests(key: string): void {
+  const index = notes.findIndex((note) => note.key === key);
+  if (index >= 0) notes.splice(index, 1);
+}
+
 export interface DemoRecallInput {
   query?: string;
   key?: string;
@@ -627,6 +660,32 @@ export function demoClaimNextTask(input: {
   });
 }
 
+function updateTaskUnlocked(input: {
+  id: number;
+  status?: TaskStatus;
+  result?: string;
+  cost_usd?: number;
+  session_id?: string;
+  assigned_agent?: string;
+}): Task {
+  touch();
+  const task = tasks.find((row) => row.id === input.id);
+  if (!task) throw new Error("Task not found");
+  const now = iso(nowFn());
+  task.updated_at = now;
+  if (input.status !== undefined && input.status !== null) {
+    task.status = input.status;
+    if (input.status === "done" || input.status === "failed" || input.status === "cancelled") {
+      task.completed_at = now;
+    }
+  }
+  if (input.result !== undefined) task.result = input.result;
+  if (input.cost_usd !== undefined) task.cost_usd = input.cost_usd;
+  if (input.session_id !== undefined) task.session_id = input.session_id;
+  if (input.assigned_agent !== undefined) task.assigned_agent = input.assigned_agent;
+  return cloneTask(task);
+}
+
 export function demoUpdateTask(input: {
   id: number;
   status?: TaskStatus;
@@ -635,24 +694,35 @@ export function demoUpdateTask(input: {
   session_id?: string;
   assigned_agent?: string;
 }): Promise<Task> {
+  return enqueue(async () => updateTaskUnlocked(input));
+}
+
+/**
+ * Compare-and-write for a demo task confirm. No await between the revision
+ * check and the write, so two confirms with one token cannot both apply.
+ */
+export function demoUpdateTaskGuarded(input: {
+  id: number;
+  status?: TaskStatus;
+  result?: string;
+  cost_usd?: number;
+  session_id?: string;
+  assigned_agent?: string;
+  expected_revision: string;
+}): Promise<Task> {
   return enqueue(async () => {
-    touch();
     const task = tasks.find((row) => row.id === input.id);
     if (!task) throw new Error("Task not found");
-    const now = iso(nowFn());
-    task.updated_at = now;
-    if (input.status !== undefined && input.status !== null) {
-      task.status = input.status;
-      if (input.status === "done" || input.status === "failed" || input.status === "cancelled") {
-        task.completed_at = now;
-      }
-    }
-    if (input.result !== undefined) task.result = input.result;
-    if (input.cost_usd !== undefined) task.cost_usd = input.cost_usd;
-    if (input.session_id !== undefined) task.session_id = input.session_id;
-    if (input.assigned_agent !== undefined) task.assigned_agent = input.assigned_agent;
-    return cloneTask(task);
+    const current = taskRevision(task);
+    if (current !== input.expected_revision) throw new StaleWrite(current);
+    return updateTaskUnlocked(input);
   });
+}
+
+/** Test hook. Production has no task delete route. */
+export function demoDeleteTaskForTests(id: number): void {
+  const index = tasks.findIndex((task) => task.id === id);
+  if (index >= 0) tasks.splice(index, 1);
 }
 
 function formatTasks(rows: Task[]): string {
@@ -741,7 +811,8 @@ export async function demoRememberTool(args: {
   if (!dry.ok) return dryRunRejected();
   if (dry.dryRun) {
     const existing = args.key ? await demoFindMemoryByKey(args.key) : null;
-    const preview = diffMemoryWrite(existing, args as MemoryWriteInput);
+    const revision = existing ? memoryRevision(existing) : absentRevision();
+    const preview = diffMemoryWrite(existing, args as MemoryWriteInput, revision);
     return { content: [{ type: "text", text: JSON.stringify(preview) }] };
   }
   const item = await demoRemember(args);
@@ -806,7 +877,7 @@ export async function demoUpdateTaskTool(args: {
   if (dry.dryRun) {
     const task = await demoGetTask(args.id);
     if (!task) return mcpToolError("task_not_found");
-    return { content: [{ type: "text", text: JSON.stringify(diffTaskUpdate(task, args)) }] };
+    return { content: [{ type: "text", text: JSON.stringify(diffTaskUpdate(task, args, taskRevision(task))) }] };
   }
   let task: Task;
   try {

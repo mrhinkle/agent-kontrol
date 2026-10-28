@@ -1,5 +1,12 @@
 import type { Actor } from "./actor";
 import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } from "./idempotency";
+import {
+  StaleWrite,
+  absentRevision,
+  hashDigest,
+  isTimestampRevision,
+  updatedAtToken,
+} from "./revision";
 import { writeSessionNote } from "./session-memory";
 import { sql, type SqlTag } from "./db";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
@@ -283,6 +290,12 @@ export async function remember(input: {
   key?: string;
   tags?: string[];
   agent_id?: string;
+  /**
+   * Preview token. When set, a keyed write is one conditional statement:
+   * it updates only the row whose revision still matches, or inserts only
+   * when the preview saw no row. A miss writes nothing.
+   */
+  expected_revision?: string;
 }): Promise<MemoryItem> {
   const db = sql();
   const key = input.key ?? null;
@@ -290,34 +303,147 @@ export async function remember(input: {
   const tags = input.tags ?? [];
   const agentId = input.agent_id ?? null;
   const updatedAt = new Date().toISOString();
+  const expected = input.expected_revision;
 
   try {
-    if (key) {
+    if (expected === undefined) {
+      if (key) {
+        const rows = await db`
+          insert into memory (key, content, tags, agent_id, updated_at)
+          values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
+          on conflict (key) do update set
+            content = excluded.content,
+            tags = excluded.tags,
+            agent_id = excluded.agent_id,
+            updated_at = excluded.updated_at,
+            source = null,
+            facts_at = null
+          returning *
+        `;
+        if (!rows[0]) throw new Error("memory upsert returned no row");
+        return rows[0] as MemoryItem;
+      }
       const rows = await db`
         insert into memory (key, content, tags, agent_id, updated_at)
         values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
-        on conflict (key) do update set
-          content = excluded.content,
-          tags = excluded.tags,
-          agent_id = excluded.agent_id,
-          updated_at = excluded.updated_at,
-          source = null,
-          facts_at = null
         returning *
       `;
-      if (!rows[0]) throw new Error("memory upsert returned no row");
+      if (!rows[0]) throw new Error("memory insert returned no row");
       return rows[0] as MemoryItem;
     }
-    const rows = await db`
-      insert into memory (key, content, tags, agent_id, updated_at)
-      values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
-      returning *
-    `;
-    if (!rows[0]) throw new Error("memory insert returned no row");
-    return rows[0] as MemoryItem;
+
+    if (!key) {
+      if (expected !== absentRevision()) throw new StaleWrite(absentRevision());
+      const rows = await db`
+        insert into memory (key, content, tags, agent_id, updated_at)
+        values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
+        returning *
+      `;
+      if (!rows[0]) throw new Error("memory insert returned no row");
+      return rows[0] as MemoryItem;
+    }
+
+    if (expected === absentRevision()) {
+      const rows = await db`
+        insert into memory (key, content, tags, agent_id, updated_at)
+        select ${key}, ${content}, ${tags}, ${agentId}, ${updatedAt}
+        where not exists (select 1 from memory where key = ${key})
+        returning *
+      `;
+      if (rows[0]) return rows[0] as MemoryItem;
+    } else {
+      const written = await updateMemoryIfCurrent({ key, content, tags, agentId, updatedAt, expected });
+      if (written) return written;
+    }
   } catch (e) {
+    if (e instanceof StaleWrite) throw e;
     throw new Error(errMsg(e));
   }
+
+  const current = await currentMemoryRevision(key);
+  if (!current) throw new Error("Memory not found");
+  throw new StaleWrite(current);
+}
+
+/**
+ * One statement. The timestamp compare is `updated_at = $expected`.
+ * The hash compare is the same `md5(...)` expression `memoryHashToken` selects,
+ * so a null `updated_at` cannot match a preview of different content.
+ * Neither path reads the row and then writes it.
+ */
+async function updateMemoryIfCurrent(input: {
+  key: string;
+  content: string;
+  tags: string[];
+  agentId: string | null;
+  updatedAt: string;
+  expected: string;
+}): Promise<MemoryItem | null> {
+  const db = sql();
+  if (isTimestampRevision(input.expected)) {
+    const rows = await db`
+      update memory set
+        content = ${input.content},
+        tags = ${input.tags},
+        agent_id = ${input.agentId},
+        updated_at = ${input.updatedAt},
+        source = null,
+        facts_at = null
+      where key = ${input.key}
+        and updated_at = ${input.expected}::timestamptz
+      returning *
+    `;
+    return (rows[0] as MemoryItem | undefined) ?? null;
+  }
+  const digest = hashDigest(input.expected);
+  if (!digest) return null;
+  const rows = await db`
+    update memory set
+      content = ${input.content},
+      tags = ${input.tags},
+      agent_id = ${input.agentId},
+      updated_at = ${input.updatedAt},
+      source = null,
+      facts_at = null
+    where key = ${input.key}
+      and updated_at is null
+      and md5(
+          coalesce(key, '') || chr(31) ||
+          coalesce(content, '') || chr(31) ||
+          coalesce(array_to_string(tags, ','), '') || chr(31) ||
+          coalesce(agent_id, '') || chr(31) ||
+          coalesce(source, '') || chr(31) ||
+          case when facts_at is null then '0' else '1' end
+        ) = ${digest} /* hash-revision */
+    returning *
+  `;
+  return (rows[0] as MemoryItem | undefined) ?? null;
+}
+
+/** Same `md5(...)` block as `updateMemoryIfCurrent`. Keep the two copies identical. */
+async function memoryHashToken(key: string): Promise<string | null> {
+  const db = sql();
+  const rows = await db`
+    select 'rev:' || md5(
+          coalesce(key, '') || chr(31) ||
+          coalesce(content, '') || chr(31) ||
+          coalesce(array_to_string(tags, ','), '') || chr(31) ||
+          coalesce(agent_id, '') || chr(31) ||
+          coalesce(source, '') || chr(31) ||
+          case when facts_at is null then '0' else '1' end
+        ) as row_revision
+    from memory
+    where key = ${key}
+    limit 1
+  `;
+  const revision = rows[0]?.row_revision;
+  return typeof revision === "string" ? revision : null;
+}
+
+async function currentMemoryRevision(key: string): Promise<string | null> {
+  const row = await findMemoryByKey(key);
+  if (!row) return null;
+  return updatedAtToken(row.updated_at) ?? (await memoryHashToken(key));
 }
 
 export async function recall(input: {
@@ -997,6 +1123,12 @@ export async function updateTask(input: {
   cost_usd?: number;
   session_id?: string;
   assigned_agent?: string;
+  /**
+   * Preview token. When set, the update is one conditional statement
+   * (`updated_at = $expected`, or the null-`updated_at` hash). A miss
+   * writes nothing. Omitted keeps the unconditional update.
+   */
+  expected_revision?: string;
 }): Promise<Task> {
   const db = sql();
   const now = new Date().toISOString();
@@ -1008,25 +1140,109 @@ export async function updateTask(input: {
   const hasCost = input.cost_usd !== undefined;
   const hasSession = input.session_id !== undefined;
   const hasAgent = input.assigned_agent !== undefined;
+  const expected = input.expected_revision;
 
+  let rows: Record<string, unknown>[] = [];
   try {
-    const rows = await db`
-      update tasks set
-        updated_at = ${now},
-        status = case when ${hasStatus} then ${status} else status end,
-        completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
-        result = case when ${hasResult} then ${input.result ?? null} else result end,
-        cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
-        session_id = case when ${hasSession} then ${input.session_id ?? null} else session_id end,
-        assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end
-      where id = ${input.id}
-      returning *
-    `;
-    if (!rows[0]) throw new Error("Task not found");
-    return asTask(rows[0] as Record<string, unknown>);
+    if (expected === undefined) {
+      rows = await db`
+        update tasks set
+          updated_at = ${now},
+          status = case when ${hasStatus} then ${status} else status end,
+          completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
+          result = case when ${hasResult} then ${input.result ?? null} else result end,
+          cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
+          session_id = case when ${hasSession} then ${input.session_id ?? null} else session_id end,
+          assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end
+        where id = ${input.id}
+        returning *
+      `;
+    } else if (isTimestampRevision(expected)) {
+      rows = await db`
+        update tasks set
+          updated_at = ${now},
+          status = case when ${hasStatus} then ${status} else status end,
+          completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
+          result = case when ${hasResult} then ${input.result ?? null} else result end,
+          cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
+          session_id = case when ${hasSession} then ${input.session_id ?? null} else session_id end,
+          assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end
+        where id = ${input.id}
+          and updated_at = ${expected}::timestamptz
+        returning *
+      `;
+    } else {
+      const digest = hashDigest(expected);
+      if (digest) {
+        rows = await db`
+          update tasks set
+            updated_at = ${now},
+            status = case when ${hasStatus} then ${status} else status end,
+            completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
+            result = case when ${hasResult} then ${input.result ?? null} else result end,
+            cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
+            session_id = case when ${hasSession} then ${input.session_id ?? null} else session_id end,
+            assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end
+          where id = ${input.id}
+            and updated_at is null
+            and md5(
+          coalesce(status, '') || chr(31) ||
+          coalesce(result, '') || chr(31) ||
+          coalesce(cost_usd::text, '') || chr(31) ||
+          coalesce(session_id, '') || chr(31) ||
+          coalesce(assigned_agent, '') || chr(31) ||
+          coalesce(title, '') || chr(31) ||
+          coalesce(description, '') || chr(31) ||
+          coalesce(project, '') || chr(31) ||
+          coalesce(platform, '') || chr(31) ||
+          coalesce(machine, '') || chr(31) ||
+          coalesce(priority::text, '') || chr(31) ||
+          coalesce(reviewer_platform, '') || chr(31) ||
+          case when completed_at is null then '0' else '1' end
+        ) = ${digest} /* hash-revision */
+          returning *
+        `;
+      }
+    }
   } catch (e) {
     throw new Error(errMsg(e));
   }
+  if (rows[0]) return asTask(rows[0]);
+  if (expected === undefined) throw new Error("Task not found");
+  const current = await getTask(input.id);
+  if (!current) throw new Error("Task not found");
+  const token = updatedAtToken(current.updated_at);
+  if (token) throw new StaleWrite(token);
+  const hash = await taskHashToken(input.id);
+  if (!hash) throw new Error("Task not found");
+  throw new StaleWrite(hash);
+}
+
+/** Same `md5(...)` block as the guarded `updateTask`. Keep the two copies identical. */
+async function taskHashToken(id: number): Promise<string | null> {
+  const db = sql();
+  const rows = await db`
+    select 'rev:' || md5(
+          coalesce(status, '') || chr(31) ||
+          coalesce(result, '') || chr(31) ||
+          coalesce(cost_usd::text, '') || chr(31) ||
+          coalesce(session_id, '') || chr(31) ||
+          coalesce(assigned_agent, '') || chr(31) ||
+          coalesce(title, '') || chr(31) ||
+          coalesce(description, '') || chr(31) ||
+          coalesce(project, '') || chr(31) ||
+          coalesce(platform, '') || chr(31) ||
+          coalesce(machine, '') || chr(31) ||
+          coalesce(priority::text, '') || chr(31) ||
+          coalesce(reviewer_platform, '') || chr(31) ||
+          case when completed_at is null then '0' else '1' end
+        ) as row_revision
+    from tasks
+    where id = ${id}
+    limit 1
+  `;
+  const revision = rows[0]?.row_revision;
+  return typeof revision === "string" ? revision : null;
 }
 
 /** Read one task. Dry-run previews use this so a cancel can show the row without updating it. */
@@ -1052,4 +1268,17 @@ export async function findMemoryByKey(key: string): Promise<MemoryItem | null> {
   } catch (e) {
     throw new Error(errMsg(e));
   }
+}
+
+/** Revision a memory preview must hand to the confirm. No row → the absent token. */
+export async function memoryPreviewRevision(key: string | null | undefined): Promise<string> {
+  if (!key) return absentRevision();
+  const row = await findMemoryByKey(key);
+  if (!row) return absentRevision();
+  return updatedAtToken(row.updated_at) ?? (await memoryHashToken(key)) ?? absentRevision();
+}
+
+/** Revision a task preview must hand to the confirm. Uses the row already read. */
+export async function taskPreviewRevision(task: { id: number; updated_at: unknown }): Promise<string> {
+  return updatedAtToken(task.updated_at) ?? (await taskHashToken(task.id)) ?? absentRevision();
 }
