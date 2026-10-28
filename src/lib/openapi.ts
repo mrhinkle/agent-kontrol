@@ -262,6 +262,7 @@ export function openApiDocument(): Json {
                   ok: { type: "boolean" },
                   error: { type: ["string", "null"] },
                   truncated: { type: "boolean", description: "True when gh repo list hit the 1000-repo cap. Seen repos are updated. Others are not marked gone." },
+                  swept_at: { type: "string", format: "date-time", description: "Collector time just before gh repo list. A sweep that is not newer than last_discovered_at is ignored." },
                   repos: {
                     type: "array",
                     items: {
@@ -1328,7 +1329,7 @@ export function openApiDocument(): Json {
           tags: ["settings"],
           summary: "Apply one collector tick of gh repo list results.",
           description:
-            "Auth matches PUT /api/settings/repos. A result with ok false, a rate-limit error, or zero repos records last_error and does not change tracked repos. A truncated list updates the repos it saw, does not mark the others gone, and stores a warning on last_error while still setting last_discovered_at. An unknown owner is an error on that result and does not fail the batch. A duplicate owner in one request is 400 and writes nothing. A repo name that is not safe to store fails that owner's sweep and writes no repo changes. One owner's metadata update and repo changes commit together. Discovery does not change pin, hide, label, short, color, origin, or the actor who saved the owner. No database is 409 and includes results.",
+            "Auth matches PUT /api/settings/repos. A result with ok false, a rate-limit error, or zero repos records last_error and does not change tracked repos. A truncated list updates the repos it saw, does not mark the others gone, and stores a warning on last_error while still setting last_discovered_at. An unknown owner is an error on that result and does not fail the batch. A duplicate owner in one request is 400 and writes nothing. A repo name that is not safe to store fails that owner's sweep and writes no repo changes. One owner's metadata update and repo changes commit together, under a per-owner advisory lock, after reloading tracked repos. swept_at orders overlapping ticks: a sweep that is not newer than last_discovered_at writes nothing. Discovery does not change pin, hide, label, short, color, origin, or the actor who saved the owner. No database, or a missing watched_owners table, is 409 and includes results.",
           security: cookieOrBearer,
           requestBody: body(ref("OwnerDiscovery")),
           responses: {
@@ -1356,7 +1357,7 @@ export function openApiDocument(): Json {
             "400": flatErrors["400"],
             "401": flatErrors["401"],
             "403": flatErrors["403"],
-            "409": jsonResponse("No database is connected.", ref("Error")),
+            "409": jsonResponse("No database is connected, or watched_owners does not exist yet.", ref("Error")),
             "500": flatErrors["500"],
           },
         }),

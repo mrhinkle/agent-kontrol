@@ -117,7 +117,25 @@ describe("watched owners discovery", () => {
 
     const calls: string[] = [];
     setSqlForTests(async (strings) => {
-      calls.push(strings.join(" "));
+      const text = strings.join(" ");
+      calls.push(text);
+      if (/from watched_repos/i.test(text)) {
+        return existing.map((row) => ({
+          repo: row.repo,
+          label: row.label,
+          short: row.short,
+          color: row.color,
+          blocked_label: row.blockedLabel,
+          position: row.position,
+          origin: row.origin,
+          pinned: row.pinned,
+          hidden: row.hidden,
+          gone: row.gone,
+          is_fork: row.isFork,
+          is_archived: row.isArchived,
+          last_activity_at: row.lastActivityAt,
+        }));
+      }
       return [];
     });
     const failed = await applyOwnerDiscovery(owner(), existing, { repos: [], error: "gh repo list returned no repos", truncated: false }, NOW);
@@ -740,5 +758,221 @@ describe("watched owners discovery", () => {
     const rollback = calls.findIndex((sql) => /^rollback\b/i.test(sql));
     assert.ok(begin !== -1 && begin < update && update < insert && insert < rollback);
     assert.equal(calls.some((sql) => /^commit\b/i.test(sql)), false);
+  });
+
+  it("a missing watched_owners table rejects discovery", async () => {
+    env.NODE_ENV = "test";
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+    const calls: string[] = [];
+    setSqlForTests(async (strings) => {
+      const text = strings.join(" ");
+      calls.push(text);
+      if (/watched_owners/i.test(text)) {
+        const err = new Error('relation "watched_owners" does not exist');
+        (err as { code?: string }).code = "42P01";
+        throw err;
+      }
+      return [];
+    });
+
+    const res = await postDiscover(new Request("http://localhost/api/settings/owners/discover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        results: [{ owner: "acme", ok: true, repos: [{ name: "app", pushedAt: atAge(1), isFork: false, isArchived: false }] }],
+      }),
+    }));
+    assert.equal(res.status, 409, JSON.stringify(await res.clone().json()));
+    const body = await res.json() as {
+      code?: string;
+      fix?: string;
+      retryable?: boolean;
+      results?: { owner?: string; ok?: boolean; error?: string }[];
+    };
+    assert.equal(body.code, "conflict");
+    assert.equal(body.retryable, false);
+    assert.match(body.fix ?? "", /20261028_watched_owners\.sql/);
+    assert.equal(body.results?.length, 1);
+    assert.equal(body.results?.[0]?.owner, "acme");
+    assert.equal(body.results?.[0]?.ok, false);
+    assert.equal(calls.some((sql) => /insert into watched_repos/i.test(sql)), false);
+    assert.equal(calls.some((sql) => /update watched_owners/i.test(sql)), false);
+  });
+
+  it("overlapping discovery sweeps do not resurrect a repo a newer sweep marked gone", async () => {
+    env.NODE_ENV = "test";
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+
+    const NEWER = "2026-10-28T00:02:00.000Z";
+    const OLDER = "2026-10-28T00:01:00.000Z";
+    const state = {
+      discoveredAt: null as string | null,
+      resurrected: false,
+      repos: [
+        { repo: "acme/app", label: "app", short: "app", color: "#2563eb", position: 0, origin: "auto", pinned: false, gone: false },
+        { repo: "acme/old", label: "old", short: "old", color: "#112233", position: 1, origin: "manual", pinned: true, gone: false },
+      ],
+    };
+    let begins = 0;
+    let firstOpen = false;
+    let markFirst = (): void => {};
+    let markSecond = (): void => {};
+    let markCommitted = (): void => {};
+    let failWait = (_err: Error): void => {};
+    const firstBegan = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("first discovery sweep did not start")), 2000);
+      markFirst = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+    const secondBegan = new Promise<void>((resolve, reject) => {
+      failWait = reject;
+      const timer = setTimeout(() => reject(new Error("second discovery sweep did not start")), 2000);
+      markSecond = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+    const firstCommitted = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("first discovery sweep did not commit")), 2000);
+      markCommitted = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+
+    setSqlForTests(async (strings, ...values) => {
+      const text = strings.join(" ").replace(/\s+/g, " ").trim().toLowerCase();
+      if (text === "begin") {
+        begins += 1;
+        if (begins === 1) {
+          firstOpen = true;
+          markFirst();
+          await secondBegan;
+        } else {
+          markSecond();
+          await firstCommitted;
+        }
+        return [];
+      }
+      if (text === "commit") {
+        if (firstOpen) {
+          firstOpen = false;
+          markCommitted();
+        }
+        return [];
+      }
+      if (text === "rollback") return [];
+      if (text.includes("from watched_owners")) {
+        return [{
+          owner: "acme",
+          activity_days: 30,
+          include_forks: false,
+          include_archived: false,
+          last_error: null,
+          last_error_at: null,
+          last_discovered_at: state.discoveredAt,
+          actor_type: "human",
+          actor_id: "operator",
+        }];
+      }
+      if (text.includes("from watched_repos")) {
+        return state.repos.map((row) => ({
+          repo: row.repo,
+          label: row.label,
+          short: row.short,
+          color: row.color,
+          blocked_label: null,
+          position: row.position,
+          origin: row.origin,
+          pinned: row.pinned,
+          hidden: false,
+          gone: row.gone,
+          is_fork: false,
+          is_archived: false,
+          last_activity_at: atAge(1),
+        }));
+      }
+      if (text.includes("update watched_owners")) {
+        if (values.includes(NEWER)) state.discoveredAt = NEWER;
+        else if (values.includes(OLDER)) state.discoveredAt = OLDER;
+        return [];
+      }
+      if (text.includes("insert into watched_repos")) {
+        const names = values[0] as string[];
+        const gone = values[9] as boolean[];
+        names.forEach((name, i) => {
+          const row = state.repos.find((item) => item.repo === name);
+          if (row?.gone === true && gone[i] === false) state.resurrected = true;
+          if (row) row.gone = gone[i];
+        });
+        return [];
+      }
+      return [];
+    });
+
+    const post = (sweptAt: string, names: string[]) => postDiscover(new Request("http://localhost/api/settings/owners/discover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        results: [{
+          owner: "acme",
+          ok: true,
+          swept_at: sweptAt,
+          repos: names.map((name) => ({ name, pushedAt: atAge(1), isFork: false, isArchived: false })),
+        }],
+      }),
+    }));
+
+    const newerPromise = post(NEWER, ["app"]);
+    try {
+      await firstBegan;
+    } catch (err) {
+      failWait(err instanceof Error ? err : new Error(String(err)));
+      throw err;
+    }
+    const olderPromise = post(OLDER, ["app", "old"]);
+    let newerRes: Response;
+    let olderRes: Response;
+    try {
+      [newerRes, olderRes] = await Promise.all([newerPromise, olderPromise]);
+    } catch (err) {
+      failWait(err instanceof Error ? err : new Error(String(err)));
+      throw err;
+    }
+
+    assert.equal(newerRes.status, 200, JSON.stringify(await newerRes.clone().json()));
+    assert.equal(olderRes.status, 200, JSON.stringify(await olderRes.clone().json()));
+    const newerBody = await newerRes.json() as { results: { ok: boolean; error: string | null; marked_gone: number }[] };
+    const olderBody = await olderRes.json() as { results: { ok: boolean; error: string | null; marked_gone: number }[] };
+    assert.equal(newerBody.results[0]?.ok, true, JSON.stringify(newerBody));
+    assert.ok((newerBody.results[0]?.marked_gone ?? 0) >= 1);
+    assert.equal(olderBody.results[0]?.ok, false, JSON.stringify(olderBody));
+    assert.match(olderBody.results[0]?.error ?? "", /stale/);
+    const old = state.repos.find((row) => row.repo === "acme/old");
+    assert.equal(old?.gone, true);
+    assert.equal(old?.pinned, true);
+    assert.equal(state.resurrected, false);
+    assert.equal(state.discoveredAt, NEWER);
+  });
+
+  it("the collector distinguishes an unwritable owner store from an empty owner list", () => {
+    const collector = fs.readFileSync("scripts/collect-progress.sh", "utf8");
+    const start = collector.indexOf("discover_watched_owners() {");
+    const end = collector.indexOf("refresh_repos_from_dashboard() {");
+    assert.ok(start > 0 && end > start);
+    const fn = collector.slice(start, end);
+    const unwritable = fn.search(/owner store is not writable/);
+    const none = fn.indexOf("owners: none configured");
+    assert.ok(unwritable > 0, "writable:false must not use the empty-list log line");
+    assert.ok(none > unwritable, "none configured remains the message for an empty owner list");
+    assert.match(fn, /swept_at/);
   });
 });

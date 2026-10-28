@@ -11,6 +11,7 @@ import {
   type OwnerRule,
   type TrackedRepo,
 } from "./owner-discovery";
+import { readTrackedRepos } from "./watched-repos";
 import {
   ACTIVITY_DAYS_DEFAULT,
   type OwnerInput,
@@ -30,6 +31,8 @@ export interface DiscoveryRequest {
   error?: string | null;
   repos?: GhListedRepo[];
   truncated?: boolean;
+  /** Collector clock time taken just before `gh repo list`. */
+  sweptAt?: string | null;
 }
 
 function iso(value: unknown): string | null {
@@ -73,6 +76,25 @@ export interface WatchedOwnerRead {
 
 /** Serializes owner-list writers. Empty-table `for update` locks nothing, so this is a transaction lock. */
 const OWNER_LIST_LOCK = 87216666;
+
+/** Per-owner discovery lock. Separate from the owner-list lock so a save is not stuck behind `gh`. */
+export function discoveryLockKey(owner: string): string {
+  const buf = createHash("sha256").update(`watched-owner-discovery:${owner.toLowerCase()}`).digest();
+  let n = 0n;
+  for (let i = 0; i < 8; i++) n = (n << 8n) | BigInt(buf[i] ?? 0);
+  const sign = 1n << 63n;
+  if (n >= sign) n -= 1n << 64n;
+  return n.toString();
+}
+
+/** A sweep is stale when the collector's clock is not strictly newer than the stored one. */
+export function isStaleDiscovery(sweptAt: string | null | undefined, storedAt: string | null): boolean {
+  if (!sweptAt || !storedAt) return false;
+  const sweepMs = Date.parse(sweptAt);
+  const storedMs = Date.parse(storedAt);
+  if (Number.isNaN(sweepMs) || Number.isNaN(storedMs)) return false;
+  return sweepMs <= storedMs;
+}
 
 export async function listWatchedOwners(): Promise<WatchedOwnerRead> {
   if (!isConfigured()) return { writable: false, owners: [] };
@@ -164,19 +186,36 @@ export function ruleOf(owner: StoredOwner): OwnerRule {
 }
 
 export function sweepOf(request: DiscoveryRequest): DiscoverySweep {
+  const sweptAt = request.sweptAt ?? null;
   if (!request.ok) {
-    return { repos: null, error: request.error?.trim() || "gh repo list failed", truncated: false };
+    return { repos: null, error: request.error?.trim() || "gh repo list failed", truncated: false, sweptAt };
   }
   return {
     repos: request.repos ?? [],
     error: request.error ?? null,
     truncated: request.truncated === true,
+    sweptAt,
+  };
+}
+
+function unchanged(existing: TrackedRepo[], failure: string): DiscoveryOutcome {
+  return {
+    failure,
+    warning: null,
+    repos: existing.map((row) => ({ ...row })),
+    added: [],
+    updated: [],
+    markedGone: [],
   };
 }
 
 /**
  * Applies one owner's sweep. A failure records `last_error` and does not
  * insert, update, hide, or delete tracked repos.
+ *
+ * The owner lock is held across the reload, the plan, and the write. A
+ * sweep whose `sweptAt` is not newer than `last_discovered_at` writes
+ * nothing, so a delayed older list cannot resurrect a repo.
  */
 export async function applyOwnerDiscovery(
   rule: OwnerRule,
@@ -184,21 +223,37 @@ export async function applyOwnerDiscovery(
   sweep: DiscoverySweep,
   now: Date,
 ): Promise<DiscoveryOutcome> {
-  const outcome = planDiscovery(existing, rule, sweep, now);
-  const visibleError = outcome.failure ?? outcome.warning;
-  const owned = outcome.failure
-    ? []
-    : outcome.repos.filter((row) => repoOwner(row.repo) === rule.owner.toLowerCase());
-  await withTransaction(async (q) => {
+  const sweptAt = sweep.sweptAt ?? null;
+  return withTransaction(async (q) => {
+    await q`select pg_advisory_xact_lock(${discoveryLockKey(rule.owner)}::bigint)`;
+    const marker = await q`
+      select last_discovered_at
+      from watched_owners
+      where owner = ${rule.owner}
+    `;
+    if (isStaleDiscovery(sweptAt, iso(marker[0]?.last_discovered_at))) {
+      return unchanged(existing, "stale discovery sweep");
+    }
+    // Failures do not depend on the repo snapshot. A success plans again
+    // from the rows read under this lock, not from `existing`.
+    const preview = planDiscovery(existing, rule, sweep, now);
+    const outcome = preview.failure
+      ? preview
+      : planDiscovery(await readTrackedRepos(q), rule, sweep, now);
+    const visibleError = outcome.failure ?? outcome.warning;
+    const discoveredAt = sweptAt ?? now.toISOString();
+    const owned = outcome.failure
+      ? []
+      : outcome.repos.filter((row) => repoOwner(row.repo) === rule.owner.toLowerCase());
     await q`
       update watched_owners set
         last_error = ${visibleError},
         last_error_at = case when ${visibleError}::text is null then null else now() end,
-        last_discovered_at = case when ${outcome.failure}::text is null then now() else last_discovered_at end,
+        last_discovered_at = case when ${outcome.failure}::text is null then ${discoveredAt}::timestamptz else last_discovered_at end,
         updated_at = now()
       where owner = ${rule.owner}
     `;
-    if (outcome.failure || owned.length === 0) return;
+    if (outcome.failure || owned.length === 0) return outcome;
     await q`
     insert into watched_repos (
       repo, label, short, color, blocked_label, position, origin, pinned, hidden, gone,
@@ -232,8 +287,8 @@ export async function applyOwnerDiscovery(
       gone = excluded.gone,
       updated_at = now()
     `;
+    return outcome;
   });
-  return outcome;
 }
 
 export function sameIdentity(a: string, b: string): boolean {

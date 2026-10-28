@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { isConfigured, sql } from "./db";
+import { isConfigured, sql, type SqlTag } from "./db";
 import { briefShown, repoOwner, type OwnerRule, type TrackedRepo } from "./owner-discovery";
 import type { RepoConfig } from "./progress-config";
 import type { RepoInput } from "./repo-validation";
@@ -89,9 +89,10 @@ async function loadOwners(): Promise<StoredOwner[]> {
   }
 }
 
-export async function loadTrackedRepos(): Promise<TrackedRepo[]> {
+/** Reads tracked repos through `q`, so a discovery transaction can reload under its lock. */
+export async function readTrackedRepos(q: SqlTag): Promise<TrackedRepo[]> {
   try {
-    const rows = await sql()`
+    const rows = await q`
       select repo, label, short, color, blocked_label, position, origin, pinned, hidden, gone,
              is_fork, is_archived, last_activity_at
       from watched_repos
@@ -101,13 +102,17 @@ export async function loadTrackedRepos(): Promise<TrackedRepo[]> {
   } catch (e) {
     const err = e as { code?: string };
     if (err.code !== "42703") throw e;
-    const rows = await sql()`
+    const rows = await q`
       select repo, label, short, color, blocked_label, position
       from watched_repos
       order by position asc, repo asc
     `;
     return rows.map((r, i) => trackedFromRow(r, i));
   }
+}
+
+export async function loadTrackedRepos(): Promise<TrackedRepo[]> {
+  return readTrackedRepos(sql());
 }
 
 export async function getWatchedRepos(fallback: RepoConfig[]): Promise<{ source: RepoSource; repos: WatchedRepo[] }> {

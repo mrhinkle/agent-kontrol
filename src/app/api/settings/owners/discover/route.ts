@@ -55,6 +55,14 @@ function parseRepos(raw: unknown): { ok: true; repos: GhListedRepo[] } | { ok: f
   return { ok: true, repos };
 }
 
+function parseSweptAt(raw: unknown): { ok: true; sweptAt: string | null } | { ok: false; error: string } {
+  if (raw == null) return { ok: true, sweptAt: null };
+  if (typeof raw !== "string" || Number.isNaN(Date.parse(raw))) {
+    return { ok: false, error: "swept_at must be an ISO timestamp." };
+  }
+  return { ok: true, sweptAt: new Date(raw).toISOString() };
+}
+
 function parseResult(raw: unknown): { ok: true; request: DiscoveryRequest } | { ok: false; error: string } {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return { ok: false, error: "Each result must be an object." };
@@ -65,9 +73,11 @@ function parseResult(raw: unknown): { ok: true; request: DiscoveryRequest } | { 
   if (typeof row.ok !== "boolean") return { ok: false, error: "ok must be true or false." };
   const error = row.error == null ? null : typeof row.error === "string" ? row.error : null;
   if (row.error != null && typeof row.error !== "string") return { ok: false, error: "error must be a string." };
-  if (!row.ok) return { ok: true, request: { owner: name.owner, ok: false, error } };
+  const swept = parseSweptAt(row.swept_at);
+  if (!swept.ok) return { ok: false, error: swept.error };
+  if (!row.ok) return { ok: true, request: { owner: name.owner, ok: false, error, sweptAt: swept.sweptAt } };
   const repos = parseRepos(row.repos);
-  if (!repos.ok) return { ok: true, request: { owner: name.owner, ok: false, error: repos.error } };
+  if (!repos.ok) return { ok: true, request: { owner: name.owner, ok: false, error: repos.error, sweptAt: swept.sweptAt } };
   return {
     ok: true,
     request: {
@@ -76,6 +86,7 @@ function parseResult(raw: unknown): { ok: true; request: DiscoveryRequest } | { 
       error,
       repos: repos.repos,
       truncated: row.truncated === true,
+      sweptAt: swept.sweptAt,
     },
   };
 }
@@ -124,7 +135,24 @@ export async function POST(req: Request) {
     });
   }
   try {
-    const owners = (await listWatchedOwners()).owners;
+    const listed = await listWatchedOwners();
+    if (!listed.writable) {
+      return apiError("conflict", {
+        message: "Owner discovery can only be saved after the owner store exists.",
+        fix: "Apply supabase/migrations/20261028_watched_owners.sql, then retry the tick.",
+        extra: {
+          results: parsed.map((item) => ({
+            owner: item.owner,
+            ok: false,
+            error: "owner store is not writable",
+            added: 0,
+            updated: 0,
+            marked_gone: 0,
+          })),
+        },
+      });
+    }
+    const owners = listed.owners;
     let existing = await loadTrackedRepos();
     const now = new Date();
     const out = [];

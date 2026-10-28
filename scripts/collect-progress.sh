@@ -513,10 +513,12 @@ run_backfill() {
 # each, and post the raw lists. A failed, rate-limited, or empty list is
 # reported as ok:false so the dashboard records last_error and leaves
 # tracked repos alone. This never deletes a repo. Hide wins over pin is
-# applied when the dashboard is read, not here.
+# applied when the dashboard is read, not here. writable:false is an
+# unavailable store, not an empty list. swept_at is taken before gh so a
+# delayed older tick cannot overwrite a newer one.
 discover_watched_owners() {
   local body owners owner listing errfile count truncated results status resp
-  local err
+  local err swept writable
   if [[ "${MC_REPOS_FROM_DASHBOARD:-1}" == "0" ]]; then
     log "owners: discovery skipped (dashboard list disabled)"; return 0
   fi
@@ -525,6 +527,11 @@ discover_watched_owners() {
   fi
   if ! body="$(curl -fsS --max-time 15 -H "Authorization: Bearer $MC_TOKEN" "${MC_URL%/}/api/settings/owners" 2>/dev/null)"; then
     log "owners: dashboard unreachable, leaving tracked repos unchanged"; return 0
+  fi
+  writable="$(jq -r 'if has("writable") then (.writable|tostring) else "missing" end' <<<"$body" 2>/dev/null || echo missing)"
+  if [[ "$writable" == "false" ]]; then
+    log "owners: owner store is not writable; discovery skipped and tracked repos unchanged"
+    return 0
   fi
   owners="$(jq -r '.owners[]?.owner // empty' <<<"$body" 2>/dev/null || true)"
   if [[ -z "$owners" ]]; then
@@ -535,29 +542,30 @@ discover_watched_owners() {
   resp="$(mktemp)"
   while IFS= read -r owner; do
     [[ -n "$owner" ]] || continue
+    swept="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     if [[ ! "$owner" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]]; then
-      results="$(jq -c --arg owner "$owner" '. + [{owner:$owner, ok:false, error:"owner is not a safe GitHub login"}]' <<<"$results")" || true
+      results="$(jq -c --arg owner "$owner" --arg swept "$swept" '. + [{owner:$owner, ok:false, error:"owner is not a safe GitHub login", swept_at:$swept}]' <<<"$results")" || true
       continue
     fi
     : >"$errfile"
     if listing="$(gh repo list "$owner" --limit 1000 --json name,pushedAt,isArchived,isFork 2>"$errfile")"; then
       if ! printf '%s\n' "$listing" | jq -e 'type=="array"' >/dev/null 2>&1; then
         err="$(tr '\n' ' ' <"$errfile" | head -c 400)"
-        results="$(jq -c --arg owner "$owner" --arg err "${err:-gh repo list returned JSON that was not an array}" '. + [{owner:$owner, ok:false, error:$err}]' <<<"$results")" || true
+        results="$(jq -c --arg owner "$owner" --arg err "${err:-gh repo list returned JSON that was not an array}" --arg swept "$swept" '. + [{owner:$owner, ok:false, error:$err, swept_at:$swept}]' <<<"$results")" || true
         continue
       fi
       count="$(jq 'length' <<<"$listing" 2>/dev/null || echo 0)"
       if [[ "${count:-0}" -eq 0 ]]; then
         err="$(tr '\n' ' ' <"$errfile" | head -c 400)"
-        results="$(jq -c --arg owner "$owner" --arg err "${err:-gh repo list returned no repos}" '. + [{owner:$owner, ok:false, error:$err}]' <<<"$results")" || true
+        results="$(jq -c --arg owner "$owner" --arg err "${err:-gh repo list returned no repos}" --arg swept "$swept" '. + [{owner:$owner, ok:false, error:$err, swept_at:$swept}]' <<<"$results")" || true
         continue
       fi
       truncated=false
       if [[ "$count" -ge 1000 ]]; then truncated=true; fi
-      results="$(jq -c --arg owner "$owner" --argjson repos "$listing" --argjson truncated "$truncated" '. + [{owner:$owner, ok:true, repos:$repos, truncated:$truncated}]' <<<"$results")" || true
+      results="$(jq -c --arg owner "$owner" --argjson repos "$listing" --argjson truncated "$truncated" --arg swept "$swept" '. + [{owner:$owner, ok:true, repos:$repos, truncated:$truncated, swept_at:$swept}]' <<<"$results")" || true
     else
       err="$(tr '\n' ' ' <"$errfile" | head -c 400)"
-      results="$(jq -c --arg owner "$owner" --arg err "${err:-gh repo list failed}" '. + [{owner:$owner, ok:false, error:$err}]' <<<"$results")" || true
+      results="$(jq -c --arg owner "$owner" --arg err "${err:-gh repo list failed}" --arg swept "$swept" '. + [{owner:$owner, ok:false, error:$err, swept_at:$swept}]' <<<"$results")" || true
     fi
   done <<<"$owners"
   rm -f "$errfile"

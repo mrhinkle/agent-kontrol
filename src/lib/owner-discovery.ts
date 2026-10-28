@@ -50,6 +50,11 @@ export interface DiscoverySweep {
   error: string | null;
   /** The list was cut at the cap. Seen repos update; absent repos are not marked gone. */
   truncated?: boolean;
+  /**
+   * When the collector started `gh repo list`. A sweep that is not newer
+   * than the stored `last_discovered_at` is stale and must not write.
+   */
+  sweptAt?: string | null;
 }
 
 export interface DiscoveryOutcome {
