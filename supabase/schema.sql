@@ -181,7 +181,7 @@ create table if not exists repo_snapshots (
   review_rounds numeric,
   no_verdict_rate numeric,
 
-  detail jsonb,                           -- lane_mix, stalled_prs, collector notes
+  detail jsonb,                           -- lane_mix, stalled_prs, notes; brief keys stuck_prs, median_lead_hours, stale_issues, drafts, merged are optional
   created_at timestamptz default now()
 );
 -- One row per repo per tick. Re-running the collector for the same instant

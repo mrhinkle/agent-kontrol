@@ -239,6 +239,9 @@ describe("OpenAPI document", () => {
     assert.equal((schemaOf(doc, "PatchTask").properties?.dry_run as { type: string }).type, "boolean");
     assert.equal((schemaOf(doc, "RepoList").properties?.dry_run as { type: string }).type, "boolean");
     assert.equal(paths["/api/tasks/{id}"]?.patch?.requestBody?.content["application/json"].schema.$ref, "#/components/schemas/PatchTask");
+    const memoryPost = (doc.paths as Record<string, { post?: { responses?: Record<string, { description?: string }> } }>)["/api/memory"]?.post;
+    assert.match(memoryPost?.responses?.["404"]?.description ?? "", /not_found/);
+    assert.match(memoryPost?.responses?.["409"]?.description ?? "", /stale_write/);
     assert.equal(paths["/api/settings/repos"]?.put?.requestBody?.content["application/json"].schema.$ref, "#/components/schemas/RepoList");
 
     const types = fs.readFileSync("src/lib/types.ts", "utf8");
