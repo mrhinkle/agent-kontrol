@@ -1,6 +1,6 @@
 import Link from "next/link";
 import type { RunMetrics } from "@/lib/run-store";
-import { DemoBanner } from "./ui";
+import { DemoPill } from "./ui";
 
 const number = (n: number | null) => n === null ? "Unavailable" : n.toLocaleString("en-US");
 const duration = (ms: number | null) => ms === null ? "Unavailable" : ms < 1000 ? `${Math.round(ms)} ms` : ms < 60_000 ? `${(ms / 1000).toFixed(1)} s` : `${(ms / 60_000).toFixed(1)} min`;
@@ -10,7 +10,7 @@ export function RunDashboard({ metrics }: { metrics: RunMetrics | null }) {
   const { totals, runs, models } = metrics;
   return (
     <section className="space-y-4" aria-labelledby="run-metrics">
-      {metrics.demo ? <DemoBanner /> : null}
+      {metrics.demo ? <DemoPill /> : null}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 id="run-metrics" className="text-lg font-medium text-white">Run observability</h2>

@@ -43,10 +43,11 @@ The Neon integration injects `DATABASE_URL`. `npm run build` applies the schema 
 | Vercel + Neon | Neon Postgres | One click | Used in the author's production |
 | Vercel + another Postgres | Any Postgres 13+ | Set `DATABASE_URL` | Supported |
 | Docker Compose (self-hosted) | Postgres 16, included | Two env vars in `.env` | Same code, less exercised |
+| Fly.io | Fly Managed Postgres or Neon | `fly launch` + three secrets | Same image as Compose; CI builds and smoke-tests it |
 | Any Node host | Any Postgres | `npm ci && npm run build && npm start` | Same code, less exercised |
 | Local demo | None | `npm ci && npm run dev` | Sample data, nothing stored |
 
-Only Vercel + Neon is used in the author's production. CI runs the data layer tests against Postgres 16 (schema applied twice). The Docker and generic-Node paths follow the same code but are less exercised. Not supported: serverless platforms that cannot run Node 22, and plain HTTP without TLS for anything but localhost.
+Only Vercel + Neon is used in the author's production. CI runs the data layer tests against Postgres 16 (schema applied twice). The Docker, Fly.io and generic-Node paths follow the same code but are less exercised; CI does build the Docker image and check that it serves `/login`. Not supported: serverless platforms that cannot run Node 22, and plain HTTP without TLS for anything but localhost.
 
 ### Vercel + Neon
 
@@ -69,7 +70,52 @@ Files:
 - `Dockerfile` — node:22-slim, multi-stage, runs as the non-root `node` user, healthcheck on `/login`, applies the schema on every container start.
 - `docker-compose.yml` — db and app; the db port is not published; data lives in the named volume `db-data`; the app listens on `${MC_PORT:-3000}`; `POSTGRES_PASSWORD` defaults to `mc` and should be changed for anything beyond local use.
 
-### Any Node host (VM, Fly, Railway, Render, etc.)
+### Fly.io
+
+Fly runs the same `Dockerfile` that Docker Compose uses. `fly.toml` in the repo root sets the port, a health check on `/login`, one always-on machine, and a release command that applies the schema once per deploy.
+
+Requirements: [flyctl](https://fly.io/docs/flyctl/install/) and a Fly account.
+
+```bash
+fly launch --copy-config --no-deploy --name <your-app> --region <region>
+```
+
+`--copy-config` keeps the repo's `fly.toml`; `--no-deploy` stops before the first deploy so you can set secrets. Pick a region close to your database.
+
+Database, one of:
+
+- **Fly Managed Postgres**: `fly mpg create --name <your-app>-db --region <region> --plan Basic` then `fly mpg attach <cluster-id> -a <your-app>` (the cluster id is in `fly mpg list`). Attach sets `DATABASE_URL` as a secret using the pooled PgBouncer URL and restarts the app; the hostname is not Neon's, so the app uses the `pg` driver. The older unmanaged `fly postgres` commands still run but Fly no longer maintains or supports them.
+- **Neon**: create a project at neon.tech and set `DATABASE_URL` yourself (next step). Neon's HTTP driver is detected automatically.
+
+Secrets:
+
+```bash
+fly secrets set --app <your-app> \
+  MC_TOKEN="$(openssl rand -hex 24)" \
+  MC_DASHBOARD_PASSWORD="$(openssl rand -hex 24)" \
+  MC_PUBLIC_URL="https://<your-app>.fly.dev"
+# plus DATABASE_URL if you are not using `fly mpg attach`
+```
+
+`MC_PUBLIC_URL` pins the OAuth issuer to your public hostname. Fly's proxy also sends `X-Forwarded-Proto`, so the app derives the right origin without it, but setting it avoids surprises when you add a custom domain later.
+
+Deploy:
+
+```bash
+fly deploy
+fly secrets list      # confirm the four names are present
+fly logs              # `migrate: schema applied` appears in the release command output
+```
+
+Notes:
+
+- The release command runs `scripts/apply-schema.mjs` on a temporary machine before the new version takes traffic. The release machine inherits `[env]`, so the command sets `MC_SKIP_MIGRATE=0` for itself; the `MC_SKIP_MIGRATE=1` in `[env]` only turns off the duplicate run the container does at start (the run Docker Compose relies on; redundant on Fly).
+- `auto_stop_machines = "off"` keeps the MCP endpoint and task queue reachable at all times. Set it to `"stop"` or `"suspend"` (and then `min_machines_running = 0`) if you only want the dashboard and can tolerate cold starts.
+- `NEXT_PUBLIC_*` values are baked in at build time and the Dockerfile declares no build args, so Fly deploys use the defaults (header name `Agent Kontrol`, sender `Operator`). To change them, add `ARG`/`ENV` lines for those names to the build stage of the Dockerfile and set them under `[build.args]` in `fly.toml`.
+- Custom domain: `fly certs add <domain>`, point DNS at the app, then update `MC_PUBLIC_URL`.
+- Upgrade: `git pull && fly deploy`. Rollback: `fly releases` then `fly deploy --image <previous image>`.
+
+### Any Node host (VM, Railway, Render, etc.)
 
 Requirements: Node 22 and a Postgres.
 
@@ -104,7 +150,14 @@ With no `DATABASE_URL`, the app runs with sample data and stores nothing.
 | `NEXT_PUBLIC_HERMES_VITALS_URL` | No | Link shown on the progress board. |
 | `MC_DB_DRIVER` | No | Driver override: `neon` or `pg`. |
 | `MC_DB_POOL_MAX` | No | pg pool size. Default 5. |
-| `MC_SKIP_MIGRATE` | No | Set to 1 to skip the automatic schema step. |
+| `MC_SKIP_MIGRATE` | No | Set to 1 to skip the automatic schema step. Set it on the Vercel Preview environment so preview builds never touch the production database. |
+| `MC_TRACE_RETENTION_DAYS` | No | Days to keep trace spans before they are deleted. A whole number of days from 1 to 999999; anything else (such as `1.5` or `14d`) is ignored and the default 30 is used. |
+| `MC_TRACE_CAPTURE_CONTENT` | No | Set to `1` to also store prompt and tool input and output in spans. Off by default; see [Telemetry and traces](TELEMETRY.md). |
+| `MC_MEMORY_WRITEBACK` | No | Set to `0` to stop writing an automatic note to memory when a session ends. On by default. |
+| `MC_MEMORY_WRITEBACK_TEXT` | No | Set to `1` to add the last reported milestones and summary (redacted) to those notes. Off by default; notes then hold structured facts only. |
+| `MC_MEMORY_WRITEBACK_PROMPTS` | No | With the text option on, also keep text that came from a prompt. Off by default. |
+| `MC_MEMORY_WRITEBACK_DAYS` | No | Days to keep automatic notes. Same rule: a whole number from 1 to 999999, otherwise 30. |
+| `MC_PROGRESS_INTERVAL` | No | Collector only: seconds between ticks. Default 900. |
 | `MC_PROGRESS_CONFIG` | No | Path to `progress.config.json` for the collector. |
 | `MC_OPENROUTER_MANAGEMENT_KEY` | No | Key for the usage ledger. |
 
@@ -118,13 +171,26 @@ openssl rand -hex 24
 
 ### Upgrade
 
-Pull and redeploy on Vercel, or:
+Pull and redeploy on Vercel, run `fly deploy` on Fly.io, or:
 
 ```bash
 git pull && docker compose up -d --build
 ```
 
 The schema step runs again and is safe to repeat.
+
+When a release changes agent adapters, re-run the adapter's `install.sh` on each machine, and when it changes hook settings (for example traces need the `PreToolUse` and `PostToolUse` hooks), re-merge `agents/claude-code/settings-fragment.json` into your Claude Code settings. The CHANGELOG says when this is needed.
+
+### Releasing on Vercel without shipping every merge
+
+By default Vercel treats `main` as production, so every merge goes live. To ship deliberately, use a `release` branch:
+
+1. Create the branch once: `git branch release main && git push origin release`.
+2. In Vercel, open Settings, then Environments, then Production, and set Branch Tracking to `release`. (Older dashboards: Settings, then Git, then Production Branch.)
+3. Merges to `main` now build previews only. To ship, open a pull request with base `release` and compare `main`, and merge it. Production deploys from that merge.
+4. To redeploy a commit without a new merge, use Redeploy on the deployment in Vercel, or promote a preview to production. Prefer a redeploy that targets production, which builds with the Production environment variables; check which variables a promoted preview ends up with before relying on it.
+
+Set `MC_SKIP_MIGRATE=1` on the Preview environment. Otherwise each preview build runs the schema step against whatever `DATABASE_URL` Preview has, which is usually your production database.
 
 ### Backups
 
@@ -146,7 +212,7 @@ The progress collector and usage collector install as macOS launchd agents. On L
 
 Use this if you already run the earlier Mission Control code on Vercel and want to move it to this repository. Nothing about your data or domain changes, and agents keep working.
 
-1. In the Vercel project, open Settings, then Git. Disconnect the old repository and connect `mrhinkle/agent-kontrol` (or your fork) with `main` as the production branch. The project, its domains, its environment variables and its database stay as they are.
+1. In the Vercel project, open Settings, then Git. Disconnect the old repository and connect `mrhinkle/agent-kontrol` (or your fork) with `main` (or `release`, see above) as the production branch. The project, its domains, its environment variables and its database stay as they are.
 2. Choose your repos. Either open Settings after the deploy and add them there, or set `NEXT_PUBLIC_MC_PROGRESS_CONFIG` before the build, for example `{"repos":[{"repo":"your-org/your-repo","label":"Your repo","short":"repo","color":"#2563eb","blockedLabel":"blocked"}]}`. Until you do one of these, the progress board shows the example repos from `progress.config.json`.
 3. If you want to keep your old header name, set `NEXT_PUBLIC_MC_NAME`. The "by The AIE" byline and trademark footer appear only under the default name.
 4. Leave `DATABASE_URL`, `MC_TOKEN`, `MC_DASHBOARD_PASSWORD` and any OAuth secrets exactly as they are. Do not rotate them, or agents and MCP connectors will need re-authorizing.

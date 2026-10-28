@@ -134,7 +134,7 @@ export const LANE_BOT_PREFIX: string = config.laneBotPrefix;
  * is the point of keeping them in one place.
  */
 export const THRESHOLDS = {
-  /** open issues labelled dependency-blocked, as a share of open issues */
+  /** open issues carrying the repo's blocked label, as a share of open issues */
   blockedRatio: 0.4,
   /** consecutive daily snapshots with net_backlog > 0 before it's an alert */
   backlogGrowingDays: 3,
@@ -144,6 +144,8 @@ export const THRESHOLDS = {
   reviewRounds: 3.0,
   /** share of review rounds that returned no parseable verdict */
   noVerdictRate: 0.15,
+  /** a skill run with no end is stalled after this many minutes, unless AK_SKILL_STALL_MINUTES overrides it */
+  skillStallMinutes: 60,
 } as const;
 
 export const WINDOWS = ["24h", "7d", "30d", "90d"] as const;

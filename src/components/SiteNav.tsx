@@ -42,7 +42,7 @@ export function SiteNav() {
   }, [pathname]);
 
   return (
-    <nav aria-label="Main" className="relative -mx-4 w-[calc(100%+2rem)] md:mx-0 md:w-auto">
+    <nav aria-label="Main" className="relative -mx-4 w-[calc(100%+2rem)] md:mx-0 md:w-auto md:basis-full">
       <div ref={ref} className="no-scrollbar flex items-center gap-1 overflow-x-auto px-3 text-sm md:overflow-visible md:px-0">
         {NAV_LINKS.map((l) => {
           const active = isActive(pathname, l.href);

@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { enforceApi } from "@/lib/auth";
+import { publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { isWindow, type TimeWindow } from "@/lib/progress-config";
 import { progress } from "@/lib/progress-store";
@@ -14,6 +16,8 @@ export const maxDuration = 30;
  * Postgres — never from GitHub. The collector owns the API budget.
  */
 export async function GET(req: Request) {
+  const denied = await enforceApi(req);
+  if (denied) return denied;
   const param = new URL(req.url).searchParams.get("window");
   const window: TimeWindow = isWindow(param) ? param : "24h";
 
@@ -33,6 +37,6 @@ export async function GET(req: Request) {
       headers: { "Cache-Control": "private, max-age=0, s-maxage=60" },
     });
   } catch (e) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    return publicError("[progress]", e);
   }
 }

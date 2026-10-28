@@ -69,5 +69,23 @@ export function formatDigest(data: ProgressResponse): string {
   }
   if (t.spend_usd !== null) lines.push(`Spend: $${t.spend_usd.toFixed(2)}`);
 
+  if (data.skills) {
+    const skills = data.skills;
+    lines.push("");
+    lines.push(`Skills — triggers in the last ${skills.window}`);
+    lines.push(skills.note);
+    if (skills.triggers_by_skill.length === 0) lines.push("  No triggers in this window.");
+    for (const row of skills.triggers_by_skill) lines.push(`  ${row.id}  ${row.count}`);
+    const runtimes = skills.triggers_by_runtime;
+    lines.push(
+      `  Runtimes: claude ${runtimes.claude} · codex ${runtimes.codex} · grok ${runtimes.grok} · hermes ${runtimes.hermes} · mini ${runtimes.mini}`,
+    );
+    if (skills.stalled.length === 0) lines.push("  Stalled runs: none.");
+    else lines.push(`  Stalled runs: ${skills.stalled.map((run) => `${run.skill_id} (${run.agent})`).join(", ")}`);
+    if (skills.enabled_never_used.length > 0) {
+      lines.push(`  Enabled, not used in this window: ${skills.enabled_never_used.join(", ")}`);
+    }
+  }
+
   return lines.join("\n");
 }

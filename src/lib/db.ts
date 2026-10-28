@@ -2,6 +2,7 @@ import { neon } from "@neondatabase/serverless";
 import { Pool } from "pg";
 
 import { toQuery } from "./sql-template";
+import { asUnknownWriteOutcome } from "./write-outcome";
 
 export type Row = Record<string, any>;
 
@@ -80,6 +81,20 @@ export function chooseDriver(
 
 let neonTag: SqlTag | null = null;
 let pgTag: SqlTag | null = null;
+let sqlOverride: SqlTag | null = null;
+
+function guardQuery(run: () => Promise<Row[]>): Promise<Row[]> {
+  return run().catch((err: unknown) => {
+    const unknown = asUnknownWriteOutcome(err);
+    if (unknown) throw unknown;
+    throw err;
+  });
+}
+
+/** Tests substitute the SQL tag. Production never calls this. */
+export function setSqlForTests(fn: SqlTag | null): void {
+  sqlOverride = fn;
+}
 
 /**
  * Cached SQL tag function. Callers only ever use the tagged-template form:
@@ -88,6 +103,7 @@ let pgTag: SqlTag | null = null;
  *   const rows = await db`select * from t where a = ${x}`;
  */
 export function sql(): SqlTag {
+  if (sqlOverride) return sqlOverride;
   if (!isConfigured()) throw new Error("DATABASE_URL is not set");
 
   const databaseUrl = process.env.DATABASE_URL as string;
@@ -95,21 +111,22 @@ export function sql(): SqlTag {
 
   if (driver === "neon") {
     if (!neonTag) {
-      neonTag = neon(databaseUrl) as unknown as SqlTag;
+      const raw = neon(databaseUrl) as unknown as SqlTag;
+      neonTag = (strings, ...values) => guardQuery(() => raw(strings, ...values));
     }
     return neonTag;
   }
 
   if (!pgTag) {
-    pgTag = async (
+    pgTag = (
       strings: TemplateStringsArray,
       ...values: unknown[]
-    ): Promise<Row[]> => {
+    ): Promise<Row[]> => guardQuery(async () => {
       const { text, params } = toQuery(strings, values);
       const pool = getPgPool();
       const res = await pool.query(text, params);
       return res.rows as Row[];
-    };
+    });
   }
   return pgTag;
 }

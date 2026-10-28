@@ -1,8 +1,10 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import type { DryRunResult } from "@/lib/dry-run";
 import { MAX_REPOS, validateRepoList, type RepoError, type RepoInput } from "@/lib/repo-validation";
 import { fromRepos, groupErrors, isDirty, moveRow, newRow, toPayload, type Row } from "@/lib/repo-settings-helpers";
+import { PreviewDialog } from "@/components/PreviewDialog";
 
 interface Loaded {
   source: "database" | "file";
@@ -30,6 +32,7 @@ export function RepoSettings() {
   const [saving, setSaving] = useState(false);
   const [stale, setStale] = useState(false);
   const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  const [preview, setPreview] = useState<DryRunResult | null>(null);
 
   const apply = useCallback((data: Loaded) => {
     setLoaded(data);
@@ -102,6 +105,33 @@ export function RepoSettings() {
     setMessage(null);
   }
 
+  type SaveBody = Partial<Loaded> & { errors?: RepoError[]; error?: string; dry_run?: boolean };
+
+  function explainSave(res: Response, body: SaveBody) {
+    if (res.status === 400 && body.errors) {
+      setServerErrors(body.errors);
+    } else if (res.status === 409 && (body as { code?: string }).code === "stale") {
+      setMessage({ kind: "error", text: body.error ?? "The list changed elsewhere. Reload and try again." });
+      setStale(true);
+    } else {
+      setMessage({ kind: "error", text: body.error ?? `Save failed (${res.status}).` });
+    }
+  }
+
+  async function putList(dryRun: boolean) {
+    const res = await fetch("/api/settings/repos", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        repos: toPayload(rows),
+        version: loaded?.version,
+        ...(dryRun ? { dry_run: true } : {}),
+      }),
+    });
+    const body = (await res.json().catch(() => ({}))) as SaveBody;
+    return { res, body };
+  }
+
   async function save() {
     setAttempted(true);
     setMessage(null);
@@ -111,22 +141,31 @@ export function RepoSettings() {
     }
     setSaving(true);
     try {
-      const res = await fetch("/api/settings/repos", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repos: toPayload(rows), version: loaded?.version }),
-      });
-      const body = (await res.json().catch(() => ({}))) as Partial<Loaded> & { errors?: RepoError[]; error?: string };
+      const { res, body } = await putList(true);
+      if (res.ok && body.dry_run === true) {
+        setPreview(body as DryRunResult);
+        return;
+      }
+      explainSave(res, body);
+    } catch (e) {
+      setMessage({ kind: "error", text: (e as Error).message });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function confirmSave() {
+    setSaving(true);
+    setMessage(null);
+    try {
+      const { res, body } = await putList(false);
       if (res.ok) {
+        setPreview(null);
         apply(body as Loaded);
         setMessage({ kind: "ok", text: "Saved. The collector picks this up within 15 minutes." });
-      } else if (res.status === 400 && body.errors) {
-        setServerErrors(body.errors);
-      } else if (res.status === 409 && (body as { code?: string }).code === "stale") {
-        setMessage({ kind: "error", text: body.error ?? "The list changed elsewhere. Reload and try again." });
-        setStale(true);
       } else {
-        setMessage({ kind: "error", text: body.error ?? `Save failed (${res.status}).` });
+        setPreview(null);
+        explainSave(res, body);
       }
     } catch (e) {
       setMessage({ kind: "error", text: (e as Error).message });
@@ -290,6 +329,16 @@ export function RepoSettings() {
           </p>
         )}
       </div>
+      {preview && (
+        <PreviewDialog
+          title="Replace watched repos"
+          preview={preview}
+          confirmLabel="Replace list"
+          busy={saving}
+          onConfirm={() => void confirmSave()}
+          onCancel={() => setPreview(null)}
+        />
+      )}
     </div>
   );
 }

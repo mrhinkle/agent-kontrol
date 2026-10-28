@@ -1,6 +1,7 @@
 import { REPOS, windowDays, type TimeWindow } from "./progress-config";
 import { buildAlerts } from "./progress-store";
 import type { HistoryPoint, ProgressResponse, RepoProgress } from "./progress-types";
+import { demoSkillsDigest } from "./skills/demo";
 
 /**
  * Demo mode for the progress board - what /progress renders with no
@@ -171,6 +172,7 @@ export function demoProgress(window: TimeWindow): ProgressResponse {
       open_issues: s.open_issues,
       open_prs: s.open_prs,
       blocked_issues: s.blocked_issues,
+      blocked_label: cfg.blockedLabel,
       blocked_ratio: s.blocked_issues === null ? null : s.blocked_issues / s.open_issues,
       merged_prs: merged,
       issues_closed: closed,
@@ -188,6 +190,7 @@ export function demoProgress(window: TimeWindow): ProgressResponse {
   for (const r of repos) for (const [k, v] of Object.entries(r.lane_mix)) laneMix[k] = (laneMix[k] ?? 0) + v;
 
   const history = demoHistory(Math.max(days, 14), anchor);
+  const skills = demoSkillsDigest(window);
 
   return {
     demo: true,
@@ -207,7 +210,8 @@ export function demoProgress(window: TimeWindow): ProgressResponse {
       lane_mix: laneMix,
     },
     history,
-    alerts: buildAlerts(repos, history),
+    alerts: buildAlerts(repos, history, skills.stalled),
+    skills,
     generated_at: new Date().toISOString(),
   };
 }

@@ -1,14 +1,29 @@
 import { createMcpHandler, withMcpAuth } from "mcp-handler";
 import { z } from "zod";
+import { actorFromPrincipal, currentActor, runWithActor } from "@/lib/actor";
+import { apiError, memoryKeyError, toolResultFromCaught, type McpToolResult } from "@/lib/api-error";
 import { secretsMatch, verifyAccessToken } from "@/lib/authcrypto";
+import { resolveAgentCredential } from "@/lib/credentials";
 import { isConfigured } from "@/lib/db";
-import { claimNextTask, createTask, fetchMessages, fleet, listTasks, recall, remember, replyFromAgent, report, updateTask } from "@/lib/store";
+import { evaluateMcpMessages, insufficientScopeBody, principalFromMcpAuth } from "@/lib/scopes";
+import { rememberForTool, updateTaskForTool } from "@/lib/dry-run-actions";
+import { claimNextTask, createTask, fetchMessages, fleet, listTasks, recall, replyFromAgent, report } from "@/lib/store";
 import { progress } from "@/lib/progress-store";
 import { formatDigest } from "@/lib/progress-digest";
 import { OPERATOR } from "@/lib/operator";
 import { demoProgress } from "@/lib/demo-progress";
+import { getSkillTool, listSkillsTool, runSkillTool } from "@/lib/skills/mcp";
 
 export const maxDuration = 60;
+
+/** Caught tool failures become an isError result. The text is the JSON error body, never the exception. */
+async function guardTool(label: string, run: () => Promise<McpToolResult>): Promise<McpToolResult> {
+  try {
+    return await run();
+  } catch (e) {
+    return toolResultFromCaught(label, e);
+  }
+}
 
 /**
  * Agent Kontrol MCP server — /api/mcp
@@ -40,7 +55,7 @@ const handler = createMcpHandler(
           summary: z.string().optional().describe("One-line summary of the overall task"),
         },
       },
-      async (args) => {
+      async (args) => guardTool("report_status", async () => {
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Agent Kontrol is in demo mode (no database configured); status not stored." }] };
         }
@@ -57,7 +72,7 @@ const handler = createMcpHandler(
           summary: args.summary ?? args.title,
         });
         return { content: [{ type: "text", text: "Status reported to Agent Kontrol." }] };
-      }
+      }),
     );
 
     server.registerTool(
@@ -68,7 +83,7 @@ const handler = createMcpHandler(
           "See what every agent in the fleet (Claude Code, Cowork, ChatGPT Work, Hermes, ...) is currently doing, with recent activity. Use this to avoid duplicating work another agent is already on.",
         inputSchema: {},
       },
-      async () => {
+      async () => guardTool("get_fleet_status", async () => {
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Agent Kontrol is in demo mode (no database configured)." }] };
         }
@@ -87,7 +102,7 @@ const handler = createMcpHandler(
           lines.push(`- [${e.created_at}] ${e.agent_id}: ${e.kind}${e.title ? ` — ${e.title}` : ""}`);
         }
         return { content: [{ type: "text", text: lines.join("\n") }] };
-      }
+      }),
     );
 
     server.registerTool(
@@ -103,7 +118,7 @@ const handler = createMcpHandler(
             .describe("Time window to summarise; defaults to 24h"),
         },
       },
-      async (args) => {
+      async (args) => guardTool("get_progress_digest", async () => {
         if (!isConfigured()) {
           return { content: [{ type: "text", text: formatDigest(demoProgress(args.window ?? "24h")) }] };
         }
@@ -117,7 +132,7 @@ const handler = createMcpHandler(
             },
           ],
         };
-      }
+      }),
     );
 
     server.registerTool(
@@ -125,21 +140,16 @@ const handler = createMcpHandler(
       {
         title: "Remember",
         description:
-          "Write a note to Agent Kontrol shared memory so other agents (and future sessions) can see it. Use for decisions, handoffs, and 'don't duplicate this' coordination notes.",
+          "Write a note to Agent Kontrol shared memory so other agents (and future sessions) can see it. Use for decisions, handoffs, and 'don't duplicate this' coordination notes. Pass dry_run true to preview an insert or key overwrite without writing.",
         inputSchema: {
           content: z.string().describe("The note to store"),
           key: z.string().optional().describe("Optional stable key; writing the same key overwrites (good for living docs like 'project-x/status')"),
           tags: z.array(z.string()).optional().describe("Tags for filtering, e.g. ['agent-kontrol','decision']"),
           agent_id: z.string().optional().describe("Who is writing this note"),
+          dry_run: z.boolean().optional().describe("When true, return what would be written and write nothing"),
         },
       },
-      async (args) => {
-        if (!isConfigured()) {
-          return { content: [{ type: "text", text: "Demo mode; note not stored." }] };
-        }
-        const item = await remember(args);
-        return { content: [{ type: "text", text: `Stored memory #${item.id}${item.key ? ` (key: ${item.key})` : ""}.` }] };
-      }
+      async (args) => guardTool("remember", () => rememberForTool(args)),
     );
 
     server.registerTool(
@@ -155,7 +165,9 @@ const handler = createMcpHandler(
           limit: z.number().int().min(1).max(100).optional(),
         },
       },
-      async (args) => {
+      async (args) => guardTool("recall", async () => {
+        const badKey = memoryKeyError(args.key);
+        if (badKey) return badKey;
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Demo mode; no stored memory." }] };
         }
@@ -170,7 +182,7 @@ const handler = createMcpHandler(
           )
           .join("\n\n");
         return { content: [{ type: "text", text }] };
-      }
+      }),
     );
 
     server.registerTool(
@@ -189,7 +201,7 @@ const handler = createMcpHandler(
             .describe("Mark messages read so they aren't returned again (default true)"),
         },
       },
-      async (args) => {
+      async (args) => guardTool("check_inbox", async () => {
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Demo mode; no inbox." }] };
         }
@@ -210,7 +222,7 @@ const handler = createMcpHandler(
             { type: "text", text: `You have ${msgs.length} message(s) from ${OPERATOR}:\n${text}` },
           ],
         };
-      }
+      }),
     );
 
     // `reply_to_mark` is the tool's original name. Existing agents are told to call it
@@ -246,9 +258,13 @@ const handler = createMcpHandler(
               .int()
               .optional()
               .describe("Optional id of the inbound message you are answering"),
+            idempotency_key: z
+              .string()
+              .optional()
+              .describe("Optional. Scoped by actor and route. The same key and the same arguments return the original reply for 24 hours and do not store a second row during that window. After 24 hours the same key starts a new write. The same key with different arguments is an error."),
           },
         },
-        async (args) => {
+        async (args) => guardTool(tool.name, async () => {
           if (!isConfigured()) {
             return { content: [{ type: "text", text: "Demo mode; reply not stored." }] };
           }
@@ -257,6 +273,8 @@ const handler = createMcpHandler(
             body: args.body,
             in_reply_to: args.in_reply_to,
             created_by: args.agent_id,
+            actor: currentActor(),
+            idempotency_key: args.idempotency_key,
           });
           return {
             content: [
@@ -267,7 +285,7 @@ const handler = createMcpHandler(
               },
             ],
           };
-        }
+        }),
       );
     }
 
@@ -290,20 +308,31 @@ const handler = createMcpHandler(
             .enum(["claude-code", "codex", "grok"])
             .optional()
             .describe("Have a second platform review the work before it's marked done"),
-          created_by: z.string().optional().describe("Your agent id"),
+          created_by: z
+            .string()
+            .optional()
+            .describe("Free-text label stored as created_by. It does not set actor_type or actor_id; the server records the authenticated credential."),
+          idempotency_key: z
+            .string()
+            .optional()
+            .describe("Optional. Scoped by actor and route. The same key and the same arguments return the original task for 24 hours and do not queue a second task during that window. After 24 hours the same key starts a new write. The same key with different arguments is an error."),
         },
       },
-      async (args) => {
+      async (args) => guardTool("create_task", async () => {
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Demo mode; task not queued." }] };
         }
-        const task = await createTask(args);
+        const task = await createTask({
+          ...args,
+          idempotency_key: args.idempotency_key,
+          actor: currentActor(),
+        });
         return {
           content: [
             { type: "text", text: `Task #${task.id} queued for ${task.platform} (priority ${task.priority}).` },
           ],
         };
-      }
+      }),
     );
 
     server.registerTool(
@@ -319,7 +348,7 @@ const handler = createMcpHandler(
             .describe("Filter (default 'open')"),
         },
       },
-      async (args) => {
+      async (args) => guardTool("get_task_queue", async () => {
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Demo mode; no task queue." }] };
         }
@@ -337,7 +366,7 @@ const handler = createMcpHandler(
           )
           .join("\n");
         return { content: [{ type: "text", text }] };
-      }
+      }),
     );
 
     server.registerTool(
@@ -352,7 +381,7 @@ const handler = createMcpHandler(
           agent_id: z.string().describe("Your agent id"),
         },
       },
-      async (args) => {
+      async (args) => guardTool("claim_task", async () => {
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Demo mode; no tasks." }] };
         }
@@ -373,7 +402,7 @@ const handler = createMcpHandler(
             },
           ],
         };
-      }
+      }),
     );
 
     server.registerTool(
@@ -381,30 +410,72 @@ const handler = createMcpHandler(
       {
         title: "Update task",
         description:
-          "Update a task you're working on: mark it running, done, or failed, and attach a result summary (and cost if known).",
+          "Update a task you're working on: mark it running, done, or failed, and attach a result summary (and cost if known). Pass dry_run true to preview the update, including a cancel, without writing.",
         inputSchema: {
           id: z.number().int(),
           status: z.enum(["running", "review", "done", "failed", "cancelled"]).optional(),
           result: z.string().optional().describe("What happened — 1-6 lines"),
           cost_usd: z.number().optional(),
           agent_id: z.string().optional().describe("Your agent id (for the activity feed)"),
+          dry_run: z.boolean().optional().describe("When true, return what would change and write nothing"),
         },
       },
-      async (args) => {
-        if (!isConfigured()) {
-          return { content: [{ type: "text", text: "Demo mode; task not updated." }] };
-        }
-        const task = await updateTask(args);
-        if (args.status && args.agent_id) {
-          await report({
-            agent_id: args.agent_id,
-            kind: args.status === "failed" ? "error" : "status",
-            title: `Task #${task.id} → ${args.status}: ${task.title}`,
-            detail: { task_id: task.id },
-          });
-        }
-        return { content: [{ type: "text", text: `Task #${task.id} updated (${task.status}).` }] };
-      }
+      async (args) => guardTool("update_task", () => updateTaskForTool(args)),
+    );
+
+    // Skills tools. Keep this block contiguous and after update_task.
+    // run_skill is one tool with two phases. A second report_skill_done name
+    // would be the same row and the same actor check.
+    server.registerTool(
+      "list_skills",
+      {
+        title: "List skills",
+        description:
+          "List skills whose trigger is not off, whose scope admits the lane, and which are compatible with runtime when runtime is passed. With no runtime, incompatible skills are not hidden. With no lane, selected-lane skills are hidden. Trigger off is omitted. category is an exact case-insensitive match. Pass uncategorized for skills with no category. Each line includes category and tags.",
+        inputSchema: {
+          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional().describe("Caller runtime. Omit to skip the runtime filter."),
+          lane: z.string().optional().describe("Lane name. Required to see skills limited to selected lanes."),
+          query: z.string().optional().describe("Case-insensitive match on id and description."),
+          category: z.string().optional().describe("Exact category, case-insensitive. Pass uncategorized to list skills with no category."),
+        },
+      },
+      async (args) => guardTool("list_skills", () => listSkillsTool(args)),
+    );
+
+    server.registerTool(
+      "get_skill",
+      {
+        title: "Get skill",
+        description:
+          "Return the mirrored SKILL.md pinned to its content SHA, or one reference file when path is set. Never fetches the upstream repository. A skill whose trigger is off is not served.",
+        inputSchema: {
+          id: z.string().describe("Skill id."),
+          path: z.string().optional().describe("Reference path relative to the skill directory. Omit for SKILL.md."),
+          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional(),
+          lane: z.string().optional(),
+        },
+      },
+      async (args) => guardTool("get_skill", () => getSkillTool(args)),
+    );
+
+    server.registerTool(
+      "run_skill",
+      {
+        title: "Run skill",
+        description:
+          "Start or finish a skill run. The agent executes the instructions. Agent Kontrol only stores the start, the end, and an optional note. Omit run_id to start. id and runtime are required then. agent_id is optional: the recorded agent is the authenticated caller. Call again with that run_id and complete true to finish, and omit id. If you pass id on completion, it must match the skill on the run. Only the actor that started the run can finish it.",
+        inputSchema: {
+          id: z.string().optional().describe("Skill id. Required on start. Omit it on completion. If you pass it then, it must match the skill on the run."),
+          agent_id: z.string().optional().describe("Omit to use the authenticated caller. An agent credential or OAuth client may pass only that same id."),
+          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional().describe("Required on start. Caller hint for the rendered instructions, not an identity."),
+          lane: z.string().optional().describe("Caller hint. Required when the skill's scope is selected. Not an identity."),
+          run_id: z.string().optional().describe("Set with complete true to finish the run you started."),
+          complete: z.boolean().optional().describe("True finishes the run. Requires run_id."),
+          status: z.enum(["done", "failed"]).optional().describe("Completion outcome. Defaults to done."),
+          note: z.string().optional().describe("Optional note, at most 500 characters. Not a prompt or a tool log."),
+        },
+      },
+      async (args) => guardTool("run_skill", () => runSkillTool(args)),
     );
   },
   {},
@@ -423,16 +494,35 @@ async function verifyToken(_req: Request, bearerToken?: string) {
   if (!bearerToken) return undefined;
 
   // 1. Legacy shared secret — keeps existing dispatchers/agents working.
+  //    It has every scope. The scope list on the AuthInfo stays ["mcp"]
+  //    so nothing that read that field changes; enforcement uses extra.kind.
   const mcToken = process.env.MC_TOKEN;
   if (mcToken && (await secretsMatch(bearerToken, mcToken))) {
     return {
       token: bearerToken,
       clientId: "mc-token",
       scopes: ["mcp"],
+      extra: { kind: "legacy" },
     };
   }
 
-  // 2. OAuth access token (HS256 JWT).
+  // 2. Per-agent credential. Unknown, revoked, expired, or a store error
+  //    returns undefined: the same 401 + WWW-Authenticate as any other
+  //    bad bearer. Do not fall through to OAuth.
+  if (bearerToken.startsWith("akc_")) {
+    const resolved = await resolveAgentCredential(bearerToken);
+    if (resolved.status !== "ok") return undefined;
+    return {
+      token: bearerToken,
+      clientId: resolved.credential.id,
+      scopes: [...resolved.credential.scopes],
+      extra: { kind: "agent" },
+    };
+  }
+
+  // 3. OAuth access token (HS256 JWT). Verification and this return value
+  //    are unchanged. An authenticated OAuth principal keeps all-access;
+  //    the "mcp" scope string is not checked against the scope table.
   const payload = await verifyAccessToken(bearerToken);
   if (!payload) return undefined;
   if (payload.typ === "refresh") return undefined;
@@ -446,9 +536,52 @@ async function verifyToken(_req: Request, bearerToken?: string) {
   };
 }
 
-const authed = withMcpAuth(handler, verifyToken, {
-  required: true,
-  resourceMetadataPath: "/.well-known/oauth-protected-resource",
-});
+function scopeDenied(body: { error: string; code: string; fix: string; retryable: false }): Response {
+  return new Response(JSON.stringify(body), {
+    status: 403,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/**
+ * tools/call is checked here, before the tool runs. An empty body or a body
+ * that is not JSON is HTTP 400 invalid_json, so mcp-handler never sees a
+ * SyntaxError from req.json(). A JSON body that is not a tool call is left
+ * to the handler. Auth still runs first: a missing bearer is 401 with
+ * WWW-Authenticate and never reaches this function.
+ */
+async function enforceMcpScope(req: Request): Promise<Response | null> {
+  if (req.method !== "POST") return null;
+  let text = "";
+  try {
+    text = await req.clone().text();
+  } catch {
+    return apiError("invalid_json");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return apiError("invalid_json");
+  }
+  const decision = evaluateMcpMessages(principalFromMcpAuth(req.auth), parsed);
+  if (decision.ok) return null;
+  return scopeDenied(decision.body);
+}
+
+const authed = withMcpAuth(
+  async (req) => {
+    const denied = await enforceMcpScope(req);
+    if (denied) return denied;
+    const principal = principalFromMcpAuth(req.auth);
+    if (!principal) return handler(req);
+    return runWithActor(actorFromPrincipal(principal), () => handler(req));
+  },
+  verifyToken,
+  {
+    required: true,
+    resourceMetadataPath: "/.well-known/oauth-protected-resource",
+  },
+);
 
 export { authed as GET, authed as POST, authed as DELETE };

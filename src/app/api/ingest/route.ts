@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { isAuthorized } from "@/lib/auth";
+import { enforceBearer } from "@/lib/auth";
+import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { report, type ReportInput } from "@/lib/store";
 import { parseRunTelemetry } from "@/lib/run-telemetry";
@@ -26,9 +27,8 @@ export const maxDuration = 30;
  * }
  */
 export async function POST(req: Request) {
-  if (!(await isAuthorized(req))) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
-  }
+  const denied = await enforceBearer(req);
+  if (denied) return denied;
   if (!isConfigured()) {
     return NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; event dropped" });
   }
@@ -37,10 +37,13 @@ export async function POST(req: Request) {
   try {
     body = (await req.json()) as ReportInput;
   } catch {
-    return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
+    return apiError("invalid_json");
   }
   if (!body.agent_id || !body.kind) {
-    return NextResponse.json({ error: "agent_id and kind are required" }, { status: 400 });
+    const fields: Record<string, string> = {};
+    if (!body.agent_id) fields.agent_id = "agent_id is required";
+    if (!body.kind) fields.kind = "kind is required";
+    return apiError("missing_field", { message: "agent_id and kind are required", fields });
   }
   if (body.kind === "run_complete" && !parseRunTelemetry(body.detail)) {
     return NextResponse.json({ error: "invalid completed-run metadata" }, { status: 400 });
@@ -50,6 +53,6 @@ export async function POST(req: Request) {
     await report(body);
     return NextResponse.json({ ok: true });
   } catch (e) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    return publicError("[ingest]", e);
   }
 }

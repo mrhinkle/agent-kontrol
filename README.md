@@ -17,7 +17,7 @@ One dashboard for the AI coding agents you run: Claude Code, Codex, Grok, Hermes
 curl -fsSL https://raw.githubusercontent.com/mrhinkle/agent-kontrol/main/scripts/quickstart.sh | bash
 ```
 
-That starts Agent Kontrol with Docker Compose (or in demo mode on Node 20+ if you have no Docker). Other targets: Vercel with Neon or any Postgres, any Node host. See [docs/DEPLOY.md](docs/DEPLOY.md).
+That starts Agent Kontrol with Docker Compose (or in demo mode on Node 20+ if you have no Docker). Other targets: Vercel with Neon or any Postgres, Fly.io, any Node host. See [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## What it does
 
@@ -26,8 +26,9 @@ That starts Agent Kontrol with Docker Compose (or in demo mode on Node 20+ if yo
 - **Progress board.** Net backlog (issues opened minus closed) per repo over time, because a day with many merges can still leave the backlog deeper. Choose the repos in Settings; no redeploy.
 - **MCP server.** Any MCP host can report status, read the fleet, check messages from you and claim tasks. OAuth 2.1 for hosts that support it, or a bearer token.
 - **Messaging.** Send an agent a message from the dashboard; it sees it when it polls and can reply.
+- **Traces.** Step-by-step spans for each agent session, shown as a waterfall. OpenTelemetry-compatible, so any exporter can send to it; the Claude Code hook emits them automatically.
 - **Usage and Costs** (experimental). Paid and included-token cost per account.
-- **Notes.** A small shared table agents can write to and search (substring search, no automatic writers).
+- **Notes.** A small shared table agents can write to and search (substring search). A short structured note (who, where, how long, outcome, tool counts) is written automatically when any agent's session ends, so the next agent can see who worked where.
 
 ```
 Claude Code hooks ──┐
@@ -56,18 +57,27 @@ Optional Langfuse fleet activity export and project access: [setup and scope](do
 
 Full matrix: [docs/AGENTS.md](docs/AGENTS.md).
 
+## Status
+
+Agent Kontrol is in **1.0 beta** ([release notes](https://github.com/mrhinkle/agent-kontrol/releases)). The API, MCP tool surface and schema are meant to stay stable through 1.0; please report anything that breaks them. Experimental: Usage and Costs, and the Notes store (a pluggable memory backend is planned for 1.1). Not yet built: forwarding traces to other OpenTelemetry backends, and Cline and Roo Code support.
+
 ## Documentation
 
 | | |
 | --- | --- |
 | [Deploy](docs/DEPLOY.md) | One-line install, targets, environment variables, operations |
 | [Agents](docs/AGENTS.md) | Adapters and what each can do |
-| [MCP](docs/MCP.md) | The 11 tools and how to connect |
+| [MCP](docs/MCP.md) | The 14 tools and how to connect |
 | [API](docs/API.md) | REST routes and authentication |
 | [Database](docs/DATABASE.md) | Neon or any Postgres, driver selection |
 | [Architecture](docs/ARCHITECTURE.md) | Data flow, tables, code map |
 | [Progress board](docs/PROGRESS-BOARD.md) | How the net-backlog board works |
+| [The Gibson](docs/GIBSON.md) | How Agent Kontrol (the manager) and the Gibson (the law) fit together |
+| [Velocity](docs/VELOCITY.md) | The morning brief, stuck PRs, coordinator liveness and the owner decision queue |
+| [Telemetry and traces](docs/TELEMETRY.md) | Spans, OpenTelemetry ingest, retention, privacy |
+| [Memory (Notes)](docs/MEMORY.md) | What the notes store does and does not do |
 | [Usage and Costs](docs/USAGE.md) | The experimental cost ledger |
+| [Roles](docs/ROLES.md) | Job descriptions for Spec Writer, Implementer, Reviewer, Dispatcher and Owner: who should hold each, and how the brief shows it working |
 | [Playbook](PLAYBOOK.md) | How to run a multi-vendor agent fleet |
 | [Security](SECURITY.md) | Threat model and reporting |
 

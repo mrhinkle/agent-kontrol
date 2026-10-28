@@ -1,14 +1,17 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { DemoBanner, PlatformBadge, TaskStatusChip, TimeAgo } from "@/components/ui";
+import { PlatformBadge, TaskStatusChip, TimeAgo } from "@/components/ui";
+import { PanelHeader } from "@/components/PanelHeader";
 import { CollapsibleMarkdown } from "@/components/Markdown";
+import { PreviewDialog } from "@/components/PreviewDialog";
+import type { DryRunResult } from "@/lib/dry-run";
 import type { Task } from "@/lib/types";
 
 const PLATFORMS = ["any", "claude-code", "codex", "grok", "hermes", "cowork-cloud"];
 const REVIEWERS = ["", "codex", "claude-code", "grok"];
 
-function NewTaskForm({ onCreated }: { onCreated: () => void }) {
+function NewTaskForm({ onCreated, onCancel }: { onCreated: () => void; onCancel?: () => void }) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [project, setProject] = useState("");
@@ -80,6 +83,11 @@ function NewTaskForm({ onCreated }: { onCreated: () => void }) {
             className="text-sm px-4 py-2 rounded-lg bg-[#f44800] hover:bg-[#ff5a10] disabled:opacity-40 text-white font-semibold transition-colors">
             {state === "sending" ? "Queuing…" : "Queue task"}
           </button>
+          {onCancel && (
+            <button type="button" onClick={onCancel} className="ml-2 text-sm text-gray-500 transition-colors hover:text-gray-200">
+              Cancel
+            </button>
+          )}
           {state === "error" && <span className="text-red-400 text-xs">Failed — try again.</span>}
         </div>
       </div>
@@ -87,7 +95,7 @@ function NewTaskForm({ onCreated }: { onCreated: () => void }) {
   );
 }
 
-function TaskRow({ t, onAction }: { t: Task; onAction: () => void }) {
+function TaskRow({ t, onAction, onCancelTask }: { t: Task; onAction: () => void; onCancelTask?: (task: Task) => void }) {
   const open = ["queued", "claimed", "running", "review"].includes(t.status);
 
   async function patch(body: Record<string, unknown>) {
@@ -119,8 +127,8 @@ function TaskRow({ t, onAction }: { t: Task; onAction: () => void }) {
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <TaskStatusChip status={t.status} />
-          {open && (
-            <button onClick={() => patch({ status: "cancelled" })}
+          {open && onCancelTask && (
+            <button onClick={() => onCancelTask(t)}
               className="text-[11px] text-gray-500 hover:text-red-400 transition-colors" title="Cancel">
               ✕
             </button>
@@ -152,8 +160,11 @@ function TaskRow({ t, onAction }: { t: Task; onAction: () => void }) {
 
 export default function TasksPage() {
   const [tasks, setTasks] = useState<Task[] | null>(null);
-  const [demo, setDemo] = useState(false);
+  const [composing, setComposing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [pendingCancel, setPendingCancel] = useState<{ id: number; preview: DryRunResult } | null>(null);
+  const [cancelling, setCancelling] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -161,7 +172,6 @@ export default function TasksPage() {
       if (!res.ok) throw new Error(`tasks API ${res.status}`);
       const json = (await res.json()) as { demo?: boolean; tasks: Task[] };
       setTasks(json.tasks);
-      setDemo(Boolean(json.demo));
       setError(null);
     } catch (e) {
       setError((e as Error).message);
@@ -174,32 +184,101 @@ export default function TasksPage() {
     return () => clearInterval(t);
   }, [load]);
 
+  async function startCancel(task: Task) {
+    setActionError(null);
+    setCancelling(true);
+    try {
+      const res = await fetch(`/api/tasks/${task.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "cancelled", dry_run: true }),
+      });
+      const body = (await res.json().catch(() => ({}))) as Partial<DryRunResult> & { error?: string };
+      if (res.ok && body.dry_run === true && Array.isArray(body.changes)) {
+        setPendingCancel({ id: task.id, preview: body as DryRunResult });
+      } else {
+        setActionError(body.error ?? `Could not preview the cancel (${res.status}).`);
+      }
+    } catch (e) {
+      setActionError((e as Error).message);
+    } finally {
+      setCancelling(false);
+    }
+  }
+
+  async function confirmCancel() {
+    if (!pendingCancel) return;
+    setCancelling(true);
+    setActionError(null);
+    try {
+      const res = await fetch(`/api/tasks/${pendingCancel.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "cancelled" }),
+      });
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { error?: string };
+        setActionError(body.error ?? `Cancel failed (${res.status}).`);
+        setPendingCancel(null);
+        return;
+      }
+      setPendingCancel(null);
+      await load();
+    } catch (e) {
+      setActionError((e as Error).message);
+    } finally {
+      setCancelling(false);
+    }
+  }
+
   if (error) return <div className="text-red-400 text-sm">Failed to load tasks: {error}</div>;
   if (!tasks) return <div className="text-gray-500 text-sm animate-pulse">Loading the queue…</div>;
 
   const open = tasks.filter((t) => ["queued", "claimed", "running", "review"].includes(t.status));
   const closed = tasks.filter((t) => !["queued", "claimed", "running", "review"].includes(t.status));
 
+  // The queue is what people come to see; the form opens on demand, or by
+  // default when there is nothing queued yet.
+  const showForm = composing || open.length === 0;
+
   return (
     <div>
-      {demo && <DemoBanner />}
-      <div className="flex items-center gap-6 mb-5">
+      <div className="mb-5 flex flex-wrap items-center gap-x-6 gap-y-2">
         <h1 className="text-lg font-semibold">Tasks</h1>
         <div className="text-sm text-gray-500">
           <span className="text-gray-200 font-semibold">{open.length}</span> open ·{" "}
           {closed.length} closed
         </div>
+        {!showForm && (
+          <button
+            type="button"
+            onClick={() => setComposing(true)}
+            className="ml-auto rounded-lg bg-[#2563eb] px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-[#1d4ed8] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#19d2ff]/70"
+          >
+            + Queue a task
+          </button>
+        )}
       </div>
 
-      <NewTaskForm onCreated={load} />
+      {showForm && (
+        <NewTaskForm
+          onCreated={() => {
+            setComposing(false);
+            load();
+          }}
+          onCancel={open.length > 0 ? () => setComposing(false) : undefined}
+        />
+      )}
+
+      {actionError && <p className="mb-3 text-sm text-red-400">{actionError}</p>}
 
       <div className="grid gap-3">
         {open.map((t) => (
-          <TaskRow key={t.id} t={t} onAction={load} />
+          <TaskRow key={t.id} t={t} onAction={load} onCancelTask={(task) => void startCancel(task)} />
         ))}
         {open.length === 0 && (
           <div className="text-gray-500 text-sm">
-            Nothing queued. Add a task above — a dispatcher will pick it up, or any MCP-connected
+            Nothing queued. Fill in the form above — a dispatcher will pick it up, or any MCP-connected
             agent can claim it with <span className="mono">claim_task</span>.
           </div>
         )}
@@ -207,13 +286,23 @@ export default function TasksPage() {
 
       {closed.length > 0 && (
         <>
-          <h2 className="text-sm font-semibold text-gray-400 mt-10 mb-2 uppercase tracking-wider">Recently closed</h2>
+          <PanelHeader title="Recently closed" count={closed.length} className="mt-10" />
           <div className="grid gap-3">
             {closed.slice(0, 20).map((t) => (
               <TaskRow key={t.id} t={t} onAction={load} />
             ))}
           </div>
         </>
+      )}
+      {pendingCancel && (
+        <PreviewDialog
+          title="Cancel task"
+          preview={pendingCancel.preview}
+          confirmLabel="Cancel task"
+          busy={cancelling}
+          onConfirm={() => void confirmCancel()}
+          onCancel={() => setPendingCancel(null)}
+        />
       )}
     </div>
   );

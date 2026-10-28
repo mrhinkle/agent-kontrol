@@ -10,13 +10,14 @@ Use GitHub's private vulnerability reporting on this repository (Security tab, "
 
 ## Security model
 
-Agent Kontrol is designed for one operator running one deployment. It is not multi-tenant. There are no per-user accounts or roles.
+Agent Kontrol is designed for one operator running one deployment. It is not multi-tenant. There are no per-user accounts. Agent credentials carry scopes; they are not user accounts.
 
 Credentials:
 
-- `MC_DASHBOARD_PASSWORD` — the single shared dashboard password. A successful login sets the session cookie `mc_auth` (30 days, httpOnly, sameSite lax, secure in production).
-- `MC_TOKEN` — shared secret for agents, sent as `Authorization: Bearer`.
-- OAuth 2.1 with PKCE for MCP hosts. Consent is gated by the dashboard password.
+- `MC_DASHBOARD_PASSWORD` — the single shared dashboard password. A successful login sets the session cookie `mc_auth` (30 days, httpOnly, sameSite lax, secure in production). The session is the only credential that can issue or revoke agent credentials.
+- `MC_TOKEN` — shared secret for agents, sent as `Authorization: Bearer`. It has every scope.
+- Agent credentials — one revocable `akc_…` token per agent, with scopes enforced on MCP tools and the agent REST routes. The token is shown once. The row stores a SHA-256 hash, not the token.
+- OAuth 2.1 with PKCE for MCP hosts. Consent is gated by the dashboard password. A verified access token keeps full access to mapped tools. Issuance is unchanged.
 
 ## Controls
 
@@ -34,11 +35,12 @@ Credentials:
 
 Read these before deploying.
 
-1. **A leaked `MC_TOKEN` is remote code execution.** Anyone holding `MC_TOKEN` or a dashboard session can queue tasks. Dispatchers run those tasks as headless agent CLIs (`claude`, `codex`, `grok`) on your machines with whatever permissions those CLIs have. Treat `MC_TOKEN` like an SSH key. Run dispatchers as an unprivileged user in a project directory you are comfortable exposing. Use per-machine pinning where possible.
+1. **A leaked `MC_TOKEN` is remote code execution.** Anyone holding `MC_TOKEN` or a dashboard session can queue tasks. Dispatchers run those tasks as headless agent CLIs (`claude`, `codex`, `grok`) on your machines with whatever permissions those CLIs have. Treat `MC_TOKEN` like an SSH key. An agent credential can queue a task only when it has `tasks:write`, and it cannot mint another credential. A credential that has `tasks:write` is still remote code execution for the tasks it can queue. Run dispatchers as an unprivileged user in a project directory you are comfortable exposing. Use per-machine pinning where possible.
 2. **Agent-reported text is untrusted input.** Task results, messages and notes are rendered as text, never as HTML.
 3. **Data is stored in Postgres unencrypted by this app.** It can include project names, task prompts and results, and repo metadata. Use your provider's encryption at rest.
 4. **Deploy only behind TLS**, except on localhost.
 5. **The usage collector sends token counts, costs, model and billing metadata only** — never prompts or completions.
+6. **Traces record what agents did.** By default they hold tool names, timing, status and counts, never prompts or tool input and output; credential-looking attributes are always dropped. Setting `MC_TRACE_CAPTURE_CONTENT=1` stores prompt and tool content too, so a leaked database or token would expose it. Spans are deleted after `MC_TRACE_RETENTION_DAYS` (default 30). See [docs/TELEMETRY.md](docs/TELEMETRY.md).
 
 ## Secret rotation
 

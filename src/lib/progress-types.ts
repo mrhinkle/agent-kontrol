@@ -67,6 +67,8 @@ export interface RepoProgress {
   open_prs: number;
   /** null when the repo has no blocked label — not tracked, not zero */
   blocked_issues: number | null;
+  /** the GitHub label that marks blocked work in this repo; null when not tracked */
+  blocked_label: string | null;
   /** blocked_issues / open_issues; null when blocked work isn't tracked */
   blocked_ratio: number | null;
 
@@ -125,6 +127,18 @@ export interface FleetTotals {
   lane_mix: Record<string, number>;
 }
 
+/** Counts of skill runs that started inside the digest window, plus current stalls. */
+export interface SkillsDigest {
+  window: TimeWindow;
+  triggers_by_skill: { id: string; count: number }[];
+  triggers_by_runtime: { claude: number; codex: number; grok: number; hermes: number; mini: number };
+  /** Open runs past the stall window, including ones that started before `window`. */
+  stalled: { run_id: string; skill_id: string; agent: string; at: string }[];
+  /** Enabled skills with no run inside the window. */
+  enabled_never_used: string[];
+  note: "Only triggers routed through Agent Kontrol are counted.";
+}
+
 export interface ProgressResponse {
   demo: boolean;
   window: TimeWindow;
@@ -141,5 +155,7 @@ export interface ProgressResponse {
   totals: FleetTotals;
   history: HistoryPoint[];
   alerts: Alert[];
+  /** Absent when the skills tables are not installed. Any other digest error fails the progress request. */
+  skills?: SkillsDigest;
   generated_at: string;
 }

@@ -53,7 +53,9 @@ create table if not exists messages (
   id bigint generated always as identity primary key,
   agent_id text not null,                 -- conversation peer (the agent)
   body text not null,
-  created_by text default 'dashboard',
+  created_by text default 'dashboard',    -- free-text label from the caller; not the authenticated actor
+  actor_type text,                        -- human | agent; null on rows written before this column
+  actor_id text,                          -- credential id, mc-token, oauth client id, or operator
   created_at timestamptz default now(),
   delivered_at timestamptz,               -- when the agent fetched an inbound message
   acked_at timestamptz,                   -- when the agent consumed it (history kept)
@@ -67,6 +69,8 @@ alter table messages add column if not exists direction text not null default 'i
 alter table messages add column if not exists in_reply_to bigint;
 alter table messages add column if not exists thread_id text;
 alter table messages add column if not exists read_by_dashboard_at timestamptz;
+alter table messages add column if not exists actor_type text;
+alter table messages add column if not exists actor_id text;
 update messages set thread_id = id::text where thread_id is null;
 
 create index if not exists messages_pending_idx on messages (agent_id, acked_at, created_at);
@@ -98,14 +102,26 @@ create table if not exists tasks (
   session_id text,                        -- platform session id of the run, if known
   result text,                            -- final summary (and review verdict)
   cost_usd numeric,                       -- from claude -p json / dispatcher estimate
-  created_by text default 'dashboard',
+  created_by text default 'dashboard',    -- free-text label from the caller; not the authenticated actor
+  actor_type text,                        -- human | agent; null on rows written before this column
+  actor_id text,                          -- credential id, mc-token, oauth client id, or operator
   created_at timestamptz default now(),
   claimed_at timestamptz,
   updated_at timestamptz default now(),
   completed_at timestamptz
 );
+alter table tasks add column if not exists actor_type text;
+alter table tasks add column if not exists actor_id text;
 create index if not exists tasks_queue_idx on tasks (status, platform, priority, created_at);
 create index if not exists tasks_updated_idx on tasks (updated_at desc);
+
+-- One open scheduler task per skill. The skill tick checks for an open task and
+-- then inserts; this index is what makes that atomic when two ticks race.
+create unique index if not exists tasks_skill_schedule_one_open_idx
+  on tasks (title)
+  where actor_id = 'skill-scheduler'
+    and title like 'Run scheduled skill %'
+    and status in ('queued', 'claimed', 'running', 'review');
 
 -- OAuth 2.1 authorization server (self-hosted, for MCP clients).
 -- Access tokens are stateless signed JWTs; only clients + auth codes are stored.
@@ -281,4 +297,222 @@ create table if not exists watched_repos (
   position integer not null default 0,
   created_at timestamptz default now(),
   updated_at timestamptz default now()
+);
+
+-- Traces: OpenTelemetry-style spans from agents. A trace is the tree of spans that
+-- share a trace_id (a session, its turns, the tool and model calls inside them).
+-- Spans are upserted by (trace_id, span_id) so an open span can be closed later.
+-- Old rows are pruned after MC_TRACE_RETENTION_DAYS (default 30).
+create table if not exists spans (
+  trace_id text not null,
+  span_id text not null,
+  parent_span_id text,
+  agent_id text not null,
+  session_id text,
+  name text not null,
+  kind text not null default 'other',     -- session | turn | tool | model | other
+  status text not null default 'unset',   -- ok | error | unset
+  status_message text,
+  started_at timestamptz not null,
+  ended_at timestamptz,                   -- null while the span is open
+  attributes jsonb not null default '{}'::jsonb,
+  model text,
+  input_tokens bigint,
+  output_tokens bigint,
+  cost_usd numeric,
+  created_at timestamptz default now(),
+  primary key (trace_id, span_id)
+);
+create index if not exists spans_started_idx on spans (started_at desc);
+create index if not exists spans_agent_idx on spans (agent_id, started_at desc);
+create index if not exists spans_session_idx on spans (session_id);
+
+-- Automatic session notes: `source` marks rows the server wrote itself so cleanup never
+-- touches notes an agent wrote; `facts_at` is the newest event the note was built from, so
+-- a slower, staler write can never replace a newer note.
+alter table memory add column if not exists source text;
+alter table memory add column if not exists facts_at timestamptz;
+create index if not exists memory_auto_idx on memory (updated_at) where source = 'automatic-session';
+create index if not exists events_session_idx on events (session_id, created_at);
+create index if not exists spans_session_kind_idx on spans (session_id, kind);
+
+-- Per-agent credentials. The token is shown once at creation and is not stored.
+-- token_prefix is the first 8 characters, for the settings list.
+-- token_hash is the SHA-256 hex of the full token.
+-- scopes is the allow-list enforced on MCP tools and agent REST routes.
+-- Timestamps record creation, optional expiry, revocation, and last successful use.
+-- Prompts and tool input/output are not stored in this table.
+create table if not exists agent_credentials (
+  id text primary key,
+  label text not null,
+  token_prefix text not null,
+  token_hash text not null,
+  scopes text[] not null,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz,
+  revoked_at timestamptz,
+  last_used_at timestamptz
+);
+alter table agent_credentials add column if not exists label text;
+alter table agent_credentials add column if not exists token_prefix text;
+alter table agent_credentials add column if not exists token_hash text;
+alter table agent_credentials add column if not exists scopes text[];
+alter table agent_credentials add column if not exists created_at timestamptz not null default now();
+alter table agent_credentials add column if not exists expires_at timestamptz;
+alter table agent_credentials add column if not exists revoked_at timestamptz;
+alter table agent_credentials add column if not exists last_used_at timestamptz;
+create unique index if not exists agent_credentials_token_hash_idx on agent_credentials (token_hash);
+
+-- Decisions queue (see supabase/migrations/20261025_decisions.sql and docs/VELOCITY.md).
+-- kind, labels, opened_at, repo_short and github_present are nullable additions
+-- so a database that already created the table still upgrades. The brief's
+-- decisions list is computed from these columns; it does not call GitHub again.
+create table if not exists decisions (
+  id bigint generated always as identity primary key,
+  key text not null unique,
+  source text not null,
+  repo text,
+  number int,
+  url text,
+  title text not null,
+  why text,
+  options jsonb,
+  recommended text,
+  requested_by text,
+  status text not null default 'open',
+  decision text,
+  decided_by text,
+  decided_at timestamptz,
+  defer_until timestamptz,
+  kind text,
+  labels jsonb,
+  opened_at timestamptz,
+  repo_short text,
+  github_present boolean,
+  first_seen_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+alter table decisions add column if not exists kind text;
+alter table decisions add column if not exists labels jsonb;
+alter table decisions add column if not exists opened_at timestamptz;
+alter table decisions add column if not exists repo_short text;
+alter table decisions add column if not exists github_present boolean;
+create index if not exists decisions_status_first_seen_idx on decisions (status, first_seen_at);
+create index if not exists decisions_repo_number_idx on decisions (repo, number);
+
+-- Client idempotency keys for create_task, operator messages, and replies.
+-- scope is actor_type:actor_id:route, so two callers can reuse one key string.
+-- response is null until the write stores a result. The resource insert
+-- and that response commit in one statement, and the insert runs only
+-- while claim_token still matches. started_at begins a 30 second lease on
+-- an empty claim. claim_token is the attempt that owns the lease, including
+-- when the claim insert commits and the connection drops before RETURNING
+-- arrives. A key is unused after expires_at (24 hours from the claim).
+-- Changelog: supabase/migrations/20261025_idempotency.sql
+-- and supabase/migrations/20261026_idempotency_lease.sql.
+create table if not exists idempotency_keys (
+  scope text not null,
+  idempotency_key text not null,
+  request_hash text not null,
+  response jsonb,
+  expires_at timestamptz not null,
+  created_at timestamptz not null default now(),
+  started_at timestamptz,
+  claim_token text,
+  primary key (scope, idempotency_key)
+);
+alter table idempotency_keys add column if not exists started_at timestamptz;
+alter table idempotency_keys add column if not exists claim_token text;
+
+-- Skills mirror (see supabase/migrations/20261027_skills.sql and docs/MCP.md).
+-- Agent Kontrol copies SKILL.md files from the seeded git sources. It does not
+-- execute them. skill_runs stores a start and an end, plus an optional note of
+-- at most 500 characters. It does not store prompts or tool input or output.
+-- A second sync cannot insert another status='running' row: the partial unique
+-- index is the lease. A row left running is expired by the next sync after
+-- 10 minutes, which is what keeps a crashed sync from wedging the mirror.
+create table if not exists skill_sources (
+  id text primary key,
+  repo text not null,
+  ref text,
+  path_globs jsonb not null,
+  label text not null,
+  enabled boolean not null default true,
+  position integer not null
+);
+
+insert into skill_sources (id, repo, ref, path_globs, label, enabled, position)
+values
+  ('master-skills', 'mrhinkle/master-skills', null, '["skills/*"]'::jsonb, 'master-skills', true, 0),
+  ('the-gibson', 'The-AIE/the-gibson', null, '["skills/*", ".agents/skills/*"]'::jsonb, 'the-gibson', true, 1)
+on conflict (id) do nothing;
+
+create table if not exists skills (
+  id text primary key,
+  source_id text not null references skill_sources (id),
+  path text not null,
+  name text not null,
+  description text not null default '',
+  version text,
+  sha text not null,
+  commit_sha text,
+  body text not null,
+  "references" jsonb not null default '[]'::jsonb,
+  runtimes jsonb not null,
+  frontmatter jsonb not null default '{}'::jsonb,
+  category text,
+  tags jsonb not null default '[]'::jsonb,
+  removed_at timestamptz,
+  synced_at timestamptz not null default now()
+);
+alter table skills add column if not exists category text;
+alter table skills add column if not exists tags jsonb not null default '[]'::jsonb;
+
+create table if not exists skill_settings (
+  skill_id text primary key references skills (id),
+  trigger text not null default 'off' check (trigger in ('off', 'on_request', 'auto_inject', 'scheduled')),
+  scope jsonb not null default '{"mode":"all","lanes":[]}'::jsonb,
+  schedule text,
+  updated_by text,
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists skill_runs (
+  run_id uuid primary key,
+  skill_id text not null,
+  skill_sha text not null,
+  agent_id text not null,
+  lane text,
+  runtime text not null,
+  started_at timestamptz not null default now(),
+  ended_at timestamptz,
+  status text not null default 'running' check (status in ('running', 'done', 'failed')),
+  note text check (note is null or char_length(note) <= 500),
+  actor_type text,
+  actor_id text
+);
+create index if not exists skill_runs_skill_started_idx on skill_runs (skill_id, started_at desc);
+create index if not exists skill_runs_started_idx on skill_runs (started_at desc);
+
+create table if not exists skill_sync_runs (
+  id uuid primary key,
+  started_at timestamptz not null default now(),
+  finished_at timestamptz,
+  trigger text not null check (trigger in ('manual', 'scheduled')),
+  status text not null,
+  summary jsonb,
+  error text
+);
+create unique index if not exists skill_sync_one_running_idx
+  on skill_sync_runs (status)
+  where status = 'running';
+
+create table if not exists skill_drift (
+  host text not null,
+  dir text not null,
+  reported_at timestamptz not null default now(),
+  entries jsonb not null,
+  primary key (host, dir)
 );

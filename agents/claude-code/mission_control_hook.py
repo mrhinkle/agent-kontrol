@@ -14,10 +14,12 @@ Config via environment (put these in ~/.zshenv or the hook command):
 Fail-open by design: any error exits 0 so hooks never block your session.
 Stdlib only — no dependencies.
 """
+import hashlib
 import json
 import os
 import socket
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -50,6 +52,237 @@ KIND_MAP = {
 }
 
 
+# ---------------------------------------------------------------- traces
+# Each Claude Code session becomes one trace: a session span, a turn span per
+# prompt, and a span per tool call. Hooks run as separate short processes, so
+# the little state needed to pair a tool's start with its end lives in a file.
+# Set MC_TRACES=0 to turn this off. Prompt text and tool input/output are NOT
+# sent unless MC_TRACE_CAPTURE_CONTENT=1 (and the server also has it set).
+
+
+def _hid(seed: str, n: int) -> str:
+    return hashlib.sha256(seed.encode()).hexdigest()[:n]
+
+
+def trace_ids(session_id: str) -> tuple:
+    """Deterministic ids so every hook process agrees without talking to each other."""
+    return _hid("trace:" + session_id, 32), _hid("root:" + session_id, 16)
+
+
+def _state_path(session_id: str) -> Path:
+    d = Path("~/.claude/mission-control-trace").expanduser()
+    d.mkdir(parents=True, exist_ok=True)
+    return d / (_hid(session_id, 24) + ".json")
+
+
+def load_state(session_id: str) -> dict:
+    try:
+        return json.loads(_state_path(session_id).read_text())
+    except Exception:
+        return {}
+
+
+def save_state(session_id: str, state: dict) -> None:
+    try:
+        _state_path(session_id).write_text(json.dumps(state))
+    except Exception:
+        pass
+
+
+def prune_old_state(days: int = 7) -> None:
+    """Sessions that crashed never send SessionEnd; drop their leftover state files."""
+    try:
+        cutoff = time.time() - days * 86400
+        for f in Path("~/.claude/mission-control-trace").expanduser().glob("*.json"):
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+    except Exception:
+        pass
+
+
+def clear_state(session_id: str) -> None:
+    try:
+        _state_path(session_id).unlink()
+    except Exception:
+        pass
+
+
+def make_span(trace_id, span_id, parent, name, kind, start_ns, end_ns=None, error=False, message=None, attrs=None):
+    """One OTLP JSON span. Times are integer nanoseconds, sent as strings as OTLP requires."""
+    attributes = [{"key": "agentkontrol.span.kind", "value": {"stringValue": kind}}]
+    for k, v in (attrs or {}).items():
+        if isinstance(v, bool):
+            attributes.append({"key": k, "value": {"boolValue": v}})
+        elif isinstance(v, int):
+            attributes.append({"key": k, "value": {"intValue": str(v)}})
+        elif v is not None:
+            attributes.append({"key": k, "value": {"stringValue": str(v)[:500]}})
+    span = {
+        "traceId": trace_id,
+        "spanId": span_id,
+        "name": name,
+        "startTimeUnixNano": str(start_ns),
+        "attributes": attributes,
+    }
+    if parent:
+        span["parentSpanId"] = parent
+    if end_ns is not None:
+        span["endTimeUnixNano"] = str(end_ns)
+    if error:
+        span["status"] = {"code": 2, "message": (message or "error")[:200]}
+    elif end_ns is not None:
+        span["status"] = {"code": 1}
+    return span
+
+
+def otlp_request(agent_id: str, session_id: str, spans: list) -> dict:
+    return {
+        "resourceSpans": [
+            {
+                "resource": {
+                    "attributes": [
+                        {"key": "agent.id", "value": {"stringValue": agent_id}},
+                        {"key": "session.id", "value": {"stringValue": session_id}},
+                    ]
+                },
+                "scopeSpans": [{"scope": {"name": "agent-kontrol-claude-code-hook"}, "spans": spans}],
+            }
+        ]
+    }
+
+
+def tool_failed(payload: dict) -> bool:
+    resp = payload.get("tool_response")
+    if isinstance(resp, dict):
+        return bool(resp.get("is_error") or resp.get("error") or resp.get("interrupted"))
+    return False
+
+
+def trace_spans_for(event_name: str, payload: dict, state: dict, now_ns: int) -> list:
+    """Pure: decide which spans this hook event produces, updating `state` in place."""
+    session_id = payload.get("session_id") or "unknown"
+    trace_id, root_id = trace_ids(session_id)
+    capture = os.environ.get("MC_TRACE_CAPTURE_CONTENT", "").lower() in ("1", "true", "yes")
+    spans = []
+
+    if event_name == "SessionStart":
+        state.clear()
+        state.update({"root_start": now_ns, "turn": 0, "tools": {}})
+        cwd = payload.get("cwd") or ""
+        spans.append(make_span(trace_id, root_id, None, "session", "session", now_ns,
+                               attrs={"project": os.path.basename(cwd) if cwd else None, "session.id": session_id}))
+    elif event_name == "UserPromptSubmit":
+        state.setdefault("root_start", now_ns)
+        n = int(state.get("turn", 0)) + 1
+        state["turn"] = n
+        turn_id = _hid(f"turn:{session_id}:{n}", 16)
+        state["turn_id"], state["turn_start"] = turn_id, now_ns
+        attrs = {"turn.number": n}
+        if capture:
+            attrs["prompt"] = (payload.get("prompt") or "")[:300]
+        spans.append(make_span(trace_id, turn_id, root_id, f"turn {n}", "turn", now_ns, attrs=attrs))
+    elif event_name == "PreToolUse":
+        tools = state.setdefault("tools", {})
+        tools[payload.get("tool_use_id") or payload.get("tool_name", "tool")] = now_ns
+    elif event_name in ("PostToolUse", "PostToolUseFailure"):
+        tool_use_id = payload.get("tool_use_id")
+        start = state.get("tools", {}).pop(tool_use_id or payload.get("tool_name", "tool"), None) or max(0, now_ns - 1_000_000)
+        name = payload.get("tool_name") or "tool"
+        span_id = _hid(f"tool:{session_id}:{tool_use_id or now_ns}", 16)
+        attrs = {"tool.name": name}
+        if capture:
+            attrs["tool.input"] = json.dumps(payload.get("tool_input"))[:300]
+        failed = event_name == "PostToolUseFailure" or tool_failed(payload)
+        spans.append(make_span(trace_id, span_id, state.get("turn_id") or root_id, name, "tool", start, now_ns,
+                               error=failed, message="tool failed", attrs=attrs))
+    elif event_name == "Stop":
+        if state.get("turn_id"):
+            n = state.get("turn", 0)
+            spans.append(make_span(trace_id, state["turn_id"], root_id, f"turn {n}", "turn",
+                                   state.get("turn_start", now_ns), now_ns, attrs={"turn.number": n}))
+            state.pop("turn_id", None)
+    elif event_name == "SessionEnd":
+        spans.append(make_span(trace_id, root_id, None, "session", "session", state.get("root_start", now_ns), now_ns,
+                               attrs={"session.id": session_id}))
+    return spans
+
+
+def send_traces(url: str, agent_id: str, event_name: str, payload: dict) -> None:
+    if os.environ.get("MC_TRACES", "1") == "0":
+        return
+    session_id = payload.get("session_id")
+    if not session_id:
+        return
+    if event_name == "SessionStart":
+        prune_old_state()
+    state = load_state(session_id)
+    spans = trace_spans_for(event_name, payload, state, time.time_ns())
+    if event_name == "SessionEnd":
+        clear_state(session_id)
+    else:
+        save_state(session_id, state)
+    if not spans:
+        return
+    if trace_backoff_active():
+        return
+    req = urllib.request.Request(
+        f"{url}/api/v1/traces",
+        data=json.dumps(otlp_request(agent_id, session_id, spans)).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {os.environ.get('MC_TOKEN', '')}"},
+        method="POST",
+    )
+    post_detached(req)
+
+
+def _backoff_path() -> Path:
+    return Path("~/.claude/mission-control-trace/.down").expanduser()
+
+
+def trace_backoff_active(window: float = 30.0) -> bool:
+    """After a failed send, skip tracing for a while so a dead server cannot slow every tool call."""
+    try:
+        return time.time() - _backoff_path().stat().st_mtime < window
+    except Exception:
+        return False
+
+
+def _send_now(req) -> None:
+    try:
+        urllib.request.urlopen(req, timeout=3)
+        try:
+            _backoff_path().unlink()
+        except FileNotFoundError:
+            pass
+    except Exception:
+        try:
+            _backoff_path().parent.mkdir(parents=True, exist_ok=True)
+            _backoff_path().touch()
+        except Exception:
+            pass
+
+
+def post_detached(req) -> None:
+    """Send in a forked child so the agent never waits on the network (POSIX).
+    Where fork is unavailable the send is synchronous, bounded by its timeout."""
+    if not hasattr(os, "fork"):
+        _send_now(req)
+        return
+    try:
+        pid = os.fork()
+    except Exception:
+        _send_now(req)
+        return
+    if pid != 0:
+        return  # parent: return to the agent immediately
+    try:
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+        _send_now(req)
+    finally:
+        os._exit(0)
+
+
 def main() -> None:
     try:
         payload = json.load(sys.stdin)
@@ -63,6 +296,11 @@ def main() -> None:
 
     hostname = socket.gethostname().split(".")[0].lower()
     event_name = payload.get("hook_event_name", "unknown")
+    agent_id = os.environ.get("MC_AGENT", f"claude-code-{hostname}")
+    if event_name in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
+        # Tool events only feed traces; they would flood the fleet event log.
+        send_traces(url, agent_id, event_name, payload)
+        return
     kind = KIND_MAP.get(event_name, "status")
     cwd = payload.get("cwd") or os.getcwd()
     project = os.path.basename(cwd) if cwd else None
@@ -81,7 +319,7 @@ def main() -> None:
         title = "Session ended"
 
     body = {
-        "agent_id": os.environ.get("MC_AGENT", f"claude-code-{hostname}"),
+        "agent_id": agent_id,
         "platform": "claude-code",
         "machine": hostname,
         "display_name": os.environ.get("MC_AGENT_NAME", f"Claude Code ({hostname})"),
@@ -106,6 +344,8 @@ def main() -> None:
         urllib.request.urlopen(req, timeout=3)
     except Exception:
         pass
+
+    send_traces(url, agent_id, event_name, payload)
 
     # Two-way: at natural checkpoints, pull any messages the operator queued for this
     # agent and inject them into the session as additional context.

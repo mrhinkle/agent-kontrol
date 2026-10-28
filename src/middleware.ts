@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { apiError } from "@/lib/api-error";
 import { authCookieValue, secretsMatch } from "@/lib/authcrypto";
 
 /**
@@ -7,7 +8,7 @@ import { authCookieValue, secretsMatch } from "@/lib/authcrypto";
  * - MC_DASHBOARD_PASSWORD unset -> no gate in local dev and database-less demo
  *   deploys; a production build with DATABASE_URL set refuses to serve (503).
  * - Agent endpoints (/api/ingest and the MCP transport routes) are excluded
- *   here; they enforce their own MC_TOKEN bearer auth.
+ *   here; they enforce their own bearer auth (legacy MC_TOKEN or an agent credential).
  * - Data endpoints (/api/fleet, /api/memory) accept either the session
  *   cookie or the MC_TOKEN bearer header.
  */
@@ -22,6 +23,9 @@ const PUBLIC_PATHS: RegExp[] = [
   /^\/api\/(mcp|sse|message)(\/.*)?$/, // MCP transports (token-authed in route)
   /^\/\.well-known\//, // OAuth AS + protected-resource metadata
   /^\/oauth\//, // OAuth authorize / token / register
+  /^\/llms\.txt$/, // public agent index
+  /^\/docs\/(mcp|api|agents)\.md$/, // those three Markdown docs, exact names only
+  /^\/api\/openapi\.json$/, // public REST contract; no secrets
 ];
 
 /**
@@ -46,7 +50,10 @@ export async function middleware(req: NextRequest) {
     if (!isPublic && isUnprotectedWithRealData()) {
       const message = "MC_DASHBOARD_PASSWORD is not set. Set it to serve the dashboard.";
       return pathname.startsWith("/api/")
-        ? NextResponse.json({ error: message }, { status: 503 })
+        ? apiError("setup_required", {
+            message,
+            fix: "Set MC_DASHBOARD_PASSWORD and redeploy.",
+          })
         : new NextResponse(message, { status: 503, headers: { "content-type": "text/plain" } });
     }
     return NextResponse.next();
@@ -68,8 +75,16 @@ export async function middleware(req: NextRequest) {
     return NextResponse.next();
   }
 
+  // An agent credential (`akc_…`) is checked in the Node route. Middleware
+  // runs on the edge and cannot open Postgres. Forwarding is not a grant.
+  // Pages still require the dashboard session.
+  const agentToken = bearer?.match(/^Bearer\s+(akc_\S+)/i)?.[1];
+  if (agentToken && pathname.startsWith("/api/")) {
+    return NextResponse.next();
+  }
+
   if (pathname.startsWith("/api/")) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+    return apiError("unauthorized");
   }
 
   const url = req.nextUrl.clone();

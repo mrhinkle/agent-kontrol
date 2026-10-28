@@ -1,8 +1,11 @@
-export type UsageSource =
-  | "hermes_state"
-  | "provider_api"
-  | "subscription_fee"
-  | "quota_snapshot";
+export const USAGE_SOURCES = [
+  "hermes_state",
+  "provider_api",
+  "subscription_fee",
+  "quota_snapshot",
+] as const;
+
+export type UsageSource = (typeof USAGE_SOURCES)[number];
 
 export interface UsageFact {
   source: UsageSource;
