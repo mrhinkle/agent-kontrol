@@ -107,6 +107,10 @@ function decision(over: Partial<Decision> & Pick<Decision, "key" | "number">): D
     created_at: NOW,
     updated_at: NOW,
     age_days: 0,
+    actor_type: over.actor_type ?? null,
+    actor_id: over.actor_id ?? null,
+    chosen_option: over.chosen_option ?? null,
+    writeback: over.writeback ?? null,
   };
 }
 

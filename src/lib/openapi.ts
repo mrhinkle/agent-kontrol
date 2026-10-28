@@ -510,6 +510,10 @@ export function openApiDocument(): Json {
             "created_at",
             "updated_at",
             "age_days",
+            "actor_type",
+            "actor_id",
+            "chosen_option",
+            "writeback",
           ],
           properties: {
             id: { type: "integer" },
@@ -538,6 +542,14 @@ export function openApiDocument(): Json {
             created_at: { type: "string", format: "date-time" },
             updated_at: { type: "string", format: "date-time" },
             age_days: { type: "integer", description: "Whole days from opened_at, else first_seen_at, to now." },
+            actor_type: { type: ["string", "null"], enum: ["human", "agent", null] },
+            actor_id: { type: ["string", "null"] },
+            chosen_option: { type: ["string", "null"] },
+            writeback: {
+              type: ["string", "null"],
+              enum: ["written", "not_written", null],
+              description: "Null when the row has no GitHub target, or before it is decided. not_written means the row is decided and the GitHub comment did not land.",
+            },
           },
         },
         BriefDecision: {
@@ -608,12 +620,21 @@ export function openApiDocument(): Json {
           type: "object",
           minProperties: 1,
           description:
-            "At least one field. status decided requires non-empty decision text and sets decided_at to now. status deferred requires defer_until. status open clears decision, decided_by, decided_at, and defer_until. status withdrawn sets github_present false. decided_by is taken from this body, not from the credential.",
+            "At least one of status, decision, decided_by, or defer_until. status decided requires decision text or option_id and sets decided_at to now. status deferred requires defer_until in the future. A date-only defer_until is the end of that UTC day. A past or impossible date is 400 validation_failed. status open clears the answer. status withdrawn sets github_present false. decided_by in this body is ignored. The stored decided_by and actor fields come from the principal, and are null for dev-open. expected_updated_at must match the row or the response is 409 stale. Deciding, deferring, or withdrawing a decided or withdrawn row is 409 conflict.",
           properties: {
             status: { type: "string", enum: [...DECISION_STATUSES] },
             decision: { type: ["string", "null"] },
-            decided_by: { type: ["string", "null"] },
+            decided_by: { type: ["string", "null"], description: "Ignored. The stored actor comes from the principal." },
             defer_until: { type: ["string", "null"], format: "date-time" },
+            option_id: { type: "string" },
+            expected_updated_at: { type: "string", format: "date-time" },
+          },
+        },
+        RetryDecisionWriteback: {
+          type: "object",
+          description: "Retry the GitHub comment for a decided row. Does not decide the row again.",
+          properties: {
+            expected_updated_at: { type: "string", format: "date-time" },
           },
         },
         CreateCredential: {
@@ -1065,7 +1086,7 @@ export function openApiDocument(): Json {
           tags: ["decisions"],
           summary: "Record a decision, a deferral, or a withdrawal.",
           description:
-            "Dashboard session, MC_TOKEN, or an agent credential with decisions:write. An agent credential without that scope is 403 insufficient_scope. decided_by comes from the body, not from the credential. This records the row only. It does not comment on the GitHub issue or remove the label. A non-integer id is 400 validation_failed. A non-JSON body is 400 invalid_json. A body with none of status, decision, decided_by, or defer_until is 400 missing_field. An unknown id, when a database is connected, is 404 not_found and error stays Decision not found. Demo mode does not look the id up.",
+            "Dashboard session, MC_TOKEN, or an agent credential with decisions:write. An agent credential without that scope is 403 insufficient_scope. decided_by in the body is ignored. The stored actor is the principal, or null for dev-open. status decided records the row and then comments on the GitHub issue named by the row key and removes the decision labels. A failed write-back still decides the row and sets writeback to not_written. A past or invalid defer_until is 400 validation_failed. expected_updated_at that does not match is 409 stale. A decided or withdrawn row is 409 conflict. A non-integer id is 400 validation_failed. A non-JSON body is 400 invalid_json. A body with none of status, decision, decided_by, or defer_until is 400 missing_field. An unknown id, when a database is connected, is 404 not_found and error stays Decision not found. Demo mode does not look the id up.",
           security: cookieOrBearer,
           parameters: [pathParam("id", "Decision id.", { type: "integer", minimum: 1 })],
           requestBody: body(ref("PatchDecision")),
@@ -1095,6 +1116,47 @@ export function openApiDocument(): Json {
               "No decision has this id when a database is connected. code is not_found and error is Decision not found.",
               ref("Error"),
             ),
+            "409": jsonResponse(
+              "code stale when expected_updated_at does not match. code conflict when the row is already decided or withdrawn.",
+              ref("Error"),
+            ),
+          },
+        }),
+      },
+      "/api/decisions/{id}/writeback": {
+        post: operation({
+          operationId: "retryDecisionWriteback",
+          tags: ["decisions"],
+          summary: "Retry the GitHub comment for a decided row.",
+          description:
+            "Dashboard session, MC_TOKEN, or an agent credential with decisions:write. An agent credential without that scope is 403 insufficient_scope. Posts the decision comment only when the marker is absent, then removes decision labels. The issue is the one named by the row key. Does not decide the row again. A row that is not decided is 409 conflict. expected_updated_at that does not match is 409 stale. No token, a GitHub 403 or 404, a network error, or a closed issue leaves writeback not_written. Demo mode does not look the id up.",
+          security: cookieOrBearer,
+          parameters: [pathParam("id", "Decision id.", { type: "integer", minimum: 1 })],
+          requestBody: body(ref("RetryDecisionWriteback")),
+          responses: {
+            "200": jsonResponse("The row after the retry, or a demo acknowledgement.", {
+              oneOf: [
+                {
+                  type: "object",
+                  required: ["ok", "demo"],
+                  properties: {
+                    ok: { type: "boolean", const: true },
+                    demo: { type: "boolean", const: true },
+                  },
+                },
+                {
+                  type: "object",
+                  required: ["ok", "decision"],
+                  properties: {
+                    ok: { type: "boolean", const: true },
+                    decision: ref("Decision"),
+                  },
+                },
+              ],
+            }),
+            ...flatErrors,
+            "404": jsonResponse("No decision has this id when a database is connected.", ref("Error")),
+            "409": jsonResponse("code stale or code conflict.", ref("Error")),
           },
         }),
       },

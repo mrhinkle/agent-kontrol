@@ -1,6 +1,6 @@
 # Agent Kontrol MCP Server
 
-Agent Kontrol exposes fleet coordination to AI coding agents over the Model Context Protocol. This document covers how to connect, the 14 tools, how shared memory works, and a block of standing instructions you can paste into an agent.
+Agent Kontrol exposes fleet coordination to AI coding agents over the Model Context Protocol. This document covers how to connect, the 17 tools, how shared memory works, and a block of standing instructions you can paste into an agent.
 
 An agent that only has the deployment URL can start at [/llms.txt](/llms.txt).
 
@@ -36,13 +36,15 @@ A tool that is not in the table below is denied for every caller, including `MC_
 | `messages:read` | `check_inbox` | `GET /api/messages` |
 | `messages:write` | `reply_to_operator`, `reply_to_mark` | `POST /api/messages/reply` |
 | `progress:read` | `get_progress_digest` | `GET /api/progress`, `GET /api/progress/digest` |
-| `decisions:write` | — (no MCP tool yet) | `PATCH /api/decisions/:id` |
+| `decisions:read` | `list_decisions` | — (no REST route; the agent calls `list_decisions`) |
+| `decisions:request` | `request_decision` | — (no REST route; the agent calls `request_decision`) |
+| `decisions:write` | `resolve_decision` | `PATCH /api/decisions/:id`, `POST /api/decisions/:id/writeback` |
 | `skills:read` | `list_skills`, `get_skill` | `GET /api/skills`, `GET /api/skills/:id` |
 | `skills:write` | `run_skill` | — (no REST route; the agent calls `run_skill`) |
 
 `reply_to_mark` is the deprecated alias of `reply_to_operator` and requires the same scope.
 
-Collector and operator routes are not in this table. An agent credential cannot call them. `MC_TOKEN` and the dashboard session still can. That set is `POST /api/progress/ingest`, `POST /api/usage/ingest`, `GET /api/usage`, `POST /api/v1/traces`, `GET /api/traces`, `GET /api/traces/:traceId`, `POST /api/messages`, `PATCH /api/messages`, `GET /api/decisions`, `POST /api/decisions`, `PATCH /api/skills/:id`, `POST /api/skills/sync`, `POST /api/skills/drift`, and `GET`/`PUT /api/settings/repos`. `GET`/`POST`/`DELETE /api/settings/credentials` accepts only the dashboard session. `PATCH /api/decisions/:id` is the `decisions:write` row above. There is no MCP tool for decisions yet.
+Collector and operator routes are not in this table. An agent credential cannot call them. `MC_TOKEN` and the dashboard session still can. That set is `POST /api/progress/ingest`, `POST /api/usage/ingest`, `GET /api/usage`, `POST /api/v1/traces`, `GET /api/traces`, `GET /api/traces/:traceId`, `POST /api/messages`, `PATCH /api/messages`, `GET /api/decisions`, `POST /api/decisions`, `PATCH /api/skills/:id`, `POST /api/skills/sync`, `POST /api/skills/drift`, and `GET`/`PUT /api/settings/repos`. `GET`/`POST`/`DELETE /api/settings/credentials` accepts only the dashboard session. `PATCH /api/decisions/:id` and `POST /api/decisions/:id/writeback` are the `decisions:write` row above. `request_decision` and `list_decisions` are the request and read rows. Neither of those scopes can resolve a decision.
 
 `check_inbox` and `GET /api/messages?ack=true` can mark inbox rows delivered. That side effect is part of `messages:read`, which is how the inbox already worked.
 
@@ -88,7 +90,7 @@ A `401` on this request means the token does not match `MC_TOKEN` on the deploym
 
 ## Tools
 
-The server exposes 14 tools: `report_status`, `get_fleet_status`, `get_progress_digest`, `remember`, `recall`, `check_inbox`, `reply_to_operator`, `create_task`, `get_task_queue`, `claim_task`, `update_task`, `list_skills`, `get_skill`, `run_skill`.
+The server exposes 17 tools: `report_status`, `get_fleet_status`, `get_progress_digest`, `remember`, `recall`, `check_inbox`, `reply_to_operator`, `create_task`, `get_task_queue`, `claim_task`, `update_task`, `list_skills`, `get_skill`, `run_skill`, `request_decision`, `list_decisions`, `resolve_decision`.
 
 Tool names are part of the public API and will not change within 1.x.
 
@@ -315,13 +317,13 @@ The HTTP `401` for a missing or invalid bearer is unchanged: `WWW-Authenticate` 
 | `forbidden` | no | `reply_to_operator` when `in_reply_to` belongs to a different agent. `get_skill` or `run_skill` when the runtime is incompatible or the lane is outside the skill's scope. `run_skill` when a different actor finishes a run, or when the caller has no actor. |
 | `identity_mismatch` | no | `run_skill` when an agent credential or an OAuth client passes an `agent_id` other than the authenticated id. The message names that id. Omit `agent_id`, or pass the same id. The call writes no run and no span. `MC_TOKEN` and a dashboard session do not return this code: a supplied `agent_id` there is the span attribute `reported_agent_id` only. |
 | `not_found` | no | `reply_to_operator` when `in_reply_to` does not exist. `get_skill` or `run_skill` when the skill is missing, removed, or trigger `off`. `run_skill` when `run_id` does not exist or is not a canonical UUID. |
-| `validation_failed` | no | `create_task` or `reply_to_operator` when `idempotency_key` is longer than 200 characters or contains a control character. `run_skill` when a start omits `id` or `runtime`, when `complete` is true without `run_id`, when `run_id` is set without `complete: true`, when `id` on completion does not match the skill on the run, or when `note` is longer than 500 characters. A privacy refusal on `POST /api/usage/ingest` is this code. Schema failures are the SDK message, not this JSON. |
+| `validation_failed` | no | `create_task` or `reply_to_operator` when `idempotency_key` is longer than 200 characters or contains a control character. `run_skill` when a start omits `id` or `runtime`, when `complete` is true without `run_id`, when `run_id` is set without `complete: true`, when `id` on completion does not match the skill on the run, or when `note` is longer than 500 characters. `request_decision` when `slug` or `title` is rejected, or `recommended` is not an option id. `resolve_decision` when a decided row has no text and no `option_id`, when `defer_until` is past or not a real date, or when `option_id` is not on the row. A privacy refusal on `POST /api/usage/ingest` is this code. Schema failures are the SDK message, not this JSON. |
 | `invalid_json` | no | Not a tool result. Authenticated `POST /api/mcp` returns HTTP 400 when the body is empty or not JSON. A missing bearer stays HTTP 401 with `WWW-Authenticate`. |
 | `missing_field` | no | Not returned by a tool. The input schema rejects a missing argument first. |
 | `rate_limited` | yes | Not returned by a tool. `POST /api/login` only. The OAuth consent form shares that limiter and answers with HTML, not this JSON. |
-| `conflict` | no | Not returned by a tool. REST settings save with no database. |
+| `conflict` | no | `resolve_decision` and `PATCH /api/decisions/:id` when the row is already decided or withdrawn. `POST /api/decisions/:id/writeback` when the row is not decided. Also a REST settings save with no database. |
 | `idempotency_conflict` | no | `create_task` or `reply_to_operator` reused `idempotency_key` with different arguments, or the first request with that key is still inside its 30 second lease. `reply_to_mark` is the same tool schema and the same key as `reply_to_operator`. The same key, the same actor, the same route, and the same arguments return the original result for 24 hours. Different arguments stay non-retryable. While the first request is inside its 30 second lease, the same arguments are `retryable: true` and the tool JSON includes `retry_after` seconds. The REST form of that wait is the `Retry-After` header. After that lease, the same key and the same arguments take over a claim that never stored a result and run the write once. A claim insert whose result is lost is re-read, and the write runs once when this attempt owns the claim. The resource insert and the stored response commit in one statement, and that insert runs only while this attempt's claim token still matches. A committed write therefore has a stored response. A retry returns that response and does not insert another row while the claim is inside its 24 hour window. A caller that dies before reading the response gets the same row on retry. After that window the same key starts a new write. The key is scoped by actor and route. |
-| `stale` | no | Not returned by a tool. REST settings save with a stale `version`. |
+| `stale` | no | `resolve_decision`, `PATCH /api/decisions/:id`, and `POST /api/decisions/:id/writeback` when `expected_updated_at` does not match the row. Also a REST settings save with a stale `version`. |
 | `task_not_found` | no | `update_task` when a database is connected and the id does not exist. Demo mode is the text `Demo mode; task not updated.`, not an error. |
 | `task_not_claimable` | no | Defined, not returned. See above. |
 | `memory_key_invalid` | no | `remember` or `recall` with a bad `key`. |
@@ -347,7 +349,51 @@ Paste this block into an agent's standing instructions:
 - At the start of a session and periodically while working, call check_inbox with your agent_id. Act on operator messages and answer them with reply_to_operator.
 - Call remember for durable handoffs: decisions, gotchas, and facts another agent or a future session will need. Call recall before re-deriving something that may already be written down.
 - Call list_skills, then get_skill, then run_skill. Finish with the same run_id and complete true, and omit id. A skill read from disk is not a run Agent Kontrol can see.
+- Call request_decision to file an owner decision. Call list_decisions to read the queue. Do not call resolve_decision unless the credential has decisions:write.
 ```
+
+## Decision tools
+
+### request_decision
+
+File a decision for the owner. The key is `agent:<authenticated id>:<slug>`. The same slug updates that row. A decided row stays decided. The call does not take a key, a repo, an issue number, or `force`.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `slug` | string | yes | Short lowercase id. Unique for this caller. |
+| `title` | string | yes | What the owner is deciding. |
+| `why` | string | no | Why this needs the owner. |
+| `options` | array | no | Up to 20 objects, each `id` and `label`. |
+| `recommended` | string | no | An option id. Must be one of `options` when those are sent. |
+
+Demo mode, with no database, returns `Demo mode; decision not stored.` and writes nothing.
+
+### list_decisions
+
+Read the decision queue. This does not change a row. `status` defaults to `open`, which also includes deferrals whose date has passed.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `status` | enum | no | `open`, `decided`, `deferred`, `withdrawn`, or `all`. |
+| `repo` | string | no | `owner/name`. Omit for every repo. |
+| `limit` | number | no | 1 to 1000. |
+
+Demo mode returns `{ "demo": true, "decisions": [] }`.
+
+### resolve_decision
+
+Decide, defer, or withdraw one row. Requires `decisions:write`. `decisions:request` and `decisions:read` cannot call it. The GitHub comment is posted to the issue named by the row key `github:<owner/repo>#<n>`, never to a repo or number in the arguments. Those arguments are not accepted. A failed write-back still decides the row. The page shows `not written back`, and `POST /api/decisions/:id/writeback` retries without a second comment when the marker `<!-- agent-kontrol-decision:v1 -->` is already on the issue.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `id` | number | yes | Decision id. |
+| `status` | enum | yes | `open`, `decided`, `deferred`, or `withdrawn`. |
+| `decision` | string | no | Required for `decided` unless `option_id` names a choice. |
+| `defer_until` | string | no | Required for `deferred`. A date is the end of that UTC day. A past or impossible date is `validation_failed`. |
+| `option_id` | string | no | One of the row's option ids. |
+| `expected_updated_at` | string | no | `updated_at` from the row you loaded. A mismatch is `stale`. |
+
+A decided or withdrawn row is `conflict`. Deferred is not terminal. Demo mode returns `Demo mode; decision not resolved.` and writes nothing.
 
 ## Skills mirror
 

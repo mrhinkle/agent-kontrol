@@ -1,4 +1,4 @@
-import { sql } from "./db";
+import { isConfigured, sql } from "./db";
 
 /**
  * The decisions queue.
@@ -57,6 +57,12 @@ export interface Decision {
   updated_at: string;
   /** Whole days from opened_at (else first_seen_at) to now. Same floor as morning-brief.sh. */
   age_days: number;
+  /** Null when the caller was dev-open, or when the column was never written. */
+  actor_type: "human" | "agent" | null;
+  actor_id: string | null;
+  chosen_option: string | null;
+  /** `written` or `not_written` after a decide. Null when there is no GitHub target, or before a decide. */
+  writeback: "written" | "not_written" | null;
 }
 
 /** One element of `morning-brief.sh --json .decisions`. */
@@ -116,6 +122,42 @@ export interface PatchInput {
   setDecidedBy: boolean;
   defer_until?: string | null;
   setDefer: boolean;
+  /** When true, store actor_type and actor_id, including null for dev-open. */
+  setActor?: boolean;
+  actor_type?: "human" | "agent" | null;
+  actor_id?: string | null;
+  setChosen?: boolean;
+  chosen_option?: string | null;
+  /** When set, the update matches only a row still at this instant. */
+  expectedUpdatedAt?: string | null;
+  /** When true, a decided or withdrawn row is not updated. Deferred is not terminal. */
+  guardTerminal?: boolean;
+}
+
+export interface DecisionStore {
+  get(id: number): Promise<Record<string, unknown> | null>;
+  list(query: {
+    status: ListStatus;
+    repo: string | null;
+    source: string | null;
+    limit: number;
+    shape?: ListShape;
+  }): Promise<Record<string, unknown>[]>;
+  upsert(input: UpsertInput): Promise<{ row: Record<string, unknown>; previous_status: string | null }>;
+  patch(id: number, input: PatchInput): Promise<Record<string, unknown> | null>;
+  setWriteback(id: number, writeback: "written" | "not_written"): Promise<Record<string, unknown> | null>;
+}
+
+let testStore: DecisionStore | null = null;
+
+/** Route tests substitute the queue so they do not parse SQL. */
+export function setDecisionStoreForTests(store: DecisionStore | null): void {
+  testStore = store;
+}
+
+/** True when a database or a test store will keep the row. */
+export function decisionPersistenceOn(): boolean {
+  return isConfigured() || testStore !== null;
 }
 
 export interface ReconcileInput {
@@ -234,6 +276,10 @@ export function presentDecision(row: Record<string, unknown>, nowIso: string): D
     created_at: iso(row.created_at) ?? nowIso,
     updated_at: iso(row.updated_at) ?? nowIso,
     age_days: ageDays(opened, nowIso),
+    actor_type: row.actor_type === "human" || row.actor_type === "agent" ? row.actor_type : null,
+    actor_id: row.actor_id == null ? null : String(row.actor_id),
+    chosen_option: row.chosen_option == null ? null : String(row.chosen_option),
+    writeback: row.writeback === "written" || row.writeback === "not_written" ? row.writeback : null,
   };
 }
 
@@ -599,6 +645,37 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+export async function getDecision(id: number): Promise<Decision | null> {
+  const now = nowIso();
+  if (testStore) {
+    const row = await testStore.get(id);
+    return row ? presentDecision(row, now) : null;
+  }
+  if (!isConfigured()) return null;
+  const db = sql();
+  const rows = await db`select * from decisions where id = ${id}`;
+  return rows[0] ? presentDecision(rows[0], now) : null;
+}
+
+export async function setDecisionWriteback(
+  id: number,
+  writeback: "written" | "not_written",
+): Promise<Decision | null> {
+  const now = nowIso();
+  if (testStore) {
+    const row = await testStore.setWriteback(id, writeback);
+    return row ? presentDecision(row, now) : null;
+  }
+  const db = sql();
+  const rows = await db`
+    update decisions
+    set writeback = ${writeback}, updated_at = now()
+    where id = ${id}
+    returning *
+  `;
+  return rows[0] ? presentDecision(rows[0], now) : null;
+}
+
 export async function listDecisions(query: {
   status: ListStatus;
   repo: string | null;
@@ -607,8 +684,12 @@ export async function listDecisions(query: {
   /** `brief` selects the morning-brief population and ignores status and source. */
   shape?: ListShape;
 }): Promise<Decision[]> {
-  const db = sql();
   const now = nowIso();
+  if (testStore) {
+    const rows = await testStore.list(query);
+    return rows.map((row) => presentDecision(row, now));
+  }
+  const db = sql();
   const brief = query.shape === "brief";
   const rows = await db`
     select * from decisions
@@ -646,8 +727,17 @@ export interface UpsertResult {
 }
 
 export async function upsertDecision(input: UpsertInput): Promise<UpsertResult> {
-  const db = sql();
   const now = nowIso();
+  if (testStore) {
+    const stored = await testStore.upsert(input);
+    const decision = presentDecision(stored.row, now);
+    const previous = stored.previous_status;
+    const held =
+      (previous === "decided" && decision.status === "decided") ||
+      (previous === "deferred" && decision.status === "deferred");
+    return { decision, status_held: held };
+  }
+  const db = sql();
   const optionsJson = input.options == null ? null : JSON.stringify(input.options);
   const labelsJson = input.labels == null ? null : JSON.stringify(input.labels);
   const rows = await db`
@@ -710,6 +800,26 @@ export async function upsertDecision(input: UpsertInput): Promise<UpsertResult> 
           when ${input.force} is true and decisions.status = 'deferred' then null
           when decisions.status = 'withdrawn' then null
           else decisions.defer_until
+        end,
+        actor_type = case
+          when ${input.force} is true and decisions.status in ('decided', 'deferred') then null
+          when decisions.status = 'withdrawn' then null
+          else decisions.actor_type
+        end,
+        actor_id = case
+          when ${input.force} is true and decisions.status in ('decided', 'deferred') then null
+          when decisions.status = 'withdrawn' then null
+          else decisions.actor_id
+        end,
+        chosen_option = case
+          when ${input.force} is true and decisions.status in ('decided', 'deferred') then null
+          when decisions.status = 'withdrawn' then null
+          else decisions.chosen_option
+        end,
+        writeback = case
+          when ${input.force} is true and decisions.status in ('decided', 'deferred') then null
+          when decisions.status = 'withdrawn' then null
+          else decisions.writeback
         end
       returning *
     )
@@ -761,9 +871,17 @@ export async function reconcileDecisions(input: ReconcileInput): Promise<Reconci
 }
 
 export async function patchDecision(id: number, input: PatchInput): Promise<Decision | null> {
-  const db = sql();
   const now = nowIso();
+  if (testStore) {
+    const row = await testStore.patch(id, input);
+    return row ? presentDecision(row, now) : null;
+  }
+  const db = sql();
   const status = input.status ?? null;
+  const setActor = input.setActor === true;
+  const setChosen = input.setChosen === true;
+  const guardTerminal = input.guardTerminal === true;
+  const expected = input.expectedUpdatedAt ?? null;
   const rows = await db`
     update decisions
     set
@@ -793,8 +911,35 @@ export async function patchDecision(id: number, input: PatchInput): Promise<Deci
         when ${status} = 'withdrawn' then false
         else github_present
       end,
+      actor_type = case
+        when ${status} = 'open' then null
+        when ${setActor} then ${input.actor_type ?? null}
+        else actor_type
+      end,
+      actor_id = case
+        when ${status} = 'open' then null
+        when ${setActor} then ${input.actor_id ?? null}
+        else actor_id
+      end,
+      chosen_option = case
+        when ${status} = 'open' then null
+        when ${setChosen} then ${input.chosen_option ?? null}
+        else chosen_option
+      end,
+      writeback = case
+        when ${status} in ('open', 'decided', 'deferred', 'withdrawn') then null
+        else writeback
+      end,
       updated_at = now()
     where id = ${id}
+      and (
+        ${expected}::timestamptz is null
+        or updated_at = ${expected}::timestamptz
+      )
+      and (
+        ${guardTerminal} is not true
+        or status not in ('decided', 'withdrawn')
+      )
     returning *
   `;
   const row = rows[0];

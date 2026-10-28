@@ -19,6 +19,7 @@ The `agent_credentials` table stores the label, the first 8 characters of the to
 | Dashboard UI and data routes (default) | Session cookie `mc_auth`, or `Authorization: Bearer <MC_TOKEN>` |
 | `GET` and `POST /api/decisions` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `decisions:write` |
 | `PATCH /api/decisions/:id` | Session cookie, `MC_TOKEN`, or an agent credential with `decisions:write` |
+| `POST /api/decisions/:id/writeback` | Session cookie, `MC_TOKEN`, or an agent credential with `decisions:write` |
 | Ingest routes: `POST /api/v1/traces`, `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, `POST /api/usage/ingest` | `Authorization: Bearer <MC_TOKEN>`, or an agent credential whose scope covers the route (`status:write` for `POST /api/ingest`, `messages:write` for `POST /api/messages/reply`); the other ingest routes take `MC_TOKEN` only |
 | MCP transport: `/api/mcp` | `Authorization: Bearer <MC_TOKEN>`, an agent credential, or an OAuth access token (JWT) issued by this server |
 | Credential management: `GET`/`POST`/`DELETE /api/settings/credentials` | Dashboard session only |
@@ -56,7 +57,8 @@ Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI
 | POST | `/api/progress/ingest` | Bearer | One collection tick from `scripts/collect-progress.sh` |
 | GET | `/api/decisions` | Cookie or bearer | Decision queue, oldest first, each row with `age_days`. `shape=brief` is the morning-brief `.decisions` list |
 | POST | `/api/decisions` | Cookie or bearer | Upsert one decision, or reconcile a collector sweep |
-| PATCH | `/api/decisions/:id` | Cookie, bearer, or `decisions:write` | Record a decision, a deferral, or a withdrawal |
+| PATCH | `/api/decisions/:id` | Cookie, bearer, or `decisions:write` | Record a decision, a deferral, or a withdrawal, and write a decision back to GitHub |
+| POST | `/api/decisions/:id/writeback` | Cookie, bearer, or `decisions:write` | Retry the GitHub comment without deciding the row again |
 | GET | `/api/settings/repos` | Cookie or bearer | The repos the progress board watches |
 | PUT | `/api/settings/repos` | Cookie or bearer | Replace the watched repos |
 | GET | `/api/settings/credentials` | Session only | List agent credentials. No token and no hash |
@@ -196,7 +198,7 @@ Status on that upsert:
 
 - A new key is `open`.
 - `decided` and `deferred` stay as they are. The answer text is left in place. The response includes `status_held: true`.
-- `force: true` reopens a `decided` or `deferred` row to `open` and clears `decision`, `decided_by`, `decided_at`, and `defer_until`.
+- `force: true` reopens a `decided` or `deferred` row to `open` and clears `decision`, `decided_by`, `decided_at`, `defer_until`, `actor_type`, `actor_id`, `chosen_option`, and `writeback`. A `withdrawn` row returning to `open` clears those four added columns and `defer_until`. It leaves `decision` and `decided_by` in place.
 - `withdrawn` returns to `open` on an ordinary upsert, without `force`.
 - A body field `status` is not how a row becomes `decided`. That is `PATCH`.
 
@@ -204,9 +206,17 @@ The other POST shape is `{ "reconcile": { "repo", "source", "seen_keys" } }`. It
 
 `scripts/collect-progress.sh` POSTs one row per open issue or PR that carries a label in `brief.decisionLabels` (`key` `github:<repo>#<n>`, `source` `github-label`, `why` the matching labels joined with `", "`, `kind` `pr` when `gh` returned `isDraft`, `labels` the matching names, `opened_at` GitHub `createdAt`, `repo_short` the config short name). That POST is what backfills a legacy null `kind`, `labels`, `opened_at`, or `repo_short`. It then reconciles. It does not reconcile when `decisionLabels` is empty, when `gh` fails, when the issue list is longer than 2000 or the PR list is longer than 500, or when any upsert failed. `--backfill` does not sync decisions. `--dry-run` prints the decision JSON to stderr and does not POST, so stdout stays the progress payload.
 
-`PATCH /api/decisions/:id` body is `{ "status"?, "decision"?, "decided_by"?, "defer_until"? }` with at least one of those fields. `id` is a positive integer. `status` is one of the four. `decided` requires non-empty `decision` text and sets `decided_at` to now. `deferred` requires `defer_until` as an ISO timestamp. `open` clears `decision`, `decided_by`, `decided_at`, and `defer_until`. `withdrawn` sets `github_present` false. `decided_by` is a body field. The route does not take it from the credential. An unknown id, when a database is connected, is `404` `not_found` with `error` `Decision not found`. This PATCH only records the row. Commenting on the GitHub issue and removing the label is issue #65, not this route.
+`PATCH /api/decisions/:id` body is `{ "status"?, "decision"?, "decided_by"?, "defer_until"?, "option_id"?, "expected_updated_at"? }` with at least one of `status`, `decision`, `decided_by`, or `defer_until`. `id` is a positive integer. `status` is one of the four. `decided` requires non-empty `decision` text, or an `option_id` that matches one of the row's options (the option label is stored when the text is empty). It sets `decided_at` to now. `deferred` requires `defer_until`. A `YYYY-MM-DD` value is the end of that UTC day, so today is still in the future during the evening. A past instant, or a date that is not a real calendar day, is `400` `validation_failed`. `open` clears `decision`, `decided_by`, `decided_at`, `defer_until`, and the actor, chosen option, and write-back columns. `withdrawn` sets `github_present` false. `decided_by` in the body is ignored. The stored `decided_by`, `actor_type`, and `actor_id` come from the authenticated principal. Dev-open, when the dashboard password is unset and the request has no credential, stores those fields as null. `expected_updated_at` must be the row's `updated_at`. A mismatch is `409` `stale`, checked before the status conflict. Deciding, deferring, or withdrawing a row that is already `decided` or `withdrawn` is `409` `conflict`. Deferred is not terminal. An unknown id, when a database is connected, is `404` `not_found` with `error` `Decision not found`.
 
-Demo mode (no `DATABASE_URL`), after the body validates: `GET` returns `{ "demo": true, "decisions": [] }`. `POST` returns `{ "ok": true, "demo": true, "note": "DATABASE_URL not set; decision dropped" }`. `PATCH` returns `{ "ok": true, "demo": true }`.
+On `decided`, the route then writes back to GitHub. The target is parsed only from the row key `github:<owner/repo>#<n>`. `repo` and `number` on the row, and any repo or number in the request, are not the target. The comment is `<!-- agent-kontrol-decision:v1 --> Decision (by &lt;who&gt;, &lt;date&gt;): &lt;text&gt;` with `who`, the date, and the text HTML-escaped. The marker itself is not escaped. Decision labels from `brief.decisionLabels` are removed. Issues and pull requests both use the issues API. The token is `GH_TOKEN`, else `GITHUB_TOKEN`. No token, a GitHub 403 or 404, a network error, or an already-closed issue still leaves the row decided and sets `writeback` to `not_written`. The page shows `not written back`. A key that is not a GitHub issue leaves `writeback` null. A comment that already contains the marker is not posted again.
+
+`POST /api/decisions/:id/writeback` retries that comment and the label removal. It does not decide the row again. The same marker check is what stops a second comment when the first attempt posted and then failed while removing labels. `expected_updated_at` is the same guard as PATCH. A row that is not `decided` is `409` `conflict`. Auth is the same as PATCH: dashboard session, `MC_TOKEN`, or `decisions:write`.
+
+`actor_type`, `actor_id`, `chosen_option`, and `writeback` are nullable columns (`supabase/migrations/20261027_decisions_resolve.sql`).
+
+MCP `request_decision` (scope `decisions:request`) upserts `key` `agent:<actor id>:<slug>` with `force` false. `list_decisions` (`decisions:read`) reads the queue and does not change it. `resolve_decision` is `decisions:write`. An agent credential with only the request and read scopes cannot resolve and cannot call PATCH or the write-back retry.
+
+Demo mode (no `DATABASE_URL`), after the body validates: `GET` returns `{ "demo": true, "decisions": [] }`. `POST` returns `{ "ok": true, "demo": true, "note": "DATABASE_URL not set; decision dropped" }`. `PATCH` and `POST /api/decisions/:id/writeback` return `{ "ok": true, "demo": true }`.
 
 ### Settings
 

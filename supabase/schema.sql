@@ -381,6 +381,10 @@ create table if not exists decisions (
   opened_at timestamptz,
   repo_short text,
   github_present boolean,
+  actor_type text,
+  actor_id text,
+  chosen_option text,
+  writeback text,
   first_seen_at timestamptz not null default now(),
   last_seen_at timestamptz not null default now(),
   created_at timestamptz not null default now(),
@@ -391,6 +395,10 @@ alter table decisions add column if not exists labels jsonb;
 alter table decisions add column if not exists opened_at timestamptz;
 alter table decisions add column if not exists repo_short text;
 alter table decisions add column if not exists github_present boolean;
+alter table decisions add column if not exists actor_type text;
+alter table decisions add column if not exists actor_id text;
+alter table decisions add column if not exists chosen_option text;
+alter table decisions add column if not exists writeback text;
 create index if not exists decisions_status_first_seen_idx on decisions (status, first_seen_at);
 create index if not exists decisions_repo_number_idx on decisions (repo, number);
 

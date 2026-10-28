@@ -17,8 +17,8 @@ export type PublicDocName = keyof typeof PUBLIC_DOC_FILES;
 const PUBLIC_DOC_NAMES = new Set<string>(Object.keys(PUBLIC_DOC_FILES));
 
 /**
- * The 14 tools registered in src/app/api/[transport]/route.ts, in that order.
- * `reply_to_mark` is a deprecated alias and is not one of the 14.
+ * The 17 tools registered in src/app/api/[transport]/route.ts, in that order.
+ * `reply_to_mark` is a deprecated alias and is not one of the 17.
  */
 export const MCP_TOOL_NAMES = [
   "report_status",
@@ -35,6 +35,9 @@ export const MCP_TOOL_NAMES = [
   "list_skills",
   "get_skill",
   "run_skill",
+  "request_decision",
+  "list_decisions",
+  "resolve_decision",
 ] as const;
 
 export type PublicDocResult =
