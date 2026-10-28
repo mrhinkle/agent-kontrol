@@ -17,6 +17,17 @@ import { getSkillTool, listSkillsTool, runSkillTool } from "@/lib/skills/mcp";
 
 export const maxDuration = 60;
 
+/**
+ * MCP tool annotations. Every tool declares all four hints explicitly so hosts can
+ * warn before invoking. Agent Kontrol is a closed system (its own database), so
+ * openWorldHint is false everywhere, and nothing here deletes data.
+ */
+const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
+const WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false } as const;
+const WRITE_IDEMPOTENT = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
+/** Overwrites existing state (a keyed note, a task's status and result) and appends an event, so not idempotent. */
+const WRITE_DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false } as const;
+
 /** Caught tool failures become an isError result. The text is the JSON error body, never the exception. */
 async function guardTool(label: string, run: () => Promise<McpToolResult>): Promise<McpToolResult> {
   try {
@@ -38,6 +49,7 @@ const handler = createMcpHandler(
       "report_status",
       {
         title: "Report status",
+        annotations: WRITE,
         description:
           "Report what you are currently working on to Agent Kontrol. Call this at the start of a task, at major milestones, and when you finish or get blocked.",
         inputSchema: {
@@ -80,6 +92,7 @@ const handler = createMcpHandler(
       "get_fleet_status",
       {
         title: "Get fleet status",
+        annotations: READ_ONLY,
         description:
           "See what every agent in the fleet (Claude Code, Cowork, ChatGPT Work, Hermes, ...) is currently doing, with recent activity. Use this to avoid duplicating work another agent is already on.",
         inputSchema: {},
@@ -110,6 +123,7 @@ const handler = createMcpHandler(
       "get_progress_digest",
       {
         title: "Get progress digest",
+        annotations: READ_ONLY,
         description:
           "Read the fleet progress board as plain text: PRs merged, issues closed vs opened, net backlog per repo, and anything over a threshold that needs the operator's attention. Use this for a scheduled morning digest, or whenever asked whether the work is actually moving. The headline is net backlog (opened minus closed), not merge count — a high-merge day can still lose ground.",
         inputSchema: {
@@ -165,6 +179,7 @@ const handler = createMcpHandler(
       "remember",
       {
         title: "Remember",
+        annotations: WRITE_DESTRUCTIVE,
         description:
           "Write a note to Agent Kontrol shared memory so other agents (and future sessions) can see it. Use for decisions, handoffs, and 'don't duplicate this' coordination notes. Pass dry_run true to preview an insert or key overwrite without writing.",
         inputSchema: {
@@ -182,6 +197,7 @@ const handler = createMcpHandler(
       "recall",
       {
         title: "Recall",
+        annotations: READ_ONLY,
         description:
           "Search Agent Kontrol shared memory. Filter by free-text query, exact key, and/or tags. Returns the most recently updated notes first.",
         inputSchema: {
@@ -215,6 +231,7 @@ const handler = createMcpHandler(
       "check_inbox",
       {
         title: "Check inbox",
+        annotations: WRITE_IDEMPOTENT,
         description:
           "Check Agent Kontrol for messages the operator has sent to this agent. Call at the start of a task and periodically while working. Returns pending messages and marks them read.",
         inputSchema: {
@@ -273,6 +290,7 @@ const handler = createMcpHandler(
         tool.name,
         {
           title: tool.title,
+          annotations: WRITE,
           description: tool.description,
           inputSchema: {
             agent_id: z
@@ -319,6 +337,7 @@ const handler = createMcpHandler(
       "create_task",
       {
         title: "Create task",
+        annotations: WRITE,
         description:
           "Queue a task for the fleet. A dispatcher (or another agent) will claim and run it. Use platform to route: 'codex' for terminal-heavy/parallel implementation, 'claude-code' for deep or large-codebase work, 'grok' for research/X-adjacent work, 'hermes' for messaging/ops, 'any' when it doesn't matter. Set reviewer_platform for cross-vendor review (e.g. claude-code writes, codex reviews).",
         inputSchema: {
@@ -365,6 +384,7 @@ const handler = createMcpHandler(
       "get_task_queue",
       {
         title: "Get task queue",
+        annotations: READ_ONLY,
         description:
           "See the fleet's task queue: what's queued, running, in review, or recently finished. Use before creating tasks to avoid duplicates, or to find work you could claim.",
         inputSchema: {
@@ -399,6 +419,7 @@ const handler = createMcpHandler(
       "claim_task",
       {
         title: "Claim next task",
+        annotations: WRITE,
         description:
           "Claim the next queued task routed to your platform (or 'any'). Returns the task's full instructions. When you finish, call update_task with status done/failed and a result summary.",
         inputSchema: {
@@ -435,6 +456,7 @@ const handler = createMcpHandler(
       "update_task",
       {
         title: "Update task",
+        annotations: WRITE_DESTRUCTIVE,
         description:
           "Update a task you're working on: mark it running, done, or failed, and attach a result summary (and cost if known). Pass dry_run true to preview the update, including a cancel, without writing.",
         inputSchema: {
@@ -456,6 +478,7 @@ const handler = createMcpHandler(
       "list_skills",
       {
         title: "List skills",
+        annotations: READ_ONLY,
         description:
           "List skills whose trigger is not off, whose scope admits the lane, and which are compatible with runtime when runtime is passed. With no runtime, incompatible skills are not hidden. With no lane, selected-lane skills are hidden. Trigger off is omitted. category is an exact case-insensitive match. Pass uncategorized for skills with no category. Each line includes category and tags.",
         inputSchema: {
@@ -472,6 +495,7 @@ const handler = createMcpHandler(
       "get_skill",
       {
         title: "Get skill",
+        annotations: READ_ONLY,
         description:
           "Return the mirrored SKILL.md pinned to its content SHA, or one reference file when path is set. Never fetches the upstream repository. A skill whose trigger is off is not served.",
         inputSchema: {
@@ -488,6 +512,7 @@ const handler = createMcpHandler(
       "run_skill",
       {
         title: "Run skill",
+        annotations: WRITE,
         description:
           "Start or finish a skill run. The agent executes the instructions. Agent Kontrol only stores the start, the end, and an optional note. Omit run_id to start. id and runtime are required then. agent_id is optional: the recorded agent is the authenticated caller. Call again with that run_id and complete true to finish, and omit id. If you pass id on completion, it must match the skill on the run. Only the actor that started the run can finish it.",
         inputSchema: {
