@@ -39,6 +39,8 @@ psql "$DATABASE_URL" -f supabase/schema.sql
 
 The schema file is idempotent: it is safe to re-run, including to upgrade an existing database to the current schema.
 
+`watched_owners` (`supabase/migrations/20261028_watched_owners.sql`, also in `supabase/schema.sql`) stores the GitHub logins the collector discovers. `watched_repos` gains nullable-or-defaulted columns (`origin`, `pinned`, `hidden`, `gone`, `is_fork`, `is_archived`, `last_activity_at`). Existing rows stay, and nothing in that migration drops `watched_repos`. Hide wins over pin. A repo marked gone is not shown, including when it is pinned. A failed or empty discovery does not delete or hide rows; it records `last_error` on the owner.
+
 ## Connection limits on serverless hosts
 
 With the `pg` driver, every running instance keeps its own pool of up to `MC_DB_POOL_MAX` connections. On serverless platforms such as Vercel or AWS Lambda, many instances run concurrently, so the database's connection limit can be exhausted quickly. To avoid that:

@@ -52,10 +52,13 @@ installer so the scheduled job picks it up). Alert thresholds live in
 
 ## Choosing which repos to watch
 
-Use **Settings** in the app header. Add a repo as `owner/name`, give it a label, a short name and a color, say which GitHub label marks blocked work (or leave it empty if the repo has none), and save. Reorder with the arrows. The progress board updates immediately, and the collector reads the same list on its next tick (within 15 minutes), so nothing needs redeploying or editing on the collector's machine.
+Use **Settings** in the app header. Add a GitHub owner (a user or organization, not `owner/name`). On the next collector tick, every repo that owner pushed inside the activity window (default 30 days, and the boundary day still counts) is tracked. You do not type those repos by hand. The repo list under that is the override layer: label, short name, color, blocked label, pin, and hide. Discovered rows are marked auto. Reorder hand-added rows with the arrows. The progress board updates immediately, and the collector reads the same list on its next tick (within 15 minutes), so nothing needs redeploying or editing on the collector's machine.
 
-- **Default list.** Until you save one, the board uses `progress.config.json` (or `NEXT_PUBLIC_MC_PROGRESS_CONFIG`). The first save stores your list in the database, and from then on the database wins.
-- **Removing a repo** stops it being shown and collected. Its history stays in the database, and adding it back restores it. You cannot remove the last repo.
+Hide wins over pin. A repo marked gone is not shown, including when it is pinned. A hidden repo is still collected. A quiet repo stays in the database and drops off the brief only after `activity_days`. Forks and archived repos are excluded unless that owner's flags say otherwise. A failed or empty `gh repo list` does not delete or hide what is already tracked; the owner row shows the error.
+
+- **Default list.** Until you save one, the board uses `progress.config.json` (or `NEXT_PUBLIC_MC_PROGRESS_CONFIG`). The first save stores your list in the database, and from then on the database wins. File-fallback objects are unchanged.
+- **Removing a hand-added repo** stops it being shown and collected. Its history stays in the database, and adding it back restores it. You cannot remove the last hand-added repo unless discovered repos are already stored. Removing an owner does not delete the repos already tracked for them.
+- **Pin** keeps a repo on the brief after it goes quiet. **Hide** leaves it collected and off the brief. Hide wins over pin.
 - **New repos need history.** The collector only records the present. Run `collect-progress.sh --backfill 90` once to fill in the past.
 - **Access.** The collector's `gh` login must be able to read each repo, including private ones.
 - **The collector trusts the dashboard.** Whenever it can reach the dashboard it uses the dashboard's list, whether that is one you saved or the default, so a reinstalled collector never sweeps stale example repos. **If the dashboard is unreachable,** it keeps using its local config file. Set `MC_REPOS_FROM_DASHBOARD=0` to make it ignore the dashboard list entirely.

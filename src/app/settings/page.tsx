@@ -1,4 +1,5 @@
 import { CredentialSettings } from "@/components/CredentialSettings";
+import { OwnerSettings } from "@/components/OwnerSettings";
 import { RepoSettings } from "@/components/RepoSettings";
 
 export const metadata = { title: "Settings · Agent Kontrol" };
@@ -12,8 +13,19 @@ export default function SettingsPage() {
       </div>
       <section className="space-y-3">
         <div>
+          <h2 className="text-base font-semibold">Watched owners</h2>
+          <p className="text-sm text-gray-400">
+            GitHub users and organizations to discover. Active repos are tracked on the next collector tick. Settings below is the override layer.
+          </p>
+        </div>
+        <OwnerSettings />
+      </section>
+      <section className="space-y-3">
+        <div>
           <h2 className="text-base font-semibold">Watched repos</h2>
-          <p className="text-sm text-gray-400">The repos on the progress board. Changes apply to the board now.</p>
+          <p className="text-sm text-gray-400">
+            Hand-added repos, plus pin and hide for repos discovered automatically. Hide wins over pin. A repo marked gone is not shown, including when it is pinned.
+          </p>
         </div>
         <RepoSettings />
         <p className="text-xs text-gray-500">Reading from GitHub is done by the collector, never by this page.</p>

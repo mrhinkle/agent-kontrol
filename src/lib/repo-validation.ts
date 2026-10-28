@@ -14,9 +14,15 @@ export interface RepoInput {
   color: string;
   /** the label this repo uses for blocked work, or null if it does not track any */
   blockedLabel: string | null;
+  /** Always show on the brief, including after the activity window. Hide wins. */
+  pinned?: boolean;
+  /** Collected, but omitted from the brief and the board. Wins over pin. */
+  hidden?: boolean;
+  /** manual rows are hand-added. auto rows are discovered and are not deleted by a save that omits them. */
+  origin?: "manual" | "auto";
 }
 
-export type RepoField = "repo" | "label" | "short" | "color" | "blockedLabel" | "repos";
+export type RepoField = "repo" | "label" | "short" | "color" | "blockedLabel" | "pinned" | "hidden" | "repos";
 
 export interface RepoError {
   /** row index, or -1 for an error about the whole list */
@@ -112,7 +118,21 @@ export function validateRepoList(input: unknown): RepoValidation {
       }
     }
 
-    repos.push({ repo, label, short, color: color.toLowerCase(), blockedLabel });
+    const flag = (value: unknown, field: "pinned" | "hidden"): boolean | undefined => {
+      if (value === undefined) return undefined;
+      if (typeof value !== "boolean") {
+        errors.push({ index, field, message: `${field} must be true or false.` });
+        return undefined;
+      }
+      return value;
+    };
+    const pinned = flag(e.pinned, "pinned");
+    const hidden = flag(e.hidden, "hidden");
+    const row: RepoInput = { repo, label, short, color: color.toLowerCase(), blockedLabel };
+    if (pinned !== undefined) row.pinned = pinned;
+    if (hidden !== undefined) row.hidden = hidden;
+    if (e.origin === "auto" || e.origin === "manual") row.origin = e.origin;
+    repos.push(row);
   });
 
   return errors.length > 0 ? { ok: false, errors } : { ok: true, repos };

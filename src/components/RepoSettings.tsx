@@ -6,12 +6,17 @@ import { MAX_REPOS, validateRepoList, type RepoError, type RepoInput } from "@/l
 import { fromRepos, groupErrors, isDirty, moveRow, newRow, toPayload, type Row } from "@/lib/repo-settings-helpers";
 import { PreviewDialog } from "@/components/PreviewDialog";
 
+interface ListedRepo extends RepoInput {
+  gone?: boolean;
+  shown?: boolean;
+}
+
 interface Loaded {
   source: "database" | "file";
   writable: boolean;
   max: number;
   version?: string;
-  repos: RepoInput[];
+  repos: ListedRepo[];
 }
 
 const input =
@@ -27,6 +32,7 @@ export function RepoSettings() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [initial, setInitial] = useState<RepoInput[]>([]);
   const [rows, setRows] = useState<Row[]>([]);
+  const [autoRepos, setAutoRepos] = useState<ListedRepo[]>([]);
   const [attempted, setAttempted] = useState(false);
   const [serverErrors, setServerErrors] = useState<RepoError[]>([]);
   const [saving, setSaving] = useState(false);
@@ -35,9 +41,11 @@ export function RepoSettings() {
   const [preview, setPreview] = useState<DryRunResult | null>(null);
 
   const apply = useCallback((data: Loaded) => {
+    const manual = data.repos.filter((repo) => repo.origin !== "auto");
     setLoaded(data);
-    setInitial(data.repos);
-    setRows(fromRepos(data.repos));
+    setAutoRepos(data.repos.filter((repo) => repo.origin === "auto"));
+    setInitial(manual);
+    setRows(fromRepos(manual));
     setAttempted(false);
     setServerErrors([]);
     setStale(false);
@@ -87,7 +95,10 @@ export function RepoSettings() {
     return () => document.removeEventListener("click", guard, true);
   }, [dirty]);
 
-  const clientCheck = useMemo(() => validateRepoList(toPayload(rows)), [rows]);
+  const clientCheck = useMemo(() => {
+    if (rows.length === 0 && autoRepos.length > 0) return { ok: true as const, errors: [] as RepoError[] };
+    return validateRepoList(toPayload(rows));
+  }, [rows, autoRepos.length]);
   const errors = attempted ? (clientCheck.ok ? serverErrors : clientCheck.errors) : serverErrors;
   const grouped = useMemo(() => groupErrors(errors), [errors]);
   const writable = loaded?.writable ?? false;
@@ -135,7 +146,9 @@ export function RepoSettings() {
   async function save() {
     setAttempted(true);
     setMessage(null);
-    if (!validateRepoList(toPayload(rows)).ok) {
+    const payload = toPayload(rows);
+    const allowEmpty = rows.length === 0 && autoRepos.length > 0;
+    if (!allowEmpty && !validateRepoList(payload).ok) {
       requestAnimationFrame(() => document.querySelector<HTMLElement>("[data-repo-settings] [aria-invalid='true']")?.focus());
       return;
     }
@@ -174,6 +187,28 @@ export function RepoSettings() {
     }
   }
 
+  async function setOverride(repo: string, patch: { pinned?: boolean; hidden?: boolean }) {
+    setSaving(true);
+    setMessage(null);
+    try {
+      const res = await fetch("/api/settings/repos", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repo, ...patch }),
+      });
+      const body = (await res.json().catch(() => ({}))) as SaveBody;
+      if (res.ok && body.dry_run !== true) {
+        apply(body as Loaded);
+        return;
+      }
+      explainSave(res, body);
+    } catch (e) {
+      setMessage({ kind: "error", text: (e as Error).message });
+    } finally {
+      setSaving(false);
+    }
+  }
+
   if (loadError) {
     return (
       <div className="rounded-xl border border-white/10 bg-[#101828] p-6">
@@ -195,6 +230,51 @@ export function RepoSettings() {
   return (
     <div className="space-y-4">
       <div className="rounded-lg border border-[#2563eb]/40 bg-[#2563eb]/10 px-3 py-2 text-sm text-blue-100">{banner}</div>
+
+      {autoRepos.length > 0 && (
+        <div className="rounded-xl border border-white/10 bg-[#101828] p-4 md:p-6">
+          <h3 className="text-sm font-medium text-gray-200">Discovered</h3>
+          <p className="mt-1 text-xs text-gray-500">
+            These stay collected. Pin keeps a quiet repo on the brief. Hide wins over pin. A repo marked gone is not shown, including when it is pinned.
+          </p>
+          <ul className="mt-3 space-y-2">
+            {autoRepos.map((repo) => {
+              const pinned = repo.pinned === true;
+              const hidden = repo.hidden === true;
+              return (
+                <li key={repo.repo} className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 px-3 py-2 text-sm">
+                  <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-gray-300">auto</span>
+                  <span className="mono text-gray-100">{repo.repo}</span>
+                  <span className="text-gray-400">{repo.label}</span>
+                  {repo.gone && <span className="text-xs text-amber-300">gone</span>}
+                  {repo.shown === false && !repo.gone && <span className="text-xs text-gray-500">off the brief</span>}
+                  <label className="ml-auto flex items-center gap-1 text-xs text-gray-300">
+                    <input
+                      type="checkbox"
+                      checked={pinned}
+                      disabled={disabled}
+                      aria-label={`Pin ${repo.repo}`}
+                      onChange={(ev) => void setOverride(repo.repo, { pinned: ev.target.checked })}
+                    />
+                    Pin
+                  </label>
+                  <label className="flex items-center gap-1 text-xs text-gray-300">
+                    <input
+                      type="checkbox"
+                      checked={hidden}
+                      disabled={disabled}
+                      aria-label={`Hide ${repo.repo}`}
+                      onChange={(ev) => void setOverride(repo.repo, { hidden: ev.target.checked })}
+                    />
+                    Hide
+                  </label>
+                  {pinned && hidden && <span className="text-xs text-amber-300">Hide wins, so this repo stays off the brief.</span>}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
 
       <div data-repo-settings className="rounded-xl border border-white/10 bg-[#101828] p-4 md:p-6">
         <div className={`hidden ${GRID} mb-2 text-[11px] uppercase tracking-wider text-gray-500`}>
@@ -283,7 +363,11 @@ export function RepoSettings() {
           })}
         </ul>
 
-        {rows.length === 0 && <p className="text-sm text-gray-400">No repos yet. Add one to start.</p>}
+        {rows.length === 0 && (
+          <p className="text-sm text-gray-400">
+            {autoRepos.length > 0 ? "No hand-added repos. Discovered repos stay tracked." : "No repos yet. Add one to start."}
+          </p>
+        )}
 
         {attempted && errors.length > 0 && (
           <p role="alert" className="mt-3 text-sm text-red-400">

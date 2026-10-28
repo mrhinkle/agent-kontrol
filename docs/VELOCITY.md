@@ -104,8 +104,11 @@ Existing tables carry most of it. Additions:
   upserted by `key` (`github:<owner/repo>#<n>` for label-sourced rows, `agent:<id>:<slug>` for
   MCP-filed ones). `status` is `open | decided | deferred | withdrawn`; `decision`,
   `decided_by`, `decided_at` record the answer; `defer_until` lets a row disappear and come back.
-- **`watched_owners`** (planned): the GitHub owners whose repos are auto-discovered, with a
-  per-owner activity window. `watched_repos` stays as the override layer.
+- **`watched_owners`** (shipped, `supabase/migrations/20261028_watched_owners.sql`): the GitHub
+  owners whose repos are auto-discovered, with a per-owner activity window. `watched_repos`
+  stays as the override layer (pin, hide, label, short, color). Hide wins over pin. A repo
+  marked gone is not shown, including when it is pinned. A failed or empty `gh repo list`
+  records `last_error` and does not delete or hide tracked repos.
 
 ## API and MCP surface (planned)
 
@@ -195,6 +198,9 @@ and a resolve path, so those come before any page.
    upsert from labels. Resolve ships with the table, as a CLI if the page is not ready.
 4. `/api/brief` + `get_morning_brief` reading the database; scheduler switches to the route.
 5. `/decisions` page; `request_decision` MCP tool.
-6. Owner-based repo discovery (`watched_owners`); Settings becomes the override layer.
+6. Owner-based repo discovery (`watched_owners`); Settings becomes the override layer. Shipped:
+   `GET`/`PUT /api/settings/owners`, `POST /api/settings/owners/discover`, `PATCH /api/settings/repos`,
+   and `discover_watched_owners` in `scripts/collect-progress.sh`. The morning brief drops a repo
+   only when `shown` is false. The collector still sweeps hidden and quiet repos and skips `gone`.
 7. Remaining threshold alerts (zero-merge repo, review SLA, 14-day decision), enabled after
    the owner's first backlog clear.

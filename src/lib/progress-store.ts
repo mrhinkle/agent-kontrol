@@ -2,7 +2,7 @@ import { sql } from "./db";
 import { REPOS, THRESHOLDS, windowDays, type TimeWindow } from "./progress-config";
 import type { SkillsDigest } from "./progress-types";
 import { stallMinutes } from "./skills/clock";
-import { getWatchedRepos } from "./watched-repos";
+import { getWatchedRepos, visibleOnBoard } from "./watched-repos";
 import type {
   Alert,
   FleetTotals,
@@ -354,7 +354,7 @@ export async function progress(window: TimeWindow): Promise<Omit<ProgressRespons
   const targetMs = anchor.getTime() - days * 86_400_000;
   const slackMs = Math.max(6 * 3_600_000, days * 86_400_000 * 0.2);
 
-  const watched = (await getWatchedRepos(REPOS)).repos;
+  const watched = (await getWatchedRepos(REPOS)).repos.filter(visibleOnBoard);
   const repos: RepoProgress[] = watched.map((cfg) => {
     const now = latest.get(cfg.repo);
     const then = baseline.get(cfg.repo);

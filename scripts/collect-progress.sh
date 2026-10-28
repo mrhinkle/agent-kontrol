@@ -507,6 +507,76 @@ run_backfill() {
   done
 }
 
+# ------------------------------------------------------------ owner discovery
+
+# Ask the dashboard which GitHub owners to discover, run `gh repo list` for
+# each, and post the raw lists. A failed, rate-limited, or empty list is
+# reported as ok:false so the dashboard records last_error and leaves
+# tracked repos alone. This never deletes a repo. Hide wins over pin is
+# applied when the dashboard is read, not here.
+discover_watched_owners() {
+  local body owners owner listing errfile count truncated results status resp
+  local err
+  if [[ "${MC_REPOS_FROM_DASHBOARD:-1}" == "0" ]]; then
+    log "owners: discovery skipped (dashboard list disabled)"; return 0
+  fi
+  if [[ -z "${MC_URL:-}" || -z "${MC_TOKEN:-}" ]]; then
+    log "owners: discovery skipped (no MC_URL or MC_TOKEN)"; return 0
+  fi
+  if ! body="$(curl -fsS --max-time 15 -H "Authorization: Bearer $MC_TOKEN" "${MC_URL%/}/api/settings/owners" 2>/dev/null)"; then
+    log "owners: dashboard unreachable, leaving tracked repos unchanged"; return 0
+  fi
+  owners="$(jq -r '.owners[]?.owner // empty' <<<"$body" 2>/dev/null || true)"
+  if [[ -z "$owners" ]]; then
+    log "owners: none configured"; return 0
+  fi
+  results="[]"
+  errfile="$(mktemp)"
+  resp="$(mktemp)"
+  while IFS= read -r owner; do
+    [[ -n "$owner" ]] || continue
+    if [[ ! "$owner" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]]; then
+      results="$(jq -c --arg owner "$owner" '. + [{owner:$owner, ok:false, error:"owner is not a safe GitHub login"}]' <<<"$results")" || true
+      continue
+    fi
+    : >"$errfile"
+    if listing="$(gh repo list "$owner" --limit 1000 --json name,pushedAt,isArchived,isFork 2>"$errfile")"; then
+      if ! printf '%s\n' "$listing" | jq -e 'type=="array"' >/dev/null 2>&1; then
+        err="$(tr '\n' ' ' <"$errfile" | head -c 400)"
+        results="$(jq -c --arg owner "$owner" --arg err "${err:-gh repo list returned JSON that was not an array}" '. + [{owner:$owner, ok:false, error:$err}]' <<<"$results")" || true
+        continue
+      fi
+      count="$(jq 'length' <<<"$listing" 2>/dev/null || echo 0)"
+      if [[ "${count:-0}" -eq 0 ]]; then
+        err="$(tr '\n' ' ' <"$errfile" | head -c 400)"
+        results="$(jq -c --arg owner "$owner" --arg err "${err:-gh repo list returned no repos}" '. + [{owner:$owner, ok:false, error:$err}]' <<<"$results")" || true
+        continue
+      fi
+      truncated=false
+      if [[ "$count" -ge 1000 ]]; then truncated=true; fi
+      results="$(jq -c --arg owner "$owner" --argjson repos "$listing" --argjson truncated "$truncated" '. + [{owner:$owner, ok:true, repos:$repos, truncated:$truncated}]' <<<"$results")" || true
+    else
+      err="$(tr '\n' ' ' <"$errfile" | head -c 400)"
+      results="$(jq -c --arg owner "$owner" --arg err "${err:-gh repo list failed}" '. + [{owner:$owner, ok:false, error:$err}]' <<<"$results")" || true
+    fi
+  done <<<"$owners"
+  rm -f "$errfile"
+  if ! status="$(curl -sS -o "$resp" -w '%{http_code}' --max-time 30 \
+      -H "Authorization: Bearer $MC_TOKEN" -H "Content-Type: application/json" \
+      -d "$(jq -c -n --argjson results "$results" '{results:$results}')" \
+      "${MC_URL%/}/api/settings/owners/discover")"; then
+    log "owners: discovery post failed; tracked repos unchanged"
+    rm -f "$resp"
+    return 0
+  fi
+  if [[ "$status" != "200" ]]; then
+    log "owners: discovery post returned $status; tracked repos unchanged"
+  else
+    log "owners: discovery posted ($(jq -r '.results | length' <"$resp" 2>/dev/null || echo '?') results)"
+  fi
+  rm -f "$resp"
+}
+
 # ------------------------------------------------------------ repo list from the dashboard
 
 # Ask the dashboard which repos to sweep, so adding one in Settings needs no edit on
@@ -527,8 +597,13 @@ refresh_repos_from_dashboard() {
   if ! body="$(curl -fsS --max-time 15 -H "Authorization: Bearer $MC_TOKEN" "${MC_URL%/}/api/settings/repos" 2>/dev/null)"; then
     log "repos: dashboard unreachable, using ${#REPOS[@]} from the local config"; return 0
   fi
-  lines="$(jq -r '.repos[]? | [.repo, .label, (.blockedLabel // ""), (.short // "")] | join("|")' <<<"$body" 2>/dev/null || true)"
+  lines="$(jq -r '.repos[]? | select(.gone != true) | [.repo, .label, (.blockedLabel // ""), (.short // "")] | join("|")' <<<"$body" 2>/dev/null || true)"
   if [[ -z "$lines" ]]; then
+    if jq -e '.repos | type == "array" and any(.[]; .gone == true)' >/dev/null 2>&1 <<<"$body"; then
+      REPOS=()
+      log "repos: dashboard list is only gone repos; not sweeping them"
+      return 0
+    fi
     log "repos: dashboard list was empty, using ${#REPOS[@]} from the local config"; return 0
   fi
   REPOS=()
@@ -540,6 +615,7 @@ refresh_repos_from_dashboard() {
 
 # ------------------------------------------------------------------- dispatch
 
+discover_watched_owners
 refresh_repos_from_dashboard
 
 if [[ "$MODE" == "backfill" ]]; then

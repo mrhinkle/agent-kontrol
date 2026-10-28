@@ -299,6 +299,33 @@ create table if not exists watched_repos (
   updated_at timestamptz default now()
 );
 
+-- Owner discovery (#66). watched_owners names the GitHub logins to list.
+-- watched_repos stays the override layer: origin manual|auto, pin, hide.
+-- Hide wins over pin. gone means the repo left the last successful gh list
+-- and is not shown, including when pinned. A failed or empty gh list must
+-- not delete or hide rows; it records last_error on the owner instead.
+create table if not exists watched_owners (
+  owner text primary key,
+  activity_days integer not null default 30,
+  include_forks boolean not null default false,
+  include_archived boolean not null default false,
+  last_error text,
+  last_error_at timestamptz,
+  last_discovered_at timestamptz,
+  actor_type text,                        -- human | agent; null for dev-open
+  actor_id text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+alter table watched_repos add column if not exists origin text not null default 'manual';
+alter table watched_repos add column if not exists pinned boolean not null default false;
+alter table watched_repos add column if not exists hidden boolean not null default false;
+alter table watched_repos add column if not exists gone boolean not null default false;
+alter table watched_repos add column if not exists is_fork boolean not null default false;
+alter table watched_repos add column if not exists is_archived boolean not null default false;
+alter table watched_repos add column if not exists last_activity_at timestamptz;
+
 -- Traces: OpenTelemetry-style spans from agents. A trace is the tree of spans that
 -- share a trace_id (a session, its turns, the tool and model calls inside them).
 -- Spans are upserted by (trace_id, span_id) so an open span can be closed later.
