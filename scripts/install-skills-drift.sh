@@ -67,7 +67,8 @@ if ! env_file_has MC_URL; then
     [[ -t 0 ]] || { echo "Set MC_URL (or run interactively)." >&2; exit 1; }
     read -r -p "Agent Kontrol URL (e.g. https://your-deploy.vercel.app): " MC_URL
   fi
-  case "${MC_URL}" in https://*|http://localhost*|http://127.0.0.1*) ;; *) echo "MC_URL must be https (http only for localhost)" >&2; exit 1 ;; esac
+  "$NODE_BIN" -e 'const u=new URL(process.argv[1]);const l=["localhost","127.0.0.1","[::1]"].includes(u.hostname);if(!(u.protocol==="https:"||(u.protocol==="http:"&&l)))process.exit(1)' "$MC_URL" 2>/dev/null \
+    || { echo "MC_URL must be an https URL (http only for localhost)" >&2; exit 1; }
   check_value MC_URL "$MC_URL"
   append_env MC_URL "${MC_URL%/}"
 fi
