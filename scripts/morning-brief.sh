@@ -386,11 +386,23 @@ jq -r '.repos[] | if .incomplete then [ "!! " + .label, "-", "-", "-", "-", "-",
 echo "  stale = open issue untouched ${STALE_ISSUE_DAYS}d+ · stuck = non-draft PR open ${STUCK_PR_HOURS}h+ or blocked/dirty · lead-med = median hours PR open→merge"
 echo
 
+# A fleet with no counted repo was not measured. "none" would read as a clean queue.
+# BEGIN stuck_heading
+stuck_heading() {
+  local n_incomplete="$1" n_counted="$2" n_stuck="$3"
+  if [[ "$n_incomplete" -gt 0 && "$n_counted" -eq 0 ]]; then
+    printf '%s\n' "STUCK PRs: DATA INCOMPLETE."
+  elif [[ "$n_stuck" -eq 0 ]]; then
+    printf '%s\n' "STUCK PRs: none."
+  else
+    printf '%s\n' "STUCK PRs (${n_stuck}) — oldest first"
+  fi
+}
+# END stuck_heading
 n_stuck="$(jq -r .totals.stuck_prs <<<"$brief")"
-if [[ "$n_stuck" -eq 0 ]]; then
-  echo "STUCK PRs: none."
-else
-  echo "STUCK PRs ($n_stuck) — oldest first"
+n_counted="$(jq -r .totals.repos_counted <<<"$brief")"
+stuck_heading "$n_incomplete" "$n_counted" "$n_stuck"
+if [[ "$n_incomplete" -eq 0 || "$n_counted" -gt 0 ]] && [[ "$n_stuck" -gt 0 ]]; then
   jq -r '.stuck_prs[] | "  \(.repo) #\(.number)  \(.age_days)d  \(.reason)\n      \(.title[0:78])  \(.url)"' <<<"$brief"
 fi
 echo

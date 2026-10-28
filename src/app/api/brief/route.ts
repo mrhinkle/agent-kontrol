@@ -21,7 +21,7 @@ export async function GET(req: Request) {
   if (!parsed.ok) return briefQueryError(parsed);
 
   try {
-    const headers = { "Cache-Control": "private, max-age=0, s-maxage=60" };
+    const headers = { "Cache-Control": "private, max-age=0, s-maxage=60", Vary: "Accept" };
     if (briefWantsJson(req.headers.get("accept"))) {
       return NextResponse.json(await loadBrief(parsed.window), { headers });
     }

@@ -7,6 +7,7 @@ import {
   applyTableDecisions,
   assembleBrief,
   briefWantsJson,
+  coordinatorFromDb,
   coordinatorStatus,
   formatBriefText,
   loadBrief,
@@ -1084,6 +1085,217 @@ describe("GET /api/brief", { concurrency: false }, () => {
     assert.equal(equalWildcard.status, 200);
     assert.equal(equalWildcard.headers.get("content-type"), "text/plain; charset=utf-8");
   });
+
+  it("sends Vary Accept on both brief representations", async () => {
+    const text = await GET(briefRequest());
+    assert.equal(text.status, 200);
+    assert.equal(text.headers.get("vary"), "Accept");
+    assert.match(text.headers.get("cache-control") ?? "", /s-maxage=60/);
+    assert.match(text.headers.get("content-type") ?? "", /text\/plain/);
+
+    const json = await GET(briefRequest("", { accept: "application/json" }));
+    assert.equal(json.status, 200);
+    assert.equal(json.headers.get("vary"), "Accept");
+    assert.match(json.headers.get("cache-control") ?? "", /s-maxage=60/);
+    assert.match(json.headers.get("content-type") ?? "", /application\/json/);
+  });
+
+  it("a burst of non-work events does not hide a work event inside the silence window", async () => {
+    const now = "2026-10-27T12:00:00Z";
+    const nowMs = Date.parse(now);
+    const at = (secondsAgo: number) => new Date(nowMs - secondsAgo * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+    const agentId = "hermes-carmack";
+    let events: Row[] = [];
+    env.DATABASE_URL = "postgres://brief:brief@127.0.0.1:9/brief_test";
+    setSqlForTests(async (strings, ...values) => {
+      const text = strings.join(" ");
+      if (text.includes("from agents")) {
+        return [{ id: agentId, last_seen_at: "2026-10-27T11:59:00Z" }];
+      }
+      if (text.includes("from events")) return applyEventQuery(strings, values, events);
+      throw new Error(`unexpected sql: ${text}`);
+    });
+    const settings = readBriefSettings({
+      brief: { coordinator: { agentId, maxSilenceHours: 3, workKinds: ["session_end", "milestone", "status"] } },
+    });
+
+    // 201 turn_start rows are newer than a milestone that is still inside 3h.
+    // An error sits in that same burst. The milestone has to win.
+    const noise = Array.from({ length: 201 }, (_, i) => ({
+      id: i + 1,
+      agent_id: agentId,
+      kind: "turn_start",
+      created_at: at(30 + i * 10),
+    }));
+    events = [
+      ...noise,
+      { id: 900, agent_id: agentId, kind: "error", created_at: at(20) },
+      { id: 901, agent_id: agentId, kind: "milestone", created_at: at(2 * 3600) },
+      { id: 902, agent_id: agentId, kind: "status_update", created_at: at(15) },
+    ];
+    const buried = await coordinatorFromDb(settings, now);
+    assert.equal(buried.verdict, "working: last work event 2h ago");
+    assert.equal(buried.last_work_kind, "milestone");
+    assert.equal(buried.recent_errors, 1);
+
+    // The newest work event is older than the window, and newer noise would
+    // fill a 200-row cap. The age still has to come from that work event.
+    events = [
+      ...noise,
+      { id: 903, agent_id: agentId, kind: "session_end", created_at: at(11 * 3600) },
+    ];
+    const stale = await coordinatorFromDb(settings, now);
+    assert.equal(stale.verdict, "NOT WORKING: last work event 11h ago (limit 3h)");
+    assert.equal(stale.last_work_kind, "session_end");
+
+    events = Array.from({ length: 201 }, (_, i) => ({
+      id: i + 1,
+      agent_id: agentId,
+      kind: "error",
+      created_at: at(10 + i),
+    }));
+    const manyErrors = await coordinatorFromDb(settings, now);
+    assert.equal(manyErrors.verdict, "FAILING: 201 error event(s) in the last 3h and no completed work");
+    assert.equal(manyErrors.recent_errors, 201);
+
+    const custom = readBriefSettings({
+      brief: { coordinator: { agentId, maxSilenceHours: 3, workKinds: ["custom_work", "heartbeat"] } },
+    });
+    events = [
+      ...noise.map((row) => ({ ...row, kind: "status_update" })),
+      { id: 904, agent_id: agentId, kind: "custom_work", created_at: at(2 * 3600) },
+    ];
+    const configured = await coordinatorFromDb(custom, now);
+    assert.equal(configured.verdict, "working: last work event 2h ago");
+    assert.equal(configured.last_work_kind, "custom_work");
+  });
+
+  it("collector merged_list is the 24h window and merged keeps 72h", () => {
+    execFileSync("bash", ["-n", "scripts/collect-progress.sh"]);
+    const program = quotedVar(fs.readFileSync("scripts/collect-progress.sh", "utf8"), "BRIEF_METRICS_JQ");
+    const now = "2026-10-27T12:00:00Z";
+    const out = jq(program, [
+      "--arg", "short", "app",
+      "--arg", "now", now,
+      "--arg", "stale_before", "2026-10-06T12:00:00Z",
+      "--argjson", "stuck_h", "48",
+      "--argjson", "issues", "[]",
+      "--argjson", "prs", "[]",
+      "--argjson", "merged", JSON.stringify([
+        {
+          number: 3,
+          title: "today",
+          url: "https://example.test/3",
+          createdAt: "2026-10-27T08:00:00Z",
+          mergedAt: "2026-10-27T10:00:00Z",
+          author: { login: "ada" },
+        },
+        {
+          number: 8,
+          title: "edge",
+          url: "https://example.test/8",
+          createdAt: "2026-10-26T08:00:00Z",
+          mergedAt: "2026-10-26T12:00:00Z",
+          author: { login: "ada" },
+        },
+        {
+          number: 9,
+          title: "weekend",
+          url: "https://example.test/9",
+          createdAt: "2026-10-25T11:59:59Z",
+          mergedAt: "2026-10-26T11:59:59Z",
+          author: { login: "ada" },
+        },
+      ]),
+    ]) as {
+      merged_list: { number: number; lead_hours: number }[];
+      merged: { number: number; merged_at: string }[];
+      median_lead_hours: number;
+    };
+    assert.deepEqual(out.merged_list.map((row) => row.number), [3, 8]);
+    assert.deepEqual(out.merged.map((row) => row.number), [3, 8, 9]);
+    assert.equal(out.merged_list.some((row) => row.number === 9), false);
+    assert.equal(out.median_lead_hours, 3);
+    assert.equal(out.merged.find((row) => row.number === 9)?.merged_at, "2026-10-26T11:59:59Z");
+  });
+
+  it("does not say STUCK PRs none when every repo is incomplete", () => {
+    const now = "2026-10-27T12:00:00Z";
+    const clock = { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] };
+    const blank = {
+      merged_prs: null,
+      median_lead_hours: null,
+      issues_opened: null,
+      issues_closed: null,
+      net_backlog: null,
+      open_issues: null,
+      open_prs: null,
+      drafts: null,
+      stale_issues: null,
+      stale_ratio: null,
+      blocked_issues: null,
+      stuck_prs: null,
+      decisions: null,
+      merged_list: null,
+    };
+    const brief = assembleBrief({
+      generatedAt: now,
+      windowHours: 24,
+      repoSource: "dashboard",
+      stuckPrHours: 48,
+      staleIssueDays: 21,
+      coordinator: { configured: false, agent_id: null },
+      repos: [
+        section({
+          repo: "acme/app",
+          short: "app",
+          label: "Acme",
+          incomplete: true,
+          errors: ["no snapshot"],
+          ...blank,
+          stuck_prs: [stuck("app", 99, 900)],
+        }),
+        section({
+          repo: "other/app",
+          short: "other",
+          label: "Other",
+          incomplete: true,
+          errors: ["counts not measured"],
+          ...blank,
+        }),
+      ],
+    });
+    assert.equal(brief.totals.repos_counted, 0);
+    assert.equal(brief.incomplete_repos.length, 2);
+    const text = formatBriefText(brief, clock);
+    assert.match(text, /DATA INCOMPLETE for 2 of 2 repos/);
+    assert.equal(text.includes("STUCK PRs: none."), false);
+    assert.match(text, /STUCK PRs: DATA INCOMPLETE\./);
+    assert.equal(text.includes("#99"), false);
+
+    const measured = formatBriefText(assembleBrief({
+      generatedAt: now,
+      windowHours: 24,
+      repoSource: "dashboard",
+      stuckPrHours: 48,
+      staleIssueDays: 21,
+      coordinator: { configured: false, agent_id: null },
+      repos: [section({ repo: "acme/app", short: "app", label: "Acme", stuck_prs: [] })],
+    }), clock);
+    assert.match(measured, /STUCK PRs: none\./);
+
+    const script = fs.readFileSync("scripts/morning-brief.sh", "utf8");
+    const start = script.indexOf("stuck_heading() {");
+    const end = script.indexOf("# END stuck_heading");
+    assert.ok(start >= 0 && end > start);
+    const fn = script.slice(start, end);
+    const heading = (args: string) => execFileSync("bash", ["-c", `${fn}\nstuck_heading ${args}`], { encoding: "utf8" });
+    assert.equal(heading("2 0 0"), "STUCK PRs: DATA INCOMPLETE.\n");
+    assert.equal(heading("1 1 0"), "STUCK PRs: none.\n");
+    assert.equal(heading("0 3 0"), "STUCK PRs: none.\n");
+    assert.match(heading("0 1 4"), /^STUCK PRs \(4\) /);
+    assert.match(script, /stuck_heading "\$n_incomplete" "\$n_counted" "\$n_stuck"/);
+  });
 });
 
 /** A repo_snapshots row. Nulls are unmeasured counts, not zeros. */
@@ -1135,4 +1347,66 @@ function installSnapshotSql(rows: Row[]): void {
     }
     return [...best.values()];
   });
+}
+
+/**
+ * Applies one coordinator event query to an in-memory table.
+ * Kind filters, the silence cutoff, and LIMIT are honored, so a newest-200
+ * read drops a work row that a kind-scoped read keeps.
+ */
+function applyEventQuery(strings: TemplateStringsArray, values: unknown[], events: Row[]): Row[] {
+  let text = "";
+  strings.forEach((part, i) => {
+    text += part;
+    if (i < values.length) text += `\u0000${i}\u0000`;
+  });
+  const branches = text.split(/\bunion\s+all\b|\bunion\b/i);
+  const rows: Row[] = [];
+  for (const branch of branches) {
+    if (!/from\s+events/i.test(branch)) continue;
+    rows.push(...evalEventBranch(branch, values, events));
+  }
+  return rows;
+}
+
+function evalEventBranch(branch: string, values: unknown[], events: Row[]): Row[] {
+  const idxs = [...branch.matchAll(/\u0000(\d+)\u0000/g)].map((match) => Number(match[1]));
+  const bound = idxs.map((index) => values[index]);
+  let rows = events.filter((row) => bound.length === 0 || row.agent_id === bound[0]);
+  const notIn = branch.match(/kind\s+not\s+in\s*\(([^)]*)\)/i);
+  if (notIn) {
+    const banned = [...notIn[1].matchAll(/'([^']+)'/g)].map((match) => match[1]);
+    rows = rows.filter((row) => !banned.includes(String(row.kind)));
+  } else {
+    const only = branch.match(/kind\s+in\s*\(([^)]*)\)/i);
+    if (only) {
+      const allowed = [...only[1].matchAll(/'([^']+)'/g)].map((match) => match[1]);
+      rows = rows.filter((row) => allowed.includes(String(row.kind)));
+    }
+  }
+  const exact = branch.match(/kind\s*=\s*'([^']+)'/i);
+  if (exact) rows = rows.filter((row) => String(row.kind) === exact[1]);
+  if (/kind\s*=\s*any\s*\(/i.test(branch)) {
+    const kinds = bound.find((value) => Array.isArray(value));
+    const allowed = Array.isArray(kinds) ? kinds.map(String) : [];
+    rows = rows.filter((row) => allowed.includes(String(row.kind)));
+  }
+  if (/created_at\s*>=/.test(branch)) {
+    const cutoff = bound.find((value) => typeof value === "string" && value.includes("T"));
+    if (typeof cutoff === "string") {
+      const min = Date.parse(cutoff);
+      rows = rows.filter((row) => Date.parse(String(row.created_at)) >= min);
+    }
+  }
+  if (/created_at\s*</.test(branch) && !/created_at\s*<=/.test(branch)) {
+    const cutoff = bound.find((value) => typeof value === "string" && value.includes("T"));
+    if (typeof cutoff === "string") {
+      const max = Date.parse(cutoff);
+      rows = rows.filter((row) => Date.parse(String(row.created_at)) < max);
+    }
+  }
+  rows = [...rows].sort((a, b) => Date.parse(String(b.created_at)) - Date.parse(String(a.created_at)));
+  const limit = branch.match(/limit\s+(\d+)/i);
+  if (limit) rows = rows.slice(0, Number(limit[1]));
+  return rows.map((row) => ({ id: row.id, kind: row.kind, created_at: row.created_at }));
 }

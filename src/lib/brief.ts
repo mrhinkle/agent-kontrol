@@ -594,7 +594,9 @@ export function formatBriefText(
   lines.push(`  stale = open issue untouched ${brief.thresholds.stale_issue_days}d+ \u00b7 stuck = non-draft PR open ${brief.thresholds.stuck_pr_hours}h+ or blocked/dirty \u00b7 lead-med = median hours PR open\u2192merge`);
   lines.push("");
   const stuckUnmeasured = brief.repos.some((repo) => !repo.incomplete && repo.stuck_prs == null);
-  if (stuckUnmeasured && brief.stuck_prs.length === 0) {
+  // No counted repo means stuck PRs were not measured. "none" would read as a clean queue.
+  const noneCounted = brief.totals.repos_counted === 0 && brief.incomplete_repos.length > 0;
+  if (noneCounted || (stuckUnmeasured && brief.stuck_prs.length === 0)) {
     lines.push("STUCK PRs: DATA INCOMPLETE.");
   } else if (!stuckUnmeasured && brief.totals.stuck_prs === 0) {
     lines.push("STUCK PRs: none.");
@@ -665,6 +667,21 @@ function toSnapshot(row: Row): RepoSnapshot {
   };
 }
 
+/** Same id from the work query and the newest-row query is one event, not two errors. */
+function uniqueEventRows(rows: Row[]): Row[] {
+  const seen = new Set<string>();
+  const out: Row[] = [];
+  for (let index = 0; index < rows.length; index++) {
+    const row = rows[index];
+    const id = row.id;
+    const key = id === null || id === undefined ? `missing:${index}` : `id:${String(id)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(row);
+  }
+  return out;
+}
+
 /**
  * Newest row per repo.
  *
@@ -694,26 +711,43 @@ async function snapshotsAt(repos: string[], beforeIso: string | null): Promise<M
   return new Map((rows as Row[]).map((row) => [String(row.repo), toSnapshot(row)]));
 }
 
-async function coordinatorFromDb(settings: BriefSettings, nowIso: string): Promise<BriefCoordinator> {
+export async function coordinatorFromDb(settings: BriefSettings, nowIso: string): Promise<BriefCoordinator> {
   const agentId = settings.coordinator.agentId;
   if (!agentId) return { configured: false, agent_id: null };
   try {
     const db = sql();
+    const silenceMs = settings.coordinator.maxSilenceHours * 3_600_000;
+    const cutoff = toSecondIso(new Date(Date.parse(nowIso) - silenceMs));
+    const workKinds = settings.coordinator.workKinds;
     const agents = await db`select id, last_seen_at from agents where id = ${agentId} limit 1`;
+    // Do not take the newest N non-heartbeat rows and classify that slice.
+    // A burst of turn_start or status_update would drop a milestone that is
+    // still inside the silence window, and the brief would say NOT WORKING
+    // or FAILING. Work is the newest configured kind, whatever sits after it.
+    // Every error inside the window is counted. The newest row of any kind
+    // only names last_any_kind.
     const events = await db`
-      (select kind, created_at from events
-        where agent_id = ${agentId} and kind not in ('heartbeat', 'telemetry')
-        order by created_at desc limit 200)
+      (select id, kind, created_at from events
+        where agent_id = ${agentId}
+          and kind = any(${workKinds}::text[])
+        order by created_at desc
+        limit 1)
       union all
-      (select kind, created_at from events
-        where agent_id = ${agentId} and kind in ('heartbeat', 'telemetry')
-        order by created_at desc limit 20)
+      (select id, kind, created_at from events
+        where agent_id = ${agentId}
+          and kind = 'error'
+          and created_at >= ${cutoff})
+      union all
+      (select id, kind, created_at from events
+        where agent_id = ${agentId}
+        order by created_at desc
+        limit 1)
     `;
     const agentRow = (agents as Row[])[0];
     return coordinatorStatus({
       agentId,
       maxSilenceHours: settings.coordinator.maxSilenceHours,
-      workKinds: settings.coordinator.workKinds,
+      workKinds,
       nowIso,
       reachable: true,
       agent: agentRow
@@ -722,7 +756,7 @@ async function coordinatorFromDb(settings: BriefSettings, nowIso: string): Promi
             last_seen_at: agentRow.last_seen_at ? new Date(String(agentRow.last_seen_at)).toISOString() : null,
           }
         : null,
-      events: (events as Row[]).map((row) => ({
+      events: uniqueEventRows(events as Row[]).map((row) => ({
         kind: String(row.kind ?? ""),
         created_at: new Date(String(row.created_at)).toISOString(),
       })),

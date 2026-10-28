@@ -42,7 +42,7 @@ depends on a file on an operator's laptop or on an agent remembering to report:
   own channel.
 - **Liveness is a work event, never a heartbeat.** A heartbeat proves the daemon that posts
   heartbeats is up. The brief calls a coordinator "working" only if a `session_end`,
-  `milestone` or `status` event arrived within `maxSilenceHours`. `turn_start` and `error`
+  `milestone` or `status` event arrived within `maxSilenceHours`. The read is that work event, not the newest 200 other events, so a burst of `turn_start` cannot hide it. `turn_start` and `error`
   do not count: a coordinator that starts turns and errors every hour is not working, it is
   failing, and the brief says *failing* for that case. Telemetry-only is reported as exactly
   that. Configuring `workKinds` as `heartbeat`, `telemetry`, `turn_start`, or `status_update`

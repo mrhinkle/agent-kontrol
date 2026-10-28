@@ -394,13 +394,16 @@ BRIEF_METRICS_JQ='
                     else "open " + ((.age_h/24|floor)|tostring) + "d with no blocker reported" end)})
       | sort_by(-.age_hours)) as $stuck
   | ([$merged[] | select(.createdAt != null and .mergedAt != null)]) as $merged_ok
+  # merged keeps the 72h sweep. merged_list and median_lead_hours are the 24h
+  # display fallback SnapshotDetail documents. A row at exactly 24h stays.
+  | ([$merged_ok[] | select(hours(.mergedAt; $now) >= 0 and hours(.mergedAt; $now) <= 24)]) as $merged_24h
   | {
       stuck_prs: $stuck,
-      median_lead_hours: ([$merged_ok[] | hours(.createdAt; .mergedAt)] | median),
+      median_lead_hours: ([$merged_24h[] | hours(.createdAt; .mergedAt)] | median),
       stale_issues: ($stale|length),
       stale_ratio: (if ($issues|length) > 0 then (($stale|length) / ($issues|length)) else null end),
       drafts: ([$prs[] | select(.isDraft)] | length),
-      merged_list: [$merged_ok[] | {number, title, url, author: .author.login, lead_hours: hours(.createdAt; .mergedAt)}],
+      merged_list: [$merged_24h[] | {number, title, url, author: .author.login, lead_hours: hours(.createdAt; .mergedAt)}],
       merged: [$merged_ok[] | {number, title, url, author: .author.login, created_at: .createdAt, merged_at: .mergedAt}],
       notes: ([
         (if ($issues|length) >= 200 then "open issues truncated at 200" else empty end),

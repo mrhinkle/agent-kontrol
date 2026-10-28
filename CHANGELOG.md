@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Morning brief liveness reads the newest configured work event and every error inside the silence window, so a burst of `turn_start` or `status_update` cannot hide a `milestone` that is still inside `maxSilenceHours` (#64). `GET /api/brief` sends `Vary: Accept`. The collector's `detail.merged_list` and `median_lead_hours` are the 24h window; `detail.merged` keeps the 72h rows. When every repo is incomplete the text says `STUCK PRs: DATA INCOMPLETE.`, not `none`.
 - A `github-label` decisions row from before `kind`, `labels`, `opened_at`, and `repo_short` existed is not authoritative for `GET /api/decisions?shape=brief`. The response lists that repo in `incomplete_repos`, and `scripts/morning-brief.sh` keeps the GitHub sweep for it (kind, labels, age from `createdAt`, configured short name). The collector's next upsert fills the null columns.
 - `agents/grok/README.md`: the MCP server key in the config example is now `agent-kontrol` (was `mission-control`).
 

@@ -55,7 +55,8 @@ export interface SnapshotDetail {
    * Morning-brief fields written by the collector. Absent on older ticks.
    * `stuck_prs[].repo` is the config short name, matching `scripts/morning-brief.sh`.
    * `merged` rows carry timestamps so a 72h brief can filter them. `merged_list`
-   * is the 24h display list when timestamps were not stored.
+   * is the 24h display list when timestamps were not stored. The collector
+   * writes only that 24h window into `merged_list` and `median_lead_hours`.
    */
   stuck_prs?: BriefSnapshotStuckPr[];
   median_lead_hours?: number | null;
