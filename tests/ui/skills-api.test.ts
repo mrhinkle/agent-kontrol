@@ -474,7 +474,7 @@ describe("skills contract files", () => {
     assert.match(docs, /first 7 hex characters/);
     assert.match(docs, /Any other `dir` is HTTP 400/);
     assert.match(docs, /same name on two hosts counts once/);
-    assert.match(docs, /Nothing in this change runs that cron/);
+    assert.match(docs, /Agent Kontrol does not run the skill. It queues a task/);
     assert.match(docs, /does not store prompts/);
     assert.match(docs, /DATABASE_URL not set; skill run not stored/);
     assert.match(docs, /events\.agent_id/);

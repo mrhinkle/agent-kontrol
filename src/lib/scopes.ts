@@ -86,6 +86,8 @@ const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   // file a drift report. The lookahead keeps those two paths off skills:read.
   { method: "GET", path: /^\/api\/skills$/, scope: "skills:read" },
   { method: "GET", path: /^\/api\/skills\/(?!sync$|drift$)[^/]+$/, scope: "skills:read" },
+  // Read-only: renders the pointer block, and POST only transforms the text sent.
+  { method: "POST", path: /^\/api\/skills\/pointers$/, scope: "skills:read" },
 ];
 
 export type Principal =

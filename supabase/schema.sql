@@ -115,6 +115,14 @@ alter table tasks add column if not exists actor_id text;
 create index if not exists tasks_queue_idx on tasks (status, platform, priority, created_at);
 create index if not exists tasks_updated_idx on tasks (updated_at desc);
 
+-- One open scheduler task per skill. The skill tick checks for an open task and
+-- then inserts; this index is what makes that atomic when two ticks race.
+create unique index if not exists tasks_skill_schedule_one_open_idx
+  on tasks (title)
+  where actor_id = 'skill-scheduler'
+    and title like 'Run scheduled skill %'
+    and status in ('queued', 'claimed', 'running', 'review');
+
 -- OAuth 2.1 authorization server (self-hosted, for MCP clients).
 -- Access tokens are stateless signed JWTs; only clients + auth codes are stored.
 create table if not exists oauth_clients (
