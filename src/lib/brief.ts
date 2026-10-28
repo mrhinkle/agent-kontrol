@@ -140,14 +140,14 @@ export function briefQueryError(parsed: Extract<BriefQuery, { ok: false }>): Res
 
 /**
  * Plain text is the default, including when the client sends `Accept: *\/*`
- * or no Accept header. JSON is returned only when `application/json` is
- * present and is not outranked by `text/plain`.
+ * or no Accept header. JSON is returned only when `application/json` has a
+ * quality strictly greater than `text/plain` (and `text/*`). A repeated media
+ * type uses its highest quality in 0..1. Equal quality stays text.
  */
 export function briefWantsJson(accept: string | null): boolean {
   if (!accept || !accept.trim()) return false;
-  let jsonQ = 0;
+  let jsonQ: number | null = null;
   let textQ: number | null = null;
-  let sawJson = false;
   for (const part of accept.split(",")) {
     const bits = part.split(";").map((bit) => bit.trim()).filter(Boolean);
     if (bits.length === 0) continue;
@@ -157,17 +157,16 @@ export function briefWantsJson(accept: string | null): boolean {
       const match = /^q\s*=\s*([0-9]*\.?[0-9]+)$/i.exec(bit);
       if (!match) continue;
       const n = Number(match[1]);
-      if (Number.isFinite(n)) q = n;
+      if (Number.isFinite(n) && n >= 0 && n <= 1) q = n;
     }
     if (type === "application/json") {
-      sawJson = true;
-      jsonQ = q;
-    } else if ((type === "text/plain" || type === "text/*") && (textQ === null || q > textQ)) {
-      textQ = q;
+      jsonQ = jsonQ === null ? q : Math.max(jsonQ, q);
+    } else if (type === "text/plain" || type === "text/*") {
+      textQ = textQ === null ? q : Math.max(textQ, q);
     }
   }
-  if (!sawJson || jsonQ <= 0) return false;
-  if (textQ !== null && textQ > jsonQ) return false;
+  if (jsonQ === null || jsonQ <= 0) return false;
+  if (textQ !== null && textQ >= jsonQ) return false;
   return true;
 }
 
@@ -385,7 +384,11 @@ function incompleteSection(cfg: Pick<RepoConfig, "repo" | "label" | "short">, er
   };
 }
 
-/** One watched repo from its latest snapshot. No snapshot is incomplete, not a zero. */
+/**
+ * One watched repo from its latest snapshot. No row is incomplete, not a zero.
+ * A row whose measured counts are null is also incomplete: `open_issues`,
+ * `open_prs`, and the window's merge and issue counts all have to be present.
+ */
 export function repoSection(args: {
   cfg: Pick<RepoConfig, "repo" | "label" | "short" | "blockedLabel">;
   snap: RepoSnapshot | null;
@@ -394,7 +397,7 @@ export function repoSection(args: {
   nowIso: string;
 }): BriefRepo {
   const { cfg, snap } = args;
-  if (!snap || snap.open_issues === null) return incompleteSection(cfg, ["no snapshot"]);
+  if (!snap) return incompleteSection(cfg, ["no snapshot"]);
   const detail = snap.detail;
   let merged = args.windowHours === 24 ? snap.merged_prs_24h : delta(snap.total_prs_merged, args.baseline?.total_prs_merged ?? null);
   let opened = args.windowHours === 24 ? snap.issues_opened_24h : delta(snap.total_issues_created, args.baseline?.total_issues_created ?? null);
@@ -404,7 +407,15 @@ export function repoSection(args: {
     opened = opened ?? snap.issues_opened_24h;
     closed = closed ?? snap.issues_closed_24h;
   }
-  if (merged === null || opened === null || closed === null) return incompleteSection(cfg, ["counts not measured"]);
+  if (
+    snap.open_issues === null ||
+    snap.open_prs === null ||
+    merged === null ||
+    opened === null ||
+    closed === null
+  ) {
+    return incompleteSection(cfg, ["counts not measured"]);
+  }
   const mergedRows = mergedFromDetail(detail, args.windowHours, args.nowIso);
   const staleIssues = num(detail?.stale_issues);
   const staleRatio = num(detail?.stale_ratio) ?? (
@@ -641,6 +652,14 @@ function toSnapshot(row: Row): RepoSnapshot {
   };
 }
 
+/**
+ * Newest row per repo.
+ *
+ * The latest read does not drop a row whose counts are null. A newer partial
+ * ingest has to win, so the brief can mark that repo DATA INCOMPLETE instead
+ * of reprinting an older complete snapshot as current. `beforeIso` is only the
+ * 72h baseline cutoff, chosen separately from the latest row.
+ */
 async function snapshotsAt(repos: string[], beforeIso: string | null): Promise<Map<string, RepoSnapshot>> {
   if (repos.length === 0) return new Map();
   const db = sql();
@@ -656,7 +675,6 @@ async function snapshotsAt(repos: string[], beforeIso: string | null): Promise<M
         select distinct on (repo) *
         from repo_snapshots
         where repo = any(${repos}::text[])
-          and open_issues is not null
         order by repo, collected_at desc
       `;
   return new Map((rows as Row[]).map((row) => [String(row.repo), toSnapshot(row)]));

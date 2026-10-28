@@ -9,6 +9,7 @@ import {
   briefWantsJson,
   coordinatorStatus,
   formatBriefText,
+  loadBrief,
   parseBriefQuery,
   repoSection,
   type BriefRepo,
@@ -17,6 +18,7 @@ import {
 } from "../../src/lib/brief";
 import type { BriefDecision } from "../../src/lib/decisions";
 import { createCredential, resetCredentialsForTests } from "../../src/lib/credentials";
+import { setSqlForTests, type Row } from "../../src/lib/db";
 import type { RepoSnapshot } from "../../src/lib/progress-types";
 import { scopeForRoute, TOOL_SCOPES } from "../../src/lib/scopes";
 
@@ -56,6 +58,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setSqlForTests(null);
   resetCredentialsForTests();
   restoreEnv();
 });
@@ -736,4 +739,245 @@ describe("GET /api/brief", { concurrency: false }, () => {
     assert.equal(out.median_lead_hours, 2);
     assert.equal(out.merged[0].merged_at, "2026-10-27T10:00:00Z");
   });
+
+  it("keeps a newer partial snapshot instead of an older complete row", async () => {
+    const now = new Date("2026-10-27T15:00:00Z");
+    const repo = "example-org/app-server";
+    const older = snapshotRow({
+      repo,
+      label: "App Server",
+      collected_at: "2026-10-26T12:00:00.000Z",
+      open_issues: 9,
+      open_prs: 3,
+      merged_prs_24h: 4,
+      issues_opened_24h: 2,
+      issues_closed_24h: 1,
+      total_issues_created: 20,
+      total_issues_closed: 11,
+      total_prs_merged: 7,
+    });
+    const newer = snapshotRow({
+      repo,
+      label: "App Server",
+      collected_at: "2026-10-27T14:00:00.000Z",
+      open_issues: null,
+      open_prs: null,
+      blocked_issues: null,
+      merged_prs_24h: null,
+      issues_opened_24h: null,
+      issues_closed_24h: null,
+      total_issues_created: null,
+      total_issues_closed: null,
+      total_prs_merged: null,
+    });
+    installSnapshotSql([older, newer]);
+
+    for (const window of ["24h", "72h"] as const) {
+      const brief = await loadBrief(window, now);
+      const section = brief.repos.find((row) => row.repo === repo);
+      assert.equal(brief.generated_at, "2026-10-27T15:00:00Z", window);
+      assert.equal(section?.incomplete, true, window);
+      assert.deepEqual(section?.errors, ["counts not measured"], window);
+      assert.equal(section?.open_issues, null, window);
+      assert.equal(section?.open_prs, null, window);
+      assert.equal(section?.merged_prs, null, window);
+      assert.equal(brief.totals.repos_counted, 0, window);
+      assert.equal(brief.totals.merged_prs, 0, window);
+      assert.equal(brief.incomplete_repos.some((row) => row.repo === repo), true, window);
+      const text = formatBriefText(brief, {
+        clock: "Tue 2026-10-27 11:00 EDT",
+        decisionLabels: ["needs-owner"],
+      });
+      assert.match(text, /DATA INCOMPLETE/);
+      assert.match(text, new RegExp(`${repo}: counts not measured`));
+      assert.equal(text.includes("undefined"), false);
+    }
+  });
+
+  it("keeps the 72h baseline on the newest row at the cutoff when that row has null open_issues", async () => {
+    const now = new Date("2026-10-27T15:00:00Z");
+    const repo = "example-org/web-studio";
+    const cutoff = "2026-10-24T15:00:00.000Z";
+    installSnapshotSql([
+      snapshotRow({
+        repo,
+        label: "Web Studio",
+        collected_at: "2026-10-23T15:00:00.000Z",
+        open_issues: 1,
+        open_prs: 1,
+        total_issues_created: 0,
+        total_issues_closed: 0,
+        total_prs_merged: 1,
+      }),
+      snapshotRow({
+        repo,
+        label: "Web Studio",
+        collected_at: cutoff,
+        open_issues: null,
+        open_prs: null,
+        merged_prs_24h: null,
+        issues_opened_24h: null,
+        issues_closed_24h: null,
+        total_issues_created: 10,
+        total_issues_closed: 6,
+        total_prs_merged: 4,
+      }),
+      snapshotRow({
+        repo,
+        label: "Web Studio",
+        collected_at: "2026-10-27T15:00:00.000Z",
+        open_issues: 5,
+        open_prs: 2,
+        merged_prs_24h: 1,
+        issues_opened_24h: 1,
+        issues_closed_24h: 1,
+        total_issues_created: 12,
+        total_issues_closed: 8,
+        total_prs_merged: 10,
+      }),
+    ]);
+
+    const brief = await loadBrief("72h", now);
+    const section = brief.repos.find((row) => row.repo === repo);
+    assert.equal(section?.incomplete, false);
+    assert.equal(section?.merged_prs, 6);
+    assert.equal(section?.issues_opened, 2);
+    assert.equal(section?.issues_closed, 2);
+    assert.equal(brief.totals.repos_counted, 1);
+  });
+
+  it("marks a snapshot incomplete when open_prs was not measured", () => {
+    const now = "2026-10-27T12:00:00Z";
+    const cfg = { repo: "acme/app", label: "Acme", short: "app", blockedLabel: "blocked" };
+    const snap: RepoSnapshot = {
+      repo: "acme/app",
+      label: "Acme",
+      collected_at: now,
+      kind: "tick",
+      open_issues: 5,
+      open_prs: null,
+      blocked_issues: 1,
+      merged_prs_24h: 2,
+      issues_closed_24h: 3,
+      issues_opened_24h: 4,
+      total_issues_created: 12,
+      total_issues_closed: 8,
+      total_prs_merged: 6,
+      review_rounds: null,
+      no_verdict_rate: null,
+      detail: null,
+    };
+    const baseline: RepoSnapshot = {
+      ...snap,
+      open_issues: 1,
+      open_prs: 1,
+      total_issues_created: 1,
+      total_issues_closed: 1,
+      total_prs_merged: 1,
+    };
+    const day = repoSection({ cfg, snap, baseline: null, windowHours: 24, nowIso: now });
+    assert.equal(day.incomplete, true);
+    assert.deepEqual(day.errors, ["counts not measured"]);
+    assert.equal(day.open_prs, null);
+    assert.equal(day.open_issues, null);
+    assert.equal(day.merged_prs, null);
+
+    const weekend = repoSection({ cfg, snap, baseline, windowHours: 72, nowIso: now });
+    assert.equal(weekend.incomplete, true);
+    assert.deepEqual(weekend.errors, ["counts not measured"]);
+
+    const brief = assembleBrief({
+      generatedAt: now,
+      windowHours: 24,
+      repoSource: "dashboard",
+      stuckPrHours: 48,
+      staleIssueDays: 21,
+      coordinator: { configured: false, agent_id: null },
+      repos: [day],
+    });
+    assert.equal(brief.totals.repos_counted, 0);
+    assert.equal(brief.totals.merged_prs, 0);
+    assert.equal(brief.totals.issues_opened, 0);
+    assert.deepEqual(brief.incomplete_repos, [{ repo: "acme/app", errors: ["counts not measured"] }]);
+    const text = formatBriefText(brief, { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] });
+    assert.match(text, /DATA INCOMPLETE for 1 of 1 repos/);
+    assert.match(text, /acme\/app: counts not measured/);
+    assert.match(text, /!! Acme/);
+    assert.equal(text.includes("undefined"), false);
+  });
+
+  it("stays on text when JSON and text/plain tie, and uses the highest quality of a repeated type", async () => {
+    assert.equal(briefWantsJson("text/plain;q=0.5, application/json;q=0.5"), false);
+    assert.equal(briefWantsJson("application/json;q=0.5, text/plain;q=0.5"), false);
+    assert.equal(briefWantsJson("application/json;q=0.9, application/json;q=0.2, text/plain;q=0.5"), true);
+    assert.equal(briefWantsJson("application/json;q=0.2, application/json;q=0.9, text/plain;q=0.5"), true);
+    assert.equal(briefWantsJson("text/plain;q=0.2, text/plain;q=0.8, application/json;q=0.5"), false);
+    assert.equal(briefWantsJson("application/json;q=0.6, text/plain;q=0.5"), true);
+    assert.equal(briefWantsJson("application/json;q=2, text/plain"), false);
+
+    const equal = await GET(briefRequest("", { accept: "text/plain;q=0.5, application/json;q=0.5" }));
+    assert.equal(equal.status, 200);
+    assert.equal(equal.headers.get("content-type"), "text/plain; charset=utf-8");
+    assert.match(await bodyText(equal), /^MORNING BRIEF /);
+
+    const repeated = await GET(briefRequest("", {
+      accept: "application/json;q=0.9, application/json;q=0.2, text/plain;q=0.5",
+    }));
+    assert.equal(repeated.status, 200);
+    assert.match(repeated.headers.get("content-type") ?? "", /application\/json/);
+    const body = await repeated.json();
+    assert.equal(body.window_hours, 24);
+    assert.equal(body.demo, undefined);
+  });
 });
+
+/** A repo_snapshots row. Nulls are unmeasured counts, not zeros. */
+function snapshotRow(over: Partial<Row> & Pick<Row, "repo" | "collected_at">): Row {
+  return {
+    label: null,
+    kind: "tick",
+    open_issues: 0,
+    open_prs: 0,
+    blocked_issues: 0,
+    merged_prs_24h: 0,
+    issues_closed_24h: 0,
+    issues_opened_24h: 0,
+    total_issues_created: 0,
+    total_issues_closed: 0,
+    total_prs_merged: 0,
+    review_rounds: null,
+    no_verdict_rate: null,
+    detail: null,
+    ...over,
+  };
+}
+
+/**
+ * Applies the brief's snapshot SQL to an in-memory table, including the
+ * `open_issues is not null` predicate when the query still has it.
+ */
+function installSnapshotSql(rows: Row[]): void {
+  env.DATABASE_URL = "postgres://brief:brief@127.0.0.1:9/brief_test";
+  setSqlForTests(async (strings, ...values) => {
+    const text = strings.join(" ");
+    if (text.includes("from watched_repos")) return [];
+    if (text.includes("from decisions")) return [];
+    if (!text.includes("from repo_snapshots")) throw new Error(`unexpected sql: ${text}`);
+    const repos = new Set((values[0] as string[]) ?? []);
+    let pool = rows.filter((row) => repos.has(String(row.repo)));
+    if (/open_issues\s+is\s+not\s+null/i.test(text)) {
+      pool = pool.filter((row) => row.open_issues !== null && row.open_issues !== undefined);
+    }
+    if (text.includes("collected_at <=")) {
+      const before = String(values[1]);
+      pool = pool.filter((row) => String(row.collected_at) <= before);
+    }
+    const best = new Map<string, Row>();
+    for (const row of pool) {
+      const key = String(row.repo);
+      const prev = best.get(key);
+      if (!prev || String(row.collected_at) > String(prev.collected_at)) best.set(key, row);
+    }
+    return [...best.values()];
+  });
+}
