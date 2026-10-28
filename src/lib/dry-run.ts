@@ -28,15 +28,15 @@ export interface DryRunResult {
   changes: DryRunChange[];
   affected: Record<string, unknown>[];
   /**
-   * Send this back as `expected_revision` to confirm. It is the row's
-   * `updated_at`, or a `rev:` hash when that column is missing. Omitted on
-   * previews that have no row revision (a refused demo preview).
+   * Send this back as `expected_revision` to confirm. It is `md5` of the row,
+   * or the literal `absent` when a memory key has no row. Omitted on previews
+   * that have no row revision (a refused demo preview).
    */
   expected_revision?: string;
   note?: string;
 }
 
-/** Confirm tokens are short. An ISO timestamp or a `rev:` hash fits; a dump does not. */
+/** Confirm tokens are short. A row hash or `absent` fits; a dump does not. */
 export const EXPECTED_REVISION_MAX = 200;
 
 /**

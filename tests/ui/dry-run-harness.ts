@@ -3,16 +3,17 @@
  * query spy so a dry run can be proved not to write, without a database.
  *
  * Unconditional inserts and updates return a row and leave the fixture
- * alone, matching the older tests. A conditional write (updated_at equals
- * the expected token, a hash predicate, or insert-if-absent) mutates the
- * fixture only when the predicate matches, and counts that apply.
+ * alone, matching the older tests. A conditional write (`md5(alias::text)`
+ * or insert-if-absent) mutates the fixture only when the predicate matches,
+ * and counts that apply. `md5(alias::text)` is the stable JSON of the stored
+ * row, which keeps a microsecond timestamp the driver would otherwise truncate.
  */
 process.env.DATABASE_URL = "postgres://test:test@127.0.0.1:5432/ak_dry_run";
 process.env.MC_DB_DRIVER = "pg";
 process.env.MC_TOKEN = "dry-run-test-token";
 process.env.MC_DASHBOARD_PASSWORD = "dry-run-dashboard";
 
-import { memoryDigest, taskDigest, updatedAtToken } from "../../src/lib/revision";
+import { stableRowRevision } from "../../src/lib/revision";
 
 export const queries: string[] = [];
 export const writes: string[] = [];
@@ -27,10 +28,33 @@ const state = {
 
 let rejectWrites = false;
 let appliedCount = 0;
+let afterMemorySelect: (() => void) | null = null;
+let insertRaceNeed = 0;
+let insertRaceWaiters: Array<() => void> = [];
 
 /** Tests set this after resetSpy. Assigning the imported binding is illegal. */
 export function setRejectWrites(value: boolean) {
   rejectWrites = value;
+}
+
+/**
+ * Run once, after the next memory SELECT has copied its rows and before
+ * that result is returned. A second read in the same preview then sees
+ * the mutated row. One combined read does not.
+ */
+export function divergeAfterNextMemorySelect(fn: () => void) {
+  afterMemorySelect = fn;
+}
+
+/**
+ * The next two `INSERT ... WHERE NOT EXISTS` statements both observe the
+ * key as absent. The loser then hits the unique constraint, which is what
+ * PostgreSQL does under READ COMMITTED. `ON CONFLICT DO NOTHING` does not
+ * use this path.
+ */
+export function armReadCommittedInsertRace() {
+  insertRaceNeed = 2;
+  insertRaceWaiters = [];
 }
 
 /** Conditional applies since the last resetSpy. A miss does not count. */
@@ -43,6 +67,9 @@ export function resetSpy() {
   writes.length = 0;
   rejectWrites = false;
   appliedCount = 0;
+  afterMemorySelect = null;
+  insertRaceNeed = 0;
+  insertRaceWaiters = [];
 }
 
 export function setFixture(next: { repos?: Row[]; tasks?: Row[]; memory?: Row[] }) {
@@ -66,14 +93,19 @@ function placeholder(text: string, pattern: RegExp): number | null {
   return Number.isInteger(index) && index >= 0 ? index : null;
 }
 
-function sameInstant(stored: unknown, expected: unknown): boolean {
-  const left = updatedAtToken(stored);
-  const right = updatedAtToken(expected);
-  if (!left || !right) return false;
-  const leftMs = Date.parse(left);
-  const rightMs = Date.parse(right);
-  if (Number.isFinite(leftMs) && Number.isFinite(rightMs)) return leftMs === rightMs;
-  return left === right;
+function hasMicroseconds(value: unknown): boolean {
+  return typeof value === "string" && /\.\d{4,}/.test(value);
+}
+
+/** node-pg returns `timestamptz` as a Date, which keeps only milliseconds. */
+function driverView(row: Row): Row {
+  if (!Object.values(row).some((value) => hasMicroseconds(value))) return row;
+  const copy: Row = { ...row };
+  if (Array.isArray(row.tags)) copy.tags = [...row.tags];
+  for (const key of Object.keys(copy)) {
+    if (hasMicroseconds(copy[key])) copy[key] = new Date(String(copy[key]));
+  }
+  return copy;
 }
 
 function applyTaskSet(task: Row, params: unknown[]) {
@@ -95,6 +127,9 @@ function applyTaskSet(task: Row, params: unknown[]) {
 function returningRows(text: string, params: unknown[]): Row[] {
   if (/\bupdate\s+tasks\b/i.test(text)) return applyTaskWrite(text, params);
   if (/\bupdate\s+memory\b/i.test(text)) return applyMemoryWrite(text, params);
+  if (/\binsert\s+into\s+memory\b/i.test(text) && /on conflict\s*\(\s*key\s*\)\s*do nothing/i.test(text)) {
+    return applyMemoryInsertIfAbsent(params);
+  }
   if (/\binsert\s+into\s+memory\b/i.test(text) && /where\s+not\s+exists/i.test(text)) {
     return applyMemoryInsertIfAbsent(params);
   }
@@ -118,37 +153,31 @@ function returningRows(text: string, params: unknown[]): Row[] {
   return [];
 }
 
+function revisionIndex(text: string): number | null {
+  return placeholder(text, /md5\(\s*(?:m|t)::text\s*\)\s*=\s*\$(\d+)/i);
+}
+
 function applyTaskWrite(text: string, params: unknown[]): Row[] {
-  const idIndex = placeholder(text, /where\s+id\s*=\s*\$(\d+)/i);
+  const idIndex = placeholder(text, /where\s+(?:\w+\.)?id\s*=\s*\$(\d+)/i);
   const id = idIndex == null ? params[params.length - 1] : params[idIndex];
   const task = state.tasks.find((row) => row.id === id || row.id === Number(id));
   if (!task) return [];
-  const tsIndex = placeholder(text, /updated_at\s*=\s*\$(\d+)::timestamptz/i);
-  const hashIndex = placeholder(text, /=\s*\$(\d+)\s*\/\*\s*hash-revision\s*\*\//);
-  if (tsIndex == null && hashIndex == null) return [{ ...task }];
-  if (tsIndex != null) {
-    if (!sameInstant(task.updated_at, params[tsIndex])) return [];
-  } else if (task.updated_at != null || taskDigest(task) !== params[hashIndex ?? -1]) {
-    return [];
-  }
+  const revIndex = revisionIndex(text);
+  if (revIndex == null) return [{ ...task }];
+  if (stableRowRevision(task) !== params[revIndex]) return [];
   applyTaskSet(task, params);
   appliedCount += 1;
   return [{ ...task }];
 }
 
 function applyMemoryWrite(text: string, params: unknown[]): Row[] {
-  const keyIndex = placeholder(text, /where\s+key\s*=\s*\$(\d+)/i);
+  const keyIndex = placeholder(text, /where\s+(?:\w+\.)?key\s*=\s*\$(\d+)/i);
   if (keyIndex == null) return [];
   const note = state.memory.find((row) => row.key === params[keyIndex]);
   if (!note) return [];
-  const tsIndex = placeholder(text, /updated_at\s*=\s*\$(\d+)::timestamptz/i);
-  const hashIndex = placeholder(text, /=\s*\$(\d+)\s*\/\*\s*hash-revision\s*\*\//);
-  if (tsIndex == null && hashIndex == null) return [{ ...note }];
-  if (tsIndex != null) {
-    if (!sameInstant(note.updated_at, params[tsIndex])) return [];
-  } else if (note.updated_at != null || memoryDigest(note) !== params[hashIndex ?? -1]) {
-    return [];
-  }
+  const revIndex = revisionIndex(text);
+  if (revIndex == null) return [{ ...note }];
+  if (stableRowRevision(note) !== params[revIndex]) return [];
   note.content = params[0];
   note.tags = Array.isArray(params[1]) ? [...params[1]] : [];
   note.agent_id = params[2] ?? null;
@@ -159,9 +188,18 @@ function applyMemoryWrite(text: string, params: unknown[]): Row[] {
   return [{ ...note, tags: Array.isArray(note.tags) ? [...(note.tags as unknown[])] : [] }];
 }
 
-function applyMemoryInsertIfAbsent(params: unknown[]): Row[] {
+function duplicateKey(): Error {
+  const err = new Error('duplicate key value violates unique constraint "memory_key_key"');
+  (err as Error & { code: string }).code = "23505";
+  return err;
+}
+
+function applyMemoryInsertIfAbsent(params: unknown[], raced = false): Row[] {
   const key = params[0];
-  if (state.memory.some((row) => row.key === key)) return [];
+  if (state.memory.some((row) => row.key === key)) {
+    if (raced) throw duplicateKey();
+    return [];
+  }
   const row: Row = {
     id: 100 + state.memory.length,
     key: typeof key === "string" ? key : null,
@@ -178,11 +216,39 @@ function applyMemoryInsertIfAbsent(params: unknown[]): Row[] {
   return [{ ...row, tags: [...(row.tags as unknown[])] }];
 }
 
-function withRowRevision(kind: "task" | "memory", rows: Row[]): Row[] {
-  return rows.map((row) => ({
-    ...row,
-    row_revision: updatedAtToken(row.updated_at) ?? `rev:${kind === "task" ? taskDigest(row) : memoryDigest(row)}`,
-  }));
+function isAbsentInsert(text: string): boolean {
+  return /\binsert\s+into\s+memory\b/i.test(text) && /where\s+not\s+exists/i.test(text);
+}
+
+function waitForInsertRace(): Promise<void> {
+  return new Promise((resolve) => {
+    insertRaceWaiters.push(resolve);
+    if (insertRaceWaiters.length >= insertRaceNeed) {
+      const pending = insertRaceWaiters.splice(0);
+      insertRaceNeed = 0;
+      for (const resume of pending) resume();
+    }
+  });
+}
+
+function projectRow(text: string, alias: "m" | "t", row: Row): Row {
+  if (!new RegExp(`md5\\(\\s*${alias}::text\\s*\\)`, "i").test(text)) return driverView(row);
+  const revision = stableRowRevision(row);
+  if (!new RegExp(`${alias}\\.\\*`).test(text)) return { revision };
+  const viewed = driverView(row);
+  return viewed === row ? { ...viewed, revision } : { ...viewed, revision };
+}
+
+function finishMemoryRead(text: string, params: unknown[]): Row[] {
+  const key = params[0];
+  const matched = key === undefined ? state.memory : state.memory.filter((row) => row.key === key);
+  const rows = matched.map((row) => projectRow(text, "m", row));
+  if (afterMemorySelect) {
+    const fn = afterMemorySelect;
+    afterMemorySelect = null;
+    fn();
+  }
+  return rows;
 }
 
 (
@@ -196,29 +262,21 @@ function withRowRevision(kind: "task" | "memory", rows: Row[]): Row[] {
     if (isWrite(text)) {
       writes.push(text);
       if (rejectWrites) throw new Error(`dry run attempted a write: ${text}`);
+      if (insertRaceNeed > 0 && isAbsentInsert(text)) {
+        await waitForInsertRace();
+        return { rows: applyMemoryInsertIfAbsent(params, true) };
+      }
       return { rows: returningRows(text, params) };
-    }
-    if (text.includes("row_revision") && text.includes("from tasks")) {
-      const id = params[0];
-      const rows = state.tasks.filter((row) => row.id === id || row.id === Number(id));
-      return { rows: withRowRevision("task", rows) };
-    }
-    if (text.includes("row_revision") && text.includes("from memory")) {
-      const key = params[0];
-      const rows = state.memory.filter((row) => row.key === key);
-      return { rows: withRowRevision("memory", rows) };
     }
     if (text.includes("watched_repos")) return { rows: state.repos };
     if (text.includes("from tasks")) {
       const id = params[0];
-      if (id === undefined) return { rows: state.tasks };
-      return { rows: state.tasks.filter((row) => row.id === id || row.id === Number(id)) };
+      const matched = id === undefined
+        ? state.tasks
+        : state.tasks.filter((row) => row.id === id || row.id === Number(id));
+      return { rows: matched.map((row) => projectRow(text, "t", row)) };
     }
-    if (text.includes("from memory")) {
-      const key = params[0];
-      if (key === undefined) return { rows: state.memory };
-      return { rows: state.memory.filter((row) => row.key === key) };
-    }
+    if (text.includes("from memory")) return { rows: finishMemoryRead(text, params) };
     return { rows: [] };
   },
 };

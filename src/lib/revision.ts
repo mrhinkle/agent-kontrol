@@ -1,17 +1,13 @@
 /**
  * Revision tokens for a confirm-after-preview write.
  *
- * A row with `updated_at` uses that timestamp. A row without one uses
- * `rev:` plus an MD5 of the current value. The absent token is the preview
- * of a missing memory key. Postgres compares the timestamp in the UPDATE
- * predicate, or the same MD5 expression the preview selected. Demo mode
- * compares the token this module builds. The two hashes are not required
- * to be equal across those stores; each store compares a token to itself.
+ * Postgres computes `md5(<table alias>::text)` in the same statement that
+ * reads or updates the row, so a timestamp's microseconds never pass through
+ * a JavaScript Date. Demo mode hashes stable JSON of the stored object.
+ * The two digests are not required to match across stores. The absent token
+ * is the literal `absent`.
  */
 import { createHash } from "node:crypto";
-
-const TIMESTAMP =
-  /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?$/;
 
 export class StaleWrite extends Error {
   readonly currentRevision: string;
@@ -25,115 +21,30 @@ export class StaleWrite extends Error {
 
 /** Preview of a memory key that has no row yet. */
 export function absentRevision(): string {
-  return `rev:${createHash("md5").update("absent").digest("hex")}`;
+  return "absent";
 }
 
-export function updatedAtToken(value: unknown): string | null {
-  if (typeof value === "string" && value.length > 0) return value;
-  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString();
-  return null;
+function stableJson(value: unknown): string {
+  if (value === undefined) return "null";
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (value instanceof Date) return JSON.stringify(value.toISOString());
+  if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record)
+    .filter((key) => record[key] !== undefined)
+    .sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(",")}}`;
 }
 
-export function isTimestampRevision(value: string): boolean {
-  return TIMESTAMP.test(value) && Number.isFinite(Date.parse(value));
+/** Demo-mode revision of one stored object. Postgres uses `md5(alias::text)`. */
+export function stableRowRevision(row: object): string {
+  return createHash("md5").update(stableJson(row)).digest("hex");
 }
 
-/** Hex digest without the `rev:` prefix, or null when the token is not a hash. */
-export function hashDigest(value: string): string | null {
-  const match = /^rev:([0-9a-f]{32})$/.exec(value);
-  return match ? match[1] : null;
+export function memoryRevision(row: object): string {
+  return stableRowRevision(row);
 }
 
-/**
- * Field order matches the `md5(...)` expression in `store.ts`:
- * key, content, tags joined by comma, agent_id, source, and "1" when
- * facts_at is set.
- */
-export function memoryDigest(row: {
-  key?: string | null;
-  content?: string | null;
-  tags?: unknown;
-  agent_id?: string | null;
-  source?: string | null;
-  facts_at?: unknown;
-}): string {
-  const tags = Array.isArray(row.tags) ? row.tags.map((tag) => String(tag)).join(",") : "";
-  const parts = [
-    row.key ?? "",
-    row.content ?? "",
-    tags,
-    row.agent_id ?? "",
-    row.source ?? "",
-    row.facts_at ? "1" : "0",
-  ];
-  return createHash("md5").update(parts.join("\u001f")).digest("hex");
-}
-
-/**
- * Field order matches the task `md5(...)` expression in `store.ts`.
- * completed_at contributes "1" or "0" so a timestamp's text format is not
- * part of the hash.
- */
-export function taskDigest(row: {
-  status?: string | null;
-  result?: string | null;
-  cost_usd?: unknown;
-  session_id?: string | null;
-  assigned_agent?: string | null;
-  title?: string | null;
-  description?: string | null;
-  project?: string | null;
-  platform?: string | null;
-  machine?: string | null;
-  priority?: unknown;
-  reviewer_platform?: string | null;
-  completed_at?: unknown;
-}): string {
-  const parts = [
-    row.status ?? "",
-    row.result ?? "",
-    row.cost_usd == null ? "" : String(row.cost_usd),
-    row.session_id ?? "",
-    row.assigned_agent ?? "",
-    row.title ?? "",
-    row.description ?? "",
-    row.project ?? "",
-    row.platform ?? "",
-    row.machine ?? "",
-    row.priority == null ? "" : String(row.priority),
-    row.reviewer_platform ?? "",
-    row.completed_at ? "1" : "0",
-  ];
-  return createHash("md5").update(parts.join("\u001f")).digest("hex");
-}
-
-export function memoryRevision(row: {
-  updated_at?: unknown;
-  key?: string | null;
-  content?: string | null;
-  tags?: unknown;
-  agent_id?: string | null;
-  source?: string | null;
-  facts_at?: unknown;
-}): string {
-  return updatedAtToken(row.updated_at) ?? `rev:${memoryDigest(row)}`;
-}
-
-export function taskRevision(row: {
-  updated_at?: unknown;
-  status?: string | null;
-  result?: string | null;
-  cost_usd?: unknown;
-  session_id?: string | null;
-  assigned_agent?: string | null;
-  title?: string | null;
-  description?: string | null;
-  project?: string | null;
-  platform?: string | null;
-  machine?: string | null;
-  priority?: unknown;
-  reviewer_platform?: string | null;
-  completed_at?: unknown;
-}): string {
-  return updatedAtToken(row.updated_at) ?? `rev:${taskDigest(row)}`;
+export function taskRevision(row: object): string {
+  return stableRowRevision(row);
 }

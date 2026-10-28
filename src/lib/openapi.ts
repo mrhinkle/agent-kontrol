@@ -107,7 +107,7 @@ const expectedRevision: Json = {
   minLength: 1,
   maxLength: 200,
   description:
-    "Optional token from the dry-run preview. It is the row's updated_at, or a rev: hash when that column is missing. When it no longer matches, the route answers 409 stale_write with current_revision and writes nothing. Omit it to keep the previous unconditional write. An empty string, a non-string, or a value longer than 200 characters is 400 and writes nothing.",
+    "Optional token from the dry-run preview. For a memory row or a task it is the md5 of the whole row, computed in SQL on that same read. A memory key with no row uses the literal absent. When it no longer matches, the route answers 409 stale_write with current_revision and writes nothing. Omit it to keep the previous unconditional write. An empty string, a non-string, or a value longer than 200 characters is 400 and writes nothing.",
 };
 
 const staleWrite: Json = jsonResponse(
@@ -509,7 +509,7 @@ export function openApiDocument(): Json {
             expected_revision: {
               type: "string",
               description:
-                "Token to send back as expected_revision. The row's updated_at, or a rev: hash when that column is missing. Omitted when the preview has no row revision.",
+                "Token to send back as expected_revision. The md5 of the row from the same read, or the literal absent when a memory key has no row.",
             },
             note: { type: "string" },
           },
@@ -751,7 +751,7 @@ export function openApiDocument(): Json {
           tags: ["memory"],
           summary: "Store a note, or preview the write.",
           description:
-            "The REST twin of MCP remember. An agent credential needs memory:write. dry_run true returns the insert or the key overwrite and writes nothing. action is overwrite_memory when the key already exists, otherwise insert_memory. The preview includes expected_revision. Sending that token makes the write conditional: a mismatch is 409 stale_write with current_revision and writes nothing. Omitting expected_revision keeps the unconditional write. A non-boolean dry_run, or an expected_revision that is empty, non-string, or longer than 200 characters, is 400 and writes nothing. With no database, a dry run still describes the note and sets would_write to false. A confirm that omits expected_revision still answers the demo acknowledgement and does not store the note.",
+            "The REST twin of MCP remember. An agent credential needs memory:write. dry_run true returns the insert or the key overwrite and writes nothing. action is overwrite_memory when the key already exists, otherwise insert_memory. The preview includes expected_revision, the md5 of the row from that same read, or the literal absent when the key has no row. Sending that token makes the write conditional: a mismatch is 409 stale_write with current_revision and writes nothing. When expected_revision is present and the key is already gone, the route answers 404 not_found and writes nothing. Omitting expected_revision keeps the unconditional write. A non-boolean dry_run, or an expected_revision that is empty, non-string, or longer than 200 characters, is 400 and writes nothing. With no database, a dry run still describes the note and sets would_write to false. A confirm that omits expected_revision still answers the demo acknowledgement and does not store the note.",
           security: cookieOrBearer,
           requestBody: body(ref("RememberInput")),
           responses: {
@@ -772,6 +772,10 @@ export function openApiDocument(): Json {
               ],
             }),
             ...flatErrors,
+            "404": jsonResponse(
+              "No memory row has this key when expected_revision is present. code is not_found and error is not found. A missing key with no expected_revision still inserts.",
+              ref("Error"),
+            ),
             "409": staleWrite,
           },
         }),
