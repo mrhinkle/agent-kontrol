@@ -95,6 +95,7 @@ describe("scope table", { concurrency: false }, () => {
       "report_status",
       "get_fleet_status",
       "get_progress_digest",
+      "get_morning_brief",
       "remember",
       "recall",
       "check_inbox",

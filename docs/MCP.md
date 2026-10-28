@@ -1,6 +1,6 @@
 # Agent Kontrol MCP Server
 
-Agent Kontrol exposes fleet coordination to AI coding agents over the Model Context Protocol. This document covers how to connect, the 14 tools, how shared memory works, and a block of standing instructions you can paste into an agent.
+Agent Kontrol exposes fleet coordination to AI coding agents over the Model Context Protocol. This document covers how to connect, the 15 tools, how shared memory works, and a block of standing instructions you can paste into an agent.
 
 An agent that only has the deployment URL can start at [/llms.txt](/llms.txt).
 
@@ -35,7 +35,7 @@ A tool that is not in the table below is denied for every caller, including `MC_
 | `memory:write` | `remember` | `POST /api/memory` |
 | `messages:read` | `check_inbox` | `GET /api/messages` |
 | `messages:write` | `reply_to_operator`, `reply_to_mark` | `POST /api/messages/reply` |
-| `progress:read` | `get_progress_digest` | `GET /api/progress`, `GET /api/progress/digest` |
+| `progress:read` | `get_progress_digest`, `get_morning_brief` | `GET /api/progress`, `GET /api/progress/digest`, `GET /api/brief` |
 | `decisions:write` | — (no MCP tool yet) | `PATCH /api/decisions/:id` |
 | `skills:read` | `list_skills`, `get_skill` | `GET /api/skills`, `GET /api/skills/:id` |
 | `skills:write` | `run_skill` | — (no REST route; the agent calls `run_skill`) |
@@ -88,7 +88,7 @@ A `401` on this request means the token does not match `MC_TOKEN` on the deploym
 
 ## Tools
 
-The server exposes 14 tools: `report_status`, `get_fleet_status`, `get_progress_digest`, `remember`, `recall`, `check_inbox`, `reply_to_operator`, `create_task`, `get_task_queue`, `claim_task`, `update_task`, `list_skills`, `get_skill`, `run_skill`.
+The server exposes 15 tools: `report_status`, `get_fleet_status`, `get_progress_digest`, `get_morning_brief`, `remember`, `recall`, `check_inbox`, `reply_to_operator`, `create_task`, `get_task_queue`, `claim_task`, `update_task`, `list_skills`, `get_skill`, `run_skill`.
 
 Tool names are part of the public API and will not change within 1.x.
 
@@ -133,6 +133,16 @@ Read the progress board as plain text: PRs merged, issues closed vs opened, net 
 | `window` | enum | no | `24h`, `7d`, `30d`, or `90d`. Defaults to `24h`. |
 
 When to call: when you need the current progress picture across repos as plain text.
+
+### get_morning_brief
+
+Read the morning brief as plain text: merges, issue flow, stuck pull requests, decisions waiting on the owner, and whether the coordinator's last event is real work. A heartbeat or a telemetry event does not count as working. This is the same text as `GET /api/brief`. The tool is read-only.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `window` | enum | no | `24h` or `72h`. Defaults to `24h`. Anything else is rejected. |
+
+When to call: for the daily brief, or when asked whether the coordinator is working rather than merely alive.
 
 ### remember
 
