@@ -13,8 +13,10 @@ describe("MCP tool names", () => {
   });
 
   it("declares an annotations block on every registered tool", () => {
-    // 11 registerTool calls plus the reply_to_* loop (one call site) = 11 call sites.
+    // One call site per tool, plus one for the reply_to_* loop (reply_to_operator and reply_to_mark).
     const calls = src.match(/server\.registerTool\(/g)?.length ?? 0;
+    // Fails if registrations are renamed away from server.registerTool( and the count drops to zero.
+    assert.ok(calls >= 13, `expected at least 13 registerTool call sites, found ${calls}`);
     const annotated = src.match(/^\s+annotations: (READ_ONLY|WRITE|WRITE_IDEMPOTENT|WRITE_DESTRUCTIVE),$/gm)?.length ?? 0;
     assert.equal(annotated, calls, "every registerTool call needs annotations");
     for (const hint of ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"]) {

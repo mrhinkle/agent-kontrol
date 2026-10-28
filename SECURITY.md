@@ -21,7 +21,7 @@ Credentials:
 
 Where each credential goes:
 
-- The MCP server (`/api/mcp`) runs inside the app. It reads its secrets from the deployment's environment and sends none of them anywhere. Callers authenticate to it; it never forwards `MC_TOKEN` to another host.
+- The MCP server (`/api/mcp`) runs inside the app. It reads its secrets from the deployment's environment. Callers authenticate to it; it never forwards `MC_TOKEN` or a caller's credential to another host.
 - `MC_TOKEN` leaves a machine in one case: the agent-side collectors and hooks under `agents/` and `scripts/` send it as a bearer token to your own `MC_URL`. Point `MC_URL` at your own deployment over https.
 - Those collectors read `MC_URL` and `MC_TOKEN` from the environment or from `~/.claude/mission-control.env` (`chmod 600`, written by `agents/claude-code/install.sh`). The path keeps the pre-rename name so existing installs work. They read nothing else from `~/.claude`. The usage collector and `scripts/collect-progress.sh` also honor `MC_ENV_FILE` to use another path; the Claude Code hook always reads the fixed path, and the dispatcher and `mc-agent` also check `~/.mission-control/env`.
 - `MC_COOKIE_SECRET`, `MC_DASHBOARD_PASSWORD`, `MC_OAUTH_SECRET` and the OpenRouter management keys are read only by the server, for the dashboard, OAuth and usage features. Agents never need them.
