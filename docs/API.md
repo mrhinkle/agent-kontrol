@@ -53,6 +53,7 @@ Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI
 | POST | `/api/messages/reply` | Bearer | Non-MCP agents post replies |
 | GET | `/api/progress` | Cookie or bearer | Everything the progress board needs |
 | GET | `/api/progress/digest` | Cookie or bearer | The board as plain text, for schedulers and terminals. A failure is the JSON error body, not plain text. |
+| GET | `/api/brief` | Cookie, bearer, or `progress:read` | Morning brief. `text/plain` by default; `Accept: application/json` for the object. `window` is `24h` (default) or `72h`. A failure is the JSON error body. |
 | POST | `/api/progress/ingest` | Bearer | One collection tick from `scripts/collect-progress.sh` |
 | GET | `/api/decisions` | Cookie or bearer | Decision queue, oldest first, each row with `age_days`. `shape=brief` is the morning-brief `.decisions` list |
 | POST | `/api/decisions` | Cookie or bearer | Upsert one decision, or reconcile a collector sweep |
@@ -180,7 +181,25 @@ Each entry in `repos`:
 | `total_prs_merged` | number | no | Total PRs merged. |
 | `review_rounds` | number | no | Review rounds. |
 | `no_verdict_rate` | number | no | No-verdict rate. |
-| `detail` | object | no | `{lane_mix?, stalled_prs?, notes?}`. |
+| `detail` | object | no | `{lane_mix?, stalled_prs?, notes?, stuck_prs?, median_lead_hours?, stale_issues?, stale_ratio?, drafts?, merged_list?, merged?}`. The brief keys are optional. Older ticks omit them. |
+
+### Brief
+
+`GET /api/brief?window=24h` is the morning brief. `window` may be omitted (that means `24h`) or `72h`. `1h`, an empty `window`, a repeated `window`, `window[]`, or any other value is `400` with `code: "validation_failed"`, `fields.window`, and the usual `fix` and `retryable: false`. It is not a 500 and it does not fall through to 24h.
+
+The success body is `text/plain; charset=utf-8` unless `Accept` lists `application/json` with a `q` greater than `text/plain`. A missing `Accept`, `text/plain`, and `*/*` stay text. `application/json;q=0` stays text. The JSON body is the brief object (`generated_at`, `window_hours`, `repo_source`, `thresholds`, `coordinator`, `incomplete_repos`, `totals`, `repos`, `stuck_prs`, `decisions`). It is not wrapped in `{demo: true}`.
+
+Auth is the same as the other data routes. With `MC_DASHBOARD_PASSWORD` set, a session cookie or `MC_TOKEN` is required, and an agent credential needs `progress:read`. With the password unset, a caller with no credential is allowed (dev-open). An `akc_` token is still checked: unknown is `401`, and a credential without `progress:read` is `403` `insufficient_scope`. The error body is JSON even when the client asked for text, and it does not contain the brief.
+
+Counts, stuck PRs, stale issues, and lead time come from the latest `repo_snapshots` row. There is no migration: the collector writes `detail.stuck_prs`, `detail.median_lead_hours`, `detail.stale_issues`, `detail.drafts`, `detail.merged_list`, and timestamped `detail.merged`. A 24h window reads the `*_24h` columns. A 72h window differences the cumulative counters against the snapshot at or before 72h earlier, and falls back to the 24h columns when that delta is null. The 72h median and shipped list are filtered from `detail.merged` by `merged_at`. A stored 24h `median_lead_hours` is not presented as a 72h median. The route does not call GitHub, so it cannot recompute a 72h lead time the way `scripts/morning-brief.sh` does when `detail.merged` is absent.
+
+Decisions come from `GET /api/decisions?shape=brief` logic in-process. A row joins the watched repo whose `owner/name` equals `repo`. The short name is display only, so two watched repos that share a short name keep distinct sections. A repo listed in `incomplete_repos` (a brief-eligible row is missing `kind`, `labels`, `opened_at`, or `repo_short`) keeps an empty `decisions` array. The script still sweeps GitHub for that repo; this route has no sweep.
+
+No snapshot, or a snapshot whose counts were not measured, is an incomplete section. Totals skip those repos. The text says `DATA INCOMPLETE` and prints `-` for the unmeasured cells. It does not print the word `undefined`.
+
+Coordinator liveness uses `brief.coordinator` in `progress.config.json`. `agentId` null omits the COORDINATOR section (`configured: false`). A configured agent is `working` only when the newest work event (`session_end`, `milestone`, or `status`, exact match) is within `maxSilenceHours`. `heartbeat` and `telemetry` do not count, even when `last_seen_at` is seconds old. `status_update` is not `status`. `turn_start` does not count. An `error` in the silence window with no work event is `FAILING`. The text adds `(telemetry seen Nh ago)` from `last_seen_at` when that timestamp exists, including `0`.
+
+`scripts/morning-brief.sh` remains the fallback. A scheduler should `curl` this route. `repo_source` is `dashboard` when the watched list came from the database and `config` when it came from `progress.config.json`.
 
 ### Decisions
 

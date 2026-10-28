@@ -10,6 +10,7 @@ import { rememberForTool, updateTaskForTool } from "@/lib/dry-run-actions";
 import { claimNextTask, createTask, fetchMessages, fleet, listTasks, recall, replyFromAgent, report } from "@/lib/store";
 import { progress } from "@/lib/progress-store";
 import { formatDigest } from "@/lib/progress-digest";
+import { morningBriefText } from "@/lib/brief";
 import { OPERATOR } from "@/lib/operator";
 import { demoProgress } from "@/lib/demo-progress";
 import { getSkillTool, listSkillsTool, runSkillTool } from "@/lib/skills/mcp";
@@ -132,6 +133,31 @@ const handler = createMcpHandler(
             },
           ],
         };
+      }),
+    );
+
+    server.registerTool(
+      "get_morning_brief",
+      {
+        title: "Get morning brief",
+        description:
+          "Read the morning brief as plain text: merges, issue flow, stuck PRs, decisions waiting on the owner, and whether the coordinator's last event is real work. Same text as GET /api/brief. window is 24h (default) or 72h. A heartbeat does not count as working.",
+        inputSchema: {
+          window: z
+            .enum(["24h", "72h"])
+            .optional()
+            .describe("24h or 72h. Defaults to 24h."),
+        },
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async (args) => guardTool("get_morning_brief", async () => {
+        const text = await morningBriefText(args.window ?? "24h");
+        return { content: [{ type: "text", text }] };
       }),
     );
 

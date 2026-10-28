@@ -6,6 +6,8 @@
 #   scripts/morning-brief.sh                 # text, last 24h, repos from the dashboard or config
 #   scripts/morning-brief.sh --window 72     # a Monday brief that covers the weekend
 #   scripts/morning-brief.sh --json          # the same facts as JSON (for /api/brief and tests)
+# The scheduler should curl GET /api/brief (text/plain; Accept: application/json
+# for the object). This script is the fallback when that route is down.
 #   scripts/morning-brief.sh --repo owner/a --repo owner/b   # override the repo list
 #   scripts/morning-brief.sh --no-dashboard  # never call MC_URL; GitHub only
 #
@@ -290,9 +292,8 @@ if [[ "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_TOKEN:-}" ]]; then
 fi
 
 # ------------------------------------------------------------------- assemble
-brief="$(jq -n --arg at "$NOW_ISO" --argjson window "$WINDOW_H" --arg repo_source "$REPO_SOURCE" \
-            --argjson repos "$repo_results" --argjson coordinator "$coordinator" \
-            --argjson stuck_h "$STUCK_PR_HOURS" --argjson stale_d "$STALE_ISSUE_DAYS" '
+# BEGIN brief-assemble-jq
+BRIEF_ASSEMBLE_JQ='
   {
     generated_at: $at, window_hours: $window, repo_source: $repo_source,
     thresholds: {stuck_pr_hours: $stuck_h, stale_issue_days: $stale_d},
@@ -310,7 +311,12 @@ brief="$(jq -n --arg at "$NOW_ISO" --argjson window "$WINDOW_H" --arg repo_sourc
     repos: $repos,
     stuck_prs: ([$repos[] | select(.incomplete | not) | .stuck_prs[]] | sort_by(-.age_hours)),
     decisions: ([$repos[] | select(.incomplete | not) | .decisions[]] | sort_by(-.age_hours))
-  }')"
+  }'
+# END brief-assemble-jq
+brief="$(jq -n --arg at "$NOW_ISO" --argjson window "$WINDOW_H" --arg repo_source "$REPO_SOURCE" \
+            --argjson repos "$repo_results" --argjson coordinator "$coordinator" \
+            --argjson stuck_h "$STUCK_PR_HOURS" --argjson stale_d "$STALE_ISSUE_DAYS" \
+            "$BRIEF_ASSEMBLE_JQ")"
 
 n_incomplete="$(jq '.incomplete_repos|length' <<<"$brief")"
 if [[ "$AS_JSON" -eq 1 ]]; then

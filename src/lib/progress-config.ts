@@ -158,3 +158,57 @@ export function windowDays(w: TimeWindow): number {
 export function isWindow(v: string | null): v is TimeWindow {
   return !!v && (WINDOWS as readonly string[]).includes(v);
 }
+
+/** Thresholds for `GET /api/brief`. Defaults match `scripts/morning-brief.sh`. */
+export interface BriefSettings {
+  decisionLabels: string[];
+  stuckPrHours: number;
+  staleIssueDays: number;
+  coordinator: {
+    agentId: string | null;
+    maxSilenceHours: number;
+    /** Exact event kinds. `status_update` is not `status`. Heartbeat and telemetry are never included. */
+    workKinds: string[];
+  };
+}
+
+const DEFAULT_WORK_KINDS = ["session_end", "milestone", "status"];
+
+function finiteNumber(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+/** Reads `brief` from the resolved progress config. A missing block keeps the script's defaults. */
+export function readBriefSettings(raw: unknown): BriefSettings {
+  const root = raw && typeof raw === "object" ? (raw as { brief?: unknown }).brief : undefined;
+  const brief = root && typeof root === "object" ? (root as Record<string, unknown>) : {};
+  const coord = brief.coordinator && typeof brief.coordinator === "object"
+    ? (brief.coordinator as Record<string, unknown>)
+    : {};
+  const labels = Array.isArray(brief.decisionLabels)
+    ? brief.decisionLabels.filter((item): item is string => typeof item === "string")
+    : [];
+  const agent = coord.agentId;
+  const agentId = typeof agent === "string" && agent.trim() ? agent.trim() : null;
+  let workKinds: string[] = DEFAULT_WORK_KINDS;
+  if (typeof coord.workKinds === "string") {
+    workKinds = coord.workKinds.split("|").map((kind) => kind.trim()).filter(Boolean);
+  } else if (Array.isArray(coord.workKinds)) {
+    workKinds = coord.workKinds.filter((kind): kind is string => typeof kind === "string" && kind.length > 0);
+  }
+  if (workKinds.length === 0) workKinds = DEFAULT_WORK_KINDS;
+  return {
+    decisionLabels: labels,
+    stuckPrHours: finiteNumber(brief.stuckPrHours, 48),
+    staleIssueDays: finiteNumber(brief.staleIssueDays, 21),
+    coordinator: {
+      agentId,
+      maxSilenceHours: finiteNumber(coord.maxSilenceHours, 3),
+      workKinds,
+    },
+  };
+}
+
+export function briefConfig(): BriefSettings {
+  return readBriefSettings(config);
+}

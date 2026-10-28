@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Morning brief API (#64): `GET /api/brief?window=24h|72h` returns the brief as `text/plain` (or the `scripts/morning-brief.sh --json` object when `Accept: application/json`). MCP tool `get_morning_brief` (`progress:read`, read-only) returns the same text. Counts, stuck PRs, and lead time come from `repo_snapshots.detail`. Decisions join on `owner/name`. Coordinator liveness is a work event, never a heartbeat. The script stays the fallback. `scripts/collect-progress.sh` writes the brief detail keys and still posts the tick if that extra sweep fails.
 - `GET /api/openapi.json` serves an OpenAPI 3.1 description of the REST routes. `docs/API.md` links to it. `npm run test:ui` fails when a route under `src/app/api` has no spec entry. No SDK is generated.
 - `docs/GIBSON.md`: how Agent Kontrol (development manager) complements the Gibson (deterministic gates), what belongs in each, and how the dashboard's Gibson page differs from the harness.
 - `docs/ROLES.md`: job descriptions for the four fleet roles (Spec Writer, Implementer, Reviewer, Dispatcher) and the Owner. Each card states mission, accountabilities, inputs, output artifact, may/never, quality bar, cadence and cost shape, the brief signals that show it working or failing, a dated failure seen in this fleet, and the Gibson playbook it maps to. Non-normative: binding rules stay in each repo's `AGENTS.md`.

@@ -21,11 +21,12 @@ if (!baseUrl || !token) {
   throw new Error("AK_MCP_BASE_URL and AK_MCP_TOKEN are required; run npm run test:mcp");
 }
 
-/** The 14 tools in docs/MCP.md. Names are stable for the 1.x line. */
+/** The 15 tools in docs/MCP.md. Names are stable for the 1.x line. */
 const DOCUMENTED_TOOLS = [
   "report_status",
   "get_fleet_status",
   "get_progress_digest",
+  "get_morning_brief",
   "remember",
   "recall",
   "check_inbox",
@@ -41,7 +42,7 @@ const DOCUMENTED_TOOLS = [
 
 /**
  * The server still registers this deprecated alias (docs/MCP.md). The live
- * list is the 14 documented names plus this one alias, and nothing else.
+ * list is the 15 documented names plus this one alias, and nothing else.
  */
 const DEPRECATED_ALIAS = "reply_to_mark";
 
@@ -157,7 +158,7 @@ describe("MCP client against demo mode", { concurrency: 1 }, () => {
     }
   });
 
-  it("lists exactly the 14 documented tools plus the reply_to_mark alias", async () => {
+  it("lists exactly the 15 documented tools plus the reply_to_mark alias", async () => {
     const listed = await client.listTools();
     const nextCursor = (listed as { nextCursor?: unknown }).nextCursor;
     assert.equal(
@@ -177,7 +178,10 @@ describe("MCP client against demo mode", { concurrency: 1 }, () => {
     for (const name of expected) {
       assert.equal(counts.get(name), 1, `${name} should appear once`);
     }
-    assert.equal(names.length, 15);
+    assert.equal(names.length, 16);
+    const morning = listed.tools.find((tool) => tool.name === "get_morning_brief");
+    assert.equal(morning?.annotations?.readOnlyHint, true);
+    assert.equal(morning?.annotations?.destructiveHint, false);
   });
 
   it("report_status then get_fleet_status does not show the reported agent in demo mode", async () => {

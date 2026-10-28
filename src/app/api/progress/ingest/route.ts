@@ -21,7 +21,8 @@ export const maxDuration = 30;
  *     merged_prs_24h?, issues_closed_24h?, issues_opened_24h?,
  *     total_issues_created?, total_issues_closed?, total_prs_merged?,
  *     review_rounds?, no_verdict_rate?,
- *     detail?: { lane_mix?, stalled_prs?, notes? }
+ *     detail?: { lane_mix?, stalled_prs?, notes?, stuck_prs?, median_lead_hours?,
+ *                stale_issues?, stale_ratio?, drafts?, merged_list?, merged? }
  *   }]
  * }
  */
