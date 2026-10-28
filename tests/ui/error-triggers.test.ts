@@ -630,15 +630,16 @@ describe("documented MCP error triggers", () => {
     assert.equal(text.includes("SECRET-DETAIL"), false);
   });
 
-  it("update_task in demo mode is not an error", async () => {
+  it("update_task in demo mode returns task_not_found for a missing id", async () => {
     const prev = process.env.DATABASE_URL;
     delete process.env.DATABASE_URL;
     try {
       const { res, text } = await callTool("update_task", { id: 999999, status: "done" });
       assert.equal(res.status, 200);
-      const result = toolBody(text);
-      assert.equal(result.isError, undefined);
-      assert.match(result.content?.[0].text ?? "", /Demo mode; task not updated\./);
+      const body = assertTool(toolBody(text), "task_not_found", "Task not found");
+      assert.equal(body.fields, undefined);
+      assert.equal(text.includes("Demo mode; task not updated."), false);
+      assert.equal(text.includes("[demo — in-memory"), false);
     } finally {
       process.env.DATABASE_URL = prev;
     }
