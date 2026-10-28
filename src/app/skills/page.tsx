@@ -36,6 +36,10 @@ function SkillsList() {
   }
   const categories = [...seenCategories.current.values()].sort((a, b) => a.localeCompare(b));
 
+  // The URL this page last wrote. Its own write must not be read back as a Back/Forward change,
+  // or a fast typist's next keystroke is overwritten by the debounced value.
+  const writtenPath = useRef<string | null>(null);
+
   useEffect(() => {
     const timer = window.setTimeout(() => setQ(qInput.trim()), 300);
     return () => window.clearTimeout(timer);
@@ -44,6 +48,7 @@ function SkillsList() {
   useEffect(() => {
     const path = `/skills${skillsQuery({ q, runtime, category })}`;
     if (path === window.location.pathname + window.location.search) return;
+    writtenPath.current = path;
     router.replace(path, { scroll: false });
   }, [q, runtime, category, router]);
 
@@ -52,6 +57,7 @@ function SkillsList() {
   const paramRuntime = normalizeRuntime(params.get("runtime"));
   const paramCategory = params.get("category")?.trim() || "all";
   useEffect(() => {
+    if (`/skills${skillsQuery({ q: paramQ, runtime: paramRuntime, category: paramCategory })}` === writtenPath.current) return;
     setQInput((cur) => (cur.trim() === paramQ.trim() ? cur : paramQ));
     setQ(paramQ.trim());
     setRuntime(paramRuntime);
