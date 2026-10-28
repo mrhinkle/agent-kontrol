@@ -7,12 +7,12 @@ import { isConfigured } from "./db";
 import {
   diffMemoryWrite,
   diffTaskUpdate,
-  refusedDryRun,
   type DryRunResult,
   type MemoryWriteInput,
   type StoredMemory,
   type TaskPatch,
 } from "./dry-run";
+import { demoRememberTool, demoUpdateTaskTool } from "./demo-store";
 import { findMemoryByKey, getTask, remember, report, updateTask } from "./store";
 import type { TaskStatus } from "./types";
 
@@ -37,23 +37,10 @@ export async function rememberForTool(args: {
 }): Promise<McpToolResult> {
   const badKey = memoryKeyError(args.key);
   if (badKey) return badKey;
+  if (!isConfigured()) return demoRememberTool(args);
   if (args.dry_run === true) {
-    if (!isConfigured()) {
-      const preview = diffMemoryWrite(null, args);
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ ...preview, would_write: false, note: "Demo mode; note not stored." }),
-          },
-        ],
-      };
-    }
     const preview = await previewMemoryWrite(args);
     return { content: [{ type: "text", text: JSON.stringify(preview) }] };
-  }
-  if (!isConfigured()) {
-    return { content: [{ type: "text", text: "Demo mode; note not stored." }] };
   }
   const item = await remember(args);
   return {
@@ -69,28 +56,11 @@ export async function updateTaskForTool(args: {
   agent_id?: string;
   dry_run?: boolean;
 }): Promise<McpToolResult> {
+  if (!isConfigured()) return demoUpdateTaskTool(args);
   if (args.dry_run === true) {
-    if (!isConfigured()) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              refusedDryRun(
-                args.status === "cancelled" ? "cancel_task" : "update_task",
-                "Demo mode; task not updated.",
-              ),
-            ),
-          },
-        ],
-      };
-    }
     const preview = await previewTaskChange(args.id, args);
     if (!preview) return mcpToolError("task_not_found");
     return { content: [{ type: "text", text: JSON.stringify(preview) }] };
-  }
-  if (!isConfigured()) {
-    return { content: [{ type: "text", text: "Demo mode; task not updated." }] };
   }
   const task = await updateTask({
     id: args.id,

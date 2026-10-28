@@ -275,7 +275,7 @@ OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this sha
 | `conflict` | 409 | no | `PUT /api/settings/repos` when no database is connected. |
 | `idempotency_conflict` | 409 | no | `POST /api/tasks`, `POST /api/messages`, or `POST /api/messages/reply` reused an `Idempotency-Key` with different arguments, or the first request with that key is still inside its 30 second lease. MCP `create_task` and `reply_to_operator` (and its `reply_to_mark` alias) return the same code. The same key, the same actor, the same route, and the same arguments return the original result for 24 hours. Different arguments stay `retryable: false`. While the first request is inside its 30 second lease, the same arguments are `retryable: true` and the response carries `Retry-After` in seconds plus `retry_after` in the body. After that lease, the same key and the same arguments take over a claim that never stored a result and run the write once. A claim insert whose result is lost is re-read, and the write runs once when this attempt owns the claim. The resource insert and the stored response commit in one statement, and that insert runs only while this attempt's claim token still matches. A committed write therefore has a stored response. A retry returns that response and does not insert another row while the claim is inside its 24 hour window. A caller that dies before reading the response gets the same row on retry. After that window the same key starts a new write. The key is scoped by actor and route. |
 | `stale` | 409 | no | `PUT /api/settings/repos` when `version` does not match the list currently stored. |
-| `task_not_found` | 404 | no | `PATCH /api/tasks/:id` or MCP `update_task` when a database is connected and that id does not exist. `error` stays `Task not found`. Demo mode does not look the id up. |
+| `task_not_found` | 404 | no | `PATCH /api/tasks/:id` when a database is connected and that id does not exist, or MCP `update_task` when the id does not exist in the database or, in demo mode, in the in-memory store. `error` stays `Task not found`. REST demo mode does not look the id up and answers `{ "ok": true, "demo": true }`. |
 | `task_not_claimable` | 409 | no | Defined, not returned. See above. |
 | `memory_key_invalid` | 400 | no | MCP `remember` or `recall` when `key` is empty, longer than 200 characters, or contains a control character. |
 | `repo_list_invalid` | 400 | no | `PUT /api/settings/repos` when the list fails validation. `errors` is unchanged. |
@@ -293,6 +293,8 @@ With no `DATABASE_URL` set (demo mode):
 - The auth gate is open.
 - GET routes return demo data, usually with `demo: true` in the response. `GET /api/decisions` returns `{ "demo": true, "decisions": [] }`.
 - Ingest routes answer `{"ok": true, "demo": true}` and drop the data. `POST /api/decisions` does the same and adds `note`. `PATCH /api/decisions/:id` answers `{ "ok": true, "demo": true }` and does not look the id up.
+- MCP `report_status`, `remember`, `create_task`, `claim_task`, and `update_task` store in memory for this process. `get_fleet_status`, `recall`, and `get_task_queue` read that store. Successful text starts with `[demo — in-memory, cleared when this process restarts]`. The store is cleared when the process restarts. Those rows are not mixed into the sample data on GET routes.
+- REST `POST` and `PATCH` in demo mode still answer `{ "ok": true, "demo": true }` (memory adds `note`) and do not write the in-memory store.
 
 ## Versioning
 

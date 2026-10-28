@@ -15,7 +15,7 @@ Read `docs/ARCHITECTURE.md` and the code map in it.
 - `npm run typecheck`
 - `npm run test:ui`
 - `npm test` — includes Python unit tests and ingest/provider/usage/message tests
-- `npm run test:mcp` — starts the app in demo mode (no `DATABASE_URL`) and drives `/api/mcp` with the official MCP client. The token is a throwaway value the test generates. Write tools do not persist in demo mode; the test locks that.
+- `npm run test:mcp` — starts the app in demo mode (no `DATABASE_URL`) and drives `/api/mcp` with the official MCP client. The token is a throwaway value the test generates. The five write tools store in memory for that process and the test round-trips them. The store is cleared when the process exits.
 - `npm run build`
 - `npm run test:pg` — runs against a Postgres. Set `DATABASE_URL` to a scratch database with `supabase/schema.sql` applied. The suite skips when unset.
 
