@@ -27,6 +27,7 @@ export function DecisionCard({
     const body: Record<string, unknown> = {
       status,
       expected_updated_at: decision.updated_at,
+      expected_revision: decision.revision,
     };
     if (status === "decided") {
       body.decision = String(data.get("decision") ?? "");
@@ -114,6 +115,7 @@ export function DecisionCard({
               onResolve?.(decision.id, {
                 status: "withdrawn",
                 expected_updated_at: decision.updated_at,
+                expected_revision: decision.revision,
               })
             }
           >

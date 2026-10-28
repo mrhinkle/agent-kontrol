@@ -25,8 +25,20 @@ import { DECISION_LABEL_PATTERNS } from "./progress-config";
 
 export { WRITEBACK_LOCK_LEASE_SECONDS };
 
-/** A crashed writer keeps the lock only this long, so a retry can finish label removal. */
+/**
+ * Bound every GitHub fetch so a stalled request cannot outlive the write-back
+ * lease. The MCP route's maxDuration is 60s and the lease is 180s.
+ */
+export const GITHUB_FETCH_TIMEOUT_MS = 15_000;
+
+/** How long to wait for another writer to finish before stamping not_written. */
 const WRITEBACK_LOCK_WAIT_MS = 20_000;
+let writebackLockWaitMs = WRITEBACK_LOCK_WAIT_MS;
+
+/** Tests shorten the busy wait. Production stays at 20 seconds. */
+export function setWritebackLockWaitForTests(ms: number | null): void {
+  writebackLockWaitMs = ms == null ? WRITEBACK_LOCK_WAIT_MS : ms;
+}
 
 export class GitHubWriteError extends Error {
   constructor(readonly reason: string) {
@@ -105,6 +117,7 @@ export function githubWriteClient(fetchImpl: typeof fetch, token: string): GitHu
         method,
         headers: body ? { ...headers, "content-type": "application/json" } : headers,
         body,
+        signal: AbortSignal.timeout(GITHUB_FETCH_TIMEOUT_MS),
       });
     } catch {
       throw new GitHubWriteError("network error");
@@ -188,12 +201,6 @@ function withLocalLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
-function sameRevision(left: string, right: string): boolean {
-  const a = Date.parse(left);
-  const b = Date.parse(right);
-  return !Number.isNaN(a) && a === b;
-}
-
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -202,21 +209,24 @@ function delay(ms: number): Promise<void> {
  * Claim one decided revision. Wait only while that same revision is still
  * decided and another writer holds the lock. A reopen, or any other revision
  * change, returns superseded so the caller does not contact GitHub.
+ * Giving up stamps `not_written` on that revision so the row stays in the
+ * retry queue instead of sitting at writeback null.
  */
 async function claimRevision(
   id: number,
-  revision: string,
-): Promise<{ ok: true; token: string } | { ok: false; outcome: WritebackOutcome }> {
-  const deadline = Date.now() + WRITEBACK_LOCK_WAIT_MS;
+  revision: number,
+): Promise<{ ok: true; token: string; revision: number } | { ok: false; outcome: WritebackOutcome }> {
+  const deadline = Date.now() + writebackLockWaitMs;
   while (Date.now() < deadline) {
-    const token = await claimDecisionWriteback(id, revision);
-    if (token) return { ok: true, token };
+    const claimed = await claimDecisionWriteback(id, revision);
+    if (claimed) return { ok: true, token: claimed.token, revision: claimed.revision };
     const current = await getDecision(id);
-    if (!current || current.status !== "decided" || !sameRevision(current.updated_at, revision)) {
+    if (!current || current.status !== "decided" || current.revision !== revision) {
       return { ok: false, outcome: { status: "superseded" } };
     }
     await delay(25);
   }
+  await setDecisionWriteback(id, "not_written", revision, null);
   return { ok: false, outcome: { status: "not_written", reason: "write-back busy" } };
 }
 
@@ -268,26 +278,27 @@ async function postDecision(
  * commented. A comment counts as already posted only when it contains the
  * canonical decision text. The marker alone does not.
  *
- * The writer claims `row.updated_at` while the row is still decided, before
- * any GitHub call. Reopening conflicts until that claim is released. The
- * writeback stamp matches the same revision and `status = 'decided'`, and it
- * runs before the claim is released. A row that was reopened is not posted
- * and is not stamped.
+ * The writer claims `row.revision` while the row is still decided, before
+ * any GitHub call. The claim increments revision and stores the fencing token.
+ * Reopening conflicts until that claim expires. Immediately before each
+ * GitHub mutation the writer checks the token and that revision. The stamp
+ * matches the token, that revision, and `status = 'decided'`, then clears
+ * the lock. A row that was reopened is not posted and is not stamped.
  */
 export async function writeDecisionBack(
-  row: Pick<Decision, "id" | "key" | "actor_id" | "decided_at" | "decision" | "updated_at">,
+  row: Pick<Decision, "id" | "key" | "actor_id" | "decided_at" | "decision" | "revision">,
 ): Promise<WritebackOutcome> {
   const target = githubTargetFromKey(row.key);
   if (!target) return { status: "no_target" };
   const client = activeClient();
-  const revision = row.updated_at;
+  const revision = row.revision;
   if (!client) return publish(row.id, revision, null, target, row);
   return withLocalLock(row.key, () => publish(row.id, revision, client, target, row));
 }
 
 async function publish(
   id: number,
-  revision: string,
+  revision: number,
   client: GitHubWriteClient | null,
   target: { repo: string; number: number },
   row: Pick<Decision, "actor_id" | "decided_at" | "decision">,
@@ -295,13 +306,14 @@ async function publish(
   const claimed = await claimRevision(id, revision);
   if (!claimed.ok) return claimed.outcome;
   const token = claimed.token;
+  const heldRevision = claimed.revision;
   try {
     const outcome = client
-      ? await postDecision(client, row, target, () => decisionWritebackClaimHeld(id, token, revision))
+      ? await postDecision(client, row, target, () => decisionWritebackClaimHeld(id, token, heldRevision))
       : { status: "not_written" as const, reason: "no token" };
     if (outcome.status === "superseded") return outcome;
     const stamp = outcome.status === "written" ? "written" : "not_written";
-    const stamped = await setDecisionWriteback(id, stamp, revision);
+    const stamped = await setDecisionWriteback(id, stamp, heldRevision, token);
     if (!stamped) return { status: "superseded" };
     return outcome;
   } finally {

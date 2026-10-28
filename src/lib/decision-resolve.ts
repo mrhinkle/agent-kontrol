@@ -4,8 +4,9 @@
  * The actor comes from the principal. Body fields decided_by, actor_type,
  * actor_id, repo, number, key, and force are not read here.
  * A decided or withdrawn row is a conflict. Deferred is not terminal.
- * expected_updated_at is checked before that conflict, so a stale page
- * hears `stale` rather than `conflict`.
+ * expected_revision is checked before that conflict, so a stale page
+ * hears `stale` rather than `conflict`. expected_updated_at is still
+ * accepted and is not compared.
  */
 
 import type { Actor } from "./actor";
@@ -15,6 +16,7 @@ import { parseDeferInstant, readOptions } from "./decision-format";
 import { writeDecisionBack, type WritebackOutcome } from "./decision-writeback";
 import {
   decisionPersistenceOn,
+  decisionWritebackLocked,
   getDecision,
   isDecisionStatus,
   parseListQuery,
@@ -37,13 +39,14 @@ export interface ResolveBody {
   setDefer: boolean;
   option_id?: string | null;
   expected_updated_at?: string | null;
+  expected_revision?: number | null;
 }
 
 export type ResolveOutcome =
   | { ok: true; decision: Decision }
   | {
       ok: false;
-      code: "not_found" | "conflict" | "stale" | "validation_failed" | "missing_field";
+      code: "not_found" | "conflict" | "stale" | "writeback_in_progress" | "validation_failed" | "missing_field";
       message: string;
       fields?: Record<string, string>;
     };
@@ -51,12 +54,6 @@ export type ResolveOutcome =
 function fail(code: ParseFail["code"], fields: Record<string, string>): ParseFail {
   const message = Object.values(fields)[0] ?? (code === "missing_field" ? "a required field is missing" : "validation failed");
   return { ok: false, code, message, fields };
-}
-
-function sameInstant(left: string, right: string): boolean {
-  const a = Date.parse(left);
-  const b = Date.parse(right);
-  return !Number.isNaN(a) && a === b;
 }
 
 /**
@@ -76,6 +73,7 @@ export function parseResolveBody(body: unknown, nowMs: number = Date.now()): { o
   const hasStatus = Object.prototype.hasOwnProperty.call(raw, "status");
   const hasOption = Object.prototype.hasOwnProperty.call(raw, "option_id");
   const hasExpected = Object.prototype.hasOwnProperty.call(raw, "expected_updated_at");
+  const hasRevision = Object.prototype.hasOwnProperty.call(raw, "expected_revision");
   if (!hasStatus && !setDecision && !setDecidedBy && !setDefer && !hasOption) {
     return fail("missing_field", { body: "Send status, decision, decided_by, or defer_until." });
   }
@@ -106,6 +104,14 @@ export function parseResolveBody(body: unknown, nowMs: number = Date.now()): { o
       fields.expected_updated_at = "expected_updated_at must be an ISO 8601 timestamp.";
     } else expected = new Date(raw.expected_updated_at).toISOString();
   }
+  let expectedRevision: number | null | undefined;
+  if (hasRevision && raw.expected_revision != null && raw.expected_revision !== "") {
+    const value = raw.expected_revision;
+    const parsed = typeof value === "number" ? value : typeof value === "string" && /^\d+$/.test(value) ? Number(value) : Number.NaN;
+    if (!Number.isSafeInteger(parsed) || parsed < 0) {
+      fields.expected_revision = "expected_revision must be a non-negative integer.";
+    } else expectedRevision = parsed;
+  }
   const deferring = status === "deferred" || (status == null && setDefer);
   let deferUntil: string | null | undefined;
   if (deferring) {
@@ -132,6 +138,7 @@ export function parseResolveBody(body: unknown, nowMs: number = Date.now()): { o
       setDefer: deferring || setDefer,
       option_id: optionId ?? null,
       expected_updated_at: expected ?? null,
+      expected_revision: expectedRevision ?? null,
     },
   };
 }
@@ -158,10 +165,19 @@ function terminalConflict(): ResolveOutcome {
   };
 }
 
+function writebackInProgress(): ResolveOutcome {
+  return {
+    ok: false,
+    code: "writeback_in_progress",
+    message: "A write-back is in progress for this decision.",
+    fields: { status: "Wait for the write-back to finish before reopening." },
+  };
+}
+
 export async function resolveDecision(input: ResolveBody & { id: number; actor: Actor | null }): Promise<ResolveOutcome> {
   const row = await getDecision(input.id);
   if (!row) return notFound();
-  if (input.expected_updated_at && !sameInstant(row.updated_at, input.expected_updated_at)) return stale();
+  if (input.expected_revision != null && row.revision !== input.expected_revision) return stale();
 
   const next = input.status;
   // status open is the explicit reopen. Every other mutation of a decided or
@@ -210,12 +226,14 @@ export async function resolveDecision(input: ResolveBody & { id: number; actor: 
     setChosen,
     chosen_option: chosen,
     expectedUpdatedAt: input.expected_updated_at ?? null,
+    expectedRevision: input.expected_revision ?? null,
     guardTerminal: true,
   });
   if (!updated) {
     const again = await getDecision(input.id);
     if (!again) return notFound();
-    if (input.expected_updated_at && !sameInstant(again.updated_at, input.expected_updated_at)) return stale();
+    if (input.expected_revision != null && again.revision !== input.expected_revision) return stale();
+    if (reopening && await decisionWritebackLocked(input.id)) return writebackInProgress();
     if (again.status === "decided" || again.status === "withdrawn") return terminalConflict();
     return notFound();
   }
@@ -239,7 +257,7 @@ async function afterWrite(row: Decision, write: WritebackOutcome, follows = 0): 
     && follows < 1
     && visible.status === "decided"
     && visible.writeback !== "written"
-    && !sameInstant(visible.updated_at, row.updated_at)
+    && visible.revision !== row.revision
   ) {
     return afterWrite(visible, await writeDecisionBack(visible), follows + 1);
   }
@@ -247,10 +265,13 @@ async function afterWrite(row: Decision, write: WritebackOutcome, follows = 0): 
 }
 
 /** Retry a failed GitHub write-back. Does not decide the row again. */
-export async function retryDecisionWriteback(id: number, expectedUpdatedAt: string | null): Promise<ResolveOutcome> {
+export async function retryDecisionWriteback(
+  id: number,
+  expected: { updatedAt?: string | null; revision?: number | null },
+): Promise<ResolveOutcome> {
   const row = await getDecision(id);
   if (!row) return notFound();
-  if (expectedUpdatedAt && !sameInstant(row.updated_at, expectedUpdatedAt)) return stale();
+  if (expected.revision != null && row.revision !== expected.revision) return stale();
   if (row.status !== "decided") {
     return {
       ok: false,
@@ -340,6 +361,7 @@ export async function resolveDecisionTool(args: {
   defer_until?: string;
   option_id?: string;
   expected_updated_at?: string;
+  expected_revision?: number;
 }): Promise<McpToolResult> {
   if (!decisionPersistenceOn()) return text("Demo mode; decision not resolved.");
   const actor = currentActor();
@@ -349,6 +371,7 @@ export async function resolveDecisionTool(args: {
     ...(args.defer_until !== undefined ? { defer_until: args.defer_until } : {}),
     ...(args.option_id !== undefined ? { option_id: args.option_id } : {}),
     ...(args.expected_updated_at !== undefined ? { expected_updated_at: args.expected_updated_at } : {}),
+    ...(args.expected_revision !== undefined ? { expected_revision: args.expected_revision } : {}),
   });
   if (!parsed.ok) return mcpToolError(parsed.code, { message: parsed.message, fields: parsed.fields });
   const outcome = await resolveDecision({ ...parsed.value, id: args.id, actor });

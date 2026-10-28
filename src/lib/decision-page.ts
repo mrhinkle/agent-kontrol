@@ -5,6 +5,17 @@
 
 import type { Decision } from "./decisions";
 
+/**
+ * The empty-queue message is only for a successful load that found nothing.
+ * A failed pending-writeback load keeps the error and does not claim the
+ * queue is empty. A kept row still renders beside that error.
+ */
+export function decisionQueueVisible(rows: Decision[] | null, loadFailed: boolean): boolean {
+  if (rows == null) return false;
+  if (loadFailed && rows.length === 0) return false;
+  return true;
+}
+
 export function decisionsForPage(openRows: Decision[], decidedRows: Decision[]): Decision[] {
   const byId = new Map<number, Decision>();
   for (const row of openRows) byId.set(row.id, row);

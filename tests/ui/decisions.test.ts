@@ -106,6 +106,7 @@ function decision(over: Partial<Decision> & Pick<Decision, "key" | "number">): D
     last_seen_at: NOW,
     created_at: NOW,
     updated_at: NOW,
+    revision: over.revision ?? 0,
     age_days: 0,
     actor_type: over.actor_type ?? null,
     actor_id: over.actor_id ?? null,

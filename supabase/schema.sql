@@ -395,6 +395,7 @@ create table if not exists decisions (
   writeback text,
   writeback_lock text,
   writeback_lock_at timestamptz,
+  revision integer not null default 0,
   first_seen_at timestamptz not null default now(),
   last_seen_at timestamptz not null default now(),
   created_at timestamptz not null default now(),
@@ -411,6 +412,7 @@ alter table decisions add column if not exists chosen_option text;
 alter table decisions add column if not exists writeback text;
 alter table decisions add column if not exists writeback_lock text;
 alter table decisions add column if not exists writeback_lock_at timestamptz;
+alter table decisions add column if not exists revision integer not null default 0;
 create index if not exists decisions_status_first_seen_idx on decisions (status, first_seen_at);
 create index if not exists decisions_repo_number_idx on decisions (repo, number);
 

@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { DecisionList } from "../../src/components/DecisionQueue";
+import { decisionQueueVisible } from "../../src/lib/decision-page";
 import type { Decision } from "../../src/lib/decisions";
 
 function row(over: Partial<Decision> & Pick<Decision, "id" | "title" | "status">): Decision {
@@ -30,6 +31,7 @@ function row(over: Partial<Decision> & Pick<Decision, "id" | "title" | "status">
     last_seen_at: "2026-10-01T00:00:00.000Z",
     created_at: "2026-10-01T00:00:00.000Z",
     updated_at: "2026-10-27T00:00:00.000Z",
+    revision: 0,
     age_days: 12,
     actor_type: null,
     actor_id: null,
@@ -106,5 +108,30 @@ describe("decisions page", () => {
     assert.equal(loaded.ok, false);
     if (loaded.ok) return;
     assert.match(loaded.error, /database unavailable/);
+  });
+
+  it("hides No open decisions when the pending write-back load failed", () => {
+    const src = fs.readFileSync("src/app/decisions/page.tsx", "utf8");
+    assert.match(src, /decisionQueueVisible\(rows, loadFailed\)/);
+    assert.match(src, /expected_revision: decision\.revision/);
+    assert.equal(decisionQueueVisible([], true), false);
+    assert.equal(decisionQueueVisible([], false), true);
+    assert.equal(decisionQueueVisible(null, true), false);
+    assert.equal(decisionQueueVisible([row({ id: 1, title: "Kept", status: "decided", writeback: "not_written" })], true), true);
+
+    const failed = renderToStaticMarkup(
+      decisionQueueVisible([], true)
+        ? React.createElement(DecisionList, { decisions: [] })
+        : React.createElement("p", null, "database unavailable"),
+    );
+    assert.equal(failed.includes("No open decisions"), false);
+    assert.match(failed, /database unavailable/);
+
+    const empty = renderToStaticMarkup(
+      decisionQueueVisible([], false)
+        ? React.createElement(DecisionList, { decisions: [] })
+        : React.createElement("p", null, "database unavailable"),
+    );
+    assert.match(empty, /No open decisions/);
   });
 });

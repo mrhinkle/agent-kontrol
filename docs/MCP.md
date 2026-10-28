@@ -328,8 +328,9 @@ The HTTP `401` for a missing or invalid bearer is unchanged: `WWW-Authenticate` 
 | `missing_field` | no | Not returned by a tool. The input schema rejects a missing argument first. |
 | `rate_limited` | yes | Not returned by a tool. `POST /api/login` only. The OAuth consent form shares that limiter and answers with HTML, not this JSON. |
 | `conflict` | no | `resolve_decision` and `PATCH /api/decisions/:id` when the row is already decided or withdrawn. `POST /api/decisions/:id/writeback` when the row is not decided. Also a REST settings save with no database. |
+| `writeback_in_progress` | yes | `resolve_decision` and `PATCH /api/decisions/:id` when `status` is `open` while an unexpired write-back claim holds the row. Also `POST /api/decisions` with `force: true` in that same window. The claim expires after 180 seconds. |
 | `idempotency_conflict` | no | `create_task` or `reply_to_operator` reused `idempotency_key` with different arguments, or the first request with that key is still inside its 30 second lease. `reply_to_mark` is the same tool schema and the same key as `reply_to_operator`. The same key, the same actor, the same route, and the same arguments return the original result for 24 hours. Different arguments stay non-retryable. While the first request is inside its 30 second lease, the same arguments are `retryable: true` and the tool JSON includes `retry_after` seconds. The REST form of that wait is the `Retry-After` header. After that lease, the same key and the same arguments take over a claim that never stored a result and run the write once. A claim insert whose result is lost is re-read, and the write runs once when this attempt owns the claim. The resource insert and the stored response commit in one statement, and that insert runs only while this attempt's claim token still matches. A committed write therefore has a stored response. A retry returns that response and does not insert another row while the claim is inside its 24 hour window. A caller that dies before reading the response gets the same row on retry. After that window the same key starts a new write. The key is scoped by actor and route. |
-| `stale` | no | `resolve_decision`, `PATCH /api/decisions/:id`, and `POST /api/decisions/:id/writeback` when `expected_updated_at` does not match the row. Also a REST settings save with a stale `version`. |
+| `stale` | no | `resolve_decision`, `PATCH /api/decisions/:id`, and `POST /api/decisions/:id/writeback` when `expected_revision` does not match the row. `expected_updated_at` is accepted and is not compared. Also a REST settings save with a stale `version`. |
 | `task_not_found` | no | `update_task` when the id does not exist in the database, or in the in-memory store when `DATABASE_URL` is unset. `error` stays `Task not found`. |
 | `task_not_claimable` | no | Defined, not returned. See above. |
 | `memory_key_invalid` | no | `remember` or `recall` with a bad `key`. |
@@ -388,7 +389,7 @@ Demo mode returns `{ "demo": true, "decisions": [] }`.
 
 ### resolve_decision
 
-Decide, defer, or withdraw one row. Requires `decisions:write`. `decisions:request` and `decisions:read` cannot call it. The GitHub comment is posted to the issue named by the row key `github:<owner/repo>#<n>`, never to a repo or number in the arguments. Those arguments are not accepted. A failed write-back still decides the row. The page keeps that row next to the open queue and shows `not written back`, and `POST /api/decisions/:id/writeback` retries. A second comment is skipped only when an existing comment contains the full canonical decision text. The marker alone does not count. Concurrent retries share a per-row lock.
+Decide, defer, or withdraw one row. Requires `decisions:write`. `decisions:request` and `decisions:read` cannot call it. The GitHub comment is posted to the issue named by the row key `github:<owner/repo>#<n>`, never to a repo or number in the arguments. Those arguments are not accepted. A failed write-back still decides the row. The page keeps that row next to the open queue and shows `not written back`, and `POST /api/decisions/:id/writeback` retries. A second comment is skipped only when an existing comment contains the full canonical decision text. The marker alone does not count. Concurrent retries share a per-row lock that lasts 180 seconds. Each GitHub request aborts after 15 seconds. The writer re-checks the claim token and `revision` before each GitHub mutation.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -397,7 +398,8 @@ Decide, defer, or withdraw one row. Requires `decisions:write`. `decisions:reque
 | `decision` | string | no | Required for `decided` unless `option_id` names a choice. |
 | `defer_until` | string | no | Required for `deferred`. A date is the end of that UTC day. A past or impossible date is `validation_failed`. |
 | `option_id` | string | no | One of the row's option ids. |
-| `expected_updated_at` | string | no | `updated_at` from the row you loaded. A mismatch is `stale`. |
+| `expected_revision` | number | no | `revision` from the row you loaded. A mismatch is `stale`. |
+| `expected_updated_at` | string | no | Accepted for older clients. Not compared. |
 
 A decided or withdrawn row is `conflict`. Deferred is not terminal. Demo mode returns `Demo mode; decision not resolved.` and writes nothing.
 

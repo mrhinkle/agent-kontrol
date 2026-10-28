@@ -557,14 +557,15 @@ const handler = createMcpHandler(
         title: "Resolve a decision",
         annotations: WRITE,
         description:
-          "Decide, defer, or withdraw a decision. Requires decisions:write or the dashboard. An agent that filed the decision cannot call this with only decisions:request. Send expected_updated_at from the row you loaded. The GitHub comment goes to the issue named by the row key.",
+          "Decide, defer, or withdraw a decision. Requires decisions:write or the dashboard. An agent that filed the decision cannot call this with only decisions:request. Send expected_revision from the row you loaded. expected_updated_at is accepted and is not the concurrency token. The GitHub comment goes to the issue named by the row key.",
         inputSchema: {
           id: z.number().int().positive(),
           status: z.enum(["open", "decided", "deferred", "withdrawn"]),
           decision: z.string().optional().describe("Required when status is decided, unless option_id names a choice."),
           defer_until: z.string().optional().describe("Required when status is deferred. A date is the end of that UTC day. A past date is rejected."),
           option_id: z.string().optional().describe("One of the row's option ids."),
-          expected_updated_at: z.string().optional().describe("updated_at from the row you loaded. A mismatch is stale."),
+          expected_updated_at: z.string().optional().describe("Accepted for older clients. Not compared."),
+          expected_revision: z.number().int().nonnegative().optional().describe("revision from the row you loaded. A mismatch is stale."),
         },
       },
       async (args) => guardTool("resolve_decision", () => resolveDecisionTool({
@@ -574,6 +575,7 @@ const handler = createMcpHandler(
         defer_until: args.defer_until,
         option_id: args.option_id,
         expected_updated_at: args.expected_updated_at,
+        expected_revision: args.expected_revision,
       })),
     );
   },

@@ -14,13 +14,16 @@ import { listDecisionsTool, requestDecisionTool } from "../../src/lib/decision-r
 import {
   listDecisions,
   parseListQuery,
+  presentDecision,
   setDecisionStoreForTests,
   setDecisionWriteback,
   upsertDecision,
+  WRITEBACK_LOCK_LEASE_SECONDS,
   type Decision,
+  type DecisionStore,
   type UpsertInput,
 } from "../../src/lib/decisions";
-import { GitHubWriteError, type GitHubWriteClient, clearGitHubWriteClientForTests, setGitHubWriteClientForTests, writeDecisionBack } from "../../src/lib/decision-writeback";
+import { GitHubWriteError, GITHUB_FETCH_TIMEOUT_MS, type GitHubWriteClient, clearGitHubWriteClientForTests, setGitHubWriteClientForTests, setWritebackLockWaitForTests, writeDecisionBack } from "../../src/lib/decision-writeback";
 import { authorizeTool } from "../../src/lib/scopes";
 import { createMemoryDecisionStore } from "./decision-memory";
 
@@ -106,6 +109,7 @@ beforeEach(() => {
 afterEach(() => {
   setDecisionStoreForTests(null);
   clearGitHubWriteClientForTests();
+  setWritebackLockWaitForTests(null);
   resetCredentialsForTests();
   globalThis.fetch = originalFetch;
   restoreEnv();
@@ -575,6 +579,7 @@ describe("decision resolve", { concurrency: false }, () => {
       last_seen_at: "2026-10-01T00:00:00.000Z",
       created_at: "2026-10-01T00:00:00.000Z",
       updated_at: "2026-10-27T00:00:00.000Z",
+      revision: 0,
       age_days: 12,
       actor_type: null,
       actor_id: null,
@@ -641,25 +646,27 @@ describe("decision resolve", { concurrency: false }, () => {
     assert.notEqual(stored?.actor_id, "operator");
   });
 
-  it("F9: a stale expected_updated_at is refused, including when the row is now decided", async () => {
+  it("F9: a stale expected_revision is refused, including when the row is now decided", async () => {
     const store = createMemoryDecisionStore();
     setDecisionStoreForTests(store);
     clearGitHubWriteClientForTests();
     const row = await seed({ key: "agent:cred:race", repo: null, number: null });
-    const loaded = row.updated_at;
+    const loaded = row.revision;
     const first = await patch(row.id, {
       status: "decided",
       decision: "ship",
-      expected_updated_at: loaded,
+      expected_revision: loaded,
+      expected_updated_at: "2026-10-28 12:00:00.123456+00",
     });
     assert.equal(first.status, 200, await first.clone().text());
     const current = await first.json() as { decision: Decision };
-    assert.notEqual(current.decision.updated_at, loaded);
+    assert.notEqual(current.decision.revision, loaded);
 
     const stale = await patch(row.id, {
       status: "withdrawn",
       decision: "overwrite",
-      expected_updated_at: loaded,
+      expected_revision: loaded,
+      expected_updated_at: current.decision.updated_at,
     });
     assert.equal(stale.status, 409);
     const staleBody = await stale.json() as { code: string };
@@ -670,7 +677,8 @@ describe("decision resolve", { concurrency: false }, () => {
     const currentConflict = await patch(row.id, {
       status: "decided",
       decision: "overwrite",
-      expected_updated_at: current.decision.updated_at,
+      expected_revision: current.decision.revision,
+      expected_updated_at: "1999-01-01T00:00:00.000Z",
     });
     assert.equal(currentConflict.status, 409);
     assert.equal((await currentConflict.json()).code, "conflict");
@@ -924,7 +932,7 @@ describe("decision resolve", { concurrency: false }, () => {
 
       const reopened = await patch(row.id, { status: "open" });
       assert.equal(reopened.status, 409, await reopened.clone().text());
-      assert.equal((await reopened.json() as { code: string }).code, "conflict");
+      assert.equal((await reopened.json() as { code: string }).code, "writeback_in_progress");
       const held = store.rows.find((item) => item.id === row.id);
       assert.equal(held?.status, "decided");
       assert.equal(held?.decision, "ship");
@@ -981,13 +989,13 @@ describe("decision resolve", { concurrency: false }, () => {
       actor_id: decided.actor_id,
       decided_at: decided.decided_at,
       decision: decided.decision,
-      updated_at: decided.updated_at,
+      revision: decided.revision,
     });
     assert.notEqual(outcome.status, "written");
     assert.equal(github.calls.length, 0);
     assert.equal(github.comments.length, 0);
 
-    const stamped = await setDecisionWriteback(row.id, "written", decided.updated_at);
+    const stamped = await setDecisionWriteback(row.id, "written", decided.revision, "lost-token");
     assert.equal(stamped, null);
     const stored = store.rows.find((item) => item.id === row.id);
     assert.equal(stored?.status, "open");
@@ -1003,18 +1011,309 @@ describe("decision resolve", { concurrency: false }, () => {
     const stampEnd = src.indexOf("export async function listDecisions");
     const stamp = src.slice(stampStart, stampEnd);
     assert.match(stamp, /status = 'decided'/);
-    assert.match(stamp, /updated_at = \$\{revision\}::timestamptz/);
+    assert.match(stamp, /revision = \$\{revision\}/);
+    assert.match(stamp, /writeback_lock = \$\{token\}/);
+    assert.match(stamp, /writeback_lock = null/);
+    assert.doesNotMatch(stamp, /updated_at = \$\{revision\}/);
 
     const patchStart = src.indexOf("export async function patchDecision");
     const patchSql = src.slice(patchStart);
     assert.match(patchSql, /\$\{status\} is distinct from 'open'/);
     assert.match(patchSql, /writeback_lock is null/);
+    assert.match(patchSql, /revision = \$\{expectedRevision\}/);
+    assert.doesNotMatch(patchSql, /updated_at = \$\{expected/);
 
     const claimStart = src.indexOf("export async function claimDecisionWriteback");
     const claimEnd = src.indexOf("export async function releaseDecisionWriteback");
     assert.ok(claimStart >= 0 && claimEnd > claimStart);
     const claim = src.slice(claimStart, claimEnd);
     assert.match(claim, /status = 'decided'/);
-    assert.match(claim, /updated_at = \$\{revision\}::timestamptz/);
+    assert.match(claim, /revision = \$\{revision\}/);
+    assert.match(claim, /revision = revision \+ 1/);
+    assert.doesNotMatch(claim, /updated_at = \$\{/);
+  });
+
+  it("does not compare updated_at for equality in decision SQL", () => {
+    const src = ["src/lib/decisions.ts", "src/lib/decision-resolve.ts", "src/lib/decision-writeback.ts"]
+      .map((file) => fs.readFileSync(file, "utf8"))
+      .join("\n");
+    const bad = src.split("\n").filter((line) => {
+      if (/updated_at\s*=\s*now\(\)/.test(line)) return false;
+      if (/updated_at\s*=\s*excluded\.updated_at/.test(line)) return false;
+      return /updated_at\s*=\s*(\$\{|\$\d+)/.test(line) || /(?<!expected_)updated_at\s*=\s*'/.test(line);
+    });
+    assert.deepEqual(bad, []);
+  });
+
+  it("keeps the write-back lease longer than the caller and aborts GitHub fetches", () => {
+    assert.equal(WRITEBACK_LOCK_LEASE_SECONDS, 180);
+    assert.equal(GITHUB_FETCH_TIMEOUT_MS, 15_000);
+    const route = fs.readFileSync("src/app/api/[transport]/route.ts", "utf8");
+    assert.match(route, /maxDuration:\s*60/);
+    const src = fs.readFileSync("src/lib/decision-writeback.ts", "utf8");
+    assert.match(src, /signal:\s*AbortSignal\.timeout\(GITHUB_FETCH_TIMEOUT_MS\)/);
+    assert.ok(WRITEBACK_LOCK_LEASE_SECONDS > 60);
+  });
+
+  it("a microsecond updated_at does not break the write-back claim", async () => {
+    const stored: Record<string, unknown> = {
+      id: 1,
+      key: "github:acme/widgets#9",
+      source: "github-label",
+      repo: "acme/widgets",
+      number: 9,
+      title: "Ship the schema",
+      status: "decided",
+      decision: "ship",
+      decided_by: null,
+      decided_at: "2026-10-28 12:00:00.123456+00",
+      actor_id: "operator",
+      writeback: null,
+      writeback_lock: null,
+      writeback_lock_at: null,
+      revision: 4,
+      updated_at: "2026-10-28 12:00:00.123456+00",
+      first_seen_at: "2026-10-01T00:00:00.000Z",
+      last_seen_at: "2026-10-28 12:00:00.123456+00",
+      created_at: "2026-10-01T00:00:00.000Z",
+    };
+    const presented = presentDecision(stored, "2026-10-28T12:00:01.000Z");
+    assert.equal(presented.updated_at, "2026-10-28T12:00:00.123Z");
+    assert.equal(presented.revision, 4);
+    const claimedWith: { value: unknown } = { value: undefined };
+    const store: DecisionStore = {
+      async get() {
+        return { ...stored };
+      },
+      async list() {
+        return [];
+      },
+      async upsert() {
+        throw new Error("unused");
+      },
+      async patch() {
+        throw new Error("unused");
+      },
+      async setWriteback(_id, writeback, revision, token) {
+        if (stored.status !== "decided" || stored.revision !== revision) return null;
+        if (token != null && stored.writeback_lock !== token) return null;
+        stored.writeback = writeback;
+        stored.revision = Number(stored.revision) + 1;
+        if (token != null) {
+          stored.writeback_lock = null;
+          stored.writeback_lock_at = null;
+        }
+        return { ...stored };
+      },
+      async claimWriteback(_id, revision) {
+        claimedWith.value = revision;
+        if (typeof revision !== "number" || revision !== 4) {
+          stored.status = "open";
+          return null;
+        }
+        stored.writeback_lock = "fence";
+        stored.revision = 5;
+        return { token: "fence", revision: 5 };
+      },
+      async releaseWriteback(_id, token) {
+        if (stored.writeback_lock === token) {
+          stored.writeback_lock = null;
+          stored.writeback_lock_at = null;
+        }
+      },
+      async writebackClaimHeld(_id, token, revision) {
+        return stored.status === "decided" && stored.writeback_lock === token && stored.revision === revision;
+      },
+    };
+    setDecisionStoreForTests(store);
+    const github = new FakeGitHub();
+    install(github);
+    const outcome = await writeDecisionBack({
+      id: 1,
+      key: "github:acme/widgets#9",
+      actor_id: "operator",
+      decided_at: presented.decided_at,
+      decision: "ship",
+      revision: presented.revision,
+    });
+    assert.equal(typeof claimedWith.value, "number");
+    assert.equal(claimedWith.value, 4);
+    assert.equal(outcome.status, "written");
+    assert.equal(github.comments.length, 1);
+    assert.equal(stored.writeback, "written");
+    assert.equal(stored.status, "decided");
+  });
+
+  it("an expired-lease writer cannot post after reopen", async () => {
+    const store = createMemoryDecisionStore();
+    setDecisionStoreForTests(store);
+    const row = await seed({ key: "github:acme/widgets#80" });
+    const github = new FakeGitHub();
+    let release: () => void = () => {};
+    const entered = new Promise<void>((resolve) => {
+      github.getIssue = async (repo, number) => {
+        github.calls.push({ method: "get", repo, number });
+        resolve();
+        await new Promise<void>((done) => {
+          release = done;
+        });
+        return { state: github.state, labels: github.labels.map((label) => ({ ...label })) };
+      };
+    });
+    install(github);
+    const deciding = patch(row.id, {
+      status: "decided",
+      decision: "ship",
+      expected_updated_at: row.updated_at,
+    });
+    try {
+      await entered;
+      const during = store.rows.find((item) => item.id === row.id);
+      assert.ok(during);
+      during.writeback_lock_at = new Date(Date.now() - 50_000).toISOString();
+      const early = await patch(row.id, { status: "open" });
+      assert.equal(early.status, 409, await early.clone().text());
+      assert.equal((await early.json() as { code: string }).code, "writeback_in_progress");
+      assert.equal(store.rows.find((item) => item.id === row.id)?.status, "decided");
+      assert.equal(github.comments.length, 0);
+
+      during.writeback_lock_at = new Date(Date.now() - (WRITEBACK_LOCK_LEASE_SECONDS + 1) * 1000).toISOString();
+      const reopened = await patch(row.id, { status: "open" });
+      assert.equal(reopened.status, 200, await reopened.clone().text());
+      const opened = store.rows.find((item) => item.id === row.id);
+      assert.equal(opened?.status, "open");
+      assert.equal(opened?.writeback_lock ?? null, null);
+      assert.equal(opened?.writeback_lock_at ?? null, null);
+    } finally {
+      release();
+    }
+    const res = await deciding;
+    assert.equal(res.status, 200, await res.clone().text());
+    const body = await res.json() as { decision: Decision };
+    assert.equal(body.decision.status, "open");
+    assert.equal(github.comments.length, 0);
+    assert.equal(store.rows.find((item) => item.id === row.id)?.writeback ?? null, null);
+  });
+
+  it("crash then force reopen then a new decision writes back", async () => {
+    const store = createMemoryDecisionStore();
+    setDecisionStoreForTests(store);
+    clearGitHubWriteClientForTests();
+    const key = "github:acme/widgets#81";
+    const row = await seed({ key });
+    const decidedRes = await patch(row.id, {
+      status: "decided",
+      decision: "old answer",
+      expected_updated_at: row.updated_at,
+    });
+    assert.equal(decidedRes.status, 200, await decidedRes.clone().text());
+    const stored = store.rows.find((item) => item.id === row.id);
+    assert.ok(stored);
+    const revisionBefore = stored.revision;
+    stored.writeback = null;
+    stored.writeback_lock = "crashed-token";
+    stored.writeback_lock_at = new Date().toISOString();
+
+    const input: UpsertInput = {
+      key,
+      source: "github-label",
+      repo: "acme/widgets",
+      repo_short: "widgets",
+      number: 81,
+      url: null,
+      title: "Ship the schema",
+      why: null,
+      options: null,
+      recommended: null,
+      requested_by: null,
+      kind: "issue",
+      labels: ["decision"],
+      opened_at: "2026-10-01T00:00:00.000Z",
+      first_seen_at: "2026-10-01T00:00:00.000Z",
+      github_present: true,
+      force: true,
+    };
+    const blocked = await upsertDecision(input);
+    assert.equal(blocked.writeback_in_progress, true);
+    assert.equal(stored.status, "decided");
+    assert.equal(stored.writeback_lock, "crashed-token");
+    assert.equal(stored.revision, revisionBefore);
+    assert.equal(stored.decision, "old answer");
+
+    env.DATABASE_URL = "postgres://example.invalid/decisions";
+    const { POST: postDecisions } = await import("../../src/app/api/decisions/route");
+    const http = await postDecisions(new Request("http://localhost/api/decisions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key, source: "github-label", title: "Ship the schema", force: true }),
+    }));
+    assert.equal(http.status, 409, await http.clone().text());
+    assert.equal((await http.json() as { code: string }).code, "writeback_in_progress");
+    assert.equal(stored.writeback_lock, "crashed-token");
+    assert.equal(stored.status, "decided");
+
+    stored.writeback_lock_at = new Date(Date.now() - (WRITEBACK_LOCK_LEASE_SECONDS + 1) * 1000).toISOString();
+    const opened = await upsertDecision(input);
+    assert.equal(opened.writeback_in_progress, undefined);
+    assert.equal(opened.decision.status, "open");
+    assert.equal(opened.decision.writeback, null);
+    assert.equal(stored.writeback_lock ?? null, null);
+    assert.equal(stored.writeback_lock_at ?? null, null);
+    assert.equal(stored.writeback ?? null, null);
+
+    const github = new FakeGitHub();
+    install(github);
+    const again = await patch(row.id, {
+      status: "decided",
+      decision: "ship the new answer",
+      expected_revision: opened.decision.revision,
+    });
+    assert.equal(again.status, 200, await again.clone().text());
+    const body = await again.json() as { decision: Decision };
+    assert.equal(body.decision.status, "decided");
+    assert.equal(body.decision.writeback, "written");
+    assert.equal(github.comments.length, 1);
+    assert.match(github.comments[0].body, /ship the new answer/);
+  });
+
+  it("a claim that cannot be acquired stamps writeback not_written", async () => {
+    const store = createMemoryDecisionStore();
+    setDecisionStoreForTests(store);
+    clearGitHubWriteClientForTests();
+    const row = await seed({ key: "github:acme/widgets#82" });
+    const decidedRes = await patch(row.id, {
+      status: "decided",
+      decision: "ship",
+      expected_updated_at: row.updated_at,
+    });
+    assert.equal(decidedRes.status, 200, await decidedRes.clone().text());
+    const decided = (await decidedRes.json() as { decision: Decision }).decision;
+    assert.equal(decided.writeback, "not_written");
+    const stored = store.rows.find((item) => item.id === row.id);
+    assert.ok(stored);
+    stored.writeback = null;
+    stored.writeback_lock = "busy-token";
+    stored.writeback_lock_at = new Date().toISOString();
+    const revision = Number(stored.revision);
+    setWritebackLockWaitForTests(30);
+    const github = new FakeGitHub();
+    install(github);
+    const outcome = await writeDecisionBack({
+      id: row.id,
+      key: decided.key,
+      actor_id: decided.actor_id,
+      decided_at: decided.decided_at,
+      decision: decided.decision,
+      revision,
+    });
+    assert.equal(outcome.status, "not_written");
+    assert.equal(stored.writeback, "not_written");
+    assert.equal(stored.status, "decided");
+    assert.equal(github.comments.length, 0);
+    const parsed = parseListQuery(new URLSearchParams("status=decided&writeback=not_written"));
+    assert.equal(parsed.ok, true);
+    if (!parsed.ok) return;
+    const pending = await listDecisions(parsed);
+    assert.deepEqual(pending.map((item) => item.id), [row.id]);
   });
 });

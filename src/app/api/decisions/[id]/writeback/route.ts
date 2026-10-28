@@ -26,7 +26,8 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
       fields: { id: "invalid decision id" },
     });
   }
-  let expected: string | null = null;
+  let expectedUpdatedAt: string | null = null;
+  let expectedRevision: number | null = null;
   const text = await req.text();
   if (text.trim()) {
     let body: unknown;
@@ -38,20 +39,31 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     if (!body || typeof body !== "object" || Array.isArray(body)) {
       return apiError("validation_failed", { message: "Send a JSON object.", fields: { body: "Send a JSON object." } });
     }
-    const raw = (body as { expected_updated_at?: unknown }).expected_updated_at;
-    if (raw != null && raw !== "") {
-      if (typeof raw !== "string" || Number.isNaN(Date.parse(raw))) {
+    const raw = body as { expected_updated_at?: unknown; expected_revision?: unknown };
+    if (raw.expected_updated_at != null && raw.expected_updated_at !== "") {
+      if (typeof raw.expected_updated_at !== "string" || Number.isNaN(Date.parse(raw.expected_updated_at))) {
         return apiError("validation_failed", {
           message: "expected_updated_at must be an ISO 8601 timestamp.",
           fields: { expected_updated_at: "expected_updated_at must be an ISO 8601 timestamp." },
         });
       }
-      expected = new Date(raw).toISOString();
+      expectedUpdatedAt = new Date(raw.expected_updated_at).toISOString();
+    }
+    if (raw.expected_revision != null && raw.expected_revision !== "") {
+      const value = raw.expected_revision;
+      const parsed = typeof value === "number" ? value : typeof value === "string" && /^\d+$/.test(value) ? Number(value) : Number.NaN;
+      if (!Number.isSafeInteger(parsed) || parsed < 0) {
+        return apiError("validation_failed", {
+          message: "expected_revision must be a non-negative integer.",
+          fields: { expected_revision: "expected_revision must be a non-negative integer." },
+        });
+      }
+      expectedRevision = parsed;
     }
   }
   if (!decisionPersistenceOn()) return NextResponse.json({ ok: true, demo: true });
   try {
-    const outcome = await retryDecisionWriteback(id, expected);
+    const outcome = await retryDecisionWriteback(id, { updatedAt: expectedUpdatedAt, revision: expectedRevision });
     if (!outcome.ok) {
       return apiError(outcome.code, { message: outcome.message, fields: outcome.fields });
     }

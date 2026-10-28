@@ -1,4 +1,4 @@
-import { WRITEBACK_LOCK_LEASE_SECONDS, type DecisionStore, type ListStatus, type PatchInput, type UpsertInput } from "../../src/lib/decisions";
+import { writebackLockUnexpired, type DecisionStore, type ListStatus, type PatchInput, type UpsertInput } from "../../src/lib/decisions";
 
 /** In-memory queue with the same hold, stale, and terminal rules as the SQL. */
 export function createMemoryDecisionStore(): DecisionStore & {
@@ -11,7 +11,7 @@ export function createMemoryDecisionStore(): DecisionStore & {
   let clock = 0;
 
   // Each write moves updated_at by at least 1ms so a same-millisecond
-  // decide-then-resolve still has a revision the stale guard can reject.
+  // decide-then-resolve still has a visible timestamp. Concurrency uses revision.
   function stamp(previous?: unknown): string {
     const prev = typeof previous === "string" ? Date.parse(previous) : Number.NaN;
     const ms = Math.max(Date.now(), clock + 1, Number.isNaN(prev) ? 0 : prev + 1);
@@ -23,17 +23,14 @@ export function createMemoryDecisionStore(): DecisionStore & {
     return { ...row };
   }
 
-  function sameRevision(left: unknown, right: string): boolean {
-    const a = Date.parse(String(left ?? ""));
-    const b = Date.parse(right);
-    return !Number.isNaN(a) && a === b;
+  function revisionOf(row: Record<string, unknown>): number {
+    return typeof row.revision === "number" && Number.isSafeInteger(row.revision) ? row.revision : 0;
   }
 
-  function lockHeld(row: Record<string, unknown>, now = Date.now()): boolean {
-    if (row.writeback_lock == null || row.writeback_lock === "") return false;
-    const at = Date.parse(String(row.writeback_lock_at ?? ""));
-    if (Number.isNaN(at)) return true;
-    return now - at < WRITEBACK_LOCK_LEASE_SECONDS * 1000;
+  function bump(row: Record<string, unknown>): number {
+    const nextRevision = revisionOf(row) + 1;
+    row.revision = nextRevision;
+    return nextRevision;
   }
 
   return {
@@ -96,6 +93,9 @@ export function createMemoryDecisionStore(): DecisionStore & {
           actor_id: null,
           chosen_option: null,
           writeback: null,
+          writeback_lock: null,
+          writeback_lock_at: null,
+          revision: 0,
           first_seen_at: input.first_seen_at ?? input.opened_at ?? now,
           last_seen_at: now,
           created_at: now,
@@ -106,6 +106,13 @@ export function createMemoryDecisionStore(): DecisionStore & {
         return { row: copy(row), previous_status: null };
       }
       const previous = String(existing.status);
+      if (
+        input.force
+        && (previous === "decided" || previous === "deferred")
+        && writebackLockUnexpired(existing.writeback_lock, existing.writeback_lock_at)
+      ) {
+        return { row: copy(existing), previous_status: previous, writeback_in_progress: true };
+      }
       let clearAnswer = false;
       let clearDefer = false;
       let clearActor = false;
@@ -138,21 +145,24 @@ export function createMemoryDecisionStore(): DecisionStore & {
         existing.actor_id = null;
         existing.chosen_option = null;
         existing.writeback = null;
+        existing.writeback_lock = null;
+        existing.writeback_lock_at = null;
       }
+      bump(existing);
       return { row: copy(existing), previous_status: previous };
     },
     async patch(id, input) {
       const row = rows.find((item) => item.id === id);
       if (!row) return null;
-      if (input.expectedUpdatedAt && Date.parse(String(row.updated_at)) !== Date.parse(input.expectedUpdatedAt)) return null;
+      if (input.expectedRevision != null && revisionOf(row) !== input.expectedRevision) return null;
       if (
         input.guardTerminal
         && input.status !== "open"
         && (row.status === "decided" || row.status === "withdrawn")
       ) return null;
-      // An in-flight write-back owns this decided revision. Reopening it
-      // would let that writer publish a decision the row no longer stores.
-      if (input.status === "open" && lockHeld(row)) return null;
+      // An unexpired write-back claim owns this row. Reopening it would let
+      // that writer publish a decision the row no longer stores.
+      if (input.status === "open" && writebackLockUnexpired(row.writeback_lock, row.writeback_lock_at)) return null;
       const status = input.status ?? (row.status as PatchInput["status"]);
       const now = stamp(row.updated_at);
       if (input.status) row.status = input.status;
@@ -182,27 +192,36 @@ export function createMemoryDecisionStore(): DecisionStore & {
         if (status === "decided" || status === "deferred" || status === "withdrawn") row.writeback = null;
       }
       row.updated_at = now;
+      bump(row);
       return copy(row);
     },
-    async setWriteback(id, writeback, revision) {
+    async setWriteback(id, writeback, revision, token) {
       const row = rows.find((item) => item.id === id);
       if (!row) return null;
       if (row.status !== "decided") return null;
-      if (!sameRevision(row.updated_at, revision)) return null;
+      if (revisionOf(row) !== revision) return null;
+      if (token != null) {
+        if (row.writeback_lock !== token) return null;
+        row.writeback_lock = null;
+        row.writeback_lock_at = null;
+      }
       row.writeback = writeback;
       row.updated_at = stamp(row.updated_at);
+      bump(row);
       return copy(row);
     },
     async claimWriteback(id, revision) {
       const row = rows.find((item) => item.id === id);
       if (!row) return null;
       if (row.status !== "decided") return null;
-      if (!sameRevision(row.updated_at, revision)) return null;
-      if (lockHeld(row)) return null;
+      if (revisionOf(row) !== revision) return null;
+      if (writebackLockUnexpired(row.writeback_lock, row.writeback_lock_at)) return null;
       const token = crypto.randomUUID();
       row.writeback_lock = token;
       row.writeback_lock_at = new Date().toISOString();
-      return token;
+      row.updated_at = stamp(row.updated_at);
+      const nextRevision = bump(row);
+      return { token, revision: nextRevision };
     },
     async releaseWriteback(id, token) {
       const row = rows.find((item) => item.id === id);
@@ -214,7 +233,7 @@ export function createMemoryDecisionStore(): DecisionStore & {
       const row = rows.find((item) => item.id === id);
       if (!row || row.writeback_lock !== token) return false;
       if (row.status !== "decided") return false;
-      return sameRevision(row.updated_at, revision);
+      return revisionOf(row) === revision;
     },
   };
 }
