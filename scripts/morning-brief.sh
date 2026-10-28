@@ -467,7 +467,7 @@ decisions_heading() {
     printf '%s\n' "DECISIONS FOR YOU (${n_dec}) — oldest first; each one is work nobody else can unblock"
     return
   fi
-  if [[ "$n_dec" == "null" && ( "$n_labels" -gt 0 || "$n_known" -gt 0 ) ]]; then
+  if [[ "$n_dec" == "null" ]]; then
     printf '%s\n' "DECISIONS FOR YOU: DATA INCOMPLETE."
     return
   fi

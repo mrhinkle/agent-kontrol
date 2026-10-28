@@ -687,7 +687,8 @@ export function formatBriefText(
   if (decisionCount !== null && decisionCount > 0) {
     lines.push(`DECISIONS FOR YOU (${decisionCount}) \u2014 oldest first; each one is work nobody else can unblock`);
     writeDecisions();
-  } else if (decisionCount === null && (labels.length > 0 || brief.decisions.length > 0)) {
+  } else if (decisionCount === null) {
+    // Unmeasured wins over "not tracked": an empty label list must not hide a failed or incomplete read.
     lines.push("DECISIONS FOR YOU: DATA INCOMPLETE.");
     writeDecisions();
   } else if (labels.length === 0) {

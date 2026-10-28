@@ -302,6 +302,20 @@ describe("GET /api/brief", { concurrency: false }, () => {
     assert.match(empty, /MORNING BRIEF — Mon 2026-10-27 08:00 EDT — last 24h {2}\(repos from config\)/);
     assert.match(empty, /0 PRs merged, 0 issues closed, 0 opened — the queue held level\./);
     assert.match(empty, /not tracked \(set brief\.decisionLabels/);
+    // An unmeasured decisions total stays DATA INCOMPLETE even with no labels configured.
+    const unmeasuredBrief = assembleBrief({
+      generatedAt: "2026-10-27T12:00:00Z",
+      windowHours: 24,
+      repoSource: "config",
+      stuckPrHours: 48,
+      staleIssueDays: 21,
+      coordinator: { configured: false, agent_id: null },
+      repos: [],
+    });
+    unmeasuredBrief.totals.decisions = null;
+    const unmeasured = formatBriefText(unmeasuredBrief, { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: [] });
+    assert.match(unmeasured, /DECISIONS FOR YOU: DATA INCOMPLETE\./);
+    assert.equal(/not tracked/.test(unmeasured), false);
     assert.equal(empty.includes("undefined"), false);
 
     const missing = repoSection({
@@ -1475,7 +1489,8 @@ describe("GET /api/brief", { concurrency: false }, () => {
     assert.equal(heading("null 3 0"), "DECISIONS FOR YOU: DATA INCOMPLETE.\n");
     assert.equal(heading("null 1 4"), "DECISIONS FOR YOU: DATA INCOMPLETE.\n");
     assert.equal(heading("0 1 0"), "DECISIONS FOR YOU: none open.\n");
-    assert.match(heading("null 0 0"), /not tracked/);
+    // Empty labels plus an unmeasured count is DATA INCOMPLETE, never "not tracked" (round 7 review).
+    assert.equal(heading("null 0 0"), "DECISIONS FOR YOU: DATA INCOMPLETE.\n");
     assert.match(heading("0 0 0"), /not tracked/);
     assert.match(heading("4 1 4"), /^DECISIONS FOR YOU \(4\) /);
     assert.match(script, /decisions_heading "\$n_dec" "\$n_labels" "\$n_known_dec"/);
