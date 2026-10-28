@@ -440,25 +440,14 @@ Exit codes:
 
 A directory that exists and is readable but holds no skills posts an empty list. A skill whose name the server would reject (not `[A-Za-z0-9][A-Za-z0-9._-]{0,80}`) is skipped with a warning. Running it twice posts identical bodies.
 
-On macOS, `scripts/install-skills-drift.sh` does the setup below for you: it copies the collector to `~/.mission-control/`, adds `MC_URL` and `MC_TOKEN` to `~/.claude/mission-control.env` if they are missing (mode 600, other lines kept), writes the launchd plist, and loads it. `AK_MACHINE` and `AK_SKILL_DRIFT_DIRS` set when you run it are written to the plist. `--uninstall` removes the job. To set it up by hand, schedule it with launchd. Keep `MC_URL` and `MC_TOKEN` in `~/.claude/mission-control.env` (mode 600) and have the job source it, so the plist holds no secret. Save as `~/Library/LaunchAgents/com.missioncontrol.skills-drift.plist`, then `launchctl bootstrap gui/$(id -u) <that file>`:
+On macOS, `scripts/install-skills-drift.sh` sets up the schedule. It copies the collector to `~/.mission-control/`, adds `MC_URL` and `MC_TOKEN` to `~/.claude/mission-control.env` if they are missing (created mode 600, other lines kept), writes `~/.mission-control/run-skills-drift.sh`, and loads an hourly launchd job at `~/Library/LaunchAgents/com.missioncontrol.skills-drift.plist`. The wrapper reads `MC_URL` and `MC_TOKEN` from the env file as literal `KEY=value` lines (nothing in the file is executed), then runs the collector. The plist holds no secret. `AK_MACHINE` and `AK_SKILL_DRIFT_DIRS` set when you run the installer go into the plist. `MC_SKILLS_DRIFT_INTERVAL` sets the seconds between runs. Run it from a checkout, or copy `install-skills-drift.sh` and `collect-skills-drift.mjs` together to the machine. `--uninstall` removes the job and leaves the files.
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.missioncontrol.skills-drift</string>
-  <key>ProgramArguments</key><array>
-    <string>/bin/sh</string>
-    <string>-c</string>
-    <string>set -a; . "$HOME/.claude/mission-control.env"; exec /opt/homebrew/bin/node "$HOME/.mission-control/collect-skills-drift.mjs"</string>
-  </array>
-  <key>StartInterval</key><integer>3600</integer>
-  <key>StandardErrorPath</key><string>/Users/YOU/Library/Logs/mc-skills-drift.log</string>
-  <key>StandardOutPath</key><string>/Users/YOU/Library/Logs/mc-skills-drift.log</string>
-</dict></plist>
+```sh
+MC_URL=https://YOUR-DEPLOY.vercel.app MC_TOKEN=... ./scripts/install-skills-drift.sh
+tail ~/Library/Logs/mc-skills-drift.log   # a non-zero exit is logged here
 ```
 
-Replace the node path with what `which node` prints (`/usr/local/bin/node` on Intel). From cron, use the same sourcing: `17 * * * * set -a; . $HOME/.claude/mission-control.env; /opt/homebrew/bin/node $HOME/.mission-control/collect-skills-drift.mjs >> $HOME/Library/Logs/mc-skills-drift.log 2>&1`. A non-zero exit is the signal to look at the log.
+From cron, call the same wrapper: `17 * * * * $HOME/.mission-control/run-skills-drift.sh >> $HOME/Library/Logs/mc-skills-drift.log 2>&1`. A token or URL must be a single line.
 
 `missing` is in the mirror and not in the report. `extra` is in the report and not in the mirror. `differs` is both, with different content SHAs. The POST response is `{ ok, host, dir, missing, extra, differs, driftCount }`. `driftCount` there is the number of rows in those three lists for this report. `upstream.driftCount` on `GET /api/skills` is the number of distinct skill names that disagree in any stored report. The same name on two hosts counts once.
 

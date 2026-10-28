@@ -36,6 +36,18 @@ xml_escape() {
     -e "s/'/\&apos;/g" -e 's/"/\&quot;/g'
 }
 
+umask 077
+
+# Values go into the env file as plain KEY=value lines, which the run wrapper reads literally.
+check_value() {
+  case "$2" in *$'\n'*|*$'\r'*|'') echo "$1 must be a single non-empty line" >&2; exit 1 ;; esac
+}
+
+append_env() {
+  [[ -s "$ENV_FILE" && -n "$(tail -c1 "$ENV_FILE")" ]] && printf '\n' >> "$ENV_FILE"
+  printf '%s=%s\n' "$1" "$2" >> "$ENV_FILE"
+}
+
 env_file_has() { [[ -f "$ENV_FILE" ]] && grep -q "^$1=" "$ENV_FILE"; }
 
 NODE_BIN="$(command -v node || true)"
@@ -46,6 +58,9 @@ case "$INTERVAL_SECONDS" in ''|*[!0-9]*) echo "MC_SKILLS_DRIFT_INTERVAL must be 
 
 mkdir -p "$INSTALL_DIR" "${HOME}/Library/LaunchAgents" "${HOME}/Library/Logs" "$(dirname "$ENV_FILE")"
 
+touch "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+
 # Add MC_URL / MC_TOKEN to the env file only if it lacks them; never overwrite other lines.
 if ! env_file_has MC_URL; then
   if [[ -z "${MC_URL:-}" ]]; then
@@ -53,17 +68,17 @@ if ! env_file_has MC_URL; then
     read -r -p "Agent Kontrol URL (e.g. https://your-deploy.vercel.app): " MC_URL
   fi
   case "${MC_URL}" in https://*|http://localhost*|http://127.0.0.1*) ;; *) echo "MC_URL must be https (http only for localhost)" >&2; exit 1 ;; esac
-  printf 'MC_URL=%s\n' "${MC_URL%/}" >> "$ENV_FILE"
+  check_value MC_URL "$MC_URL"
+  append_env MC_URL "${MC_URL%/}"
 fi
 if ! env_file_has MC_TOKEN; then
   if [[ -z "${MC_TOKEN:-}" ]]; then
     [[ -t 0 ]] || { echo "Set MC_TOKEN (or run interactively)." >&2; exit 1; }
     read -r -s -p "Agent Kontrol token: " MC_TOKEN; echo >&2
   fi
-  [[ -n "$MC_TOKEN" ]] || { echo "MC_TOKEN is required" >&2; exit 1; }
-  printf 'MC_TOKEN=%s\n' "$MC_TOKEN" >> "$ENV_FILE"
+  check_value MC_TOKEN "$MC_TOKEN"
+  append_env MC_TOKEN "$MC_TOKEN"
 fi
-chmod 600 "$ENV_FILE"
 
 cp "${HERE}/collect-skills-drift.mjs" "$INSTALLED_JS"
 chmod 755 "$INSTALLED_JS"
@@ -78,7 +93,26 @@ for var in AK_MACHINE AK_SKILL_DRIFT_DIRS; do
   fi
 done
 
-RUN_CMD="set -a; . \"\$HOME/.claude/mission-control.env\"; exec \"${NODE_BIN}\" \"\$HOME/.mission-control/collect-skills-drift.mjs\""
+# The wrapper reads MC_URL and MC_TOKEN as literal text (nothing in the file is executed or expanded),
+# then runs the collector. The plist and cron both call it, so neither holds a secret.
+WRAPPER="${INSTALL_DIR}/run-skills-drift.sh"
+cat > "$WRAPPER" <<'WEOF'
+#!/bin/sh
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    MC_URL=*|MC_TOKEN=*)
+      key="${line%%=*}"; val="${line#*=}"
+      case "$val" in
+        \"*\") val="${val#?}"; val="${val%?}" ;;
+        \'*\') val="${val#?}"; val="${val%?}" ;;
+      esac
+      export "$key=$val" ;;
+  esac
+done < "$HOME/.claude/mission-control.env"
+exec NODE_BIN_PLACEHOLDER "$HOME/.mission-control/collect-skills-drift.mjs"
+WEOF
+sed -i.bak "s|NODE_BIN_PLACEHOLDER|\"${NODE_BIN}\"|" "$WRAPPER" && rm -f "$WRAPPER.bak"
+chmod 755 "$WRAPPER"
 
 launchctl bootout "${DOMAIN}/${LABEL}" >/dev/null 2>&1 || true
 
@@ -92,8 +126,7 @@ cat > "$PLIST" <<EOF
   <key>ProgramArguments</key>
   <array>
     <string>/bin/sh</string>
-    <string>-c</string>
-    <string>$(xml_escape "$RUN_CMD")</string>
+    <string>$(xml_escape "$WRAPPER")</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
