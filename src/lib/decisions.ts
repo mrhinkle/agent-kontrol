@@ -130,7 +130,11 @@ export interface PatchInput {
   chosen_option?: string | null;
   /** When set, the update matches only a row still at this instant. */
   expectedUpdatedAt?: string | null;
-  /** When true, a decided or withdrawn row is not updated. Deferred is not terminal. */
+  /**
+   * When true, a decided or withdrawn row is not updated unless status is
+   * open (the explicit reopen). Deferred is not terminal. Resolve sets this
+   * on every mutation so omitting status cannot change the answer text.
+   */
   guardTerminal?: boolean;
 }
 
@@ -142,6 +146,7 @@ export interface DecisionStore {
     source: string | null;
     limit: number;
     shape?: ListShape;
+    writeback?: "written" | "not_written" | null;
   }): Promise<Record<string, unknown>[]>;
   upsert(input: UpsertInput): Promise<{ row: Record<string, unknown>; previous_status: string | null }>;
   patch(id: number, input: PatchInput): Promise<Record<string, unknown> | null>;
@@ -606,7 +611,7 @@ export function parseDecisionId(raw: string): number | null {
   return Number.isSafeInteger(id) ? id : null;
 }
 
-export function parseListQuery(params: URLSearchParams): { ok: true; status: ListStatus; repo: string | null; source: string | null; limit: number; shape: ListShape } | ParseFail {
+export function parseListQuery(params: URLSearchParams): { ok: true; status: ListStatus; repo: string | null; source: string | null; limit: number; shape: ListShape; writeback: "written" | "not_written" | null } | ParseFail {
   const shapeRaw = params.get("shape") ?? "row";
   if (!(LIST_SHAPES as readonly string[]).includes(shapeRaw)) {
     return fail("validation_failed", { shape: "shape must be row or brief." });
@@ -631,6 +636,14 @@ export function parseListQuery(params: URLSearchParams): { ok: true; status: Lis
     }
     limit = Number(limitRaw);
   }
+  const writebackRaw = params.get("writeback");
+  let writeback: "written" | "not_written" | null = null;
+  if (writebackRaw != null && writebackRaw !== "") {
+    if (writebackRaw !== "written" && writebackRaw !== "not_written") {
+      return fail("validation_failed", { writeback: "writeback must be written or not_written." });
+    }
+    writeback = writebackRaw;
+  }
   return {
     ok: true,
     status: statusRaw as ListStatus,
@@ -638,6 +651,7 @@ export function parseListQuery(params: URLSearchParams): { ok: true; status: Lis
     source: sourceRaw,
     limit,
     shape: shapeRaw as ListShape,
+    writeback,
   };
 }
 
@@ -681,8 +695,9 @@ export async function listDecisions(query: {
   repo: string | null;
   source: string | null;
   limit: number;
-  /** `brief` selects the morning-brief population and ignores status and source. */
+  /** `brief` selects the morning-brief population and ignores status, source, and writeback. */
   shape?: ListShape;
+  writeback?: "written" | "not_written" | null;
 }): Promise<Decision[]> {
   const now = nowIso();
   if (testStore) {
@@ -713,6 +728,11 @@ export async function listDecisions(query: {
         when ${brief} is true then source = 'github-label'
         else (${query.source}::text is null or source = ${query.source})
       end
+    )
+    and (
+      ${brief} is true
+      or ${query.writeback ?? null}::text is null
+      or writeback = ${query.writeback ?? null}
     )
     order by first_seen_at asc, id asc
     limit ${query.limit}
@@ -938,6 +958,7 @@ export async function patchDecision(id: number, input: PatchInput): Promise<Deci
       )
       and (
         ${guardTerminal} is not true
+        or ${status} = 'open'
         or status not in ('decided', 'withdrawn')
       )
     returning *

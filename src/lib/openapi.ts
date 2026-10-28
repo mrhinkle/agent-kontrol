@@ -996,6 +996,11 @@ export function openApiDocument(): Json {
               { type: "integer", minimum: 1, maximum: 1000, default: 500 },
               "Maximum rows. Default 500. Maximum 1000.",
             ),
+            query(
+              "writeback",
+              { type: "string", enum: ["written", "not_written"] },
+              "When set, only rows with this write-back stamp. Ignored when shape is brief.",
+            ),
           ],
           responses: {
             "200": jsonResponse("Queue rows, the morning-brief list, or an empty demo list.", {
@@ -1086,7 +1091,7 @@ export function openApiDocument(): Json {
           tags: ["decisions"],
           summary: "Record a decision, a deferral, or a withdrawal.",
           description:
-            "Dashboard session, MC_TOKEN, or an agent credential with decisions:write. An agent credential without that scope is 403 insufficient_scope. decided_by in the body is ignored. The stored actor is the principal, or null for dev-open. status decided records the row and then comments on the GitHub issue named by the row key and removes the decision labels. A failed write-back still decides the row and sets writeback to not_written. A past or invalid defer_until is 400 validation_failed. expected_updated_at that does not match is 409 stale. A decided or withdrawn row is 409 conflict. A non-integer id is 400 validation_failed. A non-JSON body is 400 invalid_json. A body with none of status, decision, decided_by, or defer_until is 400 missing_field. An unknown id, when a database is connected, is 404 not_found and error stays Decision not found. Demo mode does not look the id up.",
+            "Dashboard session, MC_TOKEN, or an agent credential with decisions:write. An agent credential without that scope is 403 insufficient_scope. decided_by in the body is ignored. The stored actor is the principal, or null for dev-open. status decided records the row and then comments on the GitHub issue named by the row key and removes the decision labels. A failed write-back still decides the row and sets writeback to not_written. A past or invalid defer_until is 400 validation_failed. expected_updated_at that does not match is 409 stale. A decided or withdrawn row is 409 conflict, including a body that omits status. status open is the reopen. A non-integer id is 400 validation_failed. A non-JSON body is 400 invalid_json. A body with none of status, decision, decided_by, or defer_until is 400 missing_field. An unknown id, when a database is connected, is 404 not_found and error stays Decision not found. Demo mode does not look the id up.",
           security: cookieOrBearer,
           parameters: [pathParam("id", "Decision id.", { type: "integer", minimum: 1 })],
           requestBody: body(ref("PatchDecision")),
@@ -1129,7 +1134,7 @@ export function openApiDocument(): Json {
           tags: ["decisions"],
           summary: "Retry the GitHub comment for a decided row.",
           description:
-            "Dashboard session, MC_TOKEN, or an agent credential with decisions:write. An agent credential without that scope is 403 insufficient_scope. Posts the decision comment only when the marker is absent, then removes decision labels. The issue is the one named by the row key. Does not decide the row again. A row that is not decided is 409 conflict. expected_updated_at that does not match is 409 stale. No token, a GitHub 403 or 404, a network error, or a closed issue leaves writeback not_written. Demo mode does not look the id up.",
+            "Dashboard session, MC_TOKEN, or an agent credential with decisions:write. An agent credential without that scope is 403 insufficient_scope. Posts the decision comment unless an existing comment contains the full canonical text for this row, then removes decision labels. A marker alone does not count. Concurrent retries share a per-row lock. The issue is the one named by the row key. Does not decide the row again. A row that is not decided is 409 conflict. expected_updated_at that does not match is 409 stale. No token, a GitHub 403 or 404, a network error, or a closed issue leaves writeback not_written. Demo mode does not look the id up.",
           security: cookieOrBearer,
           parameters: [pathParam("id", "Decision id.", { type: "integer", minimum: 1 })],
           requestBody: body(ref("RetryDecisionWriteback")),

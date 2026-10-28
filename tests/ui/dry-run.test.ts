@@ -5,6 +5,7 @@ import fs from "node:fs";
 import { PUT as putRepos } from "../../src/app/api/settings/repos/route";
 import { PATCH as patchTask } from "../../src/app/api/tasks/[id]/route";
 import { POST as postMemory } from "../../src/app/api/memory/route";
+import { DEMO_BANNER, demoStoreSize, resetDemoStoreForTests } from "../../src/lib/demo-store";
 import { rememberForTool, updateTaskForTool } from "../../src/lib/dry-run-actions";
 import {
   changeDetails,
@@ -663,22 +664,30 @@ describe("dry run writes nothing", () => {
     assert.ok(writes.some((sql) => /insert into agents/i.test(sql)));
   });
 
-  it("keeps the demo-mode text when dry_run is omitted and writes nothing when it is set", async () => {
+  it("stores a demo remember in memory, previews dry_run without writing, and returns task_not_found for a missing task", async () => {
     const previous = process.env.DATABASE_URL;
     delete process.env.DATABASE_URL;
     try {
       resetSpy();
-      const plain = await rememberForTool({ content: "nope", key: "project/status" });
-      assert.equal(plain.content[0].text, "Demo mode; note not stored.");
-      const preview = await rememberForTool({ content: "nope", key: "project/status", dry_run: true });
+      resetDemoStoreForTests();
+      const plain = await rememberForTool({ content: "kept", key: "project/status" });
+      assert.equal(plain.content[0].text.startsWith(`${DEMO_BANNER}\n`), true);
+      assert.match(plain.content[0].text, /Stored memory #/);
+      assert.equal(demoStoreSize().notes, 1);
+      const preview = await rememberForTool({ content: "ghost", key: "project/ghost", dry_run: true });
       const body = JSON.parse(preview.content[0].text);
       assert.equal(body.dry_run, true);
-      assert.equal(body.would_write, false);
+      assert.equal(body.would_write, true);
       assert.equal(body.applied, false);
+      assert.equal(demoStoreSize().notes, 1);
       const task = await updateTaskForTool({ id: 7, status: "cancelled", dry_run: true });
-      assert.equal(JSON.parse(task.content[0].text).would_write, false);
+      assert.equal(task.isError, true);
+      assert.equal(JSON.parse(task.content[0].text).code, "task_not_found");
+      assert.equal(JSON.parse(task.content[0].text).error, "Task not found");
       const taskPlain = await updateTaskForTool({ id: 7, status: "done" });
-      assert.equal(taskPlain.content[0].text, "Demo mode; task not updated.");
+      assert.equal(taskPlain.isError, true);
+      assert.equal(JSON.parse(taskPlain.content[0].text).error, "Task not found");
+      assert.equal(demoStoreSize().tasks, 0);
       assert.equal(queries.length, 0);
       assert.equal(writes.length, 0);
     } finally {

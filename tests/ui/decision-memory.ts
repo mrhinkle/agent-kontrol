@@ -46,6 +46,7 @@ export function createMemoryDecisionStore(): DecisionStore & {
       }).filter((row) => {
         if (query.repo && row.repo !== query.repo) return false;
         if (query.shape !== "brief" && query.source && row.source !== query.source) return false;
+        if (query.shape !== "brief" && query.writeback && row.writeback !== query.writeback) return false;
         return true;
       });
       matched.sort((a, b) => String(a.first_seen_at).localeCompare(String(b.first_seen_at)) || Number(a.id) - Number(b.id));
@@ -131,7 +132,11 @@ export function createMemoryDecisionStore(): DecisionStore & {
       const row = rows.find((item) => item.id === id);
       if (!row) return null;
       if (input.expectedUpdatedAt && Date.parse(String(row.updated_at)) !== Date.parse(input.expectedUpdatedAt)) return null;
-      if (input.guardTerminal && (row.status === "decided" || row.status === "withdrawn")) return null;
+      if (
+        input.guardTerminal
+        && input.status !== "open"
+        && (row.status === "decided" || row.status === "withdrawn")
+      ) return null;
       const status = input.status ?? (row.status as PatchInput["status"]);
       const now = stamp(row.updated_at);
       if (input.status) row.status = input.status;

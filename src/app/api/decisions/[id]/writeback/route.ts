@@ -11,7 +11,8 @@ export const maxDuration = 30;
  * POST /api/decisions/:id/writeback
  *
  * Retry the GitHub comment and label removal for a decided row.
- * Does not decide again. The same marker skips a second comment.
+ * Does not decide again. A comment that already contains the canonical
+ * decision text skips a second comment. The marker alone does not.
  * Dashboard session, MC_TOKEN, or decisions:write.
  */
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {

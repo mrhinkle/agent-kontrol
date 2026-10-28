@@ -165,8 +165,11 @@ export async function resolveDecision(input: ResolveBody & { id: number; actor: 
   if (input.expected_updated_at && !sameInstant(row.updated_at, input.expected_updated_at)) return stale();
 
   const next = input.status;
-  const terminal = next === "decided" || next === "deferred" || next === "withdrawn";
-  if (terminal && (row.status === "decided" || row.status === "withdrawn")) return terminalConflict();
+  // status open is the explicit reopen. Every other mutation of a decided or
+  // withdrawn row is a conflict, including a body that omits status and only
+  // sends decision text. Deferred is not terminal.
+  const reopening = next === "open";
+  if ((row.status === "decided" || row.status === "withdrawn") && !reopening) return terminalConflict();
 
   let decisionText = input.setDecision ? input.decision ?? null : undefined;
   let chosen: string | null = null;
@@ -208,7 +211,7 @@ export async function resolveDecision(input: ResolveBody & { id: number; actor: 
     setChosen,
     chosen_option: chosen,
     expectedUpdatedAt: input.expected_updated_at ?? null,
-    guardTerminal: terminal,
+    guardTerminal: true,
   });
   if (!updated) {
     const again = await getDecision(input.id);

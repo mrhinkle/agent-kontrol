@@ -2,21 +2,21 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { DecisionList } from "@/components/DecisionQueue";
+import { decisionsForPage, loadDecisionPage } from "@/lib/decision-page";
 import type { Decision } from "@/lib/decisions";
 
 export default function DecisionsPage() {
   const [rows, setRows] = useState<Decision[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
-    const res = await fetch("/api/decisions?status=open");
-    const body = (await res.json().catch(() => ({}))) as { decisions?: Decision[]; error?: string };
-    if (!res.ok) {
-      setError(body.error ?? "Failed to load decisions.");
-      setRows([]);
+  const load = useCallback(async (keep?: Decision | null) => {
+    const loaded = await loadDecisionPage();
+    if (!loaded.ok) {
+      setError(loaded.error);
+      setRows(keep?.writeback === "not_written" ? decisionsForPage([], [keep]) : []);
       return;
     }
-    setRows(body.decisions ?? []);
+    setRows(keep?.writeback === "not_written" ? decisionsForPage(loaded.decisions, [keep]) : loaded.decisions);
   }, []);
 
   useEffect(() => {
@@ -33,13 +33,15 @@ export default function DecisionsPage() {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
     });
-    const body = (await res.json().catch(() => ({}))) as { code?: string; error?: string };
+    const body = (await res.json().catch(() => ({}))) as { code?: string; error?: string; decision?: Decision };
     if (!res.ok) {
       if (body.code === "stale") setError("This decision changed. Reload to see the latest.");
       else if (body.code === "conflict") setError("This decision is already decided or withdrawn.");
       else setError(body.error ?? "Could not update the decision.");
+      await load();
+      return;
     }
-    await load();
+    await load(body.decision ?? null);
   }
 
   async function onRetry(decision: Decision) {
@@ -49,12 +51,14 @@ export default function DecisionsPage() {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ expected_updated_at: decision.updated_at }),
     });
-    const body = (await res.json().catch(() => ({}))) as { code?: string; error?: string };
+    const body = (await res.json().catch(() => ({}))) as { code?: string; error?: string; decision?: Decision };
     if (!res.ok) {
       if (body.code === "stale") setError("This decision changed. Reload to see the latest.");
       else setError(body.error ?? "Could not write the decision back.");
+      await load(decision.writeback === "not_written" ? decision : null);
+      return;
     }
-    await load();
+    await load(body.decision ?? null);
   }
 
   return (

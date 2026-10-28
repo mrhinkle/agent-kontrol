@@ -38,6 +38,21 @@ export function buildDecisionComment(input: { who: string; date: string; text: s
 }
 
 /**
+ * A comment counts as this write-back only when it contains the full canonical
+ * text. The marker alone does not. When the token's GitHub login is known, a
+ * different author does not count either.
+ */
+export function commentRecordsThisDecision(
+  comment: { body: string; author?: string | null },
+  expected: string,
+  viewer: string | null,
+): boolean {
+  if (expected.length === 0 || !comment.body.includes(expected)) return false;
+  if (viewer && comment.author && comment.author !== viewer) return false;
+  return true;
+}
+
+/**
  * http(s) url on the row, otherwise the GitHub url implied by the key.
  * `repo` and `number` columns are not read. A `javascript:` url falls through to the key.
  */

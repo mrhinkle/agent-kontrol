@@ -12,6 +12,8 @@ import { DecisionCard, DecisionList } from "../../src/components/DecisionQueue";
 import { DECISION_MARKER, buildDecisionComment, decisionSourceHref } from "../../src/lib/decision-format";
 import { listDecisionsTool, requestDecisionTool } from "../../src/lib/decision-resolve";
 import {
+  listDecisions,
+  parseListQuery,
   setDecisionStoreForTests,
   upsertDecision,
   type Decision,
@@ -197,9 +199,14 @@ class FakeGitHub implements GitHubWriteClient {
     { name: "decision" },
     { name: "owner-gate-tierc" },
   ];
-  comments: { body: string }[] = [];
+  comments: { body: string; author?: string | null }[] = [];
+  viewerLogin: string | null = null;
   failGet: "403" | "404" | "network" | null = null;
   failLabel = false;
+
+  async viewer(): Promise<string | null> {
+    return this.viewerLogin;
+  }
 
   async getIssue(repo: string, number: number) {
     this.calls.push({ method: "get", repo, number });
@@ -215,7 +222,7 @@ class FakeGitHub implements GitHubWriteClient {
 
   async createComment(repo: string, number: number, body: string) {
     this.calls.push({ method: "comment", repo, number, body });
-    this.comments.push({ body });
+    this.comments.push({ body, author: this.viewerLogin });
   }
 
   async removeLabel(repo: string, number: number, name: string) {
@@ -710,5 +717,177 @@ describe("decision resolve", { concurrency: false }, () => {
     assert.equal(github.calls.length, 0);
     assert.equal((await deferred.json() as { decision: Decision }).decision.writeback, null);
     assert.equal(fetchCalls, 0);
+  });
+
+  it("rejects a decision-text overwrite of a decided or withdrawn row when status is omitted", async () => {
+    const store = createMemoryDecisionStore();
+    setDecisionStoreForTests(store);
+    const github = new FakeGitHub();
+    install(github);
+    const row = await seed({ key: "github:acme/widgets#41", repo: null, number: null });
+    const first = await patch(row.id, {
+      status: "decided",
+      decision: "ship",
+      expected_updated_at: row.updated_at,
+    });
+    assert.equal(first.status, 200, await first.clone().text());
+    const decided = (await first.json() as { decision: Decision }).decision;
+    assert.equal(decided.writeback, "written");
+    assert.equal(github.comments.length, 1);
+
+    const overwrite = await patch(decided.id, {
+      decision: "overwrite",
+      expected_updated_at: decided.updated_at,
+    });
+    assert.equal(overwrite.status, 409);
+    assert.equal((await overwrite.json() as { code: string }).code, "conflict");
+    const stored = store.rows.find((item) => item.id === row.id);
+    assert.equal(stored?.status, "decided");
+    assert.equal(stored?.decision, "ship");
+    assert.equal(stored?.writeback, "written");
+    assert.equal(github.comments.length, 1);
+
+    const parked = await seed({ key: "agent:cred:gone-text" });
+    const withdrawn = await patch(parked.id, {
+      status: "withdrawn",
+      expected_updated_at: parked.updated_at,
+    });
+    assert.equal(withdrawn.status, 200, await withdrawn.clone().text());
+    const gone = (await withdrawn.json() as { decision: Decision }).decision;
+    const rewrite = await patch(parked.id, {
+      decision: "overwrite",
+      expected_updated_at: gone.updated_at,
+    });
+    assert.equal(rewrite.status, 409);
+    assert.equal((await rewrite.json() as { code: string }).code, "conflict");
+    const withdrawnRow = store.rows.find((item) => item.id === parked.id);
+    assert.equal(withdrawnRow?.status, "withdrawn");
+    assert.equal(withdrawnRow?.decision, null);
+    assert.equal(fetchCalls, 0);
+  });
+
+  it("does not treat a bare decision marker as a completed write-back", async () => {
+    const store = createMemoryDecisionStore();
+    setDecisionStoreForTests(store);
+    const github = new FakeGitHub();
+    github.comments.push({ body: `${DECISION_MARKER}\nlooks done` });
+    install(github);
+    const row = await seed({ key: "github:acme/widgets#42" });
+    const res = await patch(row.id, {
+      status: "decided",
+      decision: "ship",
+      expected_updated_at: row.updated_at,
+    });
+    assert.equal(res.status, 200, await res.clone().text());
+    assert.equal(github.comments.length, 2, github.comments.map((comment) => comment.body).join("\n---\n"));
+    const posted = github.comments[1].body;
+    assert.equal(posted.startsWith(DECISION_MARKER), true);
+    assert.match(posted, /ship/);
+    assert.equal((await res.json() as { decision: Decision }).decision.writeback, "written");
+    assert.equal(github.labels.some((label) => label.name === "needs-owner"), false);
+
+    clearGitHubWriteClientForTests();
+    const again = await seed({ key: "github:acme/widgets#43" });
+    const held = await patch(again.id, {
+      status: "decided",
+      decision: "ship",
+      expected_updated_at: again.updated_at,
+    });
+    const heldRow = (await held.json() as { decision: Decision }).decision;
+    assert.equal(heldRow.writeback, "not_written");
+    const expected = buildDecisionComment({
+      who: heldRow.actor_id ?? "unknown",
+      date: heldRow.decided_at ?? "",
+      text: heldRow.decision ?? "",
+    });
+    const forged = new FakeGitHub();
+    forged.viewerLogin = "ak-bot";
+    forged.comments.push({ body: expected, author: "mallory" });
+    install(forged);
+    const retry = await writeback(heldRow.id, { expected_updated_at: heldRow.updated_at });
+    assert.equal(retry.status, 200, await retry.clone().text());
+    assert.equal(forged.comments.length, 2);
+    assert.equal(forged.comments[1].body, expected);
+    assert.equal(forged.comments[1].author, "ak-bot");
+    assert.equal(fetchCalls, 0);
+  });
+
+  it("serializes concurrent write-backs so only one GitHub comment is posted", async () => {
+    const store = createMemoryDecisionStore();
+    setDecisionStoreForTests(store);
+    clearGitHubWriteClientForTests();
+    const row = await seed({ key: "github:acme/widgets#44" });
+    const first = await patch(row.id, {
+      status: "decided",
+      decision: "ship",
+      expected_updated_at: row.updated_at,
+    });
+    assert.equal(first.status, 200, await first.clone().text());
+    const decided = (await first.json() as { decision: Decision }).decision;
+    assert.equal(decided.writeback, "not_written");
+    assert.equal(decided.decision, "ship");
+
+    const github = new FakeGitHub();
+    let creates = 0;
+    let release: () => void = () => {};
+    const entered = new Promise<void>((resolve) => {
+      github.createComment = async (repo, number, body) => {
+        creates += 1;
+        if (creates === 1) {
+          resolve();
+          await new Promise<void>((done) => {
+            release = done;
+          });
+        }
+        github.calls.push({ method: "comment", repo, number, body });
+        github.comments.push({ body, author: github.viewerLogin });
+      };
+    });
+    install(github);
+    const one = writeback(decided.id, { expected_updated_at: decided.updated_at });
+    await entered;
+    const two = writeback(decided.id, { expected_updated_at: decided.updated_at });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    try {
+      assert.equal(creates, 1);
+    } finally {
+      release();
+    }
+    const [left, right] = await Promise.all([one, two]);
+    assert.equal(left.status, 200, await left.clone().text());
+    assert.equal(right.status, 200, await right.clone().text());
+    assert.equal(github.comments.length, 1);
+    assert.match(github.comments[0].body, /ship/);
+    assert.equal(creates, 1);
+    assert.equal(fetchCalls, 0);
+  });
+
+  it("lists decided rows whose write-back did not land", async () => {
+    const store = createMemoryDecisionStore();
+    setDecisionStoreForTests(store);
+    clearGitHubWriteClientForTests();
+    const missed = await seed({ key: "github:acme/widgets#45", title: "Missed" });
+    const posted = await seed({ key: "github:acme/widgets#46", title: "Posted" });
+    const missedRes = await patch(missed.id, {
+      status: "decided",
+      decision: "ship",
+      expected_updated_at: missed.updated_at,
+    });
+    const postedRes = await patch(posted.id, {
+      status: "decided",
+      decision: "ship",
+      expected_updated_at: posted.updated_at,
+    });
+    assert.equal((await missedRes.json() as { decision: Decision }).decision.writeback, "not_written");
+    assert.equal((await postedRes.json() as { decision: Decision }).decision.writeback, "not_written");
+    const stored = store.rows.find((item) => item.id === posted.id);
+    assert.ok(stored);
+    stored.writeback = "written";
+
+    const parsed = parseListQuery(new URLSearchParams("status=decided&writeback=not_written"));
+    assert.equal(parsed.ok, true);
+    if (!parsed.ok) return;
+    const rows = await listDecisions(parsed);
+    assert.deepEqual(rows.map((item) => item.title), ["Missed"]);
   });
 });
