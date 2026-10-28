@@ -13,6 +13,7 @@
 #   AK_MACHINE=mac-mini AK_SKILL_DRIFT_DIRS=~/.codex/skills ./install-skills-drift.sh   # optional overrides
 #   ./install-skills-drift.sh --uninstall
 set -euo pipefail
+set +x  # never trace: MC_TOKEN passes through shell functions below
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LABEL="com.missioncontrol.skills-drift"
