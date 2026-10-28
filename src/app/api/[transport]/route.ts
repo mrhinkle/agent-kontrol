@@ -12,6 +12,7 @@ import { progress } from "@/lib/progress-store";
 import { formatDigest } from "@/lib/progress-digest";
 import { OPERATOR } from "@/lib/operator";
 import { demoProgress } from "@/lib/demo-progress";
+import { getSkillTool, listSkillsTool, runSkillTool } from "@/lib/skills/mcp";
 
 export const maxDuration = 60;
 
@@ -420,6 +421,61 @@ const handler = createMcpHandler(
         },
       },
       async (args) => guardTool("update_task", () => updateTaskForTool(args)),
+    );
+
+    // Skills tools. Keep this block contiguous and after update_task.
+    // run_skill is one tool with two phases. A second report_skill_done name
+    // would be the same row and the same actor check.
+    server.registerTool(
+      "list_skills",
+      {
+        title: "List skills",
+        description:
+          "List skills whose trigger is not off, whose scope admits the lane, and which are compatible with runtime when runtime is passed. With no runtime, incompatible skills are not hidden. With no lane, selected-lane skills are hidden. Trigger off is omitted. category is an exact case-insensitive match. Pass uncategorized for skills with no category. Each line includes category and tags.",
+        inputSchema: {
+          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional().describe("Caller runtime. Omit to skip the runtime filter."),
+          lane: z.string().optional().describe("Lane name. Required to see skills limited to selected lanes."),
+          query: z.string().optional().describe("Case-insensitive match on id and description."),
+          category: z.string().optional().describe("Exact category, case-insensitive. Pass uncategorized to list skills with no category."),
+        },
+      },
+      async (args) => guardTool("list_skills", () => listSkillsTool(args)),
+    );
+
+    server.registerTool(
+      "get_skill",
+      {
+        title: "Get skill",
+        description:
+          "Return the mirrored SKILL.md pinned to its content SHA, or one reference file when path is set. Never fetches the upstream repository. A skill whose trigger is off is not served.",
+        inputSchema: {
+          id: z.string().describe("Skill id."),
+          path: z.string().optional().describe("Reference path relative to the skill directory. Omit for SKILL.md."),
+          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional(),
+          lane: z.string().optional(),
+        },
+      },
+      async (args) => guardTool("get_skill", () => getSkillTool(args)),
+    );
+
+    server.registerTool(
+      "run_skill",
+      {
+        title: "Run skill",
+        description:
+          "Start or finish a skill run. The agent executes the instructions. Agent Kontrol only stores the start, the end, and an optional note. Omit run_id to start. id and runtime are required then. agent_id is optional: the recorded agent is the authenticated caller. Call again with that run_id and complete true to finish, and omit id. If you pass id on completion, it must match the skill on the run. Only the actor that started the run can finish it.",
+        inputSchema: {
+          id: z.string().optional().describe("Skill id. Required on start. Omit it on completion. If you pass it then, it must match the skill on the run."),
+          agent_id: z.string().optional().describe("Omit to use the authenticated caller. An agent credential or OAuth client may pass only that same id."),
+          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional().describe("Required on start. Caller hint for the rendered instructions, not an identity."),
+          lane: z.string().optional().describe("Caller hint. Required when the skill's scope is selected. Not an identity."),
+          run_id: z.string().optional().describe("Set with complete true to finish the run you started."),
+          complete: z.boolean().optional().describe("True finishes the run. Requires run_id."),
+          status: z.enum(["done", "failed"]).optional().describe("Completion outcome. Defaults to done."),
+          note: z.string().optional().describe("Optional note, at most 500 characters. Not a prompt or a tool log."),
+        },
+      },
+      async (args) => guardTool("run_skill", () => runSkillTool(args)),
     );
   },
   {},

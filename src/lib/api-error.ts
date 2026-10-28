@@ -23,6 +23,12 @@ export const API_ERRORS = {
     fix: "This caller cannot perform that action. Use a resource that belongs to this agent.",
     retryable: false,
   },
+  identity_mismatch: {
+    status: 403,
+    message: "agent_id does not match the authenticated caller",
+    fix: "Omit agent_id, or pass the authenticated id.",
+    retryable: false,
+  },
   not_found: {
     status: 404,
     message: "not found",

@@ -6,8 +6,8 @@ import fs from "node:fs";
 const src = fs.readFileSync("src/app/api/[transport]/route.ts", "utf8");
 
 describe("MCP tool names", () => {
-  it("registers the eleven documented tools", () => {
-    for (const name of ["report_status", "get_fleet_status", "get_progress_digest", "remember", "recall", "check_inbox", "reply_to_operator", "create_task", "get_task_queue", "claim_task", "update_task"]) {
+  it("registers the fourteen documented tools", () => {
+    for (const name of ["report_status", "get_fleet_status", "get_progress_digest", "remember", "recall", "check_inbox", "reply_to_operator", "create_task", "get_task_queue", "claim_task", "update_task", "list_skills", "get_skill", "run_skill"]) {
       assert.ok(src.includes(`"${name}"`), `missing tool ${name}`);
     }
   });

@@ -127,7 +127,7 @@ describe("GET /llms.txt", () => {
     assert.equal(other.includes(ORIGIN), false);
   });
 
-  it("lists the 11 tool names with a line taken from docs/MCP.md", () => {
+  it("lists the tool names with a line taken from docs/MCP.md", () => {
     const tools = toolLinesFromMcpDoc(mcp);
     assert.deepEqual(
       tools.map((tool) => tool.name),

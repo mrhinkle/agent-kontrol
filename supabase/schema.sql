@@ -115,6 +115,14 @@ alter table tasks add column if not exists actor_id text;
 create index if not exists tasks_queue_idx on tasks (status, platform, priority, created_at);
 create index if not exists tasks_updated_idx on tasks (updated_at desc);
 
+-- One open scheduler task per skill. The skill tick checks for an open task and
+-- then inserts; this index is what makes that atomic when two ticks race.
+create unique index if not exists tasks_skill_schedule_one_open_idx
+  on tasks (title)
+  where actor_id = 'skill-scheduler'
+    and title like 'Run scheduled skill %'
+    and status in ('queued', 'claimed', 'running', 'review');
+
 -- OAuth 2.1 authorization server (self-hosted, for MCP clients).
 -- Access tokens are stateless signed JWTs; only clients + auth codes are stored.
 create table if not exists oauth_clients (
@@ -417,3 +425,94 @@ create table if not exists idempotency_keys (
 );
 alter table idempotency_keys add column if not exists started_at timestamptz;
 alter table idempotency_keys add column if not exists claim_token text;
+
+-- Skills mirror (see supabase/migrations/20261027_skills.sql and docs/MCP.md).
+-- Agent Kontrol copies SKILL.md files from the seeded git sources. It does not
+-- execute them. skill_runs stores a start and an end, plus an optional note of
+-- at most 500 characters. It does not store prompts or tool input or output.
+-- A second sync cannot insert another status='running' row: the partial unique
+-- index is the lease. A row left running is expired by the next sync after
+-- 10 minutes, which is what keeps a crashed sync from wedging the mirror.
+create table if not exists skill_sources (
+  id text primary key,
+  repo text not null,
+  ref text,
+  path_globs jsonb not null,
+  label text not null,
+  enabled boolean not null default true,
+  position integer not null
+);
+
+insert into skill_sources (id, repo, ref, path_globs, label, enabled, position)
+values
+  ('master-skills', 'mrhinkle/master-skills', null, '["skills/*"]'::jsonb, 'master-skills', true, 0),
+  ('the-gibson', 'The-AIE/the-gibson', null, '["skills/*", ".agents/skills/*"]'::jsonb, 'the-gibson', true, 1)
+on conflict (id) do nothing;
+
+create table if not exists skills (
+  id text primary key,
+  source_id text not null references skill_sources (id),
+  path text not null,
+  name text not null,
+  description text not null default '',
+  version text,
+  sha text not null,
+  commit_sha text,
+  body text not null,
+  "references" jsonb not null default '[]'::jsonb,
+  runtimes jsonb not null,
+  frontmatter jsonb not null default '{}'::jsonb,
+  category text,
+  tags jsonb not null default '[]'::jsonb,
+  removed_at timestamptz,
+  synced_at timestamptz not null default now()
+);
+alter table skills add column if not exists category text;
+alter table skills add column if not exists tags jsonb not null default '[]'::jsonb;
+
+create table if not exists skill_settings (
+  skill_id text primary key references skills (id),
+  trigger text not null default 'off' check (trigger in ('off', 'on_request', 'auto_inject', 'scheduled')),
+  scope jsonb not null default '{"mode":"all","lanes":[]}'::jsonb,
+  schedule text,
+  updated_by text,
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists skill_runs (
+  run_id uuid primary key,
+  skill_id text not null,
+  skill_sha text not null,
+  agent_id text not null,
+  lane text,
+  runtime text not null,
+  started_at timestamptz not null default now(),
+  ended_at timestamptz,
+  status text not null default 'running' check (status in ('running', 'done', 'failed')),
+  note text check (note is null or char_length(note) <= 500),
+  actor_type text,
+  actor_id text
+);
+create index if not exists skill_runs_skill_started_idx on skill_runs (skill_id, started_at desc);
+create index if not exists skill_runs_started_idx on skill_runs (started_at desc);
+
+create table if not exists skill_sync_runs (
+  id uuid primary key,
+  started_at timestamptz not null default now(),
+  finished_at timestamptz,
+  trigger text not null check (trigger in ('manual', 'scheduled')),
+  status text not null,
+  summary jsonb,
+  error text
+);
+create unique index if not exists skill_sync_one_running_idx
+  on skill_sync_runs (status)
+  where status = 'running';
+
+create table if not exists skill_drift (
+  host text not null,
+  dir text not null,
+  reported_at timestamptz not null default now(),
+  entries jsonb not null,
+  primary key (host, dir)
+);

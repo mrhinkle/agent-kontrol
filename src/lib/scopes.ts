@@ -22,6 +22,8 @@ export const SCOPES = [
   "messages:write",
   "progress:read",
   "decisions:write",
+  "skills:read",
+  "skills:write",
 ] as const;
 
 export type Scope = (typeof SCOPES)[number];
@@ -46,6 +48,9 @@ export const TOOL_SCOPES: Record<string, Scope> = {
   get_task_queue: "tasks:read",
   claim_task: "tasks:write",
   update_task: "tasks:write",
+  list_skills: "skills:read",
+  get_skill: "skills:read",
+  run_skill: "skills:write",
 };
 
 /**
@@ -70,6 +75,13 @@ const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   // dashboard uses the session. An agent credential can change a decision
   // only when it holds decisions:write.
   { method: "PATCH", path: /^\/api\/decisions\/[^/]+$/, scope: "decisions:write" },
+  // GET only. PATCH, POST /api/skills/sync, and POST /api/skills/drift are
+  // operator routes: an agent must not be able to turn a skill on, sync, or
+  // file a drift report. The lookahead keeps those two paths off skills:read.
+  { method: "GET", path: /^\/api\/skills$/, scope: "skills:read" },
+  { method: "GET", path: /^\/api\/skills\/(?!sync$|drift$)[^/]+$/, scope: "skills:read" },
+  // Read-only: renders the pointer block, and POST only transforms the text sent.
+  { method: "POST", path: /^\/api\/skills\/pointers$/, scope: "skills:read" },
 ];
 
 export type Principal =

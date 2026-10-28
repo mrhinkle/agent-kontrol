@@ -134,6 +134,7 @@ export function openApiDocument(): Json {
       { name: "settings" },
       { name: "usage" },
       { name: "traces" },
+      { name: "skills" },
       { name: "auth" },
       { name: "mcp" },
     ],
@@ -1298,6 +1299,168 @@ export function openApiDocument(): Json {
             "413": jsonResponse("The body is over 2 MB.", ref("Error")),
             "415": jsonResponse("The body is not JSON.", ref("Error")),
             "500": flatErrors["500"],
+          },
+        }),
+      },
+      "/api/skills": {
+        get: operation({
+          operationId: "listSkills",
+          tags: ["skills"],
+          summary: "List mirrored skills.",
+          description:
+            "Agent credentials need skills:read. runtime filters to skills compatible with that runtime. An unknown runtime is 400 validation_failed. q matches name and description, case-insensitive. category is an exact case-insensitive match on the stored category. The value uncategorized matches a null category. The taxonomy is not enforced. Each skill includes category (string or null) and tags (string array), plus lastScheduledAt and nextDueAt (ISO strings or null). Removed skills are omitted. With no database the body is demo true and a fixture list.",
+          security: cookieOrBearer,
+          parameters: [
+            query("runtime", { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] }, "Compatible runtime. Omit to return every skill."),
+            query("q", { type: "string" }, "Case-insensitive match on name and description."),
+            query("category", { type: "string" }, "Exact category, case-insensitive. uncategorized matches a null category."),
+          ],
+          responses: {
+            "200": jsonResponse("demo, upstream, and skills. List runtimes is an array of names. Each skill has category and tags.", { type: "object" }),
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/skills/pointers": {
+        get: operation({
+          operationId: "getSkillPointers",
+          tags: ["skills"],
+          summary: "The AGENTS.md pointer block for a lane.",
+          description:
+            "Agent credentials need skills:read. Returns the block between <!-- ak-skills:begin --> and <!-- ak-skills:end --> for skills whose trigger is auto_inject, which match runtime, and whose scope admits lane. lane and runtime are required; a bad value is 400 validation_failed. empty is true and block is \"\" when nothing matches. format=text returns the block as text/plain, or an empty body.",
+          security: cookieOrBearer,
+          parameters: [
+            query("lane", { type: "string" }, "Lane name. Selected-scope skills match only an exact lane.", { required: true }),
+            query("runtime", { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] }, "Runtime that will read the file.", { required: true }),
+            query("format", { type: "string", enum: ["json", "text"] }, "json (default) or text."),
+          ],
+          responses: {
+            "200": {
+              description: "json: demo, lane, runtime, empty, and block. text: the block, or an empty body.",
+              content: { ...jsonResponse("", { type: "object" }).content as Json, ...textResponse("").content as Json },
+            },
+            ...flatErrors,
+          },
+        }),
+        post: operation({
+          operationId: "applySkillPointers",
+          tags: ["skills"],
+          summary: "Apply the pointer block to an AGENTS.md text.",
+          description:
+            "Agent credentials need skills:read. Nothing is stored and no file is written. The block is inserted at the end, replaced in place, or removed when empty. Text outside the markers is preserved, CRLF is kept, and a second run changes nothing. agents_md omitted or null means the file does not exist: content is null when there is nothing to write. An unpaired or nested marker in agents_md is 400 validation_failed.",
+          security: cookieOrBearer,
+          requestBody: body({
+            type: "object",
+            required: ["lane", "runtime"],
+            properties: {
+              lane: { type: "string" },
+              runtime: { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] },
+              agents_md: { type: ["string", "null"] },
+            },
+          }),
+          responses: {
+            "200": jsonResponse("demo, lane, runtime, empty, changed, and content (string or null).", { type: "object" }),
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/skills/sync": {
+        post: operation({
+          operationId: "syncSkills",
+          tags: ["skills"],
+          summary: "Mirror skill sources from GitHub.",
+          description:
+            "Operator route. An agent credential is denied. Omit the body, or send {trigger:manual}, for a manual run. A scheduler sends {trigger:scheduled} with MC_TOKEN. status in the body is ok, failed, or busy. failed means a source or a SKILL.md could not be evaluated. It is not a deletion. busy writes nothing. With no database the body is a no-op note and no sync is claimed.",
+          security: cookieOrBearer,
+          requestBody: body({
+            type: "object",
+            properties: { trigger: { type: "string", enum: ["manual", "scheduled"] } },
+          }),
+          responses: {
+            "200": jsonResponse("Sync result, or a demo no-op.", { type: "object" }),
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/skills/schedule/tick": {
+        post: operation({
+          operationId: "tickSkillSchedule",
+          tags: ["skills"],
+          summary: "Queue a task for each scheduled skill that is due.",
+          description:
+            "Operator route. An agent credential is denied, including one with skills:write. An external scheduler calls it every minute with MC_TOKEN. The body is ignored. For each skill whose trigger is scheduled and whose cron (UTC) has a due minute in the catch-up window, it queues one task titled Run scheduled skill <id>. A connected agent claims the task and calls run_skill. Agent Kontrol never runs the skill. The task is keyed on the skill and the due minute, so a repeated tick queues nothing. A skill is skipped while its previous scheduled task is still queued, claimed, running, or in review. Due minutes with no task are folded into the next one and counted in missed. items[].reason is previous_open, already_scheduled, duplicate, or no_runtime. With no database the body is a no-op note.",
+          security: cookieOrBearer,
+          responses: {
+            "200": jsonResponse("ok, now, scheduled, queued, skipped, and items; or a demo no-op.", { type: "object" }),
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/skills/drift": {
+        post: operation({
+          operationId: "reportSkillDrift",
+          tags: ["skills"],
+          summary: "Report skills present on a machine.",
+          description:
+            "Operator route. An agent credential is denied. The server does not read the machine. sha is the SHA-256 hex of the SKILL.md bytes. An empty skills array means the directory was read and was empty.",
+          security: cookieOrBearer,
+          requestBody: body({
+            type: "object",
+            required: ["host", "dir", "skills"],
+            properties: {
+              host: { type: "string" },
+              dir: { type: "string" },
+              skills: {
+                type: "array",
+                items: {
+                  type: "object",
+                  required: ["name", "sha"],
+                  properties: { name: { type: "string" }, sha: { type: "string" } },
+                },
+              },
+            },
+          }),
+          responses: {
+            "200": jsonResponse("This report compared with the mirror. driftCount is the finding count for this host and dir.", { type: "object" }),
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/skills/{id}": {
+        get: operation({
+          operationId: "getSkill",
+          tags: ["skills"],
+          summary: "One skill, its body, and recent runs.",
+          description:
+            "Agent credentials need skills:read. runtimes is an object of booleans, not the array used by the list. category is a string or null. tags is an array of strings. Both come from SKILL.md and are not checked against a vocabulary. lastScheduledAt is the newest slot the scheduler queued, or null. nextDueAt is the next due minute in UTC for a scheduled skill, or null. triggers status is done when the run ended, running inside the stall window, and stalled after it. outcome carries done or failed. Unknown id is 404.",
+          security: cookieOrBearer,
+          parameters: [pathParam("id", "Skill id. The directory slug.")],
+          responses: {
+            "200": jsonResponse("The skill. Demo mode returns the fixture or 404.", { type: "object" }),
+            ...flatErrors,
+            "404": jsonResponse("Unknown or removed skill.", ref("Error")),
+          },
+        }),
+        patch: operation({
+          operationId: "patchSkillSettings",
+          tags: ["skills"],
+          summary: "Set trigger, scope, and schedule.",
+          description:
+            "Operator route. An agent credential is denied. trigger is off, on_request, auto_inject, or scheduled. scope.mode all stores lanes as an empty array. selected requires at least one lane. scheduled requires a five-field cron. Any other trigger clears schedule. Unknown keys are 400. dry_run is not accepted. With no database the body is a no-op note and the id is not looked up.",
+          security: cookieOrBearer,
+          parameters: [pathParam("id", "Skill id.")],
+          requestBody: body({
+            type: "object",
+            properties: {
+              trigger: { type: "string", enum: ["off", "on_request", "auto_inject", "scheduled"] },
+              scope: { type: "object" },
+              schedule: { type: ["string", "null"] },
+            },
+          }),
+          responses: {
+            "200": jsonResponse("The updated skill, or a demo no-op.", { type: "object" }),
+            ...flatErrors,
+            "404": jsonResponse("Unknown or removed skill when a database is connected.", ref("Error")),
           },
         }),
       },
