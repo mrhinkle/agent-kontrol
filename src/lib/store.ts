@@ -1,7 +1,9 @@
 import type { Actor } from "./actor";
 import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } from "./idempotency";
 import { writeSessionNote } from "./session-memory";
-import { sql, type SqlTag } from "./db";
+import { sql, sqlTransaction, type SqlTag } from "./db";
+import { queueLangfuseEvent } from "./langfuse-report";
+import { parseRunTelemetry } from "./run-telemetry";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
 import { asUnknownWriteOutcome } from "./write-outcome";
 
@@ -63,6 +65,8 @@ function rethrowStore(e: unknown): never {
 }
 
 export async function report(input: ReportInput): Promise<void> {
+  const run = input.kind === "run_complete" ? parseRunTelemetry(input.detail) : null;
+  if (input.kind === "run_complete" && !run) throw new Error("invalid run telemetry");
   const db = sql();
   const now = new Date().toISOString();
   const agentId = slugify(input.agent_id);
@@ -71,10 +75,11 @@ export async function report(input: ReportInput): Promise<void> {
   // never clobbers platform/machine/display_name set by hooks (or vice versa).
   // COALESCE on conflict keeps existing values when the new side is null.
   const platform = input.platform ?? null;
+  let storedPlatform = platform;
   const machine = input.machine ?? null;
   const displayName = input.display_name ?? null;
   try {
-    await db`
+    const agents = await db`
       insert into agents (id, platform, machine, display_name, last_seen_at)
       values (
         ${agentId},
@@ -88,7 +93,10 @@ export async function report(input: ReportInput): Promise<void> {
         platform = coalesce(${platform}, agents.platform),
         machine = coalesce(${machine}, agents.machine),
         display_name = coalesce(${displayName}, agents.display_name)
+      returning platform
     `;
+    const savedPlatform = agents[0]?.platform;
+    if (typeof savedPlatform === "string") storedPlatform = savedPlatform;
   } catch (e) {
     throw new Error(`agents upsert: ${errMsg(e)}`);
   }
@@ -162,8 +170,19 @@ export async function report(input: ReportInput): Promise<void> {
     }
   }
 
+  let persistedEvent: { id: number; created_at: string | Date } | undefined;
   try {
-    await db`
+    const events = run ? (await sqlTransaction([
+      { text: "select pg_advisory_xact_lock(hashtextextended($1, 0))", params: [JSON.stringify([agentId, run.run_id])] },
+      { text: `
+        insert into events (agent_id, session_id, kind, title, detail)
+        select $1, $2, 'run_complete', 'CLI run completed', $3::jsonb
+        where not exists (
+          select 1 from events where agent_id = $1 and kind = 'run_complete' and detail->>'run_id' = $4
+        )
+        returning id, created_at
+      `, params: [agentId, input.session_id ?? null, JSON.stringify(run), run.run_id] },
+    ]))[1] : await db`
       insert into events (agent_id, session_id, kind, title, detail)
       values (
         ${agentId},
@@ -172,7 +191,9 @@ export async function report(input: ReportInput): Promise<void> {
         ${input.title ?? null},
         ${JSON.stringify(input.detail ?? null)}::jsonb
       )
+      returning id, created_at
     `;
+    persistedEvent = events[0] as typeof persistedEvent;
   } catch (e) {
     throw new Error(`events insert: ${errMsg(e)}`);
   }
@@ -186,6 +207,16 @@ export async function report(input: ReportInput): Promise<void> {
     await Promise.race([work, new Promise<void>((resolve) => (timer = setTimeout(resolve, 2500)))]);
     clearTimeout(timer);
   }
+  if (persistedEvent) queueLangfuseEvent({
+    id: Number(persistedEvent.id),
+    created_at: persistedEvent.created_at,
+    agent_id: agentId,
+    session_id: input.session_id,
+    platform: storedPlatform,
+    kind: input.kind,
+    status: input.status,
+    ...(run ? { run } : {}),
+  });
 }
 
 const OFFLINE_AFTER_MS = 15 * 60 * 1000;
