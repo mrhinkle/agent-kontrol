@@ -227,3 +227,21 @@ export function countOf(value: unknown): number {
   if (Array.isArray(value)) return value.length;
   return typeof value === "number" ? value : 0;
 }
+
+/**
+ * Fold a successful PATCH response into the optimistic row. The API answers with the full detail
+ * (runtimes as a flag map), so only the settings it owns are taken: trigger, scope, schedule.
+ * A body without them (demo mode) leaves the optimistic row as is.
+ */
+export function reconcileSkill(optimistic: SkillSummary, body: unknown): SkillSummary {
+  if (!body || typeof body !== "object") return optimistic;
+  const row = body as Record<string, unknown>;
+  const trigger = row.trigger;
+  if (trigger !== "off" && trigger !== "on_request" && trigger !== "auto_inject" && trigger !== "scheduled") return optimistic;
+  const scope = row.scope as { mode?: unknown; lanes?: unknown } | null | undefined;
+  const next: SkillSummary = { ...optimistic, trigger, schedule: typeof row.schedule === "string" ? row.schedule : null };
+  if (scope && (scope.mode === "all" || scope.mode === "selected") && Array.isArray(scope.lanes)) {
+    next.scope = { mode: scope.mode, lanes: scope.lanes.filter((l): l is string => typeof l === "string") };
+  }
+  return next;
+}

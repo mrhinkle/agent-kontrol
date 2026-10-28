@@ -47,6 +47,17 @@ function SkillsList() {
     router.replace(path, { scroll: false });
   }, [q, runtime, category, router]);
 
+  // Back/Forward changes the URL without remounting; pull the controls back in line with it.
+  const paramQ = params.get("q") ?? "";
+  const paramRuntime = normalizeRuntime(params.get("runtime"));
+  const paramCategory = params.get("category")?.trim() || "all";
+  useEffect(() => {
+    setQInput((cur) => (cur.trim() === paramQ.trim() ? cur : paramQ));
+    setQ(paramQ.trim());
+    setRuntime(paramRuntime);
+    setCategory(paramCategory);
+  }, [paramQ, paramRuntime, paramCategory]);
+
   const skills = data?.skills ?? [];
   const visible = filterSkills(skills, qInput);
   const lanes = laneOptions(skills);

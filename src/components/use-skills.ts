@@ -52,7 +52,7 @@ export function useSkills({ q, runtime, category = "all" }: { q: string; runtime
     } finally {
       if (my === epoch.current) setLoading(false);
     }
-  }, [q, runtime]);
+  }, [q, runtime, category]);
 
   useEffect(() => {
     void load();
@@ -70,6 +70,8 @@ export function useSkills({ q, runtime, category = "all" }: { q: string; runtime
   const holdSkill = useCallback((id: string, held: boolean) => {
     if (held) heldRef.current.add(id);
     else heldRef.current.delete(id);
+    // A poll that started before this change carries the old row; drop it.
+    epoch.current += 1;
   }, []);
 
   return { data, error, loading, reload: load, mutateSkill, holdSkill };

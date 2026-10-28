@@ -39,3 +39,28 @@ describe("skills categories and wire tolerance", () => {
     assert.equal(shortSha(null), "—");
   });
 });
+
+import { reconcileSkill, mergePolledSkills } from "../../src/components/SkillHelpers";
+import { skillsListFixture } from "./skills-fixtures";
+
+describe("PATCH reconciliation", () => {
+  const row = skillsListFixture.skills[0];
+  it("takes trigger, scope and schedule from a detail-shaped response", () => {
+    const next = reconcileSkill({ ...row, trigger: "scheduled", schedule: "0 7 * * *" }, {
+      trigger: "off", schedule: null, scope: { mode: "selected", lanes: ["a"] }, runtimes: { claude: true },
+    });
+    assert.equal(next.trigger, "off");
+    assert.equal(next.schedule, null);
+    assert.deepEqual(next.scope, { mode: "selected", lanes: ["a"] });
+    assert.deepEqual(next.runtimes, row.runtimes);
+  });
+  it("keeps the optimistic row for a demo-mode body", () => {
+    const optimistic = { ...row, trigger: "off" as const };
+    assert.equal(reconcileSkill(optimistic, { ok: true, demo: true }), optimistic);
+    assert.equal(reconcileSkill(optimistic, null), optimistic);
+  });
+  it("still protects held rows when merging a poll", () => {
+    const merged = mergePolledSkills([{ ...row, trigger: "off" }], [row], new Set([row.id]));
+    assert.equal(merged[0].trigger, "off");
+  });
+});

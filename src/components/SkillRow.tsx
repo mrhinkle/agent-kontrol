@@ -8,12 +8,12 @@ import {
   dimSkillRow,
   formatVersion,
   isCronNonEmpty,
-  isSkillSummary,
   readApiError,
   runtimePlatformId,
   showClaudeOnlyFlag,
   skillDetailPath,
   categoryLabel,
+  reconcileSkill,
 } from "./SkillHelpers";
 import { SkillScopeControl } from "./SkillScopeControl";
 import { SkillTriggerControl } from "./SkillTriggerControl";
@@ -90,7 +90,8 @@ export function SkillRow({
     clearError();
     const previous = skill;
     const touchesTrigger = patch.trigger !== undefined;
-    mutateSkill(skill.id, applyOptimisticSkillPatch([skill], skill.id, patch)[0]);
+    const optimistic = applyOptimisticSkillPatch([skill], skill.id, patch)[0];
+    mutateSkill(skill.id, optimistic);
     try {
       const res = await fetch(`/api/skills/${encodeURIComponent(skill.id)}`, {
         method: "PATCH",
@@ -108,7 +109,7 @@ export function SkillRow({
         return;
       }
       const body: unknown = await res.json().catch(() => null);
-      if (isSkillSummary(body)) mutateSkill(skill.id, body);
+      mutateSkill(skill.id, reconcileSkill(optimistic, body));
       if (touchesTrigger) {
         setCronDirty(false);
         setVisualScheduled(false);
