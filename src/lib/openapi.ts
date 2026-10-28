@@ -10,6 +10,7 @@ import { INGEST_KINDS } from "@/lib/store";
 import { TASK_STATUSES } from "@/lib/types";
 import { USAGE_SOURCES } from "@/lib/usage-types";
 import { USAGE_WINDOWS } from "@/lib/usage-window";
+import { LIST_MAX } from "./list-params";
 
 /**
  * OpenAPI 3.1 for the documented REST routes.
@@ -55,6 +56,36 @@ function textResponse(description: string): Json {
 function query(name: string, schema: Json, description: string, opts?: { required?: boolean }): Json {
   return { name, in: "query", required: opts?.required === true, schema, description };
 }
+
+function listLimit(defaultLimit: number): Json {
+  return { type: "integer", minimum: 1, maximum: LIST_MAX, default: defaultLimit };
+}
+
+const listCursor = query(
+  "cursor",
+  { type: "string" },
+  "Opaque keyset cursor from next_cursor. A tampered or mismatched cursor is 400 validation_failed. It does not restart at the first page.",
+);
+
+const listFields = query(
+  "fields",
+  { type: "string" },
+  "Comma-separated allowlisted names. The id is always returned (trace_id on traces). An unknown name, an empty name, or text that is not an allowlisted name is 400. Omitted returns the same columns as before. Names are not read from the database as SQL.",
+);
+
+function listLimitParam(defaultLimit: number): Json {
+  return query(
+    "limit",
+    listLimit(defaultLimit),
+    `Maximum rows, from 1 to ${LIST_MAX}. Default ${defaultLimit}. Above ${LIST_MAX}, zero, a negative, or a non-integer is 400. Passing limit or cursor adds next_cursor. Omitting both leaves the body without that field.`,
+  );
+}
+
+const nextCursor: Json = {
+  type: ["string", "null"],
+  description:
+    "Present only when the request passed limit or cursor. Null when there is no further page. Opaque; send it back as cursor.",
+};
 
 function pathParam(name: string, description: string, schema: Json = { type: "string" }): Json {
   return { name, in: "path", required: true, schema, description };
@@ -733,14 +764,17 @@ export function openApiDocument(): Json {
           parameters: [
             query("query", { type: "string" }, "Free-text search."),
             query("tag", { type: "string" }, "One tag."),
-            query("limit", { type: "integer", default: 50 }, "Maximum notes. Default 50."),
+            listLimitParam(50),
+            listCursor,
+            listFields,
           ],
           responses: {
-            "200": jsonResponse("Matching notes, newest update first.", {
+            "200": jsonResponse("Matching notes, newest update first. next_cursor is absent unless limit or cursor was passed.", {
               type: "object",
               properties: {
                 demo: { type: "boolean" },
                 items: { type: "array", items: ref("MemoryItem") },
+                next_cursor: nextCursor,
               },
             }),
             ...flatErrors,
@@ -902,14 +936,17 @@ export function openApiDocument(): Json {
               { type: "string", enum: ["open", "all", ...TASK_STATUSES] },
               "open, all, or one status. Default all on this route.",
             ),
-            query("limit", { type: "integer" }, "Maximum rows."),
+            listLimitParam(100),
+            listCursor,
+            listFields,
           ],
           responses: {
-            "200": jsonResponse("Tasks. actor_type and actor_id are server-set.", {
+            "200": jsonResponse("Tasks. actor_type and actor_id are server-set. next_cursor is absent unless limit or cursor was passed.", {
               type: "object",
               properties: {
                 demo: { type: "boolean" },
                 tasks: { type: "array", items: ref("Task") },
+                next_cursor: nextCursor,
               },
             }),
             ...flatErrors,
@@ -1322,10 +1359,19 @@ export function openApiDocument(): Json {
             query("agent", { type: "string" }, "Filter by agent id."),
             query("errors", { type: "string", enum: ["1"] }, "When 1, only traces with an error."),
             query("before", { type: "string", format: "date-time" }, "Return traces before this instant."),
-            query("limit", { type: "integer" }, "Maximum rows. Default 50."),
+            listLimitParam(50),
+            listCursor,
+            listFields,
           ],
           responses: {
-            "200": jsonResponse("demo and traces.", { type: "object" }),
+            "200": jsonResponse("demo and traces. next_cursor is absent unless limit or cursor was passed.", {
+              type: "object",
+              properties: {
+                demo: { type: "boolean" },
+                traces: { type: "array", items: { type: "object" } },
+                next_cursor: nextCursor,
+              },
+            }),
             ...flatErrors,
           },
         }),

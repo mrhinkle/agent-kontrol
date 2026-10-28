@@ -29,6 +29,17 @@ import { finishSyncRun, markSkillRemoved, SyncLeaseLost, upsertSettings, upsertS
 import { runScheduleTick, type TickResult } from "../src/lib/skills/schedule";
 import { listLastScheduledTasks, listOpenScheduledTasks } from "../src/lib/skills/schedule-store";
 import type { SkillRecord } from "../src/lib/skills/types";
+import {
+  MEMORY_REST,
+  TASK_REST,
+  TRACE_LIST,
+  decodeCursor,
+  memoryKeyset,
+  parseToolList,
+  splitPage,
+  taskKeyset,
+  traceKeyset,
+} from "../src/lib/list-params";
 
 async function main() {
   if (!process.env.DATABASE_URL) {
@@ -290,6 +301,7 @@ async function main() {
   await testDecisions(tag);
   await testSkillLeaseFence(tag);
   await testSkillSchedule(tag);
+  await testListCursors(tag);
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
 }
@@ -800,6 +812,142 @@ async function holdExpiredLease<T>(holder: Client, runId: string, marker: string
     await holder.query("rollback").catch(() => undefined);
     if (pending) await pending.catch(() => undefined);
     throw err;
+  }
+}
+
+/**
+ * Keyset pages on Postgres. An insert ahead of the cursor must not repeat or
+ * skip a row, and two timestamps that differ only after the millisecond still
+ * page in id order.
+ */
+async function testListCursors(tag: string): Promise<void> {
+  const probe = `${tag}-cursor`;
+  const agent = `${tag}-cursor`;
+  await sql()`delete from tasks where status = 'cursorprobe' and title like ${probe + "%"}`;
+  await sql()`delete from memory where key like ${probe + "%"}`;
+  await sql()`delete from spans where agent_id = ${agent}`;
+  try {
+    const taskId = async (name: string, at: string) => {
+      const rows = await sql()`
+        insert into tasks (title, status, priority, platform, updated_at)
+        values (${`${probe}-${name}`}, 'cursorprobe', 2, 'any', ${at}::timestamptz)
+        returning id::text as id
+      `;
+      return String(rows[0].id);
+    };
+    const a = await taskId("a", "2026-10-28 12:00:00.200000+00");
+    const b = await taskId("b", "2026-10-28 12:00:00.123456+00");
+    const c = await taskId("c", "2026-10-28 12:00:00.123789+00");
+    const d = await taskId("d", "2026-10-28 12:00:00.100000+00");
+    const seen: string[] = [];
+    let cursor: ReturnType<typeof taskKeyset> | null = null;
+    let planted = false;
+    let tie: string | null = null;
+    for (let n = 0; n < 8; n++) {
+      const batch = await listTasks({ status: "cursorprobe", limit: 2, keyset: true, cursor });
+      for (const row of batch) assert.equal("list_sort_at" in row, false);
+      const page = splitPage(batch as never, parseToolList(TASK_REST, { limit: 1 }));
+      assert.equal(page.rows.length > 0, true, "a cursorprobe page must not be empty before the end");
+      seen.push(String(page.rows[0].id));
+      if (tie === null && n === 1) tie = page.next_cursor;
+      if (!page.next_cursor) break;
+      if (!planted) {
+        await taskId("e", "2026-10-28 12:00:00.900000+00");
+        planted = true;
+      } else if (tie && page.next_cursor) {
+        const firstTie = decodeCursor(TASK_REST, tie);
+        const nextTie = decodeCursor(TASK_REST, page.next_cursor);
+        if (String(firstTie.k[2]) === String(nextTie.k[2])) {
+          assert.equal(String(nextTie.k[2]).endsWith(".123Z"), true, "microseconds collapse to the same millisecond");
+        }
+      }
+      cursor = taskKeyset(decodeCursor(TASK_REST, page.next_cursor));
+    }
+    assert.deepEqual(seen, [a, b, c, d], "keyset returns each original task once after a newer insert");
+    const bCursor = decodeCursor(TASK_REST, tie as string);
+    assert.equal(String(bCursor.k[2]), "2026-10-28T12:00:00.123Z");
+
+    const noteId = async (name: string, at: string) => {
+      const rows = await sql()`
+        insert into memory (key, content, tags, updated_at)
+        values (${`${probe}-${name}`}, ${name}, ${[probe]}::text[], ${at}::timestamptz)
+        returning id::text as id
+      `;
+      return String(rows[0].id);
+    };
+    const newer = await noteId("newer", "2026-10-28 13:00:00.500000+00");
+    const low = await noteId("low", "2026-10-28 13:00:00.123111+00");
+    const high = await noteId("high", "2026-10-28 13:00:00.123999+00");
+    const notes: string[] = [];
+    let memoryCursor: ReturnType<typeof memoryKeyset> | null = null;
+    let memoryPlanted = false;
+    let memoryTie: string | null = null;
+    for (let n = 0; n < 8; n++) {
+      const batch = await recall({ tags: [probe], limit: 2, keyset: true, cursor: memoryCursor });
+      for (const row of batch) assert.equal("list_sort_at" in row, false);
+      const page = splitPage(batch as never, parseToolList(MEMORY_REST, { limit: 1 }));
+      if (page.rows.length === 0) break;
+      notes.push(String(page.rows[0].id));
+      if (n === 1) memoryTie = page.next_cursor;
+      if (!page.next_cursor) break;
+      if (!memoryPlanted) {
+        await noteId("front", "2026-10-28 13:00:01.000000+00");
+        memoryPlanted = true;
+      }
+      memoryCursor = memoryKeyset(decodeCursor(MEMORY_REST, page.next_cursor));
+    }
+    assert.deepEqual(notes, [newer, low, high], "keyset returns each original note once");
+    assert.equal(String(decodeCursor(MEMORY_REST, memoryTie as string).k[0]), "2026-10-28T13:00:00.123Z");
+
+    const hex = (ch: string) => ch.repeat(32);
+    const span = (trace: string, at: string): SpanInput => ({
+      trace_id: trace,
+      span_id: "0000000000000001",
+      parent_span_id: null,
+      agent_id: agent,
+      session_id: null,
+      name: "session",
+      kind: "session",
+      status: "ok",
+      status_message: null,
+      started_at: at,
+      ended_at: at,
+      attributes: {},
+      model: null,
+      input_tokens: null,
+      output_tokens: null,
+      cost_usd: null,
+    });
+    const traceC = hex("c");
+    const traceA = hex("a");
+    const traceB = hex("b");
+    await upsertSpans([span(traceC, "2026-10-28T16:00:00.000000Z")]);
+    await upsertSpans([span(traceA, "2026-10-28T15:00:00.123456Z")]);
+    await upsertSpans([span(traceB, "2026-10-28T15:00:00.123999Z")]);
+    const traces: string[] = [];
+    let traceCursor: ReturnType<typeof traceKeyset> | null = null;
+    let tracePlanted = false;
+    let traceTie: string | null = null;
+    for (let n = 0; n < 8; n++) {
+      const batch = await listTraces({ agent, limit: 2, keyset: true, cursor: traceCursor });
+      const page = splitPage(batch as never, parseToolList(TRACE_LIST, { limit: 1 }));
+      if (page.rows.length === 0) break;
+      traces.push(String(page.rows[0].trace_id));
+      assert.equal("list_sort_at" in page.rows[0], false);
+      if (n === 1) traceTie = page.next_cursor;
+      if (!page.next_cursor) break;
+      if (!tracePlanted) {
+        await upsertSpans([span(hex("d"), "2026-10-28T17:00:00.000000Z")]);
+        tracePlanted = true;
+      }
+      traceCursor = traceKeyset(decodeCursor(TRACE_LIST, page.next_cursor));
+    }
+    assert.deepEqual(traces, [traceC, traceA, traceB], "keyset returns each original trace once, trace_id ascending on a tie");
+    assert.equal(String(decodeCursor(TRACE_LIST, traceTie as string).k[0]), "2026-10-28T15:00:00.123Z");
+  } finally {
+    await sql()`delete from tasks where status = 'cursorprobe' and title like ${probe + "%"}`;
+    await sql()`delete from memory where key like ${probe + "%"}`;
+    await sql()`delete from spans where agent_id = ${agent}`;
   }
 }
 

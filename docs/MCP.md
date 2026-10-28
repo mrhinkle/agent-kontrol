@@ -167,7 +167,9 @@ Search shared memory. Results come back most recently updated first.
 | `query` | string | no | Case-insensitive substring match over note content. |
 | `key` | string | no | Exact key match. |
 | `tags` | string[] | no | Matches notes sharing any of these tags. |
-| `limit` | int | no | 1-100. Defaults to 20. |
+| `limit` | int | no | 1-200. Defaults to 20. Passing `limit` or `cursor` adds a final `next_cursor:` line (`null` on the last page). Omitting both leaves the text as before. |
+| `cursor` | string | no | Opaque cursor from a previous `next_cursor` line. A bad cursor is `validation_failed`, not the first page. |
+| `fields` | string | no | Comma-separated allowlisted names (`id`, `key`, `content`, `tags`, `agent_id`, `source`, `facts_at`, `created_at`, `updated_at`). `id` is always included. One JSON object per line. An unknown name is `validation_failed`. |
 
 When to call: before re-deriving something another agent may already have written down.
 
@@ -224,6 +226,9 @@ See the task queue.
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `status` | enum | no | `open`, `all`, `queued`, `claimed`, `running`, `review`, `done`, `failed`, or `cancelled`. Defaults to `open`. |
+| `limit` | int | no | 1-200. Defaults to 40. Passing `limit` or `cursor` adds a final `next_cursor:` line. Omitting both leaves the text as before, still capped at 40. |
+| `cursor` | string | no | Opaque cursor from a previous `next_cursor` line. A bad cursor is `validation_failed`, not the first page. |
+| `fields` | string | no | Comma-separated allowlisted task fields. `id` is always included. One JSON object per line. An unknown name is `validation_failed`. |
 
 When to call: before creating a task, to see what is already queued or in flight.
 
