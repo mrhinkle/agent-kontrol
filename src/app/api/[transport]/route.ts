@@ -5,6 +5,14 @@ import { apiError, memoryKeyError, toolResultFromCaught, type McpToolResult } fr
 import { secretsMatch, verifyAccessToken } from "@/lib/authcrypto";
 import { resolveAgentCredential } from "@/lib/credentials";
 import { isConfigured } from "@/lib/db";
+import {
+  demoClaimTaskTool,
+  demoCreateTaskTool,
+  demoFleetStatusTool,
+  demoRecallTool,
+  demoReportStatusTool,
+  demoTaskQueueTool,
+} from "@/lib/demo-store";
 import { evaluateMcpMessages, insufficientScopeBody, principalFromMcpAuth } from "@/lib/scopes";
 import { rememberForTool, updateTaskForTool } from "@/lib/dry-run-actions";
 import { claimNextTask, createTask, fetchMessages, fleet, listTasks, recall, replyFromAgent, report } from "@/lib/store";
@@ -68,9 +76,7 @@ const handler = createMcpHandler(
         },
       },
       async (args) => guardTool("report_status", async () => {
-        if (!isConfigured()) {
-          return { content: [{ type: "text", text: "Agent Kontrol is in demo mode (no database configured); status not stored." }] };
-        }
+        if (!isConfigured()) return demoReportStatusTool(args);
         await report({
           agent_id: args.agent_id,
           platform: args.platform,
@@ -97,9 +103,7 @@ const handler = createMcpHandler(
         inputSchema: {},
       },
       async () => guardTool("get_fleet_status", async () => {
-        if (!isConfigured()) {
-          return { content: [{ type: "text", text: "Agent Kontrol is in demo mode (no database configured)." }] };
-        }
+        if (!isConfigured()) return demoFleetStatusTool();
         const { agents, events } = await fleet();
         const lines: string[] = [];
         for (const a of agents) {
@@ -184,9 +188,7 @@ const handler = createMcpHandler(
       async (args) => guardTool("recall", async () => {
         const badKey = memoryKeyError(args.key);
         if (badKey) return badKey;
-        if (!isConfigured()) {
-          return { content: [{ type: "text", text: "Demo mode; no stored memory." }] };
-        }
+        if (!isConfigured()) return demoRecallTool(args);
         const items = await recall(args);
         if (items.length === 0) {
           return { content: [{ type: "text", text: "No matching memory." }] };
@@ -338,9 +340,7 @@ const handler = createMcpHandler(
         },
       },
       async (args) => guardTool("create_task", async () => {
-        if (!isConfigured()) {
-          return { content: [{ type: "text", text: "Demo mode; task not queued." }] };
-        }
+        if (!isConfigured()) return demoCreateTaskTool(args, currentActor());
         const task = await createTask({
           ...args,
           idempotency_key: args.idempotency_key,
@@ -369,9 +369,7 @@ const handler = createMcpHandler(
         },
       },
       async (args) => guardTool("get_task_queue", async () => {
-        if (!isConfigured()) {
-          return { content: [{ type: "text", text: "Demo mode; no task queue." }] };
-        }
+        if (!isConfigured()) return demoTaskQueueTool(args);
         const tasks = await listTasks({ status: args.status ?? "open", limit: 40 });
         if (tasks.length === 0) {
           return { content: [{ type: "text", text: "Task queue is empty." }] };
@@ -403,9 +401,7 @@ const handler = createMcpHandler(
         },
       },
       async (args) => guardTool("claim_task", async () => {
-        if (!isConfigured()) {
-          return { content: [{ type: "text", text: "Demo mode; no tasks." }] };
-        }
+        if (!isConfigured()) return demoClaimTaskTool(args);
         const task = await claimNextTask(args);
         if (!task) {
           return { content: [{ type: "text", text: "No queued tasks for your platform." }] };
