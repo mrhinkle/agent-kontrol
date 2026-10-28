@@ -286,7 +286,8 @@ describe("GET /api/brief", { concurrency: false }, () => {
     assert.equal(text.includes("undefined"), false);
     assert.equal(/\bnull\b/.test(text), false);
     assert.equal(text.includes("COORDINATOR"), false);
-    assert.match(text, /DECISIONS FOR YOU: none open\./);
+    assert.match(text, /DECISIONS FOR YOU: DATA INCOMPLETE\./);
+    assert.equal(text.includes("DECISIONS FOR YOU: none open."), false);
     assert.ok(text.endsWith("\n"));
 
     const empty = formatBriefText(assembleBrief({
@@ -1295,6 +1296,185 @@ describe("GET /api/brief", { concurrency: false }, () => {
     assert.equal(heading("0 3 0"), "STUCK PRs: none.\n");
     assert.match(heading("0 1 4"), /^STUCK PRs \(4\) /);
     assert.match(script, /stuck_heading "\$n_incomplete" "\$n_counted" "\$n_stuck"/);
+  });
+
+  it("configured error never counts as work, including beside newer noise", async () => {
+    const now = "2026-10-27T12:00:00Z";
+    const agent = { id: "hermes-carmack", last_seen_at: "2026-10-27T11:59:30Z" };
+    const base = {
+      agentId: "hermes-carmack",
+      maxSilenceHours: 3,
+      nowIso: now,
+      reachable: true,
+      agent,
+    };
+    const onlyError = coordinatorStatus({
+      ...base,
+      workKinds: ["error"],
+      events: [{ kind: "error", created_at: "2026-10-27T11:30:00Z" }],
+    });
+    assert.equal(onlyError.verdict?.startsWith("working"), false);
+    assert.match(onlyError.verdict ?? "", /^FAILING: 1 error event/);
+    assert.equal(onlyError.last_work_kind, null);
+
+    const mixed = coordinatorStatus({
+      ...base,
+      workKinds: ["session_end", "error"],
+      events: [
+        { kind: "turn_start", created_at: "2026-10-27T11:55:00Z" },
+        { kind: "status_update", created_at: "2026-10-27T11:50:00Z" },
+        { kind: "error", created_at: "2026-10-27T11:30:00Z" },
+      ],
+    });
+    assert.equal(mixed.verdict?.startsWith("working"), false);
+    assert.match(mixed.verdict ?? "", /^FAILING: 1 error event/);
+    assert.equal(mixed.last_work_kind, null);
+    assert.equal(mixed.last_any_kind, "turn_start");
+
+    const errorOnlyConfig = readBriefSettings({ brief: { coordinator: { workKinds: ["error"] } } });
+    assert.deepEqual(errorOnlyConfig.coordinator.workKinds, ["session_end", "milestone", "status"]);
+    const errorBesideWork = readBriefSettings({ brief: { coordinator: { workKinds: ["session_end", "error"] } } });
+    assert.deepEqual(errorBesideWork.coordinator.workKinds, ["session_end"]);
+    const pipedError = readBriefSettings({ brief: { coordinator: { workKinds: "error|milestone|heartbeat" } } });
+    assert.deepEqual(pipedError.coordinator.workKinds, ["milestone"]);
+
+    const script = fs.readFileSync("scripts/morning-brief.sh", "utf8");
+    const start = script.indexOf("filter_work_kinds() {");
+    const end = script.indexOf("# end filter_work_kinds");
+    assert.ok(start >= 0 && end > start);
+    const fn = script.slice(start, end);
+    const filtered = (raw: string) => execFileSync("bash", ["-c", `${fn}\nfilter_work_kinds ${JSON.stringify(raw)}`], { encoding: "utf8" });
+    assert.equal(filtered("error"), "");
+    assert.equal(filtered("session_end|error"), "session_end");
+    assert.equal(filtered("error|turn_start|milestone|status_update"), "milestone");
+
+    const nowMs = Date.parse(now);
+    const at = (secondsAgo: number) => new Date(nowMs - secondsAgo * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+    const agentId = "hermes-carmack";
+    let events: Row[] = [];
+    const queried: string[][] = [];
+    env.DATABASE_URL = "postgres://brief:brief@127.0.0.1:9/brief_test";
+    setSqlForTests(async (strings, ...values) => {
+      const text = strings.join(" ");
+      if (text.includes("from agents")) return [{ id: agentId, last_seen_at: "2026-10-27T11:59:00Z" }];
+      if (text.includes("from events")) {
+        const kinds = values.find((value) => Array.isArray(value));
+        if (Array.isArray(kinds)) queried.push(kinds.map(String));
+        return applyEventQuery(strings, values, events);
+      }
+      throw new Error(`unexpected sql: ${text}`);
+    });
+    events = [
+      { id: 1, agent_id: agentId, kind: "turn_start", created_at: at(60) },
+      { id: 2, agent_id: agentId, kind: "error", created_at: at(600) },
+    ];
+    const errorOnly = readBriefSettings({
+      brief: { coordinator: { agentId, maxSilenceHours: 3, workKinds: ["error"] } },
+    });
+    queried.length = 0;
+    const fromErrorOnly = await coordinatorFromDb(errorOnly, now);
+    assert.equal(fromErrorOnly.verdict?.startsWith("working"), false);
+    assert.match(fromErrorOnly.verdict ?? "", /^FAILING: 1 error event/);
+    assert.equal(queried.some((kinds) => kinds.includes("error")), false);
+    assert.deepEqual(queried[0], ["session_end", "milestone", "status"]);
+
+    const sneaky = {
+      ...errorOnly,
+      coordinator: { agentId, maxSilenceHours: 3, workKinds: ["session_end", "error"] },
+    };
+    queried.length = 0;
+    const fromMixed = await coordinatorFromDb(sneaky, now);
+    assert.match(fromMixed.verdict ?? "", /^FAILING: 1 error event/);
+    assert.deepEqual(queried[0], ["session_end"]);
+    assert.equal(queried[0]?.includes("error"), false);
+  });
+
+  it("does not say decisions none open when incomplete repos suppressed them", () => {
+    const now = "2026-10-27T12:00:00Z";
+    const clock = { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] };
+    const blank = {
+      merged_prs: null,
+      median_lead_hours: null,
+      issues_opened: null,
+      issues_closed: null,
+      net_backlog: null,
+      open_issues: null,
+      open_prs: null,
+      drafts: null,
+      stale_issues: null,
+      stale_ratio: null,
+      blocked_issues: null,
+      stuck_prs: null,
+      decisions: null,
+      merged_list: null,
+    };
+    const allIncomplete = assembleBrief({
+      generatedAt: now,
+      windowHours: 24,
+      repoSource: "config",
+      stuckPrHours: 48,
+      staleIssueDays: 21,
+      coordinator: { configured: false, agent_id: null },
+      repos: [
+        section({
+          repo: "acme/app",
+          short: "app",
+          label: "Acme",
+          incomplete: true,
+          errors: ["no snapshot"],
+          ...blank,
+        }),
+      ],
+    });
+    const suppressed = formatBriefText(allIncomplete, clock);
+    assert.match(suppressed, /DECISIONS FOR YOU: DATA INCOMPLETE\./);
+    assert.equal(suppressed.includes("DECISIONS FOR YOU: none open."), false);
+
+    const mixed = formatBriefText(assembleBrief({
+      generatedAt: now,
+      windowHours: 24,
+      repoSource: "dashboard",
+      stuckPrHours: 48,
+      staleIssueDays: 21,
+      coordinator: { configured: false, agent_id: null },
+      repos: [
+        section({ repo: "acme/app", short: "app", label: "Acme", decisions: [] }),
+        section({
+          repo: "other/app",
+          short: "other",
+          label: "Other",
+          incomplete: true,
+          errors: ["counts not measured"],
+          ...blank,
+        }),
+      ],
+    }), clock);
+    assert.match(mixed, /DECISIONS FOR YOU: DATA INCOMPLETE\./);
+    assert.equal(mixed.includes("DECISIONS FOR YOU: none open."), false);
+
+    const measuredNone = formatBriefText(assembleBrief({
+      generatedAt: now,
+      windowHours: 24,
+      repoSource: "dashboard",
+      stuckPrHours: 48,
+      staleIssueDays: 21,
+      coordinator: { configured: false, agent_id: null },
+      repos: [section({ repo: "acme/app", short: "app", label: "Acme", decisions: [], stuck_prs: [] })],
+    }), clock);
+    assert.match(measuredNone, /DECISIONS FOR YOU: none open\./);
+
+    const script = fs.readFileSync("scripts/morning-brief.sh", "utf8");
+    const start = script.indexOf("decisions_heading() {");
+    const end = script.indexOf("# END decisions_heading");
+    assert.ok(start >= 0 && end > start);
+    const fn = script.slice(start, end);
+    const heading = (args: string) => execFileSync("bash", ["-c", `${fn}\ndecisions_heading ${args}`], { encoding: "utf8" });
+    assert.equal(heading("1 0 1"), "DECISIONS FOR YOU: DATA INCOMPLETE.\n");
+    assert.equal(heading("2 0 3"), "DECISIONS FOR YOU: DATA INCOMPLETE.\n");
+    assert.equal(heading("0 0 1"), "DECISIONS FOR YOU: none open.\n");
+    assert.match(heading("1 0 0"), /not tracked/);
+    assert.match(heading("1 4 1"), /^DECISIONS FOR YOU \(4\) /);
+    assert.match(script, /decisions_heading "\$n_incomplete" "\$n_dec" "\$n_labels"/);
   });
 });
 

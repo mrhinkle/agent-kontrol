@@ -75,7 +75,7 @@ COORD_ID="$(cfg '.brief.coordinator.agentId')"
 COORD_MAX_H="$(cfg '.brief.coordinator.maxSilenceHours')"; COORD_MAX_H="${COORD_MAX_H:-3}"
 # Work means output: a round ended, a milestone or status was posted. turn_start and error
 # are activity without output and do not count (docs/VELOCITY.md). A configured list cannot
-# put heartbeat, telemetry, turn_start, or status_update back in.
+# put heartbeat, telemetry, turn_start, status_update, or error back in.
 filter_work_kinds() {
   local raw="$1" kind filtered=""
   local -a kinds=()
@@ -84,7 +84,7 @@ filter_work_kinds() {
     kind="${kind#"${kind%%[![:space:]]*}"}"
     kind="${kind%"${kind##*[![:space:]]}"}"
     case "$kind" in
-      ""|heartbeat|telemetry|turn_start|status_update) ;;
+      ""|heartbeat|telemetry|turn_start|status_update|error) ;;
       *) filtered="${filtered:+$filtered|}$kind" ;;
     esac
   done
@@ -408,14 +408,28 @@ fi
 echo
 
 n_dec="$(jq -r .totals.decisions <<<"$brief")"
-if [[ "$n_dec" -eq 0 ]]; then
-  if [[ "$(jq 'length' <<<"$DECISION_LABELS_JSON")" -eq 0 ]]; then
-    echo "DECISIONS FOR YOU: not tracked (set brief.decisionLabels in progress.config.json)."
-  else
-    echo "DECISIONS FOR YOU: none open."
+n_labels="$(jq 'length' <<<"$DECISION_LABELS_JSON")"
+# Incomplete repos drop their decisions. Zero is not "none" until every repo was counted.
+# BEGIN decisions_heading
+decisions_heading() {
+  local n_incomplete="$1" n_dec="$2" n_labels="$3"
+  if [[ "$n_dec" -gt 0 ]]; then
+    printf '%s\n' "DECISIONS FOR YOU (${n_dec}) — oldest first; each one is work nobody else can unblock"
+    return
   fi
-else
-  echo "DECISIONS FOR YOU ($n_dec) — oldest first; each one is work nobody else can unblock"
+  if [[ "$n_labels" -eq 0 ]]; then
+    printf '%s\n' "DECISIONS FOR YOU: not tracked (set brief.decisionLabels in progress.config.json)."
+    return
+  fi
+  if [[ "$n_incomplete" -gt 0 ]]; then
+    printf '%s\n' "DECISIONS FOR YOU: DATA INCOMPLETE."
+    return
+  fi
+  printf '%s\n' "DECISIONS FOR YOU: none open."
+}
+# END decisions_heading
+decisions_heading "$n_incomplete" "$n_dec" "$n_labels"
+if [[ "$n_dec" -gt 0 ]]; then
   jq -r '.decisions[] | "  \(.repo_short) \(if .kind == "pr" then "PR " else "" end)#\(.number)  \(.age_days)d  [\(.labels|join(","))]  \(.title[0:70])\n      \(.url)"' <<<"$brief"
 fi
 echo

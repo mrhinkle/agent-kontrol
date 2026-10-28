@@ -1,5 +1,5 @@
 import { apiError } from "@/lib/api-error";
-import { briefConfig, filterWorkKinds, REPOS, type BriefSettings } from "@/lib/progress-config";
+import { briefConfig, filterWorkKinds, REPOS, resolveWorkKinds, type BriefSettings } from "@/lib/progress-config";
 import type { RepoConfig } from "@/lib/progress-config";
 import { hoursBetween, listDecisions, partitionBrief, type BriefDecision } from "@/lib/decisions";
 import { isConfigured, sql } from "@/lib/db";
@@ -610,9 +610,13 @@ export function formatBriefText(
   }
   lines.push("");
   if (brief.totals.decisions === 0) {
+    // Incomplete repos drop their decisions. Zero is not "none" until every repo was counted.
+    const decisionsUnmeasured = brief.incomplete_repos.length > 0;
     lines.push(labels.length === 0
       ? "DECISIONS FOR YOU: not tracked (set brief.decisionLabels in progress.config.json)."
-      : "DECISIONS FOR YOU: none open.");
+      : decisionsUnmeasured
+        ? "DECISIONS FOR YOU: DATA INCOMPLETE."
+        : "DECISIONS FOR YOU: none open.");
   } else {
     lines.push(`DECISIONS FOR YOU (${brief.totals.decisions}) \u2014 oldest first; each one is work nobody else can unblock`);
     for (const row of brief.decisions) {
@@ -718,7 +722,9 @@ export async function coordinatorFromDb(settings: BriefSettings, nowIso: string)
     const db = sql();
     const silenceMs = settings.coordinator.maxSilenceHours * 3_600_000;
     const cutoff = toSecondIso(new Date(Date.parse(nowIso) - silenceMs));
-    const workKinds = settings.coordinator.workKinds;
+    // `error` is excluded again here. A caller that skipped readBriefSettings
+    // must not put it in `kind = any(...)`, or the newest error is "working".
+    const workKinds = resolveWorkKinds(settings.coordinator.workKinds);
     const agents = await db`select id, last_seen_at from agents where id = ${agentId} limit 1`;
     // Do not take the newest N non-heartbeat rows and classify that slice.
     // A burst of turn_start or status_update would drop a milestone that is
@@ -766,7 +772,7 @@ export async function coordinatorFromDb(settings: BriefSettings, nowIso: string)
     return coordinatorStatus({
       agentId,
       maxSilenceHours: settings.coordinator.maxSilenceHours,
-      workKinds: settings.coordinator.workKinds,
+      workKinds: resolveWorkKinds(settings.coordinator.workKinds),
       nowIso,
       reachable: false,
       agent: null,
