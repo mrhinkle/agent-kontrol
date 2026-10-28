@@ -17,9 +17,9 @@ import {
 import { validateOwnerList, validateOwnerName } from "../../src/lib/owner-validation";
 import { MAX_REPOS, validateRepoList } from "../../src/lib/repo-validation";
 import { authorizeRoute, scopeForRoute } from "../../src/lib/scopes";
-import { applyOwnerDiscovery } from "../../src/lib/watched-owners";
+import { applyOwnerDiscovery, ownerListVersion } from "../../src/lib/watched-owners";
 import { getWatchedRepos, visibleOnBoard } from "../../src/lib/watched-repos";
-import { PUT as putOwners } from "../../src/app/api/settings/owners/route";
+import { GET as getOwners, PUT as putOwners } from "../../src/app/api/settings/owners/route";
 import { POST as postDiscover } from "../../src/app/api/settings/owners/discover/route";
 
 /**
@@ -122,10 +122,10 @@ describe("watched owners discovery", () => {
     });
     const failed = await applyOwnerDiscovery(owner(), existing, { repos: [], error: "gh repo list returned no repos", truncated: false }, NOW);
     assert.match(failed.failure ?? "", /no repos/);
-    assert.equal(calls.length, 1, "a failed sweep must not write watched_repos");
-    assert.match(calls[0], /update watched_owners/);
-    assert.doesNotMatch(calls[0], /watched_repos/);
-    assert.doesNotMatch(calls[0], /actor_type/);
+    const failedSql = calls.join("\n");
+    assert.doesNotMatch(failedSql, /watched_repos/, "a failed sweep must not write watched_repos");
+    assert.match(failedSql, /update watched_owners/);
+    assert.doesNotMatch(calls.find((sql) => /update watched_owners/i.test(sql)) ?? "", /actor_type/);
 
     calls.length = 0;
     const truncated = await applyOwnerDiscovery(
@@ -137,11 +137,11 @@ describe("watched owners discovery", () => {
     assert.equal(truncated.failure, null);
     assert.match(truncated.warning ?? "", /not marked gone/);
     assert.equal(truncated.repos.find((row) => row.repo === "acme/quiet")?.gone, false);
-    assert.equal(calls.length, 2);
-    assert.match(calls[1], /insert into watched_repos/);
-    assert.doesNotMatch(calls[1], /origin = excluded\.origin/);
-    assert.doesNotMatch(calls[1], /pinned = excluded\.pinned/);
-    assert.doesNotMatch(calls[1], /actor_type/);
+    const repoWrite = calls.find((sql) => /insert into watched_repos/i.test(sql)) ?? "";
+    assert.match(repoWrite, /insert into watched_repos/);
+    assert.doesNotMatch(repoWrite, /origin = excluded\.origin/);
+    assert.doesNotMatch(repoWrite, /pinned = excluded\.pinned/);
+    assert.doesNotMatch(repoWrite, /actor_type/);
   });
 
   it("F2 a quiet repo stays stored and leaves the brief only after activity_days", () => {
@@ -534,5 +534,211 @@ describe("watched owners discovery", () => {
     assert.ok(page.indexOf("<OwnerSettings />") < page.indexOf("<RepoSettings />"));
     assert.match(fs.readFileSync("src/components/RepoSettings.tsx", "utf8"), /origin === "auto"/);
     assert.match(fs.readFileSync("src/components/RepoSettings.tsx", "utf8"), /method: "PATCH"/);
+  });
+
+  it("concurrent owner saves with the same version cannot overwrite each other", async () => {
+    env.NODE_ENV = "test";
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+
+    const stored: Row[] = [];
+    let held = false;
+    let reads = 0;
+    let blockedOnLock = false;
+    const waiters: Array<() => void> = [];
+    let markSecond = (): void => {};
+    let failSecond = (_err: Error): void => {};
+    const secondArrived = new Promise<void>((resolve, reject) => {
+      failSecond = reject;
+      const timer = setTimeout(() => reject(new Error("second writer did not arrive")), 2000);
+      markSecond = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+    // The first version read parks until the other writer has either read the
+    // same version or blocked on the owner-list lock. That is the two-tab race.
+    const arrive = () => markSecond();
+
+    setSqlForTests(async (strings, ...values) => {
+      const text = strings.join(" ").replace(/\s+/g, " ").toLowerCase();
+      if (text.includes("commit") || text.includes("rollback")) {
+        const next = waiters.shift();
+        if (next) next();
+        else held = false;
+        return [];
+      }
+      if (text.includes("pg_advisory_xact_lock")) {
+        if (held) {
+          blockedOnLock = true;
+          arrive();
+          await new Promise<void>((resolve) => {
+            waiters.push(() => {
+              held = true;
+              resolve();
+            });
+          });
+        } else {
+          held = true;
+        }
+        return [];
+      }
+      if (text.includes("insert into watched_owners")) {
+        const names = values[0] as string[];
+        stored.length = 0;
+        names.forEach((name, i) => {
+          stored.push({
+            owner: name,
+            activity_days: (values[1] as number[])[i],
+            include_forks: (values[2] as boolean[])[i],
+            include_archived: (values[3] as boolean[])[i],
+            actor_type: values[4],
+            actor_id: values[5],
+            last_error: null,
+            last_error_at: null,
+            last_discovered_at: null,
+          });
+        });
+        return [];
+      }
+      if (text.includes("from watched_owners")) {
+        const snapshot = stored.map((row) => ({ ...row }));
+        reads += 1;
+        if (reads === 1) await secondArrived;
+        else arrive();
+        return snapshot;
+      }
+      return [];
+    });
+
+    const version = ownerListVersion([]);
+    const put = (ownerName: string) => putOwners(new Request("http://localhost/api/settings/owners", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ owners: [{ owner: ownerName }], version }),
+    }));
+
+    let left: Response;
+    let right: Response;
+    try {
+      [left, right] = await Promise.all([put("alpha"), put("beta")]);
+    } catch (err) {
+      failSecond(err instanceof Error ? err : new Error(String(err)));
+      throw err;
+    }
+    const statuses = [left.status, right.status].sort((a, b) => a - b);
+    assert.deepEqual(statuses, [200, 409]);
+    assert.equal(blockedOnLock, true, "the second writer must wait on the owner-list lock");
+    const winner = left.status === 200 ? left : right;
+    const loser = left.status === 409 ? left : right;
+    const saved = await winner.json() as { owners: { owner: string }[] };
+    const rejected = await loser.json() as { code?: string };
+    assert.equal(rejected.code, "stale");
+    assert.equal(saved.owners.length, 1);
+    assert.deepEqual(stored.map((row) => row.owner), saved.owners.map((row) => row.owner));
+    assert.ok(saved.owners[0].owner === "alpha" || saved.owners[0].owner === "beta");
+  });
+
+  it("a missing watched_owners table is not writable and rejects the save", async () => {
+    env.NODE_ENV = "test";
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+    const calls: string[] = [];
+    setSqlForTests(async (strings) => {
+      calls.push(strings.join(" "));
+      const err = new Error('relation "watched_owners" does not exist');
+      (err as { code?: string }).code = "42P01";
+      throw err;
+    });
+
+    const got = await getOwners(new Request("http://localhost/api/settings/owners"));
+    assert.equal(got.status, 200);
+    const body = await got.json() as { writable?: boolean; owners?: unknown[]; max?: number };
+    assert.equal(body.writable, false);
+    assert.deepEqual(body.owners, []);
+    assert.equal(body.max, 20);
+
+    calls.length = 0;
+    const dry = await putOwners(new Request("http://localhost/api/settings/owners", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ owners: [{ owner: "acme" }], dry_run: true }),
+    }));
+    assert.equal(dry.status, 200);
+    const preview = await dry.json() as { would_write?: boolean; applied?: boolean };
+    assert.equal(preview.would_write, false);
+    assert.equal(preview.applied, false);
+
+    calls.length = 0;
+    const put = await putOwners(new Request("http://localhost/api/settings/owners", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ owners: [{ owner: "acme" }], version: ownerListVersion([]) }),
+    }));
+    assert.equal(put.status, 409);
+    const denied = await put.json() as { code?: string; error?: string; retryable?: boolean };
+    assert.equal(denied.code, "conflict");
+    assert.equal(typeof denied.error, "string");
+    assert.equal(denied.retryable, false);
+    assert.equal(calls.some((sql) => /insert into watched_owners/i.test(sql)), false);
+  });
+
+  it("a discovery request rejects a duplicate owner", async () => {
+    env.NODE_ENV = "test";
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+    const calls: string[] = [];
+    setSqlForTests(async (strings) => {
+      calls.push(strings.join(" "));
+      return [{ owner: "acme", activity_days: 30, include_forks: false, include_archived: false }];
+    });
+    const res = await postDiscover(new Request("http://localhost/api/settings/owners/discover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        results: [
+          { owner: "acme", ok: true, repos: [{ name: "app", pushedAt: atAge(1), isFork: false, isArchived: false }] },
+          { owner: "Acme", ok: true, repos: [{ name: "other", pushedAt: atAge(1), isFork: false, isArchived: false }] },
+        ],
+      }),
+    }));
+    assert.equal(res.status, 400);
+    const body = await res.json() as { code?: string; fields?: { results?: string } };
+    assert.equal(body.code, "validation_failed");
+    assert.match(body.fields?.results ?? "", /duplicate/i);
+    assert.equal(calls.length, 0, "a duplicate owner must not apply either sweep");
+  });
+
+  it("owner discovery metadata and repo rows are one transaction", async () => {
+    const calls: string[] = [];
+    setSqlForTests(async (strings) => {
+      const text = strings.join(" ").replace(/\s+/g, " ").trim();
+      calls.push(text);
+      if (/insert into watched_repos/i.test(text)) {
+        throw Object.assign(new Error("repo insert failed"), { code: "53100" });
+      }
+      return [];
+    });
+    await assert.rejects(
+      () => applyOwnerDiscovery(
+        owner(),
+        [],
+        { repos: [listed("app", 1)], error: null, truncated: false },
+        NOW,
+      ),
+      /repo insert failed/,
+    );
+    const begin = calls.findIndex((sql) => /^begin\b/i.test(sql));
+    const update = calls.findIndex((sql) => /update watched_owners/i.test(sql));
+    const insert = calls.findIndex((sql) => /insert into watched_repos/i.test(sql));
+    const rollback = calls.findIndex((sql) => /^rollback\b/i.test(sql));
+    assert.ok(begin !== -1 && begin < update && update < insert && insert < rollback);
+    assert.equal(calls.some((sql) => /^commit\b/i.test(sql)), false);
   });
 });

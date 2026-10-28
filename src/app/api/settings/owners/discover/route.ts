@@ -104,6 +104,16 @@ export async function POST(req: Request) {
     }
     parsed.push(one.request);
   }
+  const seen = new Set<string>();
+  for (const item of parsed) {
+    if (seen.has(item.owner)) {
+      return apiError("validation_failed", {
+        message: "Each owner may appear once in a discovery request.",
+        fields: { results: "Duplicate owner in results." },
+      });
+    }
+    seen.add(item.owner);
+  }
   if (!isConfigured()) {
     return apiError("conflict", {
       message: "Owner discovery can only be saved when a database is connected.",
@@ -114,7 +124,7 @@ export async function POST(req: Request) {
     });
   }
   try {
-    const owners = await listWatchedOwners();
+    const owners = (await listWatchedOwners()).owners;
     let existing = await loadTrackedRepos();
     const now = new Date();
     const out = [];

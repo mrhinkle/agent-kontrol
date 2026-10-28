@@ -4,7 +4,7 @@ import { apiError, publicError } from "@/lib/api-error";
 import { deny, resolveApiAccess } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import { diffOwnerList, readDryRun } from "@/lib/dry-run";
-import { MAX_OWNERS, validateOwnerList, type OwnerError } from "@/lib/owner-validation";
+import { MAX_OWNERS, validateOwnerList, type OwnerError, type OwnerInput } from "@/lib/owner-validation";
 import { listWatchedOwners, ownerListVersion, replaceWatchedOwners } from "@/lib/watched-owners";
 
 export const dynamic = "force-dynamic";
@@ -34,13 +34,20 @@ function failure(e: unknown, what: string) {
   return publicError(`[settings/owners] ${what}`, e, `Could not ${what}.`);
 }
 
+function notReady(fix: string) {
+  return apiError("conflict", {
+    message: "Owners can only be saved when a database is connected.",
+    fix,
+  });
+}
+
 async function current() {
-  const owners = await listWatchedOwners();
+  const listed = await listWatchedOwners();
   return {
-    writable: isConfigured(),
+    writable: listed.writable,
     max: MAX_OWNERS,
-    version: ownerListVersion(owners),
-    owners: owners.map((owner) => ({
+    version: ownerListVersion(listed.owners),
+    owners: listed.owners.map((owner) => ({
       owner: owner.owner,
       activity_days: owner.activityDays,
       include_forks: owner.includeForks,
@@ -52,6 +59,15 @@ async function current() {
       actor_id: owner.actorId,
     })),
   };
+}
+
+function asOwnerInput(cur: Awaited<ReturnType<typeof current>>): OwnerInput[] {
+  return cur.owners.map((owner) => ({
+    owner: owner.owner,
+    activityDays: owner.activity_days,
+    includeForks: owner.include_forks,
+    includeArchived: owner.include_archived,
+  }));
 }
 
 export async function GET(req: Request) {
@@ -100,48 +116,37 @@ export async function PUT(req: Request) {
     if (dry.dryRun) {
       try {
         const cur = await current();
-        return NextResponse.json(
-          diffOwnerList(
-            cur.owners.map((owner) => ({
-              owner: owner.owner,
-              activityDays: owner.activity_days,
-              includeForks: owner.include_forks,
-              includeArchived: owner.include_archived,
-            })),
-            checked.owners,
-            false,
-          ),
-        );
+        return NextResponse.json(diffOwnerList(asOwnerInput(cur), checked.owners, false));
       } catch (e) {
         return failure(e, "load owners");
       }
     }
-    return apiError("conflict", {
-      message: "Owners can only be saved when a database is connected.",
-      fix: "Connect a database (DATABASE_URL) and retry the save.",
-    });
+    return notReady("Connect a database (DATABASE_URL) and retry the save.");
   }
   try {
     const sent = (body as { version?: unknown } | null)?.version;
     const cur = await current();
+    if (!cur.writable) {
+      if (dry.dryRun) return NextResponse.json(diffOwnerList(asOwnerInput(cur), checked.owners, false));
+      return notReady("Apply supabase/migrations/20261028_watched_owners.sql, then retry the save.");
+    }
+    // A mismatch here is enough for a dry run, which writes nothing. A real
+    // save checks the version again under the owner-list lock.
     if (typeof sent === "string" && sent !== cur.version) {
       return apiError("stale");
     }
     if (dry.dryRun) {
-      return NextResponse.json(
-        diffOwnerList(
-          cur.owners.map((owner) => ({
-            owner: owner.owner,
-            activityDays: owner.activity_days,
-            includeForks: owner.include_forks,
-            includeArchived: owner.include_archived,
-          })),
-          checked.owners,
-          true,
-        ),
-      );
+      return NextResponse.json(diffOwnerList(asOwnerInput(cur), checked.owners, true));
     }
-    await replaceWatchedOwners(checked.owners, actorFromPrincipal(access.principal));
+    const saved = await replaceWatchedOwners(
+      checked.owners,
+      actorFromPrincipal(access.principal),
+      typeof sent === "string" ? sent : undefined,
+    );
+    if (!saved.ok) {
+      if (saved.reason === "stale") return apiError("stale");
+      return notReady("Apply supabase/migrations/20261028_watched_owners.sql, then retry the save.");
+    }
     return NextResponse.json(await current());
   } catch (e) {
     return failure(e, "save owners");

@@ -1293,7 +1293,7 @@ export function openApiDocument(): Json {
           tags: ["settings"],
           summary: "GitHub owners whose repos are discovered.",
           description:
-            "With no database, returns writable false and an empty owners list. A missing table is the same empty list, not a 500.",
+            "With no database, returns writable false and an empty owners list. A missing table is writable false and the same empty list, not a 500.",
           security: cookieOrBearer,
           responses: {
             "200": jsonResponse("The current owner list and its version.", ref("WatchedOwners")),
@@ -1305,7 +1305,7 @@ export function openApiDocument(): Json {
           tags: ["settings"],
           summary: "Replace the watched-owner list, or preview that replace.",
           description:
-            "Auth matches PUT /api/settings/repos. An agent credential is 403 insufficient_scope. The actor is the principal, never a body field. dev-open stores null actor fields. Removing an owner does not delete repos already tracked. An empty owners list is allowed. dry_run true returns the diff and writes nothing. A stale version is 409. With no database, a dry run returns that diff with would_write false instead of 409.",
+            "Auth matches PUT /api/settings/repos. An agent credential is 403 insufficient_scope. The actor is the principal, never a body field. dev-open stores null actor fields. Removing an owner does not delete repos already tracked. An empty owners list is allowed. dry_run true returns the diff and writes nothing. A stale version is 409. The version is checked again under a lock in the same transaction as the replace. With no database, or before the table exists, a dry run returns that diff with would_write false instead of 409, and a save is 409 conflict.",
           security: cookieOrBearer,
           requestBody: body(ref("OwnerList")),
           responses: {
@@ -1328,7 +1328,7 @@ export function openApiDocument(): Json {
           tags: ["settings"],
           summary: "Apply one collector tick of gh repo list results.",
           description:
-            "Auth matches PUT /api/settings/repos. A result with ok false, a rate-limit error, or zero repos records last_error and does not change tracked repos. A truncated list updates the repos it saw, does not mark the others gone, and stores a warning on last_error while still setting last_discovered_at. An unknown owner is an error on that result and does not fail the batch. A repo name that is not safe to store fails that owner's sweep and writes no repo changes. Discovery does not change pin, hide, label, short, color, origin, or the actor who saved the owner. No database is 409 and includes results.",
+            "Auth matches PUT /api/settings/repos. A result with ok false, a rate-limit error, or zero repos records last_error and does not change tracked repos. A truncated list updates the repos it saw, does not mark the others gone, and stores a warning on last_error while still setting last_discovered_at. An unknown owner is an error on that result and does not fail the batch. A duplicate owner in one request is 400 and writes nothing. A repo name that is not safe to store fails that owner's sweep and writes no repo changes. One owner's metadata update and repo changes commit together. Discovery does not change pin, hide, label, short, color, origin, or the actor who saved the owner. No database is 409 and includes results.",
           security: cookieOrBearer,
           requestBody: body(ref("OwnerDiscovery")),
           responses: {

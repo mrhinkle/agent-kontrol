@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Actor } from "./actor";
-import { isConfigured, sql } from "./db";
+import { isConfigured, sql, withTransaction, type Row } from "./db";
 import {
   planDiscovery,
   repoIdentity,
@@ -65,8 +65,17 @@ export function ownerFromRow(r: Record<string, unknown>): StoredOwner {
   };
 }
 
-export async function listWatchedOwners(): Promise<StoredOwner[]> {
-  if (!isConfigured()) return [];
+export interface WatchedOwnerRead {
+  /** False when no database is configured, or `watched_owners` does not exist yet. */
+  writable: boolean;
+  owners: StoredOwner[];
+}
+
+/** Serializes owner-list writers. Empty-table `for update` locks nothing, so this is a transaction lock. */
+const OWNER_LIST_LOCK = 87216666;
+
+export async function listWatchedOwners(): Promise<WatchedOwnerRead> {
+  if (!isConfigured()) return { writable: false, owners: [] };
   try {
     const rows = await sql()`
       select owner, activity_days, include_forks, include_archived,
@@ -74,44 +83,75 @@ export async function listWatchedOwners(): Promise<StoredOwner[]> {
       from watched_owners
       order by owner asc
     `;
-    return rows.map((r) => ownerFromRow(r));
+    return { writable: true, owners: rows.map((r) => ownerFromRow(r)) };
   } catch (e) {
-    if (missingRelation(e)) return [];
+    if (missingRelation(e)) return { writable: false, owners: [] };
     throw e;
   }
 }
 
-/** Replaces the owner list. Does not delete discovered repos. Records the actor. */
-export async function replaceWatchedOwners(owners: OwnerInput[], actor: Actor | null): Promise<void> {
+export type OwnerWriteResult =
+  | { ok: true }
+  | { ok: false; reason: "stale" | "missing_table" };
+
+/**
+ * Replaces the owner list. Does not delete discovered repos. Records the actor.
+ * `expectedVersion`, when passed, is checked again after `pg_advisory_xact_lock`
+ * so two writers that read the same version cannot both commit.
+ */
+export async function replaceWatchedOwners(
+  owners: OwnerInput[],
+  actor: Actor | null,
+  expectedVersion?: string,
+): Promise<OwnerWriteResult> {
   const actorType = actor?.actor_type ?? null;
   const actorId = actor?.actor_id ?? null;
-  await sql()`
-    with incoming as (
-      select * from unnest(
-        ${owners.map((o) => o.owner)}::text[],
-        ${owners.map((o) => o.activityDays)}::int[],
-        ${owners.map((o) => o.includeForks)}::boolean[],
-        ${owners.map((o) => o.includeArchived)}::boolean[]
-      ) as t(owner, activity_days, include_forks, include_archived)
-    ),
-    upserted as (
-      insert into watched_owners (
-        owner, activity_days, include_forks, include_archived, actor_type, actor_id, updated_at
+  return withTransaction(async (q) => {
+    await q`select pg_advisory_xact_lock(${OWNER_LIST_LOCK}::bigint)`;
+    let rows: Row[];
+    try {
+      rows = await q`
+        select owner, activity_days, include_forks, include_archived,
+               last_error, last_error_at, last_discovered_at, actor_type, actor_id
+        from watched_owners
+        order by owner asc
+      `;
+    } catch (e) {
+      if (missingRelation(e)) return { ok: false, reason: "missing_table" };
+      throw e;
+    }
+    if (expectedVersion !== undefined && expectedVersion !== ownerListVersion(rows.map((r) => ownerFromRow(r)))) {
+      return { ok: false, reason: "stale" };
+    }
+    await q`
+      with incoming as (
+        select * from unnest(
+          ${owners.map((o) => o.owner)}::text[],
+          ${owners.map((o) => o.activityDays)}::int[],
+          ${owners.map((o) => o.includeForks)}::boolean[],
+          ${owners.map((o) => o.includeArchived)}::boolean[]
+        ) as t(owner, activity_days, include_forks, include_archived)
+      ),
+      upserted as (
+        insert into watched_owners (
+          owner, activity_days, include_forks, include_archived, actor_type, actor_id, updated_at
+        )
+        select owner, activity_days, include_forks, include_archived, ${actorType}, ${actorId}, now()
+        from incoming
+        on conflict (owner) do update set
+          activity_days = excluded.activity_days,
+          include_forks = excluded.include_forks,
+          include_archived = excluded.include_archived,
+          actor_type = excluded.actor_type,
+          actor_id = excluded.actor_id,
+          updated_at = now()
+        returning owner
       )
-      select owner, activity_days, include_forks, include_archived, ${actorType}, ${actorId}, now()
-      from incoming
-      on conflict (owner) do update set
-        activity_days = excluded.activity_days,
-        include_forks = excluded.include_forks,
-        include_archived = excluded.include_archived,
-        actor_type = excluded.actor_type,
-        actor_id = excluded.actor_id,
-        updated_at = now()
-      returning owner
-    )
-    delete from watched_owners w
-    where not exists (select 1 from incoming i where i.owner = w.owner)
-  `;
+      delete from watched_owners w
+      where not exists (select 1 from incoming i where i.owner = w.owner)
+    `;
+    return { ok: true };
+  });
 }
 
 export function ruleOf(owner: StoredOwner): OwnerRule {
@@ -146,19 +186,20 @@ export async function applyOwnerDiscovery(
 ): Promise<DiscoveryOutcome> {
   const outcome = planDiscovery(existing, rule, sweep, now);
   const visibleError = outcome.failure ?? outcome.warning;
-  await sql()`
-    update watched_owners set
-      last_error = ${visibleError},
-      last_error_at = case when ${visibleError}::text is null then null else now() end,
-      last_discovered_at = case when ${outcome.failure}::text is null then now() else last_discovered_at end,
-      updated_at = now()
-    where owner = ${rule.owner}
-  `;
-  if (outcome.failure) return outcome;
-
-  const owned = outcome.repos.filter((row) => repoOwner(row.repo) === rule.owner.toLowerCase());
-  if (owned.length === 0) return outcome;
-  await sql()`
+  const owned = outcome.failure
+    ? []
+    : outcome.repos.filter((row) => repoOwner(row.repo) === rule.owner.toLowerCase());
+  await withTransaction(async (q) => {
+    await q`
+      update watched_owners set
+        last_error = ${visibleError},
+        last_error_at = case when ${visibleError}::text is null then null else now() end,
+        last_discovered_at = case when ${outcome.failure}::text is null then now() else last_discovered_at end,
+        updated_at = now()
+      where owner = ${rule.owner}
+    `;
+    if (outcome.failure || owned.length === 0) return;
+    await q`
     insert into watched_repos (
       repo, label, short, color, blocked_label, position, origin, pinned, hidden, gone,
       is_fork, is_archived, last_activity_at, updated_at
@@ -190,7 +231,8 @@ export async function applyOwnerDiscovery(
       is_archived = excluded.is_archived,
       gone = excluded.gone,
       updated_at = now()
-  `;
+    `;
+  });
   return outcome;
 }
 
