@@ -473,11 +473,7 @@ describe("GET /api/brief", { concurrency: false }, () => {
     assert.equal([...src.matchAll(/name: "reply_to_operator"/g)].length, 1);
 
     const block = src.slice(src.indexOf('"get_morning_brief"'), src.indexOf('"remember"'));
-    assert.match(block, /readOnlyHint:\s*true/);
-    assert.match(block, /destructiveHint:\s*false/);
-    assert.match(block, /idempotentHint:\s*true/);
-    assert.match(block, /openWorldHint:\s*false/);
-    assert.equal(src.slice(0, src.indexOf('"get_morning_brief"')).includes("readOnlyHint"), false);
+    assert.match(block, /title: "Get morning brief",\n\s+annotations: READ_ONLY,/);
 
     assert.equal(TOOL_SCOPES.get_morning_brief, "progress:read");
     assert.equal(TOOL_SCOPES.get_progress_digest, "progress:read");

@@ -154,6 +154,7 @@ const handler = createMcpHandler(
       "get_morning_brief",
       {
         title: "Get morning brief",
+        annotations: READ_ONLY,
         description:
           "Read the morning brief as plain text: merges, issue flow, stuck PRs, decisions waiting on the owner, and whether the coordinator's last event is real work. Same text as GET /api/brief. window is 24h (default) or 72h. A heartbeat does not count as working.",
         inputSchema: {
@@ -161,12 +162,6 @@ const handler = createMcpHandler(
             .enum(["24h", "72h"])
             .optional()
             .describe("24h or 72h. Defaults to 24h."),
-        },
-        annotations: {
-          readOnlyHint: true,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false,
         },
       },
       async (args) => guardTool("get_morning_brief", async () => {
