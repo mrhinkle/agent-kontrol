@@ -1,5 +1,5 @@
 import { apiError } from "@/lib/api-error";
-import { briefConfig, REPOS, type BriefSettings } from "@/lib/progress-config";
+import { briefConfig, filterWorkKinds, REPOS, type BriefSettings } from "@/lib/progress-config";
 import type { RepoConfig } from "@/lib/progress-config";
 import { hoursBetween, listDecisions, partitionBrief, type BriefDecision } from "@/lib/decisions";
 import { isConfigured, sql } from "@/lib/db";
@@ -92,7 +92,8 @@ export interface MorningBrief {
     issues_opened: number;
     issues_closed: number;
     net_backlog: number;
-    stuck_prs: number;
+    /** Null when a counted repo did not measure stuck PRs. Zero is a measured empty list. */
+    stuck_prs: number | null;
     decisions: number;
     repos_counted: number;
     repos_total: number;
@@ -141,13 +142,17 @@ export function briefQueryError(parsed: Extract<BriefQuery, { ok: false }>): Res
 /**
  * Plain text is the default, including when the client sends `Accept: *\/*`
  * or no Accept header. JSON is returned only when `application/json` has a
- * quality strictly greater than `text/plain` (and `text/*`). A repeated media
- * type uses its highest quality in 0..1. Equal quality stays text.
+ * quality strictly greater than the effective quality of `text/plain`.
+ * `text/plain` uses its own `q` when listed, otherwise `text/*`, otherwise
+ * `*\/*`. A repeated media type uses its highest quality in 0..1. Equal
+ * quality stays text.
  */
 export function briefWantsJson(accept: string | null): boolean {
   if (!accept || !accept.trim()) return false;
   let jsonQ: number | null = null;
-  let textQ: number | null = null;
+  let plainQ: number | null = null;
+  let textStarQ: number | null = null;
+  let starQ: number | null = null;
   for (const part of accept.split(",")) {
     const bits = part.split(";").map((bit) => bit.trim()).filter(Boolean);
     if (bits.length === 0) continue;
@@ -159,13 +164,14 @@ export function briefWantsJson(accept: string | null): boolean {
       const n = Number(match[1]);
       if (Number.isFinite(n) && n >= 0 && n <= 1) q = n;
     }
-    if (type === "application/json") {
-      jsonQ = jsonQ === null ? q : Math.max(jsonQ, q);
-    } else if (type === "text/plain" || type === "text/*") {
-      textQ = textQ === null ? q : Math.max(textQ, q);
-    }
+    const higher = (current: number | null) => (current === null ? q : Math.max(current, q));
+    if (type === "application/json") jsonQ = higher(jsonQ);
+    else if (type === "text/plain") plainQ = higher(plainQ);
+    else if (type === "text/*") textStarQ = higher(textStarQ);
+    else if (type === "*/*") starQ = higher(starQ);
   }
   if (jsonQ === null || jsonQ <= 0) return false;
+  const textQ = plainQ ?? textStarQ ?? starQ;
   if (textQ !== null && textQ >= jsonQ) return false;
   return true;
 }
@@ -245,7 +251,7 @@ export function coordinatorStatus(input: {
       verdict: "unknown: dashboard unreachable",
     };
   }
-  const work = new Set(input.workKinds);
+  const work = new Set(filterWorkKinds(input.workKinds));
   const events = [...input.events].sort((a, b) => stamp(b.created_at) - stamp(a.created_at));
   const age = (iso: string) => hoursBetween(iso, input.nowIso);
   const recent = events.filter((event) => age(event.created_at) <= input.maxSilenceHours);
@@ -284,9 +290,10 @@ function str(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-function stuckFromDetail(detail: SnapshotDetail | null, short: string): BriefStuckPr[] {
+function stuckFromDetail(detail: SnapshotDetail | null, short: string): BriefStuckPr[] | null {
   const raw = detail?.stuck_prs;
-  if (!Array.isArray(raw)) return [];
+  // Older ticks omit the key. That is unmeasured, not an empty fleet.
+  if (!Array.isArray(raw)) return null;
   const out: BriefStuckPr[] = [];
   for (const item of raw) {
     if (!item || typeof item !== "object") continue;
@@ -483,6 +490,7 @@ export function assembleBrief(input: {
 }): MorningBrief {
   const repos = [...input.repos];
   const counted = repos.filter((repo) => !repo.incomplete);
+  const stuckUnmeasured = counted.some((repo) => repo.stuck_prs == null);
   const stuck = stableByAgeDesc(
     counted.flatMap((repo) => repo.stuck_prs ?? []),
   );
@@ -501,7 +509,7 @@ export function assembleBrief(input: {
       issues_opened: sum(counted.map((repo) => repo.issues_opened)),
       issues_closed: sum(counted.map((repo) => repo.issues_closed)),
       net_backlog: sum(counted.map((repo) => repo.net_backlog)),
-      stuck_prs: counted.reduce((total, repo) => total + (repo.stuck_prs?.length ?? 0), 0),
+      stuck_prs: stuckUnmeasured ? null : stuck.length,
       decisions: counted.reduce((total, repo) => total + (repo.decisions?.length ?? 0), 0),
       repos_counted: counted.length,
       repos_total: repos.length,
@@ -578,16 +586,21 @@ export function formatBriefText(
           netCell(repo.net_backlog),
           cell(repo.open_issues),
           repo.stale_ratio == null ? "-" : `${Math.floor(repo.stale_ratio * 100)}%`,
-          String(repo.stuck_prs?.length ?? 0),
+          repo.stuck_prs == null ? "-" : String(repo.stuck_prs.length),
           repo.median_lead_hours == null ? "-" : `${tenths(repo.median_lead_hours)}h`,
         ];
     lines.push(cols.map((col, i) => pad(col, widths[i])).join(" ").trimEnd());
   }
   lines.push(`  stale = open issue untouched ${brief.thresholds.stale_issue_days}d+ \u00b7 stuck = non-draft PR open ${brief.thresholds.stuck_pr_hours}h+ or blocked/dirty \u00b7 lead-med = median hours PR open\u2192merge`);
   lines.push("");
-  if (brief.totals.stuck_prs === 0) lines.push("STUCK PRs: none.");
-  else {
-    lines.push(`STUCK PRs (${brief.totals.stuck_prs}) \u2014 oldest first`);
+  const stuckUnmeasured = brief.repos.some((repo) => !repo.incomplete && repo.stuck_prs == null);
+  if (stuckUnmeasured && brief.stuck_prs.length === 0) {
+    lines.push("STUCK PRs: DATA INCOMPLETE.");
+  } else if (!stuckUnmeasured && brief.totals.stuck_prs === 0) {
+    lines.push("STUCK PRs: none.");
+  } else {
+    lines.push(`STUCK PRs (${brief.stuck_prs.length}) \u2014 oldest first`);
+    if (stuckUnmeasured) lines.push("!! DATA INCOMPLETE: stuck PRs were not measured for every counted repo.");
     for (const pr of brief.stuck_prs) {
       lines.push(`  ${pr.repo} #${pr.number}  ${pr.age_days}d  ${pr.reason}`);
       lines.push(`      ${sliceText(pr.title, 78)}  ${pr.url}`);
@@ -658,7 +671,8 @@ function toSnapshot(row: Row): RepoSnapshot {
  * The latest read does not drop a row whose counts are null. A newer partial
  * ingest has to win, so the brief can mark that repo DATA INCOMPLETE instead
  * of reprinting an older complete snapshot as current. `beforeIso` is only the
- * 72h baseline cutoff, chosen separately from the latest row.
+ * 72h baseline cutoff, chosen separately from the latest row. `id desc` breaks
+ * a tie when two rows share `collected_at`.
  */
 async function snapshotsAt(repos: string[], beforeIso: string | null): Promise<Map<string, RepoSnapshot>> {
   if (repos.length === 0) return new Map();
@@ -669,13 +683,13 @@ async function snapshotsAt(repos: string[], beforeIso: string | null): Promise<M
         from repo_snapshots
         where repo = any(${repos}::text[])
           and collected_at <= ${beforeIso}
-        order by repo, collected_at desc
+        order by repo, collected_at desc, id desc
       `
     : await db`
         select distinct on (repo) *
         from repo_snapshots
         where repo = any(${repos}::text[])
-        order by repo, collected_at desc
+        order by repo, collected_at desc, id desc
       `;
   return new Map((rows as Row[]).map((row) => [String(row.repo), toSnapshot(row)]));
 }

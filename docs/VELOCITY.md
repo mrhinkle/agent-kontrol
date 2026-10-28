@@ -45,7 +45,8 @@ depends on a file on an operator's laptop or on an agent remembering to report:
   `milestone` or `status` event arrived within `maxSilenceHours`. `turn_start` and `error`
   do not count: a coordinator that starts turns and errors every hour is not working, it is
   failing, and the brief says *failing* for that case. Telemetry-only is reported as exactly
-  that.
+  that. Configuring `workKinds` as `heartbeat`, `telemetry`, `turn_start`, or `status_update`
+  does not make those events count.
 - **The watcher has a watcher.** The brief runs on a scheduler that can itself go silent (the
   coordinator's did). A dead-man's check on a second channel reports when no brief arrived by
   the expected time plus fifteen minutes. Without it the brief inherits the failure it was

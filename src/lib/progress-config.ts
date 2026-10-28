@@ -167,12 +167,23 @@ export interface BriefSettings {
   coordinator: {
     agentId: string | null;
     maxSilenceHours: number;
-    /** Exact event kinds. `status_update` is not `status`. Heartbeat and telemetry are never included. */
+    /**
+     * Exact event kinds that count as work. `heartbeat`, `telemetry`,
+     * `turn_start`, and `status_update` are removed even when configured.
+     * `status_update` is not `status`.
+     */
     workKinds: string[];
   };
 }
 
 const DEFAULT_WORK_KINDS = ["session_end", "milestone", "status"];
+
+/** Never coordinator work. A configured list cannot put these back. */
+const NEVER_WORK_KINDS = new Set(["heartbeat", "telemetry", "turn_start", "status_update"]);
+
+export function filterWorkKinds(kinds: readonly string[]): string[] {
+  return kinds.filter((kind) => kind.length > 0 && !NEVER_WORK_KINDS.has(kind));
+}
 
 function finiteNumber(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
@@ -196,6 +207,7 @@ export function readBriefSettings(raw: unknown): BriefSettings {
   } else if (Array.isArray(coord.workKinds)) {
     workKinds = coord.workKinds.filter((kind): kind is string => typeof kind === "string" && kind.length > 0);
   }
+  workKinds = filterWorkKinds(workKinds);
   if (workKinds.length === 0) workKinds = DEFAULT_WORK_KINDS;
   return {
     decisionLabels: labels,

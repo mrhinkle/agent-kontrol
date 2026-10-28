@@ -73,9 +73,28 @@ STUCK_PR_HOURS="$(cfg '.brief.stuckPrHours')";      STUCK_PR_HOURS="${STUCK_PR_H
 STALE_ISSUE_DAYS="$(cfg '.brief.staleIssueDays')";  STALE_ISSUE_DAYS="${STALE_ISSUE_DAYS:-21}"
 COORD_ID="$(cfg '.brief.coordinator.agentId')"
 COORD_MAX_H="$(cfg '.brief.coordinator.maxSilenceHours')"; COORD_MAX_H="${COORD_MAX_H:-3}"
-COORD_WORK_KINDS="$(cfg '.brief.coordinator.workKinds')"
 # Work means output: a round ended, a milestone or status was posted. turn_start and error
-# are activity without output and do not count (docs/VELOCITY.md).
+# are activity without output and do not count (docs/VELOCITY.md). A configured list cannot
+# put heartbeat, telemetry, turn_start, or status_update back in.
+filter_work_kinds() {
+  local raw="$1" kind filtered=""
+  local -a kinds=()
+  IFS='|' read -ra kinds <<< "$raw"
+  for kind in "${kinds[@]}"; do
+    kind="${kind#"${kind%%[![:space:]]*}"}"
+    kind="${kind%"${kind##*[![:space:]]}"}"
+    case "$kind" in
+      ""|heartbeat|telemetry|turn_start|status_update) ;;
+      *) filtered="${filtered:+$filtered|}$kind" ;;
+    esac
+  done
+  printf '%s' "$filtered"
+}
+# end filter_work_kinds
+COORD_WORK_KINDS="$(cfg '.brief.coordinator.workKinds')"
+if [[ -n "$COORD_WORK_KINDS" ]]; then
+  COORD_WORK_KINDS="$(filter_work_kinds "$COORD_WORK_KINDS")"
+fi
 COORD_WORK_KINDS="${COORD_WORK_KINDS:-session_end|milestone|status}"
 DECISION_LABELS_JSON="$(jq -c '.brief.decisionLabels // []' "$CONFIG_FILE")"
 

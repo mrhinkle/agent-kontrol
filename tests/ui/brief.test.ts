@@ -19,6 +19,7 @@ import {
 import type { BriefDecision } from "../../src/lib/decisions";
 import { createCredential, resetCredentialsForTests } from "../../src/lib/credentials";
 import { setSqlForTests, type Row } from "../../src/lib/db";
+import { readBriefSettings } from "../../src/lib/progress-config";
 import type { RepoSnapshot } from "../../src/lib/progress-types";
 import { scopeForRoute, TOOL_SCOPES } from "../../src/lib/scopes";
 
@@ -660,7 +661,7 @@ describe("GET /api/brief", { concurrency: false }, () => {
       nowIso: now,
     });
     assert.equal(bare.incomplete, false);
-    assert.deepEqual(bare.stuck_prs, []);
+    assert.equal(bare.stuck_prs, null);
     assert.equal(bare.median_lead_hours, null);
     assert.equal(bare.stale_issues, null);
     const rendered = formatBriefText(assembleBrief({
@@ -673,7 +674,8 @@ describe("GET /api/brief", { concurrency: false }, () => {
       repos: [bare],
     }), { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] });
     assert.equal(rendered.includes("undefined"), false);
-    assert.match(rendered, /STUCK PRs: none\./);
+    assert.equal(rendered.includes("STUCK PRs: none."), false);
+    assert.match(rendered, /STUCK PRs: DATA INCOMPLETE\./);
   });
 
   it("collector brief jq keeps a stuck PR and drops a young one", () => {
@@ -924,6 +926,163 @@ describe("GET /api/brief", { concurrency: false }, () => {
     const body = await repeated.json();
     assert.equal(body.window_hours, 24);
     assert.equal(body.demo, undefined);
+  });
+
+  it("absent stuck_prs is unmeasured, and an empty array is none", () => {
+    const now = "2026-10-27T12:00:00Z";
+    const cfg = { repo: "acme/app", label: "Acme", short: "app", blockedLabel: null };
+    const snap: RepoSnapshot = {
+      repo: "acme/app",
+      label: "Acme",
+      collected_at: now,
+      kind: "tick",
+      open_issues: 2,
+      open_prs: 0,
+      blocked_issues: 0,
+      merged_prs_24h: 1,
+      issues_closed_24h: 1,
+      issues_opened_24h: 1,
+      total_issues_created: 10,
+      total_issues_closed: 8,
+      total_prs_merged: 4,
+      review_rounds: null,
+      no_verdict_rate: null,
+      detail: { lane_mix: { grok: 1 } },
+    };
+    const bare = repoSection({ cfg, snap, baseline: null, windowHours: 24, nowIso: now });
+    assert.equal(bare.incomplete, false);
+    assert.equal(bare.stuck_prs, null);
+    assert.equal(bare.merged_prs, 1);
+    const omitted = assembleBrief({
+      generatedAt: now,
+      windowHours: 24,
+      repoSource: "dashboard",
+      stuckPrHours: 48,
+      staleIssueDays: 21,
+      coordinator: { configured: false, agent_id: null },
+      repos: [bare],
+    });
+    assert.equal(omitted.totals.stuck_prs, null);
+    assert.deepEqual(omitted.stuck_prs, []);
+    const rendered = formatBriefText(omitted, { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] });
+    assert.equal(rendered.includes("STUCK PRs: none."), false);
+    assert.match(rendered, /STUCK PRs: DATA INCOMPLETE\./);
+    const row = rendered.split("\n").find((line) => line.startsWith("Acme"));
+    assert.ok(row);
+    assert.equal(row.trimEnd().split(/\s+/)[6], "-");
+
+    const measuredEmpty = repoSection({
+      cfg,
+      snap: { ...snap, detail: { stuck_prs: [] } },
+      baseline: null,
+      windowHours: 24,
+      nowIso: now,
+    });
+    assert.deepEqual(measuredEmpty.stuck_prs, []);
+    const emptyBrief = assembleBrief({
+      generatedAt: now,
+      windowHours: 24,
+      repoSource: "dashboard",
+      stuckPrHours: 48,
+      staleIssueDays: 21,
+      coordinator: { configured: false, agent_id: null },
+      repos: [measuredEmpty],
+    });
+    assert.equal(emptyBrief.totals.stuck_prs, 0);
+    const emptyText = formatBriefText(emptyBrief, { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] });
+    assert.match(emptyText, /STUCK PRs: none\./);
+    const emptyRow = emptyText.split("\n").find((line) => line.startsWith("Acme"));
+    assert.equal(emptyRow?.trimEnd().split(/\s+/)[6], "0");
+
+    const mixed = assembleBrief({
+      generatedAt: now,
+      windowHours: 24,
+      repoSource: "dashboard",
+      stuckPrHours: 48,
+      staleIssueDays: 21,
+      coordinator: { configured: false, agent_id: null },
+      repos: [
+        section({ repo: "acme/app", short: "app", label: "Acme", stuck_prs: [stuck("app", 11, 10)] }),
+        section({ repo: "other/app", short: "other", label: "Other", stuck_prs: null }),
+      ],
+    });
+    assert.equal(mixed.totals.stuck_prs, null);
+    assert.deepEqual(mixed.stuck_prs.map((row) => row.number), [11]);
+    const mixedText = formatBriefText(mixed, { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] });
+    assert.equal(mixedText.includes("STUCK PRs: none."), false);
+    assert.match(mixedText, /DATA INCOMPLETE: stuck PRs were not measured/);
+    assert.match(mixedText, /#11/);
+  });
+
+  it("configured heartbeat, telemetry, turn_start, and status_update never count as work", () => {
+    const now = "2026-10-27T12:00:00Z";
+    const base = {
+      agentId: "hermes-carmack",
+      maxSilenceHours: 3,
+      nowIso: now,
+      reachable: true,
+      agent: { id: "hermes-carmack", last_seen_at: "2026-10-27T11:59:30Z" },
+    };
+    for (const kind of ["heartbeat", "telemetry", "turn_start", "status_update"] as const) {
+      const status = coordinatorStatus({
+        ...base,
+        workKinds: [kind],
+        events: [{ kind, created_at: "2026-10-27T11:50:00Z" }],
+      });
+      assert.equal(status.verdict?.startsWith("working"), false, kind);
+      assert.match(status.verdict ?? "", /^NOT WORKING/, kind);
+      assert.equal(status.last_work_kind, null, kind);
+    }
+
+    const heartbeatBesideWork = coordinatorStatus({
+      ...base,
+      workKinds: ["heartbeat", "milestone"],
+      events: [{ kind: "heartbeat", created_at: "2026-10-27T11:50:00Z" }],
+    });
+    assert.match(heartbeatBesideWork.verdict ?? "", /^NOT WORKING/);
+
+    const realWork = coordinatorStatus({
+      ...base,
+      workKinds: ["telemetry", "milestone"],
+      events: [{ kind: "milestone", created_at: "2026-10-27T11:30:00Z" }],
+    });
+    assert.equal(realWork.verdict, "working: last work event 0.5h ago");
+
+    const onlyNoise = readBriefSettings({ brief: { coordinator: { workKinds: ["heartbeat"] } } });
+    assert.deepEqual(onlyNoise.coordinator.workKinds, ["session_end", "milestone", "status"]);
+    const mixedKinds = readBriefSettings({ brief: { coordinator: { workKinds: ["heartbeat", "milestone", "status_update"] } } });
+    assert.deepEqual(mixedKinds.coordinator.workKinds, ["milestone"]);
+    const piped = readBriefSettings({ brief: { coordinator: { workKinds: "telemetry|turn_start|session_end" } } });
+    assert.deepEqual(piped.coordinator.workKinds, ["session_end"]);
+    const custom = readBriefSettings({ brief: { coordinator: { workKinds: ["custom_work", "heartbeat"] } } });
+    assert.deepEqual(custom.coordinator.workKinds, ["custom_work"]);
+
+    const script = fs.readFileSync("scripts/morning-brief.sh", "utf8");
+    const start = script.indexOf("filter_work_kinds() {");
+    const end = script.indexOf("# end filter_work_kinds");
+    assert.ok(start >= 0 && end > start);
+    const fn = script.slice(start, end);
+    const filtered = execFileSync("bash", ["-c", `${fn}\nfilter_work_kinds "heartbeat|milestone|telemetry|turn_start|status_update"`], { encoding: "utf8" });
+    assert.equal(filtered, "milestone");
+  });
+
+  it("wildcard Accept quality counts as text when text/plain is not listed", async () => {
+    assert.equal(briefWantsJson("application/json;q=0.5, */*;q=1"), false);
+    assert.equal(briefWantsJson("application/json;q=0.5, */*;q=0.5"), false);
+    assert.equal(briefWantsJson("application/json;q=0.4, */*;q=0.2, */*;q=0.9"), false);
+    assert.equal(briefWantsJson("application/json;q=0.9, */*;q=0.1"), true);
+    assert.equal(briefWantsJson("application/json;q=0.8, text/*;q=0.3, */*;q=0.9"), true);
+    assert.equal(briefWantsJson("application/json;q=0.4, text/plain;q=0.2, */*;q=0.9"), true);
+    assert.equal(briefWantsJson("application/json, */*"), false);
+
+    const higherWildcard = await GET(briefRequest("", { accept: "application/json;q=0.5, */*;q=1" }));
+    assert.equal(higherWildcard.status, 200);
+    assert.equal(higherWildcard.headers.get("content-type"), "text/plain; charset=utf-8");
+    assert.match(await bodyText(higherWildcard), /^MORNING BRIEF /);
+
+    const equalWildcard = await GET(briefRequest("", { accept: "application/json;q=0.5, */*;q=0.5" }));
+    assert.equal(equalWildcard.status, 200);
+    assert.equal(equalWildcard.headers.get("content-type"), "text/plain; charset=utf-8");
   });
 });
 
