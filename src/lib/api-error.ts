@@ -83,6 +83,12 @@ export const API_ERRORS = {
     fix: "Wait for the write-back to finish, then reload. The claim expires after 180 seconds.",
     retryable: true,
   },
+  stale_write: {
+    status: 409,
+    message: "stale_write",
+    fix: "Preview the write again and send the expected_revision from that preview.",
+    retryable: false,
+  },
   task_not_found: {
     status: 404,
     message: "Task not found",
@@ -284,8 +290,17 @@ function safeCaught(err: unknown): SafeCaught | null {
       fields: invalidKey.fields ?? { idempotency_key: invalidKey.message },
     };
   }
+  if (err instanceof Error && err.name === "StaleWrite") {
+    const current = (err as Error & { currentRevision?: unknown }).currentRevision;
+    return {
+      code: "stale_write",
+      message: "stale_write",
+      extra: { current_revision: typeof current === "string" ? current : "" },
+    };
+  }
   const msg = err instanceof Error ? err.message : "";
   if (msg === "Task not found") return { code: "task_not_found", message: msg };
+  if (msg === "Memory not found") return { code: "not_found", message: "not found" };
   if (msg === "in_reply_to belongs to a different agent") {
     return { code: "forbidden", message: msg, fields: { in_reply_to: msg } };
   }

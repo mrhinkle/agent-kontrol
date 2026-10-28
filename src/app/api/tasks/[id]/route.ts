@@ -2,8 +2,10 @@ import { NextResponse } from "next/server";
 import { enforceApi } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
-import { readDryRun, refusedDryRun } from "@/lib/dry-run";
+import { diffTaskUpdate, readDryRun, readExpectedRevision, refusedDryRun } from "@/lib/dry-run";
 import { previewTaskChange } from "@/lib/dry-run-actions";
+import { demoGetTask, demoUpdateTaskGuarded } from "@/lib/demo-store";
+import { taskRevision } from "@/lib/revision";
 import { updateTask, report } from "@/lib/store";
 import type { TaskStatus } from "@/lib/types";
 
@@ -11,16 +13,26 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 30;
 
 /**
- * PATCH /api/tasks/:id { status?, result?, cost_usd?, session_id?, assigned_agent?, agent_id?, dry_run? }
+ * PATCH /api/tasks/:id { status?, result?, cost_usd?, session_id?, assigned_agent?, agent_id?, dry_run?, expected_revision? }
  * Dispatchers report run progress and completion; the dashboard cancels or
  * requeues. `agent_id` (optional) attributes the change in the event feed.
  * `dry_run: true` returns the affected row and the field diff and writes nothing.
+ * `expected_revision` is optional. When present it must match the preview token
+ * or the route answers 409 stale_write and writes nothing.
  */
 export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const denied = await enforceApi(req);
   if (denied) return denied;
   if (!isConfigured()) {
-    let peeked: { dry_run?: unknown; status?: TaskStatus } | null;
+    let peeked: {
+      dry_run?: unknown;
+      status?: TaskStatus;
+      result?: string;
+      cost_usd?: number;
+      session_id?: string;
+      assigned_agent?: string;
+      expected_revision?: unknown;
+    } | null;
     try {
       peeked = await req.json();
     } catch {
@@ -35,7 +47,25 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
         fields: { dry_run: "Use true to preview, or false to apply." },
       });
     }
+    const revision = readExpectedRevision(peeked.expected_revision);
+    if (!revision.ok) {
+      return apiError("validation_failed", {
+        message: "expected_revision must be a string of 1 to 200 characters.",
+        fields: { expected_revision: "Send the revision from the preview, or omit it." },
+      });
+    }
     if (dry.dryRun) {
+      const { id } = await ctx.params;
+      const taskId = Number(id);
+      const task = Number.isFinite(taskId) ? await demoGetTask(taskId) : null;
+      if (task) {
+        const preview = diffTaskUpdate(task, peeked, taskRevision(task));
+        return NextResponse.json({
+          ...preview,
+          would_write: false,
+          note: "DATABASE_URL not set; nothing would be written.",
+        });
+      }
       return NextResponse.json(
         refusedDryRun(
           peeked.status === "cancelled" ? "cancel_task" : "update_task",
@@ -43,7 +73,26 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
         ),
       );
     }
-    return NextResponse.json({ ok: true, demo: true });
+    if (revision.revision === undefined) return NextResponse.json({ ok: true, demo: true });
+    const { id } = await ctx.params;
+    const taskId = Number(id);
+    if (!Number.isFinite(taskId)) {
+      return apiError("validation_failed", { message: "invalid task id", fields: { id: "invalid task id" } });
+    }
+    try {
+      const task = await demoUpdateTaskGuarded({
+        id: taskId,
+        status: peeked.status,
+        result: peeked.result,
+        cost_usd: peeked.cost_usd,
+        session_id: peeked.session_id,
+        assigned_agent: peeked.assigned_agent,
+        expected_revision: revision.revision,
+      });
+      return NextResponse.json({ ok: true, demo: true, applied: true, task });
+    } catch (e) {
+      return publicError("[tasks] update failed", e);
+    }
   }
   const { id } = await ctx.params;
   const taskId = Number(id);
@@ -58,6 +107,7 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
     assigned_agent?: string;
     agent_id?: string;
     dry_run?: unknown;
+    expected_revision?: unknown;
   } | null;
   try {
     body = await req.json();
@@ -73,14 +123,21 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
       fields: { dry_run: "Use true to preview, or false to apply." },
     });
   }
+  const revision = readExpectedRevision(body.expected_revision);
+  if (!revision.ok) {
+    return apiError("validation_failed", {
+      message: "expected_revision must be a string of 1 to 200 characters.",
+      fields: { expected_revision: "Send the revision from the preview, or omit it." },
+    });
+  }
   try {
     if (dry.dryRun) {
       const preview = await previewTaskChange(taskId, body);
       if (!preview) return apiError("task_not_found");
       return NextResponse.json(preview);
     }
-    const { dry_run: _ignored, ...patch } = body;
-    const task = await updateTask({ id: taskId, ...patch });
+    const { dry_run: _ignored, expected_revision: _revision, ...patch } = body;
+    const task = await updateTask({ id: taskId, ...patch, expected_revision: revision.revision });
     if (body.status && body.agent_id) {
       await report({
         agent_id: body.agent_id,

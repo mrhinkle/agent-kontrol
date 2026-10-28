@@ -13,11 +13,13 @@ import {
   demoReportStatusTool,
   demoTaskQueueTool,
 } from "@/lib/demo-store";
+import { recallResult, taskQueueResult } from "@/lib/list-read";
 import { evaluateMcpMessages, insufficientScopeBody, principalFromMcpAuth } from "@/lib/scopes";
 import { rememberForTool, updateTaskForTool } from "@/lib/dry-run-actions";
-import { claimNextTask, createTask, fetchMessages, fleet, listTasks, recall, replyFromAgent, report } from "@/lib/store";
+import { claimNextTask, createTask, fetchMessages, fleet, replyFromAgent, report } from "@/lib/store";
 import { progress } from "@/lib/progress-store";
 import { formatDigest } from "@/lib/progress-digest";
+import { morningBriefText } from "@/lib/brief";
 import { OPERATOR } from "@/lib/operator";
 import { demoProgress } from "@/lib/demo-progress";
 import { listDecisionsTool, requestDecisionTool, resolveDecisionTool } from "@/lib/decision-resolve";
@@ -155,6 +157,26 @@ const handler = createMcpHandler(
     );
 
     server.registerTool(
+      "get_morning_brief",
+      {
+        title: "Get morning brief",
+        annotations: READ_ONLY,
+        description:
+          "Read the morning brief as plain text: merges, issue flow, stuck PRs, decisions waiting on the owner, and whether the coordinator's last event is real work. Same text as GET /api/brief. window is 24h (default) or 72h. A heartbeat does not count as working.",
+        inputSchema: {
+          window: z
+            .enum(["24h", "72h"])
+            .optional()
+            .describe("24h or 72h. Defaults to 24h."),
+        },
+      },
+      async (args) => guardTool("get_morning_brief", async () => {
+        const text = await morningBriefText(args.window ?? "24h");
+        return { content: [{ type: "text", text }] };
+      }),
+    );
+
+    server.registerTool(
       "remember",
       {
         title: "Remember",
@@ -183,24 +205,17 @@ const handler = createMcpHandler(
           query: z.string().optional().describe("Free-text search over note content"),
           key: z.string().optional().describe("Exact key lookup"),
           tags: z.array(z.string()).optional(),
-          limit: z.number().int().min(1).max(100).optional(),
+          limit: z.number().optional().describe("Maximum notes, from 1 to 200. Defaults to 20. Passing limit or cursor adds a next_cursor line."),
+          cursor: z.string().optional().describe("Opaque cursor from a previous next_cursor line."),
+          fields: z.string().optional().describe("Comma-separated allowlisted fields. id is always included. One JSON object per line."),
         },
       },
       async (args) => guardTool("recall", async () => {
         const badKey = memoryKeyError(args.key);
         if (badKey) return badKey;
-        if (!isConfigured()) return demoRecallTool(args);
-        const items = await recall(args);
-        if (items.length === 0) {
-          return { content: [{ type: "text", text: "No matching memory." }] };
-        }
-        const text = items
-          .map(
-            (m) =>
-              `#${m.id}${m.key ? ` [${m.key}]` : ""}${m.tags.length ? ` (${m.tags.join(", ")})` : ""} by ${m.agent_id ?? "unknown"} @ ${m.updated_at}\n${m.content}`
-          )
-          .join("\n\n");
-        return { content: [{ type: "text", text }] };
+        if (!isConfigured() && args.limit === undefined && args.cursor === undefined && args.fields === undefined)
+          return demoRecallTool({ query: args.query, key: args.key, tags: args.tags });
+        return recallResult(args, isConfigured());
       }),
     );
 
@@ -367,24 +382,15 @@ const handler = createMcpHandler(
             .enum(["open", "all", "queued", "claimed", "running", "review", "done", "failed", "cancelled"])
             .optional()
             .describe("Filter (default 'open')"),
+          limit: z.number().optional().describe("Maximum tasks, from 1 to 200. Defaults to 40. Passing limit or cursor adds a next_cursor line."),
+          cursor: z.string().optional().describe("Opaque cursor from a previous next_cursor line."),
+          fields: z.string().optional().describe("Comma-separated allowlisted fields. id is always included. One JSON object per line."),
         },
       },
-      async (args) => guardTool("get_task_queue", async () => {
-        if (!isConfigured()) return demoTaskQueueTool(args);
-        const tasks = await listTasks({ status: args.status ?? "open", limit: 40 });
-        if (tasks.length === 0) {
-          return { content: [{ type: "text", text: "Task queue is empty." }] };
-        }
-        const text = tasks
-          .map(
-            (t) =>
-              `#${t.id} [${t.status.toUpperCase()}] (${t.platform}, p${t.priority}) ${t.title}` +
-              (t.project ? ` — project: ${t.project}` : "") +
-              (t.assigned_agent ? ` — agent: ${t.assigned_agent}` : "") +
-              (t.result ? `\n   result: ${t.result.slice(0, 200)}` : "")
-          )
-          .join("\n");
-        return { content: [{ type: "text", text }] };
+      async (args) => guardTool("get_task_queue", () => {
+        if (!isConfigured() && args.limit === undefined && args.cursor === undefined && args.fields === undefined)
+          return demoTaskQueueTool({ status: args.status });
+        return taskQueueResult(args, isConfigured());
       }),
     );
 

@@ -1,6 +1,6 @@
 # Agent Kontrol MCP Server
 
-Agent Kontrol exposes fleet coordination to AI coding agents over the Model Context Protocol. This document covers how to connect, the 17 tools, how shared memory works, and a block of standing instructions you can paste into an agent.
+Agent Kontrol exposes fleet coordination to AI coding agents over the Model Context Protocol. This document covers how to connect, the 18 tools, how shared memory works, and a block of standing instructions you can paste into an agent.
 
 An agent that only has the deployment URL can start at [/llms.txt](/llms.txt).
 
@@ -35,7 +35,7 @@ A tool that is not in the table below is denied for every caller, including `MC_
 | `memory:write` | `remember` | `POST /api/memory` |
 | `messages:read` | `check_inbox` | `GET /api/messages` |
 | `messages:write` | `reply_to_operator`, `reply_to_mark` | `POST /api/messages/reply` |
-| `progress:read` | `get_progress_digest` | `GET /api/progress`, `GET /api/progress/digest` |
+| `progress:read` | `get_progress_digest`, `get_morning_brief` | `GET /api/progress`, `GET /api/progress/digest`, `GET /api/brief` |
 | `decisions:read` | `list_decisions` | — (no REST route; the agent calls `list_decisions`) |
 | `decisions:request` | `request_decision` | — (no REST route; the agent calls `request_decision`) |
 | `decisions:write` | `resolve_decision` | `PATCH /api/decisions/:id`, `POST /api/decisions/:id/writeback` |
@@ -90,7 +90,7 @@ A `401` on this request means the token does not match `MC_TOKEN` on the deploym
 
 ## Tools
 
-The server exposes 17 tools: `report_status`, `get_fleet_status`, `get_progress_digest`, `remember`, `recall`, `check_inbox`, `reply_to_operator`, `create_task`, `get_task_queue`, `claim_task`, `update_task`, `list_skills`, `get_skill`, `run_skill`, `request_decision`, `list_decisions`, `resolve_decision`.
+The server exposes 18 tools: `report_status`, `get_fleet_status`, `get_progress_digest`, `get_morning_brief`, `remember`, `recall`, `check_inbox`, `reply_to_operator`, `create_task`, `get_task_queue`, `claim_task`, `update_task`, `list_skills`, `get_skill`, `run_skill`, `request_decision`, `list_decisions`, `resolve_decision`.
 
 Tool names are part of the public API and will not change within 1.x.
 
@@ -136,6 +136,16 @@ Read the progress board as plain text: PRs merged, issues closed vs opened, net 
 
 When to call: when you need the current progress picture across repos as plain text.
 
+### get_morning_brief
+
+Read the morning brief as plain text: merges, issue flow, stuck pull requests, decisions waiting on the owner, and whether the coordinator's last event is real work. A heartbeat or a telemetry event does not count as working. This is the same text as `GET /api/brief`. The tool is read-only.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `window` | enum | no | `24h` or `72h`. Defaults to `24h`. Anything else is rejected. |
+
+When to call: for the daily brief, or when asked whether the coordinator is working rather than merely alive.
+
 ### remember
 
 Write a note to shared memory.
@@ -159,7 +169,9 @@ Search shared memory. Results come back most recently updated first.
 | `query` | string | no | Case-insensitive substring match over note content. |
 | `key` | string | no | Exact key match. |
 | `tags` | string[] | no | Matches notes sharing any of these tags. |
-| `limit` | int | no | 1-100. Defaults to 20. |
+| `limit` | int | no | 1-200. Defaults to 20. Passing `limit` or `cursor` adds a final `next_cursor:` line (`null` on the last page). Omitting both leaves the text as before. |
+| `cursor` | string | no | Opaque cursor from a previous `next_cursor` line. A bad cursor is `validation_failed`, not the first page. |
+| `fields` | string | no | Comma-separated allowlisted names (`id`, `key`, `content`, `tags`, `agent_id`, `source`, `facts_at`, `created_at`, `updated_at`). `id` is always included. One JSON object per line. An unknown name is `validation_failed`. |
 
 When to call: before re-deriving something another agent may already have written down.
 
@@ -216,6 +228,9 @@ See the task queue.
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `status` | enum | no | `open`, `all`, `queued`, `claimed`, `running`, `review`, `done`, `failed`, or `cancelled`. Defaults to `open`. |
+| `limit` | int | no | 1-200. Defaults to 40. Passing `limit` or `cursor` adds a final `next_cursor:` line. Omitting both leaves the text as before, still capped at 40. |
+| `cursor` | string | no | Opaque cursor from a previous `next_cursor` line. A bad cursor is `validation_failed`, not the first page. |
+| `fields` | string | no | Comma-separated allowlisted task fields. `id` is always included. One JSON object per line. An unknown name is `validation_failed`. |
 
 When to call: before creating a task, to see what is already queued or in flight.
 
@@ -331,6 +346,7 @@ The HTTP `401` for a missing or invalid bearer is unchanged: `WWW-Authenticate` 
 | `writeback_in_progress` | yes | `resolve_decision` and `PATCH /api/decisions/:id` when `status` is `open` while an unexpired write-back claim holds the row. Also `POST /api/decisions` with `force: true` in that same window. The claim expires after 180 seconds. |
 | `idempotency_conflict` | no | `create_task` or `reply_to_operator` reused `idempotency_key` with different arguments, or the first request with that key is still inside its 30 second lease. `reply_to_mark` is the same tool schema and the same key as `reply_to_operator`. The same key, the same actor, the same route, and the same arguments return the original result for 24 hours. Different arguments stay non-retryable. While the first request is inside its 30 second lease, the same arguments are `retryable: true` and the tool JSON includes `retry_after` seconds. The REST form of that wait is the `Retry-After` header. After that lease, the same key and the same arguments take over a claim that never stored a result and run the write once. A claim insert whose result is lost is re-read, and the write runs once when this attempt owns the claim. The resource insert and the stored response commit in one statement, and that insert runs only while this attempt's claim token still matches. A committed write therefore has a stored response. A retry returns that response and does not insert another row while the claim is inside its 24 hour window. A caller that dies before reading the response gets the same row on retry. After that window the same key starts a new write. The key is scoped by actor and route. |
 | `stale` | no | `resolve_decision`, `PATCH /api/decisions/:id`, and `POST /api/decisions/:id/writeback` when `expected_revision` does not match the row. `expected_updated_at` is accepted and is not compared. Also a REST settings save with a stale `version`. |
+| `stale_write` | no | Not returned by a tool. REST `POST /api/memory` and `PATCH /api/tasks/:id` when `expected_revision` does not match the current row. |
 | `task_not_found` | no | `update_task` when the id does not exist in the database, or in the in-memory store when `DATABASE_URL` is unset. `error` stays `Task not found`. |
 | `task_not_claimable` | no | Defined, not returned. See above. |
 | `memory_key_invalid` | no | `remember` or `recall` with a bad `key`. |

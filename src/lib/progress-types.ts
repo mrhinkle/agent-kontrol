@@ -51,8 +51,56 @@ export interface SnapshotDetail {
    */
   lane_mix?: Record<string, number>;
   stalled_prs?: StalledPr[];
+  /**
+   * Morning-brief fields written by the collector. Absent on older ticks.
+   * `stuck_prs[].repo` is the config short name, matching `scripts/morning-brief.sh`.
+   * `merged` rows carry timestamps so a 72h brief can filter them. An empty
+   * `merged` array is a measured empty window and is not replaced by
+   * `merged_list`. `merged_list` is the 24h display list only when `merged`
+   * was not stored. The collector writes only that 24h window into
+   * `merged_list` and `median_lead_hours`.
+   */
+  stuck_prs?: BriefSnapshotStuckPr[];
+  median_lead_hours?: number | null;
+  stale_issues?: number | null;
+  stale_ratio?: number | null;
+  drafts?: number | null;
+  merged_list?: BriefSnapshotMerged[];
+  merged?: BriefSnapshotMergedRaw[];
   /** anything the collector wants to say about a partial run */
   notes?: string[];
+}
+
+/** Stuck PR as `scripts/morning-brief.sh` prints it. `repo` is the short name. */
+export interface BriefSnapshotStuckPr {
+  repo?: string;
+  number?: number;
+  title?: string;
+  url?: string;
+  author?: string | null;
+  age_hours?: number;
+  age_days?: number;
+  idle_days?: number;
+  state?: string | null;
+  review?: string | null;
+  reason?: string;
+}
+
+export interface BriefSnapshotMerged {
+  number?: number;
+  title?: string;
+  url?: string;
+  author?: string | null;
+  lead_hours?: number | null;
+}
+
+export interface BriefSnapshotMergedRaw {
+  number?: number;
+  title?: string;
+  url?: string;
+  author?: string | null;
+  created_at?: string;
+  merged_at?: string;
 }
 
 /** What a card shows: the current tick, plus the window's totals. */
