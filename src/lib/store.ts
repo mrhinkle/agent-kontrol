@@ -3,6 +3,7 @@ import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } fr
 import { StaleWrite, absentRevision } from "./revision";
 import { writeSessionNote } from "./session-memory";
 import { sql, type SqlTag } from "./db";
+import { stampSortAt } from "./list-params";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
 import { asUnknownWriteOutcome } from "./write-outcome";
 
@@ -387,11 +388,22 @@ async function memoryRevisionOf(key: string): Promise<string | null> {
   return typeof revision === "string" ? revision : null;
 }
 
+function stampListed<T extends Record<string, unknown>>(row: T): T {
+  const sortAt = row.list_sort_at;
+  delete row.list_sort_at;
+  if (typeof sortAt === "string") stampSortAt(row, sortAt);
+  return row;
+}
+
 export async function recall(input: {
   query?: string;
   key?: string;
   tags?: string[];
   limit?: number;
+  /** Set when the caller asked for a page. Adds the id tiebreak and a sort stamp. */
+  keyset?: boolean;
+  /** Millisecond updated_at and id of the last row already returned. */
+  cursor?: { updatedAt: string; id: string } | null;
 }): Promise<MemoryItem[]> {
   const db = sql();
   const limit = input.limit ?? 20;
@@ -402,16 +414,43 @@ export async function recall(input: {
 
   try {
     // Optional filters: null means "no filter" (predicate short-circuits).
+    if (!input.keyset) {
+      const rows = await db`
+        select * from memory
+        where
+          (${key}::text is null or key = ${key})
+          and (${like}::text is null or content ilike ${like})
+          and (${tags}::text[] is null or tags && ${tags}::text[])
+        order by updated_at desc
+        limit ${limit}
+      `;
+      return rows as MemoryItem[];
+    }
+    const hasCursor = input.cursor != null;
+    const updatedAt = input.cursor?.updatedAt ?? "1970-01-01T00:00:00.000Z";
+    const cursorId = input.cursor?.id ?? "1";
+    // Keyset predicate matches pageRows: updated_at desc, truncated to
+    // milliseconds, then id ascending. The stamp is not part of the JSON body.
     const rows = await db`
-      select * from memory
+      select memory.*,
+        to_char(date_trunc('milliseconds', updated_at) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as list_sort_at
+      from memory
       where
         (${key}::text is null or key = ${key})
         and (${like}::text is null or content ilike ${like})
         and (${tags}::text[] is null or tags && ${tags}::text[])
-      order by updated_at desc
+        and (
+          ${hasCursor}::boolean = false
+          or date_trunc('milliseconds', updated_at) < ${updatedAt}::timestamptz
+          or (
+            date_trunc('milliseconds', updated_at) = ${updatedAt}::timestamptz
+            and id > ${cursorId}::bigint
+          )
+        )
+      order by date_trunc('milliseconds', updated_at) desc, id asc
       limit ${limit}
     `;
-    return rows as MemoryItem[];
+    return (rows as Record<string, unknown>[]).map(stampListed) as unknown as MemoryItem[];
   } catch (e) {
     throw new Error(errMsg(e));
   }
@@ -972,15 +1011,66 @@ async function insertTask(
 
 const OPEN_STATUSES: TaskStatus[] = ["queued", "claimed", "running", "review"];
 
+function taskFromRow(row: Record<string, unknown>): Task {
+  const sortAt = row.list_sort_at;
+  delete row.list_sort_at;
+  const task = asTask(row);
+  if (typeof sortAt === "string") stampSortAt(task, sortAt);
+  return task;
+}
+
 export async function listTasks(input?: {
   status?: string; // a status, "open", or "all"
   limit?: number;
+  /** Set when the caller asked for a page. Adds the id tiebreak and a sort stamp. */
+  keyset?: boolean;
+  /** Sort key of the last row already returned. */
+  cursor?: { status: string; priority: number; updatedAt: string; id: string } | null;
 }): Promise<Task[]> {
   const db = sql();
   const limit = input?.limit ?? 100;
   const status = input?.status ?? "all";
 
   try {
+    if (input?.keyset) {
+      const hasCursor = input.cursor != null;
+      const cursorStatus = input.cursor?.status ?? "queued";
+      const cursorPriority = input.cursor?.priority ?? 0;
+      const updatedAt = input.cursor?.updatedAt ?? "1970-01-01T00:00:00.000Z";
+      const cursorId = input.cursor?.id ?? "1";
+      // Keyset predicate matches pageRows: status asc, priority asc, updated_at
+      // desc truncated to milliseconds, then id ascending.
+      const rows = await db`
+        select tasks.*,
+          to_char(date_trunc('milliseconds', updated_at) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as list_sort_at
+        from tasks
+        where
+          (
+            ${status}::text = 'all'
+            or (${status}::text = 'open' and status = any(${OPEN_STATUSES}::text[]))
+            or status = ${status}
+          )
+          and (
+            ${hasCursor}::boolean = false
+            or status > ${cursorStatus}
+            or (status = ${cursorStatus} and priority > ${cursorPriority}::int)
+            or (
+              status = ${cursorStatus}
+              and priority = ${cursorPriority}::int
+              and date_trunc('milliseconds', updated_at) < ${updatedAt}::timestamptz
+            )
+            or (
+              status = ${cursorStatus}
+              and priority = ${cursorPriority}::int
+              and date_trunc('milliseconds', updated_at) = ${updatedAt}::timestamptz
+              and id > ${cursorId}::bigint
+            )
+          )
+        order by status asc, priority asc, date_trunc('milliseconds', updated_at) desc, id asc
+        limit ${limit}
+      `;
+      return (rows as Record<string, unknown>[]).map(taskFromRow);
+    }
     if (status === "open") {
       const rows = await db`
         select * from tasks

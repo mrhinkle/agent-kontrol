@@ -4,10 +4,12 @@ import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { diffMemoryWrite, readDryRun, readExpectedRevision } from "@/lib/dry-run";
 import { previewMemoryWrite } from "@/lib/dry-run-actions";
-import { recall, remember } from "@/lib/store";
+import { remember } from "@/lib/store";
 import { demoFindMemoryByKey, demoRememberGuarded } from "@/lib/demo-store";
 import { absentRevision, memoryRevision } from "@/lib/revision";
 import { demoMemory } from "@/lib/demo-data";
+import { ListParamError, MEMORY_REST, listBody, listParamError, parseSearchList } from "@/lib/list-params";
+import { loadMemoryPage } from "@/lib/list-read";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -16,17 +18,26 @@ export const maxDuration = 30;
 export async function GET(req: Request) {
   const denied = await enforceApi(req);
   if (denied) return denied;
-  if (!isConfigured()) {
+  const url = new URL(req.url);
+  let parsed;
+  try {
+    parsed = parseSearchList(MEMORY_REST, url.searchParams);
+  } catch (e) {
+    if (e instanceof ListParamError) return listParamError(e);
+    throw e;
+  }
+  // No limit, cursor, or fields: the sample is the sample, filters included.
+  if (!isConfigured() && !parsed.active) {
     return NextResponse.json({ demo: true, items: demoMemory() });
   }
-  const url = new URL(req.url);
+  const tag = url.searchParams.get("tag");
   try {
-    const items = await recall({
+    const page = await loadMemoryPage(isConfigured() ? "database" : "demo-sample", {
       query: url.searchParams.get("query") ?? undefined,
-      tags: url.searchParams.get("tag") ? [url.searchParams.get("tag")!] : undefined,
-      limit: Number(url.searchParams.get("limit") ?? 50),
+      tags: tag ? [tag] : undefined,
+      parsed,
     });
-    return NextResponse.json({ demo: false, items });
+    return NextResponse.json(listBody("items", page.rows, page.paging, page.next_cursor, !isConfigured()));
   } catch (e) {
     return publicError("[memory]", e);
   }
