@@ -439,6 +439,43 @@ The server cannot read the operator's machine. A collector posts:
 
 `name` is the skill id. `sha` is the content SHA above. The directories a collector may report are `~/.codex/skills` and `~/.agents/skills`. `AK_SKILL_DRIFT_DIRS` replaces that list, comma-separated. Any other `dir` is HTTP 400. The server does not open those paths. An empty `skills` array means the directory was read and was empty. A collector that failed to read the directory must not post an empty list. That would look like every mirrored skill was missing.
 
+#### The drift collector
+
+`scripts/collect-skills-drift.mjs` is that collector. It is one file, needs Node 18 or newer, and has no dependencies, so it runs on a machine with no checkout of this repository.
+
+```sh
+# Copy it to a machine (laptop or the Mac Mini)
+mkdir -p ~/.mission-control && cp scripts/collect-skills-drift.mjs ~/.mission-control/   # or: scp scripts/collect-skills-drift.mjs mac-mini:.mission-control/
+
+# See what it would post. Needs no token and sends nothing.
+node ~/.mission-control/collect-skills-drift.mjs --dry-run
+
+# Post for real
+MC_URL=https://YOUR-DEPLOY.vercel.app MC_TOKEN=... node ~/.mission-control/collect-skills-drift.mjs
+```
+
+It reads `<dir>/<name>/SKILL.md` for each directory, follows one level of symlink to a directory, skips names that start with `.` (such as `.system`), hashes the raw bytes with SHA-256, and posts one report per directory. `MC_URL` and `MC_TOKEN` come from the environment only. The script does not read the token from arguments or from a file, and it never prints it or any server response text. `MC_URL` must be https, except for localhost. The `host` it reports is `--machine NAME`, then `AK_MACHINE`, then the hostname. The directories are `AK_SKILL_DRIFT_DIRS` (the same variable the server reads), otherwise the two defaults. Each is posted as written (spaces around the commas are trimmed), so it must match the server's list.
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| 0 | Every existing directory was read and posted (with `--dry-run`, read and printed). A directory that does not exist is skipped with a notice. |
+| 1 | A post failed (network error or non-2xx). |
+| 2 | A directory exists but could not be read or enumerated, including one unreadable or dangling `SKILL.md`. Nothing is posted for that directory. The other directories are still posted. |
+| 3 | Configuration error, or every configured directory is missing, so nothing was reported. |
+
+A directory that exists and is readable but holds no skills posts an empty list. A skill whose name the server would reject (not `[A-Za-z0-9][A-Za-z0-9._-]{0,80}`) is skipped with a warning. Running it twice posts identical bodies.
+
+On macOS, `scripts/install-skills-drift.sh` sets up the schedule. It copies the collector to `~/.mission-control/`, adds `MC_URL` and `MC_TOKEN` to `~/.claude/mission-control.env` if they are missing (created mode 600, other lines kept), writes `~/.mission-control/run-skills-drift.sh`, and loads an hourly launchd job at `~/Library/LaunchAgents/com.missioncontrol.skills-drift.plist`. The wrapper reads `MC_URL` and `MC_TOKEN` from the env file as literal `KEY=value` lines (nothing in the file is executed), then runs the collector. The plist holds no secret. `AK_MACHINE` and `AK_SKILL_DRIFT_DIRS` set when you run the installer go into the plist. `MC_SKILLS_DRIFT_INTERVAL` sets the seconds between runs. Run it from a checkout, or copy `install-skills-drift.sh` and `collect-skills-drift.mjs` together to the machine. `--uninstall` removes the job and leaves the files.
+
+```sh
+MC_URL=https://YOUR-DEPLOY.vercel.app MC_TOKEN=... ./scripts/install-skills-drift.sh
+tail ~/Library/Logs/mc-skills-drift.log   # a non-zero exit is logged here
+```
+
+From cron, call the same wrapper: `17 * * * * $HOME/.mission-control/run-skills-drift.sh >> $HOME/Library/Logs/mc-skills-drift.log 2>&1`. A token or URL must be a single line.
+
 `missing` is in the mirror and not in the report. `extra` is in the report and not in the mirror. `differs` is both, with different content SHAs. The POST response is `{ ok, host, dir, missing, extra, differs, driftCount }`. `driftCount` there is the number of rows in those three lists for this report. `upstream.driftCount` on `GET /api/skills` is the number of distinct skill names that disagree in any stored report. The same name on two hosts counts once.
 
 ### Runs, the brief, and pointers
