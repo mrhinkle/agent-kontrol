@@ -42,9 +42,10 @@ function iso(value: unknown): string | null {
   return Number.isNaN(t) ? null : new Date(t).toISOString();
 }
 
-function missingRelation(e: unknown): boolean {
+/** Postgres 42P01 for `watched_owners` only. Other "does not exist" errors stay errors. */
+export function missingOwnersRelation(e: unknown): boolean {
   const err = e as { code?: string; message?: string };
-  return err.code === "42P01" || (err.message?.includes("does not exist") ?? false);
+  return err.code === "42P01" && (err.message?.includes("watched_owners") ?? false);
 }
 
 export function ownerListVersion(owners: OwnerInput[]): string {
@@ -77,14 +78,24 @@ export interface WatchedOwnerRead {
 /** Serializes owner-list writers. Empty-table `for update` locks nothing, so this is a transaction lock. */
 const OWNER_LIST_LOCK = 87216666;
 
-/** Per-owner discovery lock. Separate from the owner-list lock so a save is not stuck behind `gh`. */
-export function discoveryLockKey(owner: string): string {
-  const buf = createHash("sha256").update(`watched-owner-discovery:${owner.toLowerCase()}`).digest();
-  let n = 0n;
-  for (let i = 0; i < 8; i++) n = (n << 8n) | BigInt(buf[i] ?? 0);
-  const sign = 1n << 63n;
-  if (n >= sign) n -= 1n << 64n;
-  return n.toString();
+/**
+ * One lock for every owner's discovery write, so generated short names cannot
+ * collide across owners. Held only around read-plan-write, never around `gh`.
+ * Distinct from the owner-list lock so a save is not stuck behind discovery.
+ */
+const DISCOVERY_WRITE_LOCK = 87216667;
+
+/** A second writer claimed the short name. The route maps this to 409. */
+export class DiscoveryShortConflict extends Error {
+  constructor() {
+    super("short name is already used");
+    this.name = "DiscoveryShortConflict";
+  }
+}
+
+function isUniqueViolation(e: unknown): boolean {
+  const err = e as { code?: string; cause?: { code?: string } };
+  return err?.code === "23505" || err?.cause?.code === "23505";
 }
 
 /** A sweep is stale when the collector's clock is not strictly newer than the stored one. */
@@ -107,7 +118,7 @@ export async function listWatchedOwners(): Promise<WatchedOwnerRead> {
     `;
     return { writable: true, owners: rows.map((r) => ownerFromRow(r)) };
   } catch (e) {
-    if (missingRelation(e)) return { writable: false, owners: [] };
+    if (missingOwnersRelation(e)) return { writable: false, owners: [] };
     throw e;
   }
 }
@@ -139,7 +150,7 @@ export async function replaceWatchedOwners(
         order by owner asc
       `;
     } catch (e) {
-      if (missingRelation(e)) return { ok: false, reason: "missing_table" };
+      if (missingOwnersRelation(e)) return { ok: false, reason: "missing_table" };
       throw e;
     }
     if (expectedVersion !== undefined && expectedVersion !== ownerListVersion(rows.map((r) => ownerFromRow(r)))) {
@@ -213,9 +224,12 @@ function unchanged(existing: TrackedRepo[], failure: string): DiscoveryOutcome {
  * Applies one owner's sweep. A failure records `last_error` and does not
  * insert, update, hide, or delete tracked repos.
  *
- * The owner lock is held across the reload, the plan, and the write. A
- * sweep whose `sweptAt` is not newer than `last_discovered_at` writes
- * nothing, so a delayed older list cannot resurrect a repo.
+ * One global lock is held across the reload, the plan, and the write, so
+ * two owners cannot allocate the same short name. `gh` has already finished
+ * before this runs. A sweep whose `sweptAt` is not newer than
+ * `last_discovered_at` writes nothing, so a delayed older list cannot
+ * resurrect a repo. A unique short-name violation replans once, then throws
+ * `DiscoveryShortConflict`.
  */
 export async function applyOwnerDiscovery(
   rule: OwnerRule,
@@ -223,9 +237,28 @@ export async function applyOwnerDiscovery(
   sweep: DiscoverySweep,
   now: Date,
 ): Promise<DiscoveryOutcome> {
+  try {
+    return await applyOwnerDiscoveryOnce(rule, existing, sweep, now);
+  } catch (e) {
+    if (!isUniqueViolation(e)) throw e;
+  }
+  try {
+    return await applyOwnerDiscoveryOnce(rule, existing, sweep, now);
+  } catch (e) {
+    if (!isUniqueViolation(e)) throw e;
+    throw new DiscoveryShortConflict();
+  }
+}
+
+async function applyOwnerDiscoveryOnce(
+  rule: OwnerRule,
+  existing: TrackedRepo[],
+  sweep: DiscoverySweep,
+  now: Date,
+): Promise<DiscoveryOutcome> {
   const sweptAt = sweep.sweptAt ?? null;
   return withTransaction(async (q) => {
-    await q`select pg_advisory_xact_lock(${discoveryLockKey(rule.owner)}::bigint)`;
+    await q`select pg_advisory_xact_lock(${DISCOVERY_WRITE_LOCK}::bigint)`;
     const marker = await q`
       select last_discovered_at
       from watched_owners

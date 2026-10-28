@@ -22,3 +22,21 @@ alter table watched_repos add column if not exists gone boolean not null default
 alter table watched_repos add column if not exists is_fork boolean not null default false;
 alter table watched_repos add column if not exists is_archived boolean not null default false;
 alter table watched_repos add column if not exists last_activity_at timestamptz;
+
+-- Deferrable so replaceWatchedRepos can swap two short names in one statement.
+-- Checked at the end of that statement (initially immediate). Discovery retries
+-- a 23505 once, then the route answers 409.
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'watched_repos_short_key'
+      and conrelid = 'watched_repos'::regclass
+  ) then
+    alter table watched_repos
+      add constraint watched_repos_short_key
+      unique (short)
+      deferrable initially immediate;
+  end if;
+end $$;

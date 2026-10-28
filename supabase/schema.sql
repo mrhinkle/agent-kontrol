@@ -285,9 +285,10 @@ on conflict (version, model) do update set
   cache_read_per_mtok = excluded.cache_read_per_mtok,
   notes = excluded.notes;
 
--- Settings: the repos the progress board watches. Edited from the Settings page;
--- with no rows the app falls back to progress.config.json. Uniqueness of the short
--- name is enforced by validation, not an index, so rows can be reordered freely.
+-- Settings: the repos the progress board watches. Edited from the Settings page.
+-- With no rows and no watched owners, the app falls back to progress.config.json.
+-- Short names are unique. The constraint is deferrable so one statement can swap
+-- two shorts without a false conflict. Discovery also serializes allocation.
 create table if not exists watched_repos (
   repo text primary key,                  -- owner/name
   label text not null,
@@ -325,6 +326,24 @@ alter table watched_repos add column if not exists gone boolean not null default
 alter table watched_repos add column if not exists is_fork boolean not null default false;
 alter table watched_repos add column if not exists is_archived boolean not null default false;
 alter table watched_repos add column if not exists last_activity_at timestamptz;
+
+-- Deferrable so replaceWatchedRepos can swap two short names in one statement.
+-- Checked at the end of that statement (initially immediate). Discovery retries
+-- a 23505 once, then the route answers 409.
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'watched_repos_short_key'
+      and conrelid = 'watched_repos'::regclass
+  ) then
+    alter table watched_repos
+      add constraint watched_repos_short_key
+      unique (short)
+      deferrable initially immediate;
+  end if;
+end $$;
 
 -- Traces: OpenTelemetry-style spans from agents. A trace is the tree of spans that
 -- share a trace_id (a session, its turns, the tool and model calls inside them).

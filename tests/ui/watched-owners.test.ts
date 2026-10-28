@@ -433,7 +433,12 @@ describe("watched owners discovery", () => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        results: [{ owner: "acme", ok: true, repos: [{ name: "app", pushedAt: atAge(1), isFork: false, isArchived: false }] }],
+        results: [{
+          owner: "acme",
+          ok: true,
+          swept_at: atAge(0),
+          repos: [{ name: "app", pushedAt: atAge(1), isFork: false, isArchived: false }],
+        }],
       }),
     }));
     assert.equal(discovered.status, 200, JSON.stringify(await discovered.clone().json()));
@@ -721,8 +726,8 @@ describe("watched owners discovery", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         results: [
-          { owner: "acme", ok: true, repos: [{ name: "app", pushedAt: atAge(1), isFork: false, isArchived: false }] },
-          { owner: "Acme", ok: true, repos: [{ name: "other", pushedAt: atAge(1), isFork: false, isArchived: false }] },
+          { owner: "acme", ok: true, swept_at: atAge(0), repos: [{ name: "app", pushedAt: atAge(1), isFork: false, isArchived: false }] },
+          { owner: "Acme", ok: true, swept_at: atAge(0), repos: [{ name: "other", pushedAt: atAge(1), isFork: false, isArchived: false }] },
         ],
       }),
     }));
@@ -782,7 +787,7 @@ describe("watched owners discovery", () => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        results: [{ owner: "acme", ok: true, repos: [{ name: "app", pushedAt: atAge(1), isFork: false, isArchived: false }] }],
+        results: [{ owner: "acme", ok: true, swept_at: atAge(0), repos: [{ name: "app", pushedAt: atAge(1), isFork: false, isArchived: false }] }],
       }),
     }));
     assert.equal(res.status, 409, JSON.stringify(await res.clone().json()));
@@ -974,5 +979,236 @@ describe("watched owners discovery", () => {
     assert.ok(unwritable > 0, "writable:false must not use the empty-list log line");
     assert.ok(none > unwritable, "none configured remains the message for an empty owner list");
     assert.match(fn, /swept_at/);
+  });
+
+  it("a configured owner with zero repos stays on the database source", async () => {
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    const fallback = [{ repo: "acme/file", label: "File", short: "file", color: "#2563eb", blockedLabel: null }];
+    const queries: string[] = [];
+    setSqlForTests(async (strings) => {
+      const text = strings.join(" ");
+      queries.push(text);
+      if (/from watched_owners/i.test(text)) {
+        return [{
+          owner: "acme",
+          activity_days: 30,
+          include_forks: false,
+          include_archived: false,
+          last_error: null,
+          last_error_at: null,
+          last_discovered_at: null,
+          actor_type: null,
+          actor_id: null,
+        }];
+      }
+      return [];
+    });
+    const loaded = await getWatchedRepos(fallback);
+    assert.equal(loaded.source, "database");
+    assert.deepEqual(loaded.repos, []);
+    assert.equal(queries.some((sql) => /from watched_owners/i.test(sql)), true);
+  });
+
+  it("two concurrent different-owner sweeps allocate distinct short names", async () => {
+    type Stored = { repo: string; short: string };
+    const stored: Stored[] = [];
+    const insertedShorts: string[] = [];
+    const lockKeys: string[] = [];
+    let mode: "undecided" | "same" | "different" = "undecided";
+    let firstKey: string | null = null;
+    const lockWaiters: Array<{ key: string; resume: () => void }> = [];
+    let reads = 0;
+    const readWaiters: Array<() => void> = [];
+
+    setSqlForTests(async (strings, ...values) => {
+      const text = strings.join(" ").replace(/\s+/g, " ").trim().toLowerCase();
+      if (text === "begin" || text === "rollback") return [];
+      if (text === "commit") {
+        const next = lockWaiters.shift();
+        next?.resume();
+        return [];
+      }
+      if (text.includes("pg_advisory_xact_lock")) {
+        const key = String(values[0]);
+        lockKeys.push(key);
+        if (mode === "undecided" && firstKey === null) {
+          firstKey = key;
+          await new Promise<void>((resolve) => lockWaiters.push({ key, resume: resolve }));
+          return [];
+        }
+        if (mode === "undecided") {
+          if (key === firstKey) {
+            mode = "same";
+            lockWaiters.shift()?.resume();
+            await new Promise<void>((resolve) => lockWaiters.push({ key, resume: resolve }));
+            return [];
+          }
+          mode = "different";
+          lockWaiters.shift()?.resume();
+          return [];
+        }
+        if (mode === "same" && lockWaiters.some((waiter) => waiter.key === key)) {
+          await new Promise<void>((resolve) => lockWaiters.push({ key, resume: resolve }));
+        }
+        return [];
+      }
+      if (text.includes("from watched_owners")) return [];
+      if (text.includes("from watched_repos")) {
+        if (mode === "different") {
+          reads += 1;
+          if (reads < 2) await new Promise<void>((resolve) => readWaiters.push(resolve));
+          else readWaiters.splice(0).forEach((resume) => resume());
+        }
+        return stored.map((row, i) => ({
+          repo: row.repo,
+          label: row.short,
+          short: row.short,
+          color: "#2563eb",
+          blocked_label: null,
+          position: i,
+          origin: "auto",
+          pinned: false,
+          hidden: false,
+          gone: false,
+          is_fork: false,
+          is_archived: false,
+          last_activity_at: atAge(1),
+        }));
+      }
+      if (text.includes("insert into watched_repos")) {
+        const names = values[0] as string[];
+        const shorts = values[2] as string[];
+        names.forEach((name, i) => {
+          insertedShorts.push(shorts[i]);
+          if (!stored.some((row) => row.repo === name)) stored.push({ repo: name, short: shorts[i] });
+        });
+        return [];
+      }
+      return [];
+    });
+
+    const sweep = (ownerName: string) => applyOwnerDiscovery(
+      owner({ owner: ownerName }),
+      [],
+      { repos: [listed("app", 1)], error: null, truncated: false, sweptAt: atAge(0) },
+      NOW,
+    );
+    const timed = Promise.race([
+      Promise.all([sweep("acme"), sweep("beta")]),
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error("discovery lock seam timed out")), 2000);
+      }),
+    ]);
+    const [left, right] = await timed;
+    assert.equal(left.failure, null, left.failure ?? "");
+    assert.equal(right.failure, null, right.failure ?? "");
+    assert.equal(new Set(lockKeys).size, 1, `short-name allocation must share one lock, saw ${lockKeys.join(", ")}`);
+    assert.equal(mode, "same");
+    const shorts = insertedShorts.map((short) => short.toLowerCase());
+    assert.equal(new Set(shorts).size, shorts.length, `short names collided: ${shorts.join(", ")}`);
+    assert.ok(shorts.includes("app"));
+    assert.deepEqual(stored.map((row) => row.repo).sort(), ["acme/app", "beta/app"]);
+  });
+
+  it("discovery rejects a missing swept_at", async () => {
+    env.NODE_ENV = "test";
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+    let calls = 0;
+    setSqlForTests(async () => {
+      calls += 1;
+      return [{ owner: "acme", activity_days: 30, include_forks: false, include_archived: false }];
+    });
+    const res = await postDiscover(new Request("http://localhost/api/settings/owners/discover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        results: [{ owner: "acme", ok: true, repos: [{ name: "app", pushedAt: atAge(1), isFork: false, isArchived: false }] }],
+      }),
+    }));
+    assert.equal(res.status, 400, JSON.stringify(await res.clone().json()));
+    const body = await res.json() as { code?: string; fields?: { results?: string } };
+    assert.equal(body.code, "validation_failed");
+    assert.match(body.fields?.results ?? "", /swept_at/);
+    assert.equal(calls, 0, "a missing swept_at must not touch the database");
+  });
+
+  it("a non-42P01 does-not-exist error is not a missing owners table", async () => {
+    env.NODE_ENV = "test";
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+
+    const thrower = (message: string, code: string) => async () => {
+      const err = new Error(message);
+      (err as { code?: string }).code = code;
+      throw err;
+    };
+
+    setSqlForTests(thrower('column "activity_days" of relation "watched_owners" does not exist', "42703"));
+    const column = await getOwners(new Request("http://localhost/api/settings/owners"));
+    assert.equal(column.status, 500, JSON.stringify(await column.clone().json()));
+    const columnBody = await column.json() as { code?: string; writable?: boolean };
+    assert.equal(columnBody.code, "internal_error");
+    assert.notEqual(columnBody.writable, false);
+
+    setSqlForTests(thrower('relation "watched_repos" does not exist', "42P01"));
+    const other = await getOwners(new Request("http://localhost/api/settings/owners"));
+    assert.equal(other.status, 500, JSON.stringify(await other.clone().json()));
+    const otherBody = await other.json() as { code?: string; writable?: boolean };
+    assert.equal(otherBody.code, "internal_error");
+    assert.notEqual(otherBody.writable, false);
+  });
+
+  it("a repeated short-name unique violation is 409 after one replan", async () => {
+    env.NODE_ENV = "test";
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+    let inserts = 0;
+    setSqlForTests(async (strings) => {
+      const text = strings.join(" ").replace(/\s+/g, " ").trim().toLowerCase();
+      if (text === "begin" || text === "commit" || text === "rollback") return [];
+      if (text.includes("from watched_owners") && !text.includes("update")) {
+        return [{ owner: "acme", activity_days: 30, include_forks: false, include_archived: false, last_discovered_at: null }];
+      }
+      if (text.includes("insert into watched_repos")) {
+        inserts += 1;
+        const err = new Error('duplicate key value violates unique constraint "watched_repos_short_key"');
+        (err as { code?: string }).code = "23505";
+        throw err;
+      }
+      return [];
+    });
+    const res = await postDiscover(new Request("http://localhost/api/settings/owners/discover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        results: [{
+          owner: "acme",
+          ok: true,
+          swept_at: atAge(0),
+          repos: [{ name: "app", pushedAt: atAge(1), isFork: false, isArchived: false }],
+        }],
+      }),
+    }));
+    assert.equal(res.status, 409, JSON.stringify(await res.clone().json()));
+    const body = await res.json() as { code?: string };
+    assert.equal(body.code, "conflict");
+    assert.equal(inserts, 2, "a unique violation replans once, then conflicts");
+  });
+
+  it("watched_repos short names have one unique constraint", () => {
+    for (const file of ["supabase/migrations/20261028_watched_owners.sql", "supabase/schema.sql"]) {
+      const text = fs.readFileSync(file, "utf8");
+      assert.match(text, /watched_repos_short_key/);
+      assert.match(text, /unique\s*\(\s*short\s*\)/i);
+      assert.match(text, /deferrable/i);
+    }
   });
 });

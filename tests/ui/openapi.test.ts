@@ -295,6 +295,18 @@ describe("OpenAPI document", () => {
 
     const ingest = schemaOf(doc, "ProgressIngest");
     assert.deepEqual((ingest.properties?.kind as { enum: string[] }).enum, [...PROGRESS_INGEST_KINDS]);
+
+    const watched = schemaOf(doc, "WatchedRepo");
+    for (const field of ["gone", "shown", "isFork", "isArchived", "lastActivityAt"]) {
+      assert.ok(watched.properties?.[field], `WatchedRepo.${field} is documented`);
+    }
+    const override = schemaOf(doc, "RepoOverride") as Schema & { anyOf?: { required?: string[] }[] };
+    const requiredSets = (override.anyOf ?? []).map((item) => item.required ?? []);
+    assert.ok(requiredSets.some((fields) => fields.includes("pinned")));
+    assert.ok(requiredSets.some((fields) => fields.includes("hidden")));
+    const discovery = schemaOf(doc, "OwnerDiscovery");
+    const item = (discovery.properties?.results as { items?: { required?: string[] } }).items;
+    assert.ok(item?.required?.includes("swept_at"));
   });
 
   it("covers the decisions routes, decisions:write, and the api-error codes", () => {

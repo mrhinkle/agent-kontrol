@@ -61,9 +61,10 @@ async function main() {
 
   // Watched repos: fallback, ordered replace, removal, restoring order.
   const fallback: RepoConfig[] = [{ repo: "example-org/fallback", label: "Fallback", short: "fb", color: "#000000", blockedLabel: null }];
+  await sql()`delete from watched_owners`;
   await sql()`delete from watched_repos`;
   const empty = await getWatchedRepos(fallback);
-  assert.equal(empty.source, "file", "an empty table falls back to the file list");
+  assert.equal(empty.source, "file", "no owners and no repos falls back to the file list");
   assert.deepEqual(empty.repos, fallback);
   const a = { repo: `${tag}/a`, label: "A", short: `${tag}-a`, color: "#111111", blockedLabel: null };
   const b = { repo: `${tag}/b`, label: "B", short: `${tag}-b`, color: "#222222", blockedLabel: "blocked" };

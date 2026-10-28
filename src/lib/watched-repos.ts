@@ -3,7 +3,7 @@ import { isConfigured, sql, type SqlTag } from "./db";
 import { briefShown, repoOwner, type OwnerRule, type TrackedRepo } from "./owner-discovery";
 import type { RepoConfig } from "./progress-config";
 import type { RepoInput } from "./repo-validation";
-import { ownerFromRow, ruleOf, type StoredOwner } from "./watched-owners";
+import { missingOwnersRelation, ownerFromRow, ruleOf, type StoredOwner } from "./watched-owners";
 
 export type RepoSource = "database" | "file";
 
@@ -25,9 +25,11 @@ export function visibleOnBoard(repo: { shown?: boolean }): boolean {
 }
 
 /**
- * The repos the progress board watches. Rows in `watched_repos` win; with none
- * (a fresh install, demo mode, or a database that has not been migrated yet) the
- * file or build-time default is used instead.
+ * The repos the progress board watches. Rows in `watched_repos` win. An empty
+ * repo table still wins when at least one owner is configured, so an owner
+ * whose repos are filtered or not yet discovered does not show the file list.
+ * The file list is only for an unconfigured store: no owner rows and no repo
+ * rows, demo mode, or a database that has not been migrated yet.
  */
 function iso(value: unknown): string | null {
   if (value == null) return null;
@@ -83,8 +85,7 @@ async function loadOwners(): Promise<StoredOwner[]> {
     `;
     return rows.map((r) => ownerFromRow(r));
   } catch (e) {
-    const err = e as { code?: string; message?: string };
-    if (err.code === "42P01" || err.message?.includes("does not exist")) return [];
+    if (missingOwnersRelation(e)) return [];
     throw e;
   }
 }
@@ -119,8 +120,8 @@ export async function getWatchedRepos(fallback: RepoConfig[]): Promise<{ source:
   if (!isConfigured()) return { source: "file", repos: fallback };
   try {
     const rows = await loadTrackedRepos();
-    if (rows.length === 0) return { source: "file", repos: fallback };
     const owners = (await loadOwners()).map(ruleOf);
+    if (rows.length === 0 && owners.length === 0) return { source: "file", repos: fallback };
     const now = new Date();
     return { source: "database", repos: rows.map((row) => toWatchedRepo(row, owners, now)) };
   } catch (e) {

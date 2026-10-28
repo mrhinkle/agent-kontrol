@@ -256,13 +256,13 @@ export function openApiDocument(): Json {
               type: "array",
               items: {
                 type: "object",
-                required: ["owner", "ok"],
+                required: ["owner", "ok", "swept_at"],
                 properties: {
                   owner: { type: "string" },
                   ok: { type: "boolean" },
                   error: { type: ["string", "null"] },
                   truncated: { type: "boolean", description: "True when gh repo list hit the 1000-repo cap. Seen repos are updated. Others are not marked gone." },
-                  swept_at: { type: "string", format: "date-time", description: "Collector time just before gh repo list. A sweep that is not newer than last_discovered_at is ignored." },
+                  swept_at: { type: "string", format: "date-time", description: "Required. Collector time just before gh repo list. A sweep that is not newer than last_discovered_at is ignored." },
                   repos: {
                     type: "array",
                     items: {
@@ -284,6 +284,10 @@ export function openApiDocument(): Json {
         RepoOverride: {
           type: "object",
           required: ["repo"],
+          anyOf: [
+            { required: ["pinned"] },
+            { required: ["hidden"] },
+          ],
           properties: {
             repo: { type: "string", description: "owner/name" },
             pinned: { type: "boolean" },
@@ -305,6 +309,25 @@ export function openApiDocument(): Json {
             },
           },
         },
+        WatchedRepo: {
+          type: "object",
+          required: ["repo", "label", "short", "color", "blockedLabel"],
+          properties: {
+            repo: { type: "string", description: "owner/name" },
+            label: { type: "string" },
+            short: { type: "string" },
+            color: { type: "string" },
+            blockedLabel: { type: ["string", "null"] },
+            origin: { type: "string", enum: ["manual", "auto"] },
+            pinned: { type: "boolean", description: "Always show on the brief, including after the activity window. Hide wins over pin." },
+            hidden: { type: "boolean", description: "Collected, but omitted from the brief and the board. Hide wins over pin." },
+            gone: { type: "boolean", description: "True when the repo left the last successful non-truncated gh repo list. The row is kept. A gone repo is not shown, including when it is pinned." },
+            shown: { type: "boolean", description: "False drops the repo off the brief and the board. Omitted means show." },
+            isFork: { type: "boolean", description: "True when the repo is a fork." },
+            isArchived: { type: "boolean", description: "True when the repo is archived." },
+            lastActivityAt: { type: ["string", "null"], format: "date-time", description: "Last push time from gh. The activity window uses this." },
+          },
+        },
         WatchedRepos: {
           type: "object",
           required: ["source", "writable", "max", "version", "repos"],
@@ -313,7 +336,7 @@ export function openApiDocument(): Json {
             writable: { type: "boolean" },
             max: { type: "integer", const: MAX_REPOS },
             version: { type: "string" },
-            repos: { type: "array", items: ref("RepoInput") },
+            repos: { type: "array", items: ref("WatchedRepo") },
           },
         },
         UsageFact: {
@@ -1329,7 +1352,7 @@ export function openApiDocument(): Json {
           tags: ["settings"],
           summary: "Apply one collector tick of gh repo list results.",
           description:
-            "Auth matches PUT /api/settings/repos. A result with ok false, a rate-limit error, or zero repos records last_error and does not change tracked repos. A truncated list updates the repos it saw, does not mark the others gone, and stores a warning on last_error while still setting last_discovered_at. An unknown owner is an error on that result and does not fail the batch. A duplicate owner in one request is 400 and writes nothing. A repo name that is not safe to store fails that owner's sweep and writes no repo changes. One owner's metadata update and repo changes commit together, under a per-owner advisory lock, after reloading tracked repos. swept_at orders overlapping ticks: a sweep that is not newer than last_discovered_at writes nothing. Discovery does not change pin, hide, label, short, color, origin, or the actor who saved the owner. No database, or a missing watched_owners table, is 409 and includes results.",
+            "Auth matches PUT /api/settings/repos. A result with ok false, a rate-limit error, or zero repos records last_error and does not change tracked repos. A truncated list updates the repos it saw, does not mark the others gone, and stores a warning on last_error while still setting last_discovered_at. An unknown owner is an error on that result and does not fail the batch. A duplicate owner in one request is 400 and writes nothing. A missing swept_at is 400. A repo name that is not safe to store fails that owner's sweep and writes no repo changes. One owner's metadata update and repo changes commit together, under one global advisory lock shared by every owner, after reloading tracked repos. The lock is not held during gh repo list. swept_at orders overlapping ticks: a sweep that is not newer than last_discovered_at writes nothing. A short-name unique violation replans once and then is 409. Discovery does not change pin, hide, label, short, color, origin, or the actor who saved the owner. No database, or a missing watched_owners table, is 409 and includes results.",
           security: cookieOrBearer,
           requestBody: body(ref("OwnerDiscovery")),
           responses: {

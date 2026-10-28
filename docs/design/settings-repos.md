@@ -48,7 +48,7 @@ create table if not exists watched_repos (
 );
 ```
 
-Additive and idempotent, so the usual schema step applies it. There is no unique index on `short`: validation enforces it, so rows can be reordered or have names swapped one upsert at a time.
+Additive and idempotent, so the usual schema step applies it. `short` has a deferrable unique constraint (`watched_repos_short_key`), checked at the end of the statement, so one upsert can still swap two short names. Validation still rejects a duplicate before the write.
 
 ## API
 

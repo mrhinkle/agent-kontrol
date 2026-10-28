@@ -7,6 +7,7 @@ import type { GhListedRepo } from "@/lib/owner-discovery";
 import { loadTrackedRepos } from "@/lib/watched-repos";
 import {
   applyOwnerDiscovery,
+  DiscoveryShortConflict,
   listWatchedOwners,
   ruleOf,
   sweepOf,
@@ -55,8 +56,8 @@ function parseRepos(raw: unknown): { ok: true; repos: GhListedRepo[] } | { ok: f
   return { ok: true, repos };
 }
 
-function parseSweptAt(raw: unknown): { ok: true; sweptAt: string | null } | { ok: false; error: string } {
-  if (raw == null) return { ok: true, sweptAt: null };
+function parseSweptAt(raw: unknown): { ok: true; sweptAt: string } | { ok: false; error: string } {
+  if (raw == null || raw === "") return { ok: false, error: "swept_at is required." };
   if (typeof raw !== "string" || Number.isNaN(Date.parse(raw))) {
     return { ok: false, error: "swept_at must be an ISO timestamp." };
   }
@@ -175,6 +176,12 @@ export async function POST(req: Request) {
     }
     return NextResponse.json({ results: out });
   } catch (e) {
+    if (e instanceof DiscoveryShortConflict) {
+      return apiError("conflict", {
+        message: "Discovery could not allocate a unique short name.",
+        fix: "Retry the tick.",
+      });
+    }
     return publicError("[settings/owners/discover] apply failed", e, "Could not apply discovery.");
   }
 }
