@@ -277,7 +277,7 @@ describe("GET /api/brief", { concurrency: false }, () => {
       assert.equal(repo.merged_prs, null);
       assert.equal(repo.decisions, null);
     }
-    assert.equal(body.totals.merged_prs, 0);
+    assert.equal(body.totals.merged_prs, null);
     assert.equal(body.totals.repos_counted, 0);
     assert.match(body.generated_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
 
@@ -601,7 +601,10 @@ describe("GET /api/brief", { concurrency: false }, () => {
     assert.deepEqual(tsBrief.stuck_prs.map((row) => row.number), [11, 22, 33]);
     assert.equal(tsBrief.decisions.some((row) => row.number === 99), false);
     assert.equal(tsBrief.stuck_prs.some((row) => row.number === 99), false);
-    assert.equal(tsBrief.totals.merged_prs, 3);
+    assert.equal(tsBrief.totals.merged_prs, null);
+    assert.equal(tsBrief.totals.stuck_prs, null);
+    assert.equal(tsBrief.totals.decisions, null);
+    assert.equal(tsBrief.totals.open_issues, null);
     assert.equal(tsBrief.totals.repos_counted, 3);
 
     const text = formatBriefText(tsBrief, { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] });
@@ -782,7 +785,7 @@ describe("GET /api/brief", { concurrency: false }, () => {
       assert.equal(section?.open_prs, null, window);
       assert.equal(section?.merged_prs, null, window);
       assert.equal(brief.totals.repos_counted, 0, window);
-      assert.equal(brief.totals.merged_prs, 0, window);
+      assert.equal(brief.totals.merged_prs, null, window);
       assert.equal(brief.incomplete_repos.some((row) => row.repo === repo), true, window);
       const text = formatBriefText(brief, {
         clock: "Tue 2026-10-27 11:00 EDT",
@@ -896,8 +899,8 @@ describe("GET /api/brief", { concurrency: false }, () => {
       repos: [day],
     });
     assert.equal(brief.totals.repos_counted, 0);
-    assert.equal(brief.totals.merged_prs, 0);
-    assert.equal(brief.totals.issues_opened, 0);
+    assert.equal(brief.totals.merged_prs, null);
+    assert.equal(brief.totals.issues_opened, null);
     assert.deepEqual(brief.incomplete_repos, [{ repo: "acme/app", errors: ["counts not measured"] }]);
     const text = formatBriefText(brief, { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] });
     assert.match(text, /DATA INCOMPLETE for 1 of 1 repos/);
@@ -1012,7 +1015,7 @@ describe("GET /api/brief", { concurrency: false }, () => {
     assert.deepEqual(mixed.stuck_prs.map((row) => row.number), [11]);
     const mixedText = formatBriefText(mixed, { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] });
     assert.equal(mixedText.includes("STUCK PRs: none."), false);
-    assert.match(mixedText, /DATA INCOMPLETE: stuck PRs were not measured/);
+    assert.match(mixedText, /STUCK PRs: DATA INCOMPLETE\./);
     assert.match(mixedText, /#11/);
   });
 
@@ -1291,11 +1294,10 @@ describe("GET /api/brief", { concurrency: false }, () => {
     assert.ok(start >= 0 && end > start);
     const fn = script.slice(start, end);
     const heading = (args: string) => execFileSync("bash", ["-c", `${fn}\nstuck_heading ${args}`], { encoding: "utf8" });
-    assert.equal(heading("2 0 0"), "STUCK PRs: DATA INCOMPLETE.\n");
-    assert.equal(heading("1 1 0"), "STUCK PRs: none.\n");
-    assert.equal(heading("0 3 0"), "STUCK PRs: none.\n");
-    assert.match(heading("0 1 4"), /^STUCK PRs \(4\) /);
-    assert.match(script, /stuck_heading "\$n_incomplete" "\$n_counted" "\$n_stuck"/);
+    assert.equal(heading("null"), "STUCK PRs: DATA INCOMPLETE.\n");
+    assert.equal(heading("0"), "STUCK PRs: none.\n");
+    assert.match(heading("4"), /^STUCK PRs \(4\) /);
+    assert.match(script, /stuck_heading "\$n_stuck"/);
   });
 
   it("configured error never counts as work, including beside newer noise", async () => {
@@ -1469,12 +1471,246 @@ describe("GET /api/brief", { concurrency: false }, () => {
     assert.ok(start >= 0 && end > start);
     const fn = script.slice(start, end);
     const heading = (args: string) => execFileSync("bash", ["-c", `${fn}\ndecisions_heading ${args}`], { encoding: "utf8" });
-    assert.equal(heading("1 0 1"), "DECISIONS FOR YOU: DATA INCOMPLETE.\n");
-    assert.equal(heading("2 0 3"), "DECISIONS FOR YOU: DATA INCOMPLETE.\n");
-    assert.equal(heading("0 0 1"), "DECISIONS FOR YOU: none open.\n");
-    assert.match(heading("1 0 0"), /not tracked/);
-    assert.match(heading("1 4 1"), /^DECISIONS FOR YOU \(4\) /);
-    assert.match(script, /decisions_heading "\$n_incomplete" "\$n_dec" "\$n_labels"/);
+    assert.equal(heading("null 1 0"), "DECISIONS FOR YOU: DATA INCOMPLETE.\n");
+    assert.equal(heading("null 3 0"), "DECISIONS FOR YOU: DATA INCOMPLETE.\n");
+    assert.equal(heading("null 1 4"), "DECISIONS FOR YOU: DATA INCOMPLETE.\n");
+    assert.equal(heading("0 1 0"), "DECISIONS FOR YOU: none open.\n");
+    assert.match(heading("null 0 0"), /not tracked/);
+    assert.match(heading("0 0 0"), /not tracked/);
+    assert.match(heading("4 1 4"), /^DECISIONS FOR YOU \(4\) /);
+    assert.match(script, /decisions_heading "\$n_dec" "\$n_labels" "\$n_known_dec"/);
+  });
+
+  it("an incomplete repo makes every fleet aggregate unknown, even when another repo measured an empty list", () => {
+    const now = "2026-10-27T12:00:00Z";
+    const clock = { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] };
+    const blank = {
+      merged_prs: null,
+      median_lead_hours: null,
+      issues_opened: null,
+      issues_closed: null,
+      net_backlog: null,
+      open_issues: null,
+      open_prs: null,
+      drafts: null,
+      stale_issues: null,
+      stale_ratio: null,
+      blocked_issues: null,
+      stuck_prs: null,
+      decisions: null,
+      merged_list: null,
+    };
+    const incomplete = section({
+      repo: "other/app",
+      short: "other",
+      label: "Other",
+      incomplete: true,
+      errors: ["no snapshot"],
+      ...blank,
+    });
+    const measuredEmpty = section({
+      repo: "acme/app",
+      short: "app",
+      label: "Acme",
+      merged_prs: 0,
+      issues_opened: 0,
+      issues_closed: 0,
+      net_backlog: 0,
+      open_issues: 0,
+      open_prs: 0,
+      drafts: 0,
+      stale_issues: 0,
+      stale_ratio: 0,
+      median_lead_hours: null,
+      stuck_prs: [],
+      decisions: [],
+      merged_list: [],
+    });
+    const input = {
+      generatedAt: now,
+      windowHours: 24,
+      repoSource: "dashboard",
+      stuckPrHours: 48,
+      staleIssueDays: 21,
+      coordinator: {
+        configured: true,
+        agent_id: "hermes-carmack",
+        verdict: "working: last work event 0.2h ago",
+        last_seen_hours: 0.2,
+      },
+    };
+    // One row per fleet aggregate. The complete repo measured an empty list
+    // or a zero. The incomplete repo must keep the aggregate unknown.
+    const aggregates: { field: "merged_prs" | "issues_opened" | "issues_closed" | "net_backlog" | "open_issues" | "open_prs" | "stuck_prs" | "decisions"; ban: RegExp }[] = [
+      { field: "merged_prs", ban: /0 PRs merged/ },
+      { field: "issues_opened", ban: /\b0 opened\b/ },
+      { field: "issues_closed", ban: /0 issues closed/ },
+      { field: "net_backlog", ban: /the queue held level/ },
+      { field: "open_issues", ban: /0 open issues/ },
+      { field: "open_prs", ban: /0 open PRs/ },
+      { field: "stuck_prs", ban: /STUCK PRs: none/ },
+      { field: "decisions", ban: /none open/ },
+    ];
+    for (const row of aggregates) {
+      const brief = assembleBrief({ ...input, repos: [incomplete, measuredEmpty] });
+      assert.equal(brief.totals[row.field], null, row.field);
+      const text = formatBriefText(brief, clock);
+      assert.equal(row.ban.test(text), false, row.field);
+      assert.match(text, /DATA INCOMPLETE/, row.field);
+      assert.equal(/\bnone\b/i.test(text), false, row.field);
+      assert.equal(/\bnull\b/.test(text), false, row.field);
+    }
+
+    const known = assembleBrief({
+      ...input,
+      repos: [
+        incomplete,
+        section({
+          repo: "acme/app",
+          short: "app",
+          label: "Acme",
+          merged_prs: 1,
+          issues_opened: 0,
+          issues_closed: 0,
+          net_backlog: 0,
+          open_issues: 0,
+          open_prs: 0,
+          stuck_prs: [stuck("app", 11, 10)],
+          decisions: [decision("acme/app", 8, 30, "needs a call")],
+          merged_list: [{ number: 4, title: "landed", url: "https://example.test/4", author: "ada", lead_hours: 2 }],
+        }),
+      ],
+    });
+    for (const row of aggregates) assert.equal(known.totals[row.field], null, `known ${row.field}`);
+    const knownText = formatBriefText(known, clock);
+    assert.match(knownText, /STUCK PRs: DATA INCOMPLETE\./);
+    assert.match(knownText, /#11/);
+    assert.match(knownText, /DECISIONS FOR YOU: DATA INCOMPLETE\./);
+    assert.match(knownText, /needs a call/);
+    assert.match(knownText, /SHIPPED — Acme:/);
+    assert.match(knownText, /#4/);
+    assert.equal(/\bnone\b/i.test(knownText), false);
+    assert.equal(/0 PRs merged/.test(knownText), false);
+    assert.match(knownText, /COORDINATOR {2}\[ok\] hermes-carmack — working: last work event 0\.2h ago/);
+
+    const unreachable = formatBriefText(assembleBrief({
+      ...input,
+      coordinator: { configured: true, agent_id: "hermes-carmack", verdict: "unknown: dashboard unreachable" },
+      repos: [incomplete, measuredEmpty],
+    }), clock);
+    assert.match(unreachable, /unknown: dashboard unreachable/);
+    assert.equal(/\bnone\b/i.test(unreachable), false);
+
+    const script = fs.readFileSync("scripts/morning-brief.sh", "utf8");
+    const assemble = quotedVar(script, "BRIEF_ASSEMBLE_JQ");
+    const jqBrief = jq(assemble, [
+      "--arg", "at", now,
+      "--argjson", "window", "24",
+      "--arg", "repo_source", "dashboard",
+      "--argjson", "repos", JSON.stringify([incomplete, measuredEmpty]),
+      "--argjson", "coordinator", JSON.stringify(input.coordinator),
+      "--argjson", "stuck_h", "48",
+      "--argjson", "stale_d", "21",
+    ]) as MorningBrief;
+    for (const row of aggregates) assert.equal(jqBrief.totals[row.field], null, `jq ${row.field}`);
+
+    const stuckStart = script.indexOf("stuck_heading() {");
+    const stuckEnd = script.indexOf("# END stuck_heading");
+    const stuckFn = script.slice(stuckStart, stuckEnd);
+    const stuckHeading = (args: string) => execFileSync("bash", ["-c", `${stuckFn}\nstuck_heading ${args}`], { encoding: "utf8" });
+    assert.equal(stuckHeading("null"), "STUCK PRs: DATA INCOMPLETE.\n");
+    const countsStart = script.indexOf("counts_heading() {");
+    const countsEnd = script.indexOf("# END counts_heading");
+    assert.ok(countsStart >= 0 && countsEnd > countsStart);
+    const countsFn = script.slice(countsStart, countsEnd);
+    const countsHeading = (args: string) => execFileSync("bash", ["-c", `${countsFn}\ncounts_heading ${args}`], { encoding: "utf8" });
+    const unknownCounts = countsHeading("null null null null null null");
+    assert.match(unknownCounts, /PRs merged, issues closed, and issues opened: DATA INCOMPLETE\./);
+    assert.match(unknownCounts, /Open issues and open PRs: DATA INCOMPLETE\./);
+    assert.equal(/\bnone\b/.test(unknownCounts), false);
+    assert.equal(countsHeading("0 0 0 0 0 0"), "0 PRs merged, 0 issues closed, 0 opened — the queue held level.\n");
+
+    const lacks: { field: (typeof aggregates)[number]["field"]; ban: RegExp; over: Partial<BriefRepo> }[] = [
+      { field: "merged_prs", ban: /0 PRs merged/, over: { merged_prs: null } },
+      { field: "issues_opened", ban: /\b0 opened\b/, over: { issues_opened: null } },
+      { field: "issues_closed", ban: /0 issues closed/, over: { issues_closed: null } },
+      { field: "net_backlog", ban: /the queue held level/, over: { net_backlog: null } },
+      { field: "open_issues", ban: /0 open issues/, over: { open_issues: null } },
+      { field: "open_prs", ban: /0 open PRs/, over: { open_prs: null } },
+      { field: "stuck_prs", ban: /STUCK PRs: none/, over: { stuck_prs: null } },
+      { field: "decisions", ban: /none open/, over: { decisions: null } },
+    ];
+    for (const row of lacks) {
+      const brief = assembleBrief({
+        ...input,
+        coordinator: { configured: false, agent_id: null },
+        repos: [
+          section({
+            repo: "acme/app",
+            short: "app",
+            label: "Acme",
+            merged_prs: 0,
+            issues_opened: 0,
+            issues_closed: 0,
+            net_backlog: 0,
+            open_issues: 0,
+            open_prs: 0,
+            stuck_prs: [],
+            decisions: [],
+            merged_list: [],
+            ...row.over,
+          }),
+          measuredEmpty,
+        ],
+      });
+      // measuredEmpty is a second complete repo. Rename its identity so the two rows differ.
+      brief.repos[1] = { ...brief.repos[1], repo: "beta/app", short: "beta", label: "Beta" };
+      assert.equal(brief.totals[row.field], null, `lacks ${row.field}`);
+      const text = formatBriefText(brief, clock);
+      assert.equal(row.ban.test(text), false, `lacks ${row.field}`);
+      assert.match(text, /DATA INCOMPLETE/, `lacks ${row.field}`);
+      assert.equal(/\bnull\b/.test(text), false, `lacks ${row.field}`);
+    }
+  });
+
+  it("treats an empty detail.merged array as measured and does not fall back to merged_list", () => {
+    const now = "2026-10-27T12:00:00Z";
+    const cfg = { repo: "acme/app", label: "Acme", short: "app", blockedLabel: null };
+    const decoy = { number: 1, title: "stored", url: "https://example.test/1", author: "a", lead_hours: 99 };
+    const snap: RepoSnapshot = {
+      repo: "acme/app",
+      label: "Acme",
+      collected_at: now,
+      kind: "tick",
+      open_issues: 0,
+      open_prs: 0,
+      blocked_issues: 0,
+      merged_prs_24h: 0,
+      issues_closed_24h: 0,
+      issues_opened_24h: 0,
+      total_issues_created: 4,
+      total_issues_closed: 4,
+      total_prs_merged: 2,
+      review_rounds: null,
+      no_verdict_rate: null,
+      detail: { merged: [], merged_list: [decoy], median_lead_hours: 99 },
+    };
+    const day = repoSection({ cfg, snap, baseline: null, windowHours: 24, nowIso: now });
+    assert.deepEqual(day.merged_list, []);
+    assert.equal(day.median_lead_hours, null);
+    const weekend = repoSection({ cfg, snap, baseline: null, windowHours: 72, nowIso: now });
+    assert.deepEqual(weekend.merged_list, []);
+    assert.equal(weekend.median_lead_hours, null);
+
+    const absent = repoSection({
+      cfg,
+      snap: { ...snap, detail: { merged_list: [decoy], median_lead_hours: 99 } },
+      baseline: null,
+      windowHours: 24,
+      nowIso: now,
+    });
+    assert.equal(absent.merged_list?.[0]?.number, 1);
+    assert.equal(absent.median_lead_hours, 99);
   });
 });
 

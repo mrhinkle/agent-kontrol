@@ -88,13 +88,18 @@ export interface MorningBrief {
   coordinator: BriefCoordinator;
   incomplete_repos: { repo: string; errors: string[] }[];
   totals: {
-    merged_prs: number;
-    issues_opened: number;
-    issues_closed: number;
-    net_backlog: number;
-    /** Null when a counted repo did not measure stuck PRs. Zero is a measured empty list. */
+    /**
+     * Null when any watched repo is incomplete, or a counted repo lacks the
+     * field. Zero is a measured empty set on every watched repo.
+     */
+    merged_prs: number | null;
+    issues_opened: number | null;
+    issues_closed: number | null;
+    net_backlog: number | null;
+    open_issues: number | null;
+    open_prs: number | null;
     stuck_prs: number | null;
-    decisions: number;
+    decisions: number | null;
     repos_counted: number;
     repos_total: number;
   };
@@ -328,15 +333,14 @@ function mergedFromDetail(detail: SnapshotDetail | null, windowHours: number, no
   median: number | null;
   fromTimestamps: boolean;
 } {
-  const stamped = Array.isArray(detail?.merged) ? detail.merged : [];
-  const inWindow = stamped.filter((row) => {
-    if (!row || typeof row.merged_at !== "string" || typeof row.created_at !== "string") return false;
-    const age = hoursBetween(row.merged_at, nowIso);
-    return Number.isFinite(age) && age >= 0 && age <= windowHours;
-  });
-  // Any timestamped row owns the window. An empty filter is an empty list,
-  // not a fallback to a stored 24h median.
-  if (stamped.length > 0) {
+  // An array owns the window, including an empty one. That is a measured
+  // empty list. Do not replace it with merged_list or a stored median.
+  if (Array.isArray(detail?.merged)) {
+    const inWindow = detail.merged.filter((row) => {
+      if (!row || typeof row.merged_at !== "string" || typeof row.created_at !== "string") return false;
+      const age = hoursBetween(row.merged_at, nowIso);
+      return Number.isFinite(age) && age >= 0 && age <= windowHours;
+    });
     const list = inWindow.map((row) => ({
       number: num(row.number) ?? 0,
       title: str(row.title),
@@ -475,8 +479,18 @@ export function applyTableDecisions(
   });
 }
 
-function sum(values: Array<number | null>): number {
-  return values.reduce<number>((total, value) => total + (value ?? 0), 0);
+type CountField = "merged_prs" | "issues_opened" | "issues_closed" | "net_backlog" | "open_issues" | "open_prs";
+type ListField = "stuck_prs" | "decisions";
+
+/** Null when the fleet was not fully measured. An empty counted set is a measured zero. */
+function measuredSum(counted: readonly BriefRepo[], anyIncomplete: boolean, field: CountField): number | null {
+  if (anyIncomplete || counted.some((repo) => repo[field] == null)) return null;
+  return counted.reduce((total, repo) => total + (repo[field] ?? 0), 0);
+}
+
+function measuredLen(counted: readonly BriefRepo[], anyIncomplete: boolean, field: ListField): number | null {
+  if (anyIncomplete || counted.some((repo) => repo[field] == null)) return null;
+  return counted.reduce((total, repo) => total + (repo[field]?.length ?? 0), 0);
 }
 
 export function assembleBrief(input: {
@@ -490,7 +504,9 @@ export function assembleBrief(input: {
 }): MorningBrief {
   const repos = [...input.repos];
   const counted = repos.filter((repo) => !repo.incomplete);
-  const stuckUnmeasured = counted.some((repo) => repo.stuck_prs == null);
+  const anyIncomplete = counted.length !== repos.length;
+  // Known rows from counted repos stay on the lists. Incomplete repos do not
+  // contribute, and they do make the fleet total unknown.
   const stuck = stableByAgeDesc(
     counted.flatMap((repo) => repo.stuck_prs ?? []),
   );
@@ -505,12 +521,14 @@ export function assembleBrief(input: {
     coordinator: input.coordinator,
     incomplete_repos: repos.filter((repo) => repo.incomplete).map((repo) => ({ repo: repo.repo, errors: repo.errors })),
     totals: {
-      merged_prs: sum(counted.map((repo) => repo.merged_prs)),
-      issues_opened: sum(counted.map((repo) => repo.issues_opened)),
-      issues_closed: sum(counted.map((repo) => repo.issues_closed)),
-      net_backlog: sum(counted.map((repo) => repo.net_backlog)),
-      stuck_prs: stuckUnmeasured ? null : stuck.length,
-      decisions: counted.reduce((total, repo) => total + (repo.decisions?.length ?? 0), 0),
+      merged_prs: measuredSum(counted, anyIncomplete, "merged_prs"),
+      issues_opened: measuredSum(counted, anyIncomplete, "issues_opened"),
+      issues_closed: measuredSum(counted, anyIncomplete, "issues_closed"),
+      net_backlog: measuredSum(counted, anyIncomplete, "net_backlog"),
+      open_issues: measuredSum(counted, anyIncomplete, "open_issues"),
+      open_prs: measuredSum(counted, anyIncomplete, "open_prs"),
+      stuck_prs: measuredLen(counted, anyIncomplete, "stuck_prs"),
+      decisions: measuredLen(counted, anyIncomplete, "decisions"),
       repos_counted: counted.length,
       repos_total: repos.length,
     },
@@ -555,15 +573,25 @@ export function formatBriefText(
   lines.push("");
   const incomplete = brief.incomplete_repos.length;
   if (incomplete > 0) {
-    lines.push(`!! DATA INCOMPLETE for ${incomplete} of ${brief.totals.repos_total} repos; totals below cover ${brief.totals.repos_counted} repos only.`);
+    lines.push(`!! DATA INCOMPLETE for ${incomplete} of ${brief.totals.repos_total} repos. Fleet totals stay unknown until every watched repo is measured.`);
     for (const repo of brief.incomplete_repos) {
       lines.push(`   ${repo.repo}: ${repo.errors.join("; ")}`);
     }
     lines.push("");
   }
+  const merged = brief.totals.merged_prs;
+  const opened = brief.totals.issues_opened;
+  const closed = brief.totals.issues_closed;
   const net = brief.totals.net_backlog;
-  const verdict = net > 0 ? `the queue grew by ${net}` : net < 0 ? `the queue shrank by ${String(net).replace(/^-/, "")}` : "the queue held level";
-  lines.push(`${brief.totals.merged_prs} PRs merged, ${brief.totals.issues_closed} issues closed, ${brief.totals.issues_opened} opened \u2014 ${verdict}.`);
+  if (merged === null || opened === null || closed === null || net === null) {
+    lines.push("PRs merged, issues closed, and issues opened: DATA INCOMPLETE.");
+  } else {
+    const verdict = net > 0 ? `the queue grew by ${net}` : net < 0 ? `the queue shrank by ${String(net).replace(/^-/, "")}` : "the queue held level";
+    lines.push(`${merged} PRs merged, ${closed} issues closed, ${opened} opened \u2014 ${verdict}.`);
+  }
+  if (brief.totals.open_issues === null || brief.totals.open_prs === null) {
+    lines.push("Open issues and open PRs: DATA INCOMPLETE.");
+  }
   lines.push("");
   if (brief.coordinator.configured) {
     const cv = brief.coordinator.verdict ?? "";
@@ -593,37 +621,42 @@ export function formatBriefText(
   }
   lines.push(`  stale = open issue untouched ${brief.thresholds.stale_issue_days}d+ \u00b7 stuck = non-draft PR open ${brief.thresholds.stuck_pr_hours}h+ or blocked/dirty \u00b7 lead-med = median hours PR open\u2192merge`);
   lines.push("");
-  const stuckUnmeasured = brief.repos.some((repo) => !repo.incomplete && repo.stuck_prs == null);
-  // No counted repo means stuck PRs were not measured. "none" would read as a clean queue.
-  const noneCounted = brief.totals.repos_counted === 0 && brief.incomplete_repos.length > 0;
-  if (noneCounted || (stuckUnmeasured && brief.stuck_prs.length === 0)) {
-    lines.push("STUCK PRs: DATA INCOMPLETE.");
-  } else if (!stuckUnmeasured && brief.totals.stuck_prs === 0) {
-    lines.push("STUCK PRs: none.");
-  } else {
-    lines.push(`STUCK PRs (${brief.stuck_prs.length}) \u2014 oldest first`);
-    if (stuckUnmeasured) lines.push("!! DATA INCOMPLETE: stuck PRs were not measured for every counted repo.");
+  const writeStuck = () => {
     for (const pr of brief.stuck_prs) {
       lines.push(`  ${pr.repo} #${pr.number}  ${pr.age_days}d  ${pr.reason}`);
       lines.push(`      ${sliceText(pr.title, 78)}  ${pr.url}`);
     }
+  };
+  // Null is an incomplete repo or a counted repo that did not measure the list.
+  // "none" is only a measured zero on every watched repo. Known rows stay listed.
+  if (brief.totals.stuck_prs === null) {
+    lines.push("STUCK PRs: DATA INCOMPLETE.");
+    writeStuck();
+  } else if (brief.totals.stuck_prs === 0) {
+    lines.push("STUCK PRs: none.");
+  } else {
+    lines.push(`STUCK PRs (${brief.stuck_prs.length}) \u2014 oldest first`);
+    writeStuck();
   }
   lines.push("");
-  if (brief.totals.decisions === 0) {
-    // Incomplete repos drop their decisions. Zero is not "none" until every repo was counted.
-    const decisionsUnmeasured = brief.incomplete_repos.length > 0;
-    lines.push(labels.length === 0
-      ? "DECISIONS FOR YOU: not tracked (set brief.decisionLabels in progress.config.json)."
-      : decisionsUnmeasured
-        ? "DECISIONS FOR YOU: DATA INCOMPLETE."
-        : "DECISIONS FOR YOU: none open.");
-  } else {
-    lines.push(`DECISIONS FOR YOU (${brief.totals.decisions}) \u2014 oldest first; each one is work nobody else can unblock`);
+  const writeDecisions = () => {
     for (const row of brief.decisions) {
       const kind = row.kind === "pr" ? "PR " : "";
       lines.push(`  ${row.repo_short} ${kind}#${row.number}  ${row.age_days}d  [${row.labels.join(",")}]  ${sliceText(row.title, 70)}`);
       lines.push(`      ${row.url}`);
     }
+  };
+  const decisionCount = brief.totals.decisions;
+  if (decisionCount !== null && decisionCount > 0) {
+    lines.push(`DECISIONS FOR YOU (${decisionCount}) \u2014 oldest first; each one is work nobody else can unblock`);
+    writeDecisions();
+  } else if (decisionCount === null && (labels.length > 0 || brief.decisions.length > 0)) {
+    lines.push("DECISIONS FOR YOU: DATA INCOMPLETE.");
+    writeDecisions();
+  } else if (labels.length === 0) {
+    lines.push("DECISIONS FOR YOU: not tracked (set brief.decisionLabels in progress.config.json).");
+  } else {
+    lines.push("DECISIONS FOR YOU: none open.");
   }
   lines.push("");
   for (const repo of brief.repos) {
