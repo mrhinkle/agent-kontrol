@@ -23,6 +23,12 @@ export const API_ERRORS = {
     fix: "This caller cannot perform that action. Use a resource that belongs to this agent.",
     retryable: false,
   },
+  identity_mismatch: {
+    status: 403,
+    message: "agent_id does not match the authenticated caller",
+    fix: "Omit agent_id, or pass the authenticated id.",
+    retryable: false,
+  },
   not_found: {
     status: 404,
     message: "not found",
@@ -57,6 +63,12 @@ export const API_ERRORS = {
     status: 409,
     message: "conflict",
     fix: "Reload the current state and retry the change.",
+    retryable: false,
+  },
+  idempotency_conflict: {
+    status: 409,
+    message: "idempotency conflict",
+    fix: "Send the same arguments with this key, or use a new key.",
     retryable: false,
   },
   stale: {
@@ -199,6 +211,10 @@ interface SafeCaught {
   code: ErrorCode;
   message: string;
   fields?: Record<string, string>;
+  retryable?: boolean;
+  fix?: string;
+  headers?: HeadersInit;
+  extra?: Record<string, unknown>;
 }
 
 /**
@@ -206,7 +222,62 @@ interface SafeCaught {
  * happens to contain one of these phrases must fall through to internal_error
  * so the original text is not returned.
  */
+/**
+ * Match by name. api-error is imported by middleware, which cannot load
+ * node:crypto, so this file does not import the idempotency module.
+ */
+function namedError(err: unknown, name: string): (Error & {
+  fields?: Record<string, string>;
+  retryable?: boolean;
+  retryAfterSec?: number | null;
+}) | null {
+  if (!(err instanceof Error) || err.name !== name) return null;
+  return err as Error & {
+    fields?: Record<string, string>;
+    retryable?: boolean;
+    retryAfterSec?: number | null;
+  };
+}
+
 function safeCaught(err: unknown): SafeCaught | null {
+  const unknownOutcome = namedError(err, "IdempotencyUnknownOutcome");
+  if (unknownOutcome) {
+    return {
+      code: "idempotency_conflict",
+      message: unknownOutcome.message,
+      fields: unknownOutcome.fields ?? { idempotency_key: unknownOutcome.message },
+      retryable: true,
+      fix: "Retry the same idempotency key and the same arguments. Within 24 hours of the claim, that retry does not insert another row. The key is scoped to the actor and the route.",
+    };
+  }
+  const conflict = namedError(err, "IdempotencyConflict");
+  if (conflict) {
+    const retryable = conflict.retryable === true;
+    const retryAfter = typeof conflict.retryAfterSec === "number" && conflict.retryAfterSec >= 1
+      ? Math.ceil(conflict.retryAfterSec)
+      : null;
+    return {
+      code: "idempotency_conflict",
+      message: conflict.message,
+      fields: conflict.fields ?? { idempotency_key: conflict.message },
+      retryable,
+      ...(retryable
+        ? {
+            fix: "Wait the number of seconds in Retry-After, then send the same key and the same arguments. The key is scoped to the actor and the route.",
+            headers: retryAfter != null ? { "Retry-After": String(retryAfter) } : undefined,
+            extra: retryAfter != null ? { retry_after: retryAfter } : undefined,
+          }
+        : {}),
+    };
+  }
+  const invalidKey = namedError(err, "IdempotencyKeyInvalid");
+  if (invalidKey) {
+    return {
+      code: "validation_failed",
+      message: invalidKey.message,
+      fields: invalidKey.fields ?? { idempotency_key: invalidKey.message },
+    };
+  }
   const msg = err instanceof Error ? err.message : "";
   if (msg === "Task not found") return { code: "task_not_found", message: msg };
   if (msg === "in_reply_to belongs to a different agent") {
@@ -224,13 +295,30 @@ function safeCaught(err: unknown): SafeCaught | null {
 export function publicError(logLabel: string, err: unknown, fallbackMessage?: string): NextResponse {
   console.error(logLabel, err);
   const safe = safeCaught(err);
-  if (safe) return apiError(safe.code, { message: safe.message, fields: safe.fields });
+  if (safe) {
+    return apiError(safe.code, {
+      message: safe.message,
+      fields: safe.fields,
+      retryable: safe.retryable,
+      fix: safe.fix,
+      headers: safe.headers,
+      extra: safe.extra,
+    });
+  }
   return apiError("internal_error", fallbackMessage ? { message: fallbackMessage } : undefined);
 }
 
 export function toolResultFromCaught(logLabel: string, err: unknown): McpToolResult {
   console.error(logLabel, err);
   const safe = safeCaught(err);
-  if (safe) return mcpToolError(safe.code, { message: safe.message, fields: safe.fields });
+  if (safe) {
+    return mcpToolError(safe.code, {
+      message: safe.message,
+      fields: safe.fields,
+      retryable: safe.retryable,
+      fix: safe.fix,
+      extra: safe.extra,
+    });
+  }
   return mcpToolError("internal_error");
 }

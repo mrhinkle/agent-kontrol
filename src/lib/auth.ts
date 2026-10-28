@@ -38,12 +38,16 @@ export type Access =
 const STORE_UNAVAILABLE: Access = { ok: false, status: 503, body: { error: "credential_store_unavailable" } };
 const UNAUTHORIZED: Access = { ok: false, status: 401, body: errorBody("unauthorized") };
 
-function jsonDenied(decision: Access): Response | null {
-  if (decision.ok) return null;
-  return new Response(JSON.stringify(decision.body), {
-    status: decision.status,
+export function deny(access: Exclude<Access, { ok: true }>): Response {
+  return new Response(JSON.stringify(access.body), {
+    status: access.status,
     headers: { "content-type": "application/json" },
   });
+}
+
+function jsonDenied(decision: Access): Response | null {
+  if (decision.ok) return null;
+  return deny(decision);
 }
 
 function bearerFrom(req: Request): string | null {
@@ -133,8 +137,34 @@ export async function isAuthorized(
   req: Request,
   opts?: { allowQueryKey?: boolean },
 ): Promise<boolean> {
-  const decision = await decideBearer(req, "bearer", opts?.allowQueryKey === true);
+  const decision = await resolveBearerAccess(req, opts);
   return decision.ok;
+}
+
+/** Bearer decision, including the principal that made it. */
+export async function resolveBearerAccess(
+  req: Request,
+  opts?: { allowQueryKey?: boolean },
+): Promise<Access> {
+  return decideBearer(req, "bearer", opts?.allowQueryKey === true);
+}
+
+/**
+ * Dashboard data routes. Session cookie, legacy token, or a scoped
+ * agent credential. When the dashboard password is unset, ordinary
+ * callers stay allowed and an agent credential is still checked.
+ * A matching session cookie is the signed-in operator.
+ */
+export async function resolveApiAccess(req: Request): Promise<Access> {
+  const password = process.env.MC_DASHBOARD_PASSWORD;
+  if (password) {
+    const cookie = readCookie(req, "mc_auth");
+    if (cookie && (await secretsMatch(cookie, await authCookieValue(password)))) {
+      return { ok: true, principal: { kind: "session" } };
+    }
+    return decideBearer(req, "strict", false);
+  }
+  return decideBearer(req, "dashboard-open", false);
 }
 
 /** Ingest-style routes. 401 for a bad credential, 403 for a missing scope. */
@@ -142,24 +172,16 @@ export async function enforceBearer(
   req: Request,
   opts?: { allowQueryKey?: boolean },
 ): Promise<Response | null> {
-  return jsonDenied(await decideBearer(req, "bearer", opts?.allowQueryKey === true));
+  const access = await resolveBearerAccess(req, opts);
+  if (!access.ok) return deny(access);
+  return null;
 }
 
-/**
- * Dashboard data routes. Session cookie, legacy token, or a scoped
- * agent credential. When the dashboard password is unset, ordinary
- * callers stay allowed and an agent credential is still checked.
- */
+/** Same allow decision as before. Use resolveApiAccess when the caller needs the principal. */
 export async function enforceApi(req: Request): Promise<Response | null> {
-  const password = process.env.MC_DASHBOARD_PASSWORD;
-  if (password) {
-    const cookie = readCookie(req, "mc_auth");
-    if (cookie && (await secretsMatch(cookie, await authCookieValue(password)))) {
-      return null;
-    }
-    return jsonDenied(await decideBearer(req, "strict", false));
-  }
-  return jsonDenied(await decideBearer(req, "dashboard-open", false));
+  const access = await resolveApiAccess(req);
+  if (!access.ok) return deny(access);
+  return null;
 }
 
 /**

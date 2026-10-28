@@ -1,15 +1,18 @@
 import { createMcpHandler, withMcpAuth } from "mcp-handler";
 import { z } from "zod";
-import { memoryKeyError, toolResultFromCaught, type McpToolResult } from "@/lib/api-error";
+import { actorFromPrincipal, currentActor, runWithActor } from "@/lib/actor";
+import { apiError, memoryKeyError, toolResultFromCaught, type McpToolResult } from "@/lib/api-error";
 import { secretsMatch, verifyAccessToken } from "@/lib/authcrypto";
 import { resolveAgentCredential } from "@/lib/credentials";
 import { isConfigured } from "@/lib/db";
 import { evaluateMcpMessages, insufficientScopeBody, principalFromMcpAuth } from "@/lib/scopes";
-import { claimNextTask, createTask, fetchMessages, fleet, listTasks, recall, remember, replyFromAgent, report, updateTask } from "@/lib/store";
+import { rememberForTool, updateTaskForTool } from "@/lib/dry-run-actions";
+import { claimNextTask, createTask, fetchMessages, fleet, listTasks, recall, replyFromAgent, report } from "@/lib/store";
 import { progress } from "@/lib/progress-store";
 import { formatDigest } from "@/lib/progress-digest";
 import { OPERATOR } from "@/lib/operator";
 import { demoProgress } from "@/lib/demo-progress";
+import { getSkillTool, listSkillsTool, runSkillTool } from "@/lib/skills/mcp";
 
 export const maxDuration = 60;
 
@@ -152,23 +155,16 @@ const handler = createMcpHandler(
         title: "Remember",
         annotations: WRITE_DESTRUCTIVE,
         description:
-          "Write a note to Agent Kontrol shared memory so other agents (and future sessions) can see it. Use for decisions, handoffs, and 'don't duplicate this' coordination notes.",
+          "Write a note to Agent Kontrol shared memory so other agents (and future sessions) can see it. Use for decisions, handoffs, and 'don't duplicate this' coordination notes. Pass dry_run true to preview an insert or key overwrite without writing.",
         inputSchema: {
           content: z.string().describe("The note to store"),
           key: z.string().optional().describe("Optional stable key; writing the same key overwrites (good for living docs like 'project-x/status')"),
           tags: z.array(z.string()).optional().describe("Tags for filtering, e.g. ['agent-kontrol','decision']"),
           agent_id: z.string().optional().describe("Who is writing this note"),
+          dry_run: z.boolean().optional().describe("When true, return what would be written and write nothing"),
         },
       },
-      async (args) => guardTool("remember", async () => {
-        const badKey = memoryKeyError(args.key);
-        if (badKey) return badKey;
-        if (!isConfigured()) {
-          return { content: [{ type: "text", text: "Demo mode; note not stored." }] };
-        }
-        const item = await remember(args);
-        return { content: [{ type: "text", text: `Stored memory #${item.id}${item.key ? ` (key: ${item.key})` : ""}.` }] };
-      }),
+      async (args) => guardTool("remember", () => rememberForTool(args)),
     );
 
     server.registerTool(
@@ -280,6 +276,10 @@ const handler = createMcpHandler(
               .int()
               .optional()
               .describe("Optional id of the inbound message you are answering"),
+            idempotency_key: z
+              .string()
+              .optional()
+              .describe("Optional. Scoped by actor and route. The same key and the same arguments return the original reply for 24 hours and do not store a second row during that window. After 24 hours the same key starts a new write. The same key with different arguments is an error."),
           },
         },
         async (args) => guardTool(tool.name, async () => {
@@ -291,6 +291,8 @@ const handler = createMcpHandler(
             body: args.body,
             in_reply_to: args.in_reply_to,
             created_by: args.agent_id,
+            actor: currentActor(),
+            idempotency_key: args.idempotency_key,
           });
           return {
             content: [
@@ -325,14 +327,25 @@ const handler = createMcpHandler(
             .enum(["claude-code", "codex", "grok"])
             .optional()
             .describe("Have a second platform review the work before it's marked done"),
-          created_by: z.string().optional().describe("Your agent id"),
+          created_by: z
+            .string()
+            .optional()
+            .describe("Free-text label stored as created_by. It does not set actor_type or actor_id; the server records the authenticated credential."),
+          idempotency_key: z
+            .string()
+            .optional()
+            .describe("Optional. Scoped by actor and route. The same key and the same arguments return the original task for 24 hours and do not queue a second task during that window. After 24 hours the same key starts a new write. The same key with different arguments is an error."),
         },
       },
       async (args) => guardTool("create_task", async () => {
         if (!isConfigured()) {
           return { content: [{ type: "text", text: "Demo mode; task not queued." }] };
         }
-        const task = await createTask(args);
+        const task = await createTask({
+          ...args,
+          idempotency_key: args.idempotency_key,
+          actor: currentActor(),
+        });
         return {
           content: [
             { type: "text", text: `Task #${task.id} queued for ${task.platform} (priority ${task.priority}).` },
@@ -419,30 +432,72 @@ const handler = createMcpHandler(
         title: "Update task",
         annotations: WRITE_DESTRUCTIVE,
         description:
-          "Update a task you're working on: mark it running, done, or failed, and attach a result summary (and cost if known).",
+          "Update a task you're working on: mark it running, done, or failed, and attach a result summary (and cost if known). Pass dry_run true to preview the update, including a cancel, without writing.",
         inputSchema: {
           id: z.number().int(),
           status: z.enum(["running", "review", "done", "failed", "cancelled"]).optional(),
           result: z.string().optional().describe("What happened — 1-6 lines"),
           cost_usd: z.number().optional(),
           agent_id: z.string().optional().describe("Your agent id (for the activity feed)"),
+          dry_run: z.boolean().optional().describe("When true, return what would change and write nothing"),
         },
       },
-      async (args) => guardTool("update_task", async () => {
-        if (!isConfigured()) {
-          return { content: [{ type: "text", text: "Demo mode; task not updated." }] };
-        }
-        const task = await updateTask(args);
-        if (args.status && args.agent_id) {
-          await report({
-            agent_id: args.agent_id,
-            kind: args.status === "failed" ? "error" : "status",
-            title: `Task #${task.id} → ${args.status}: ${task.title}`,
-            detail: { task_id: task.id },
-          });
-        }
-        return { content: [{ type: "text", text: `Task #${task.id} updated (${task.status}).` }] };
-      }),
+      async (args) => guardTool("update_task", () => updateTaskForTool(args)),
+    );
+
+    // Skills tools. Keep this block contiguous and after update_task.
+    // run_skill is one tool with two phases. A second report_skill_done name
+    // would be the same row and the same actor check.
+    server.registerTool(
+      "list_skills",
+      {
+        title: "List skills",
+        description:
+          "List skills whose trigger is not off, whose scope admits the lane, and which are compatible with runtime when runtime is passed. With no runtime, incompatible skills are not hidden. With no lane, selected-lane skills are hidden. Trigger off is omitted. category is an exact case-insensitive match. Pass uncategorized for skills with no category. Each line includes category and tags.",
+        inputSchema: {
+          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional().describe("Caller runtime. Omit to skip the runtime filter."),
+          lane: z.string().optional().describe("Lane name. Required to see skills limited to selected lanes."),
+          query: z.string().optional().describe("Case-insensitive match on id and description."),
+          category: z.string().optional().describe("Exact category, case-insensitive. Pass uncategorized to list skills with no category."),
+        },
+      },
+      async (args) => guardTool("list_skills", () => listSkillsTool(args)),
+    );
+
+    server.registerTool(
+      "get_skill",
+      {
+        title: "Get skill",
+        description:
+          "Return the mirrored SKILL.md pinned to its content SHA, or one reference file when path is set. Never fetches the upstream repository. A skill whose trigger is off is not served.",
+        inputSchema: {
+          id: z.string().describe("Skill id."),
+          path: z.string().optional().describe("Reference path relative to the skill directory. Omit for SKILL.md."),
+          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional(),
+          lane: z.string().optional(),
+        },
+      },
+      async (args) => guardTool("get_skill", () => getSkillTool(args)),
+    );
+
+    server.registerTool(
+      "run_skill",
+      {
+        title: "Run skill",
+        description:
+          "Start or finish a skill run. The agent executes the instructions. Agent Kontrol only stores the start, the end, and an optional note. Omit run_id to start. id and runtime are required then. agent_id is optional: the recorded agent is the authenticated caller. Call again with that run_id and complete true to finish, and omit id. If you pass id on completion, it must match the skill on the run. Only the actor that started the run can finish it.",
+        inputSchema: {
+          id: z.string().optional().describe("Skill id. Required on start. Omit it on completion. If you pass it then, it must match the skill on the run."),
+          agent_id: z.string().optional().describe("Omit to use the authenticated caller. An agent credential or OAuth client may pass only that same id."),
+          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional().describe("Required on start. Caller hint for the rendered instructions, not an identity."),
+          lane: z.string().optional().describe("Caller hint. Required when the skill's scope is selected. Not an identity."),
+          run_id: z.string().optional().describe("Set with complete true to finish the run you started."),
+          complete: z.boolean().optional().describe("True finishes the run. Requires run_id."),
+          status: z.enum(["done", "failed"]).optional().describe("Completion outcome. Defaults to done."),
+          note: z.string().optional().describe("Optional note, at most 500 characters. Not a prompt or a tool log."),
+        },
+      },
+      async (args) => guardTool("run_skill", () => runSkillTool(args)),
     );
   },
   {},
@@ -511,8 +566,11 @@ function scopeDenied(body: { error: string; code: string; fix: string; retryable
 }
 
 /**
- * tools/call is checked here, before the tool runs. A body we cannot parse
- * is denied. initialize and the other non-tool methods are left to the handler.
+ * tools/call is checked here, before the tool runs. An empty body or a body
+ * that is not JSON is HTTP 400 invalid_json, so mcp-handler never sees a
+ * SyntaxError from req.json(). A JSON body that is not a tool call is left
+ * to the handler. Auth still runs first: a missing bearer is 401 with
+ * WWW-Authenticate and never reaches this function.
  */
 async function enforceMcpScope(req: Request): Promise<Response | null> {
   if (req.method !== "POST") return null;
@@ -520,19 +578,13 @@ async function enforceMcpScope(req: Request): Promise<Response | null> {
   try {
     text = await req.clone().text();
   } catch {
-    return scopeDenied(insufficientScopeBody(null));
+    return apiError("invalid_json");
   }
-  if (!text.trim()) return null;
-  const contentType = req.headers.get("content-type") ?? "";
-  const trimmed = text.trim();
-  const looksJson =
-    contentType.includes("json") || trimmed.startsWith("{") || trimmed.startsWith("[");
-  if (!looksJson) return null;
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    return scopeDenied(insufficientScopeBody(null));
+    return apiError("invalid_json");
   }
   const decision = evaluateMcpMessages(principalFromMcpAuth(req.auth), parsed);
   if (decision.ok) return null;
@@ -543,7 +595,9 @@ const authed = withMcpAuth(
   async (req) => {
     const denied = await enforceMcpScope(req);
     if (denied) return denied;
-    return handler(req);
+    const principal = principalFromMcpAuth(req.auth);
+    if (!principal) return handler(req);
+    return runWithActor(actorFromPrincipal(principal), () => handler(req));
   },
   verifyToken,
   {

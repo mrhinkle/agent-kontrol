@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
-import { enforceBearer } from "@/lib/auth";
+import { actorFromPrincipal } from "@/lib/actor";
+import { deny, resolveBearerAccess } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
+import { readIdempotencyHeader } from "@/lib/idempotency";
 import { replyFromAgent } from "@/lib/store";
 import { isMessagesSetupError, MESSAGES_SETUP_MESSAGE } from "@/lib/message-errors";
 
@@ -13,10 +15,12 @@ export const maxDuration = 30;
  * Non-MCP agents (hooks, watchers, scripts) post replies here with Bearer MC_TOKEN.
  *
  * Body: { agent_id, body, in_reply_to?, created_by? }
+ * Optional header Idempotency-Key. Same key, actor, and route return the
+ * original reply for 24 hours. After that window the key starts a new write.
  */
 export async function POST(req: Request) {
-  const denied = await enforceBearer(req);
-  if (denied) return denied;
+  const access = await resolveBearerAccess(req);
+  if (!access.ok) return deny(access);
   if (!isConfigured()) {
     return NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; reply dropped" });
   }
@@ -43,6 +47,8 @@ export async function POST(req: Request) {
       body: body.body.trim(),
       in_reply_to: body.in_reply_to,
       created_by: body.created_by,
+      actor: actorFromPrincipal(access.principal),
+      idempotency_key: readIdempotencyHeader(req),
     });
     return NextResponse.json({ ok: true, id: msg.id, message: msg });
   } catch (e) {

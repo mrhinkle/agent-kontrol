@@ -17,8 +17,8 @@ export type PublicDocName = keyof typeof PUBLIC_DOC_FILES;
 const PUBLIC_DOC_NAMES = new Set<string>(Object.keys(PUBLIC_DOC_FILES));
 
 /**
- * The 11 tools registered in src/app/api/[transport]/route.ts, in that order.
- * `reply_to_mark` is a deprecated alias and is not one of the 11.
+ * The 14 tools registered in src/app/api/[transport]/route.ts, in that order.
+ * `reply_to_mark` is a deprecated alias and is not one of the 14.
  */
 export const MCP_TOOL_NAMES = [
   "report_status",
@@ -32,6 +32,9 @@ export const MCP_TOOL_NAMES = [
   "get_task_queue",
   "claim_task",
   "update_task",
+  "list_skills",
+  "get_skill",
+  "run_skill",
 ] as const;
 
 export type PublicDocResult =
@@ -134,7 +137,7 @@ export function buildLlmsTxt(origin: string, mcpMarkdown: string): string {
     "",
     "## Tools",
     "",
-    "Eleven tools. Names are stable within 1.x.",
+    "Fourteen tools. Names are stable within 1.x.",
     "",
     toolList,
     "",

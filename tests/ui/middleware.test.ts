@@ -101,7 +101,7 @@ describe("middleware with a dashboard password", () => {
     env.MC_DASHBOARD_PASSWORD = "pw";
     env.NODE_ENV = "production";
     delete env.MC_TOKEN;
-    for (const path of ["/llms.txt", "/docs/mcp.md", "/docs/api.md", "/docs/agents.md", "/login", "/api/mcp", "/api/ingest"]) {
+    for (const path of ["/llms.txt", "/docs/mcp.md", "/docs/api.md", "/docs/agents.md", "/login", "/api/mcp", "/api/ingest", "/api/openapi.json"]) {
       assert.equal((await middleware(req(path))).status, 200, path);
     }
     assert.equal((await middleware(req("/llms.txt?from=agent"))).status, 200);

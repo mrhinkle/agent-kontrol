@@ -21,6 +21,9 @@ export const SCOPES = [
   "messages:read",
   "messages:write",
   "progress:read",
+  "decisions:write",
+  "skills:read",
+  "skills:write",
 ] as const;
 
 export type Scope = (typeof SCOPES)[number];
@@ -45,6 +48,9 @@ export const TOOL_SCOPES: Record<string, Scope> = {
   get_task_queue: "tasks:read",
   claim_task: "tasks:write",
   update_task: "tasks:write",
+  list_skills: "skills:read",
+  get_skill: "skills:read",
+  run_skill: "skills:write",
 };
 
 /**
@@ -56,6 +62,7 @@ const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   { method: "GET", path: /^\/api\/fleet$/, scope: "fleet:read" },
   { method: "POST", path: /^\/api\/ingest$/, scope: "status:write" },
   { method: "GET", path: /^\/api\/memory$/, scope: "memory:read" },
+  { method: "POST", path: /^\/api\/memory$/, scope: "memory:write" },
   { method: "GET", path: /^\/api\/messages$/, scope: "messages:read" },
   { method: "POST", path: /^\/api\/messages\/reply$/, scope: "messages:write" },
   { method: "GET", path: /^\/api\/progress$/, scope: "progress:read" },
@@ -64,13 +71,24 @@ const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   { method: "POST", path: /^\/api\/tasks$/, scope: "tasks:write" },
   { method: "POST", path: /^\/api\/tasks\/claim$/, scope: "tasks:write" },
   { method: "PATCH", path: /^\/api\/tasks\/[^/]+$/, scope: "tasks:write" },
+  // GET and POST stay off this table: the collector uses MC_TOKEN and the
+  // dashboard uses the session. An agent credential can change a decision
+  // only when it holds decisions:write.
+  { method: "PATCH", path: /^\/api\/decisions\/[^/]+$/, scope: "decisions:write" },
+  // GET only. PATCH, POST /api/skills/sync, and POST /api/skills/drift are
+  // operator routes: an agent must not be able to turn a skill on, sync, or
+  // file a drift report. The lookahead keeps those two paths off skills:read.
+  { method: "GET", path: /^\/api\/skills$/, scope: "skills:read" },
+  { method: "GET", path: /^\/api\/skills\/(?!sync$|drift$)[^/]+$/, scope: "skills:read" },
+  // Read-only: renders the pointer block, and POST only transforms the text sent.
+  { method: "POST", path: /^\/api\/skills\/pointers$/, scope: "skills:read" },
 ];
 
 export type Principal =
   | { kind: "legacy" }
   | { kind: "session" }
   | { kind: "dev-open" }
-  | { kind: "oauth" }
+  | { kind: "oauth"; id: string }
   | { kind: "agent"; id: string; scopes: readonly string[] };
 
 export type ScopeErrorBody = {
@@ -162,7 +180,11 @@ export function principalFromMcpAuth(auth: McpAuthShape | null | undefined): Pri
     };
   }
   if (auth.clientId === "mc-token" || kind === "legacy") return { kind: "legacy" };
-  if (extra && Object.prototype.hasOwnProperty.call(extra, "sub")) return { kind: "oauth" };
+  if (extra && Object.prototype.hasOwnProperty.call(extra, "sub")) {
+    const clientId = typeof auth.clientId === "string" ? auth.clientId : "";
+    const sub = typeof extra.sub === "string" ? extra.sub : "";
+    return { kind: "oauth", id: clientId || sub || "oauth" };
+  }
   return null;
 }
 

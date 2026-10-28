@@ -17,6 +17,8 @@ The `agent_credentials` table stores the label, the first 8 characters of the to
 | Route group | Accepted credentials |
 | --- | --- |
 | Dashboard UI and data routes (default) | Session cookie `mc_auth`, or `Authorization: Bearer <MC_TOKEN>` |
+| `GET` and `POST /api/decisions` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `decisions:write` |
+| `PATCH /api/decisions/:id` | Session cookie, `MC_TOKEN`, or an agent credential with `decisions:write` |
 | Ingest routes: `POST /api/v1/traces`, `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, `POST /api/usage/ingest` | `Authorization: Bearer <MC_TOKEN>`, or an agent credential whose scope covers the route (`status:write` for `POST /api/ingest`, `messages:write` for `POST /api/messages/reply`); the other ingest routes take `MC_TOKEN` only |
 | MCP transport: `/api/mcp` | `Authorization: Bearer <MC_TOKEN>`, an agent credential, or an OAuth access token (JWT) issued by this server |
 | Credential management: `GET`/`POST`/`DELETE /api/settings/credentials` | Dashboard session only |
@@ -35,6 +37,8 @@ If `MC_DASHBOARD_PASSWORD` is unset, the gate is open in local development and o
 
 ## Routes
 
+Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI 3.1). It covers the routes in this document. Adding a route under `src/app/api` without an entry fails `npm run test:ui`.
+
 "Cookie or bearer" below means the `mc_auth` session cookie or `Authorization: Bearer <MC_TOKEN>`.
 
 | Method | Path | Auth | Purpose |
@@ -42,6 +46,7 @@ If `MC_DASHBOARD_PASSWORD` is unset, the gate is open in local development and o
 | GET | `/api/fleet` | Cookie or bearer | Everything the dashboard needs in one call |
 | POST | `/api/ingest` | Bearer | Deterministic telemetry from hooks, watchers, and daemons |
 | GET | `/api/memory` | Cookie or bearer | Memory browser feed |
+| POST | `/api/memory` | Cookie or bearer | Store a note, or preview an overwrite with `dry_run` |
 | GET | `/api/messages` | Cookie or bearer | Agent pulls its inbound inbox, or the full conversation |
 | POST | `/api/messages` | Cookie or bearer | Operator enqueues an inbound message |
 | PATCH | `/api/messages` | Cookie or bearer | Operator marks outbound replies read |
@@ -49,6 +54,9 @@ If `MC_DASHBOARD_PASSWORD` is unset, the gate is open in local development and o
 | GET | `/api/progress` | Cookie or bearer | Everything the progress board needs |
 | GET | `/api/progress/digest` | Cookie or bearer | The board as plain text, for schedulers and terminals. A failure is the JSON error body, not plain text. |
 | POST | `/api/progress/ingest` | Bearer | One collection tick from `scripts/collect-progress.sh` |
+| GET | `/api/decisions` | Cookie or bearer | Decision queue, oldest first, each row with `age_days`. `shape=brief` is the morning-brief `.decisions` list |
+| POST | `/api/decisions` | Cookie or bearer | Upsert one decision, or reconcile a collector sweep |
+| PATCH | `/api/decisions/:id` | Cookie, bearer, or `decisions:write` | Record a decision, a deferral, or a withdrawal |
 | GET | `/api/settings/repos` | Cookie or bearer | The repos the progress board watches |
 | PUT | `/api/settings/repos` | Cookie or bearer | Replace the watched repos |
 | GET | `/api/settings/credentials` | Session only | List agent credentials. No token and no hash |
@@ -108,13 +116,15 @@ Invalid JSON answers `400`.
 
 `GET /api/memory?query=&tag=&limit=` is the memory browser feed. Default limit is 50.
 
+`POST /api/memory` stores a note the same way MCP `remember` does. Body: `content` (required string), optional `key`, `tags` (array of strings), `agent_id`, and `dry_run`. `dry_run: true` returns `{ "dry_run": true, "applied": false, "would_write", "action": "overwrite_memory" | "insert_memory", "changes", "affected" }` and writes nothing. `action` is `overwrite_memory` when the key already exists. A non-boolean `dry_run` is `400` and writes nothing. With no database, a dry run still describes the note and sets `would_write` to false. An agent credential needs `memory:write`.
+
 ### Messages
 
 - `GET /api/messages?agent_id=X&ack=true` — the agent pulls its inbound inbox; `ack` marks the messages read.
 - `GET /api/messages?agent_id=X&conversation=true` — full history for the agent.
-- `POST /api/messages` — body `{agent_id, body, created_by?}` — the operator enqueues an inbound message for the agent.
+- `POST /api/messages` — body `{agent_id, body, created_by?}` — the operator enqueues an inbound message for the agent. The server sets `actor_type` and `actor_id` from the authenticated credential (`human` / `operator` for a dashboard session). When `MC_DASHBOARD_PASSWORD` is unset and the request presents no credential, both fields are null. `created_by` is stored as a label and does not set those fields. Optional header `Idempotency-Key`. The same key, the same actor, the same route, and the same body return the original message for 24 hours and do not insert a second row during that window. After 24 hours the same key starts a new write. The same key with a different body answers `409` `idempotency_conflict`. A claim still inside its 30 second lease answers `409` with `retryable: true` and `Retry-After`, the same as `POST /api/tasks`. The key is scoped by actor and route. A blank header is the same as omitting it.
 - `PATCH /api/messages` — body `{agent_id}` — the operator marks outbound replies read.
-- `POST /api/messages/reply` — bearer `MC_TOKEN` only — body `{agent_id, body, in_reply_to?, created_by?}` — non-MCP agents post replies. `in_reply_to` is the id of the inbound message being answered.
+- `POST /api/messages/reply` — bearer `MC_TOKEN` or an agent credential with `messages:write` — body `{agent_id, body, in_reply_to?, created_by?}` — non-MCP agents post replies. `in_reply_to` is the id of the inbound message being answered. `actor_type` and `actor_id` are taken from the bearer, not from `created_by`. Optional header `Idempotency-Key`. The same key, the same actor, the same route, and the same body return the original reply for 24 hours and do not insert a second row during that window. After 24 hours the same key starts a new write. The same key with a different body answers `409` `idempotency_conflict`. A claim still inside its 30 second lease answers `409` with `retryable: true` and `Retry-After`, the same as `POST /api/tasks`. The key is scoped by actor and route.
 
 ### Tasks
 
@@ -132,10 +142,14 @@ Task statuses: `queued`, `claimed`, `running`, `review`, `done`, `failed`, `canc
 | `machine` | string | no | Pin the task to one machine's dispatcher. |
 | `priority` | int | no | 1 high, 2 normal (default), 3 low. |
 | `reviewer_platform` | string | no | `claude-code`, `codex`, or `grok`. A second platform reviews the work before done. |
-| `created_by` | string | no | Who created the task. |
+| `created_by` | string | no | Free-text label. It is stored and does not set the actor. |
+| `actor_type` | string | — | Response only. `human` or `agent`, from the authenticated credential. Null on older rows, and null when the local dashboard is open because `MC_DASHBOARD_PASSWORD` is unset and the request presented no credential. |
+| `actor_id` | string | — | Response only. Credential id, `mc-token`, the OAuth client id, or `operator` for a signed-in dashboard session. Null in the same cases as `actor_type`. |
+
+Optional header `Idempotency-Key`. The same key, the same actor, the same route, and the same body fields return the original task for 24 hours and do not insert a second row during that window. After 24 hours the same key starts a new write. The same key with different body fields answers `409` `idempotency_conflict`. While the first request is inside its 30 second lease, the same body answers `409` with `retryable: true`, a `Retry-After` header in seconds, and `retry_after` in the body. After that lease, the same key and the same arguments take over a claim that never stored a result and run the write once. The key is scoped by actor and route. Omit the header, or send it blank, to create a new task on every call. The key is not a body field.
 
 - `POST /api/tasks/claim` — body `{platform, machine?, agent_id}`. `platform` and `agent_id` are required; the request answers `400` otherwise. The claim is atomic: it returns the next queued task routed to the given platform (or to `any`), or `{task: null}` when there is none.
-- `PATCH /api/tasks/:id` — body `{status?, result?, cost_usd?, session_id?, assigned_agent?, agent_id?}`. Dispatchers use it to report progress and completion; the dashboard uses it to cancel or requeue tasks.
+- `PATCH /api/tasks/:id` — body `{status?, result?, cost_usd?, session_id?, assigned_agent?, agent_id?, dry_run?}`. Dispatchers use it to report progress and completion; the dashboard uses it to cancel or requeue tasks. `dry_run: true` returns the affected task and the field diff (`action` is `cancel_task` when status is `cancelled`) and does not update the row or write an activity event. A missing id is still `404`. A non-boolean `dry_run` is `400` and writes nothing.
 
 ### Progress
 
@@ -168,10 +182,36 @@ Each entry in `repos`:
 | `no_verdict_rate` | number | no | No-verdict rate. |
 | `detail` | object | no | `{lane_mix?, stalled_prs?, notes?}`. |
 
+### Decisions
+
+The morning brief's decisions list comes from this table when every brief-eligible row for that repo has `kind`, `labels`, `opened_at`, and `repo_short`. Those rows are `source` `github-label`, `status` not `withdrawn`, and `github_present` not `false` (a null `github_present` still counts as present). `repo` is `owner/name`. `repo_short` is the config short name and is display only. The brief joins a row onto a watched repo by `owner/name`, so two repos that share a short name do not both receive the row. `age_hours` drops fractional seconds before `Z`, subtracts the unix times, and divides by 3600. `age_days` is `floor(age_hours / 24)` from `opened_at` (GitHub `createdAt`). GitHub `createdAt` is stored as `opened_at` and, on insert only, as `first_seen_at`.
+
+A row created before those columns existed has them null. `shape=brief` does not treat that row as authoritative: it does not invent `kind: "issue"`, `labels: []`, an age from `first_seen_at`, or a `repo_short` from the repo basename. The response field `incomplete_repos` lists each `owner/name` with at least one such row. `scripts/morning-brief.sh` keeps the GitHub label sweep for those repos and still replaces every other watched repo from `decisions`. The collector's next upsert fills the null `kind`, `labels`, and `repo_short`, and fills a null `opened_at`. After that fill, the table replaces the sweep for that repo.
+
+`GET /api/decisions?status=open&repo=&source=&limit=&shape=row` lists rows oldest-first by `first_seen_at`. `status` defaults to `open`. `open` also includes `deferred` rows whose `defer_until` is at or before now. `all` or one of `open`, `decided`, `deferred`, `withdrawn` is allowed. `limit` defaults to 500 and maxes at 1000. Each row includes `age_days`. `shape` defaults to `row`. `shape=brief` ignores `status` and `source`. `decisions` is the morning-brief list from complete rows only: `source` `github-label`, `status` not `withdrawn`, `github_present` not `false`, `number` set, and `kind`, `labels`, `opened_at`, and `repo_short` all set, oldest first. `incomplete_repos` is the repos with a brief-eligible row missing any of those four. `repo` and `limit` still apply to both. `scripts/morning-brief.sh` calls `GET /api/decisions?shape=brief&limit=1000` when `MC_URL` and `MC_TOKEN` are set. It replaces a watched repo's decisions from `decisions`, including when that repo's list is empty, and leaves a repo in `incomplete_repos` on the GitHub sweep. A failed call keeps the GitHub sweep for every repo. With a database the body is `{ "demo": false, "decisions": [...], "incomplete_repos": [...] }`.
+
+`POST /api/decisions` upserts by `key`. Required: `key`, `source`, `title`. Optional: `repo` (`owner/name`), `repo_short`, `number`, `url`, `why`, `options`, `recommended`, `requested_by`, `kind` (`issue` or `pr`), `labels`, `opened_at`, `first_seen_at`, `github_present`, `force`. A later upsert refreshes `title` and `last_seen_at`. It fills a null `kind`, `labels`, or `repo_short`, and fills a null `opened_at`. It does not overwrite an `opened_at` or `first_seen_at` that is already set, or an existing `requested_by`. A `github-label` upsert that omits `github_present` stores `true`.
+
+Status on that upsert:
+
+- A new key is `open`.
+- `decided` and `deferred` stay as they are. The answer text is left in place. The response includes `status_held: true`.
+- `force: true` reopens a `decided` or `deferred` row to `open` and clears `decision`, `decided_by`, `decided_at`, and `defer_until`.
+- `withdrawn` returns to `open` on an ordinary upsert, without `force`.
+- A body field `status` is not how a row becomes `decided`. That is `PATCH`.
+
+The other POST shape is `{ "reconcile": { "repo", "source", "seen_keys" } }`. It is mutually exclusive with `key`. `source` defaults to `github-label`. `seen_keys` may be empty and each key must start with `github:<repo>#`. For that repo and source, keys absent from `seen_keys` are updated and `last_seen_at` is not bumped. An absent key is an issue or PR that closed or lost the label. `open`, `deferred`, and `decided` become `withdrawn`. `defer_until` is cleared on `open` and `deferred`. `decision`, `decided_by`, and `decided_at` stay on a decided row. `github_present` becomes false. A row already `withdrawn` with `github_present` false is left alone. The response is `{ "ok": true, "reconciled", "withdrawn" }`.
+
+`scripts/collect-progress.sh` POSTs one row per open issue or PR that carries a label in `brief.decisionLabels` (`key` `github:<repo>#<n>`, `source` `github-label`, `why` the matching labels joined with `", "`, `kind` `pr` when `gh` returned `isDraft`, `labels` the matching names, `opened_at` GitHub `createdAt`, `repo_short` the config short name). That POST is what backfills a legacy null `kind`, `labels`, `opened_at`, or `repo_short`. It then reconciles. It does not reconcile when `decisionLabels` is empty, when `gh` fails, when the issue list is longer than 2000 or the PR list is longer than 500, or when any upsert failed. `--backfill` does not sync decisions. `--dry-run` prints the decision JSON to stderr and does not POST, so stdout stays the progress payload.
+
+`PATCH /api/decisions/:id` body is `{ "status"?, "decision"?, "decided_by"?, "defer_until"? }` with at least one of those fields. `id` is a positive integer. `status` is one of the four. `decided` requires non-empty `decision` text and sets `decided_at` to now. `deferred` requires `defer_until` as an ISO timestamp. `open` clears `decision`, `decided_by`, `decided_at`, and `defer_until`. `withdrawn` sets `github_present` false. `decided_by` is a body field. The route does not take it from the credential. An unknown id, when a database is connected, is `404` `not_found` with `error` `Decision not found`. This PATCH only records the row. Commenting on the GitHub issue and removing the label is issue #65, not this route.
+
+Demo mode (no `DATABASE_URL`), after the body validates: `GET` returns `{ "demo": true, "decisions": [] }`. `POST` returns `{ "ok": true, "demo": true, "note": "DATABASE_URL not set; decision dropped" }`. `PATCH` returns `{ "ok": true, "demo": true }`.
+
 ### Settings
 
 - `GET /api/settings/repos` returns `{ "source": "database" | "file", "writable": true, "max": 25, "version": "...", "repos": [{ "repo", "label", "short", "color", "blockedLabel" }] }`. `source` is `file` when no list has been saved yet, or when there is no database; `repos` is then the default from `progress.config.json`. The collector calls this on every tick.
-- `PUT /api/settings/repos` with `{ "repos": [...], "version": "..." }` replaces the whole list, in order, and returns the stored list in the same shape. `version` is optional; send the one from your last GET and the save is refused with `409 { "code": "stale" }` if someone changed the list since, so two open tabs cannot overwrite each other. The replace is a single SQL statement, so a failed save leaves the old list intact. It answers `400` with `errors: [{ "index", "field", "message" }]` when invalid (`index` is `-1` for an error about the whole list), and `409` with `code` `conflict` when no database is connected. Those bodies also include `error` (a string), `fix`, `retryable`, and `fields`. The `errors` array and `code: "stale"` stay. A list needs 1 to 25 repos, each `owner/name`, with a unique short name and a `#rrggbb` color.
+- `PUT /api/settings/repos` with `{ "repos": [...], "version": "...", "dry_run": true }` replaces the whole list, in order, and returns the stored list in the same shape. `version` is optional; send the one from your last GET and the save is refused with `409 { "code": "stale" }` if someone changed the list since, so two open tabs cannot overwrite each other. The replace is a single SQL statement, so a failed save leaves the old list intact. It answers `400` with `errors: [{ "index", "field", "message" }]` when invalid (`index` is `-1` for an error about the whole list), and `409` with `code` `conflict` when no database is connected. Those bodies also include `error` (a string), `fix`, `retryable`, and `fields`. The `errors` array and `code: "stale"` stay. A list needs 1 to 25 repos, each `owner/name`, with a unique short name and a `#rrggbb` color. `dry_run: true` returns the diff against the list GET would show (`changes` for adds, removes, updates, and reorders) and writes nothing. A stale `version` is still `409`. With no database, a dry run returns that diff with `would_write: false` instead of `409`. A non-boolean `dry_run` is `400` and writes nothing.
 
 Anyone with a dashboard session or `MC_TOKEN` can change this list, which matches the rest of the trust model (see [SECURITY.md](../SECURITY.md)). An agent credential cannot.
 
@@ -226,12 +266,14 @@ OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this sha
 | `insufficient_scope` | 403 | no | An agent credential is valid but lacks the scope for the tool or route. |
 | `credential_store_unavailable` | 503 | yes | An `akc_` credential was presented and the credential store could not be read. Not a revocation; retry. Its body is `{ "error": "credential_store_unavailable" }` only. |
 | `forbidden` | 403 | no | `POST /api/messages/reply` when `in_reply_to` names a message that belongs to a different agent. |
-| `not_found` | 404 | no | Unknown trace id on `GET /api/traces/:traceId` when a database is connected (demo mode returns 200 and an empty `spans` list), or `POST /api/messages/reply` when `in_reply_to` names a message that does not exist. |
-| `validation_failed` | 400 | no | A field is present but not usable: a bad `before` on `GET /api/traces`, a bad `since` and `until` pair on `GET /api/usage` (a `since` without `until` is ignored), a bad `collected_at` on usage or progress ingest, a bad task or trace id, a privacy refusal, or an OTLP body the parser rejected. |
-| `invalid_json` | 400 | no | The body is not JSON. On `POST /api/login` the `error` string stays `invalid request`. |
+| `identity_mismatch` | 403 | no | MCP `run_skill` when an agent credential or an OAuth client passes an `agent_id` other than the authenticated id. The call writes no run. Omit `agent_id`, or pass that id. |
+| `not_found` | 404 | no | Unknown trace id on `GET /api/traces/:traceId` when a database is connected (demo mode returns 200 and an empty `spans` list), `POST /api/messages/reply` when `in_reply_to` names a message that does not exist, or `PATCH /api/decisions/:id` when a database is connected and that id does not exist (`error` stays `Decision not found`). Demo mode does not look the decision id up. |
+| `validation_failed` | 400 | no | A field is present but not usable: a bad `before` on `GET /api/traces`, a bad `since` and `until` pair on `GET /api/usage` (a `since` without `until` is ignored), a bad `collected_at` on usage or progress ingest, a bad task, trace, or decision id, a decision body or `status` the parser rejected, a privacy refusal, an OTLP body the parser rejected, or an idempotency key longer than 200 characters or containing a control character. |
+| `invalid_json` | 400 | no | The body is not JSON. On `POST /api/login` the `error` string stays `invalid request`. On `POST /api/mcp` an empty or non-JSON body uses this code and `error` `invalid JSON`. A missing bearer on that route is still `401` with `WWW-Authenticate`. |
 | `missing_field` | 400 | no | A required field is absent. `fields` names it. |
 | `rate_limited` | 429 | yes | More than 5 `POST /api/login` attempts in 10 minutes from one client IP. `Retry-After` is seconds. The OAuth consent form shares this limiter and answers with HTML, not this JSON. |
 | `conflict` | 409 | no | `PUT /api/settings/repos` when no database is connected. |
+| `idempotency_conflict` | 409 | no | `POST /api/tasks`, `POST /api/messages`, or `POST /api/messages/reply` reused an `Idempotency-Key` with different arguments, or the first request with that key is still inside its 30 second lease. MCP `create_task` and `reply_to_operator` (and its `reply_to_mark` alias) return the same code. The same key, the same actor, the same route, and the same arguments return the original result for 24 hours. Different arguments stay `retryable: false`. While the first request is inside its 30 second lease, the same arguments are `retryable: true` and the response carries `Retry-After` in seconds plus `retry_after` in the body. After that lease, the same key and the same arguments take over a claim that never stored a result and run the write once. A claim insert whose result is lost is re-read, and the write runs once when this attempt owns the claim. The resource insert and the stored response commit in one statement, and that insert runs only while this attempt's claim token still matches. A committed write therefore has a stored response. A retry returns that response and does not insert another row while the claim is inside its 24 hour window. A caller that dies before reading the response gets the same row on retry. After that window the same key starts a new write. The key is scoped by actor and route. |
 | `stale` | 409 | no | `PUT /api/settings/repos` when `version` does not match the list currently stored. |
 | `task_not_found` | 404 | no | `PATCH /api/tasks/:id` or MCP `update_task` when a database is connected and that id does not exist. `error` stays `Task not found`. Demo mode does not look the id up. |
 | `task_not_claimable` | 409 | no | Defined, not returned. See above. |
@@ -249,8 +291,8 @@ OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this sha
 With no `DATABASE_URL` set (demo mode):
 
 - The auth gate is open.
-- GET routes return demo data, usually with `demo: true` in the response.
-- Ingest routes answer `{"ok": true, "demo": true}` and drop the data.
+- GET routes return demo data, usually with `demo: true` in the response. `GET /api/decisions` returns `{ "demo": true, "decisions": [] }`.
+- Ingest routes answer `{"ok": true, "demo": true}` and drop the data. `POST /api/decisions` does the same and adds `note`. `PATCH /api/decisions/:id` answers `{ "ok": true, "demo": true }` and does not look the id up.
 
 ## Versioning
 
