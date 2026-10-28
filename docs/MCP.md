@@ -389,7 +389,7 @@ With no database, GET returns `demo: true` and a fixture list. PATCH, sync, and 
 
 ### Sync
 
-`POST /api/skills/sync` with an empty body, or `{"trigger":"manual"}`, runs a manual sync. A scheduler uses the same route. This repository does not register a Vercel cron for it.
+`POST /api/skills/sync` with an empty body, or `{"trigger":"manual"}`, runs a manual sync. A scheduler uses the same route. This repository does not register a Vercel cron for it. Scheduled skills have their own tick; see Scheduled skills below.
 
 ```sh
 curl -s -X POST https://YOUR-DEPLOY.vercel.app/api/skills/sync \
@@ -406,7 +406,34 @@ An id that appears in more than one source is kept by the earlier source (`posit
 
 `status: "failed"` means a source was not fetched, a SKILL.md could not be parsed, or a SKILL.md could not be read. Rows that were written are still listed in `added` and `changed`. A parse problem is not a written row: the existing skill stays out of `added`, `changed`, and `removed`, and a new skill is absent. A conflict, a skipped reference, or an ignored runtime name does not by itself fail the run. Unreadable frontmatter is not stored and is not treated as compatible with every runtime.
 
-`trigger: "scheduled"` stores the cron expression. Nothing in this change runs that cron. An external scheduler has to call the sync route, and a skill schedule is not a sync.
+### Scheduled skills
+
+`trigger: "scheduled"` stores a five-field cron, read in UTC. Agent Kontrol does not run the skill. It queues a task, and a connected agent claims that task and calls `run_skill` as usual.
+
+`POST /api/skills/schedule/tick` is the tick. It is an operator route: `MC_TOKEN` or the dashboard session, never an agent credential, and `skills:write` does not help. The body is ignored. This repository deploys on Fly and registers no Vercel cron, so an external scheduler calls the route every minute, the same way it calls the sync route:
+
+```bash
+curl -s -X POST https://YOUR-DEPLOY.example/api/skills/schedule/tick \
+  -H "Authorization: Bearer $MC_TOKEN"
+```
+
+On each tick, for every skill whose trigger is `scheduled`, whose skill row is not removed, and whose cron has a due minute in the last `AK_SKILL_SCHEDULE_CATCHUP_MINUTES` minutes (default 10, allowed 1 to 1440), it queues one task:
+
+- Title `Run scheduled skill <id>`. The description names the skill, the scope (all lanes, or the selected lanes), the due slot (`Scheduled slot: 2026-10-27T12:10Z`), the compatible runtimes, and the three `run_skill` steps. The task is created by the actor `skill-scheduler`, not by the caller of the route.
+- Routing follows the skill's runtime flags. A skill compatible with exactly one of `claude`, `codex`, `grok`, or `hermes` gets that platform (`claude-code`, `codex`, `grok`, `hermes`). Any other skill gets platform `any`, and the description lists the runtimes so a worker that is not listed leaves it. A skill compatible with only `mini` is also platform `any`, and is pinned to the machine in `AK_SKILL_MINI_MACHINE` when that is set. A skill with no compatible runtime is skipped as `no_runtime`.
+- The task carries the idempotency key `skill-schedule:<id>:<slot>`, so two ticks for the same minute, from any caller, make one task.
+
+A tick queues nothing for a skill when:
+
+- `previous_open`: its previous scheduled task is still `queued`, `claimed`, `running`, or `review`. A task that never finishes blocks the skill until someone cancels or completes it.
+- `already_scheduled`: the newest scheduled task is for this slot or a later one, whatever its status.
+- `duplicate`: a concurrent tick holds the key for this slot, or queued a task for the same skill at a different slot first. The unique index `tasks_skill_schedule_one_open_idx` allows one open scheduler task per skill, so a racing insert fails and nothing is queued twice.
+
+Due minutes since the skill's previous scheduled task that no task covers are not queued one by one. A skill's first task has no previous task, so it reports none. The next task covers them, says how many there were, and the tick reports the count as `missed`. `missed` counts at most the last 7 days. A due minute older than the catch-up window is not replayed. There is no table for this: the slot in the task description is the record, and the scheduler matches only tasks written by the `skill-scheduler` actor, so an agent cannot block or fake a slot by creating a task with the same title.
+
+The response is `{ ok, now, scheduled, queued, skipped, items }`. `scheduled` counts skills with a valid cron. Each item is `{ skill_id, slot, outcome: "queued" | "skipped", reason?, task_id?, missed? }`. A skill that is not due has no item. With no database the response is `{ ok: true, demo: true, note }` and nothing is queued.
+
+`GET /api/skills` and `GET /api/skills/:id` carry two additional fields on each skill, both ISO strings or `null`: `lastScheduledAt`, the newest slot the scheduler queued, and `nextDueAt`, the next due minute for a scheduled skill (null if the cron never matches, such as `0 0 31 2 *`; the search looks 8 years ahead). Existing fields are unchanged. Run history stays in `lastRun` and `triggers`; a scheduled run appears there only after an agent calls `run_skill`.
 
 ### Drift
 
@@ -417,6 +444,43 @@ The server cannot read the operator's machine. A collector posts:
 ```
 
 `name` is the skill id. `sha` is the content SHA above. The directories a collector may report are `~/.codex/skills` and `~/.agents/skills`. `AK_SKILL_DRIFT_DIRS` replaces that list, comma-separated. Any other `dir` is HTTP 400. The server does not open those paths. An empty `skills` array means the directory was read and was empty. A collector that failed to read the directory must not post an empty list. That would look like every mirrored skill was missing.
+
+#### The drift collector
+
+`scripts/collect-skills-drift.mjs` is that collector. It is one file, needs Node 18 or newer, and has no dependencies, so it runs on a machine with no checkout of this repository.
+
+```sh
+# Copy it to a machine (laptop or the Mac Mini)
+mkdir -p ~/.mission-control && cp scripts/collect-skills-drift.mjs ~/.mission-control/   # or: scp scripts/collect-skills-drift.mjs mac-mini:.mission-control/
+
+# See what it would post. Needs no token and sends nothing.
+node ~/.mission-control/collect-skills-drift.mjs --dry-run
+
+# Post for real
+MC_URL=https://YOUR-DEPLOY.vercel.app MC_TOKEN=... node ~/.mission-control/collect-skills-drift.mjs
+```
+
+It reads `<dir>/<name>/SKILL.md` for each directory, follows one level of symlink to a directory, skips names that start with `.` (such as `.system`), hashes the raw bytes with SHA-256, and posts one report per directory. `MC_URL` and `MC_TOKEN` come from the environment only. The script does not read the token from arguments or from a file, and it never prints it or any server response text. `MC_URL` must be https, except for localhost. The `host` it reports is `--machine NAME`, then `AK_MACHINE`, then the hostname. The directories are `AK_SKILL_DRIFT_DIRS` (the same variable the server reads), otherwise the two defaults. Each is posted as written (spaces around the commas are trimmed), so it must match the server's list.
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| 0 | Every existing directory was read and posted (with `--dry-run`, read and printed). A directory that does not exist is skipped with a notice. |
+| 1 | A post failed (network error or non-2xx). |
+| 2 | A directory exists but could not be read or enumerated, including one unreadable or dangling `SKILL.md`. Nothing is posted for that directory. The other directories are still posted. |
+| 3 | Configuration error, or every configured directory is missing, so nothing was reported. |
+
+A directory that exists and is readable but holds no skills posts an empty list. A skill whose name the server would reject (not `[A-Za-z0-9][A-Za-z0-9._-]{0,80}`) is skipped with a warning. Running it twice posts identical bodies.
+
+On macOS, `scripts/install-skills-drift.sh` sets up the schedule. It copies the collector to `~/.mission-control/`, adds `MC_URL` and `MC_TOKEN` to `~/.claude/mission-control.env` if they are missing (created mode 600, other lines kept), writes `~/.mission-control/run-skills-drift.sh`, and loads an hourly launchd job at `~/Library/LaunchAgents/com.missioncontrol.skills-drift.plist`. The wrapper reads `MC_URL` and `MC_TOKEN` from the env file as literal `KEY=value` lines (nothing in the file is executed), then runs the collector. The plist holds no secret. `AK_MACHINE` and `AK_SKILL_DRIFT_DIRS` set when you run the installer go into the plist. `MC_SKILLS_DRIFT_INTERVAL` sets the seconds between runs. Run it from a checkout, or copy `install-skills-drift.sh` and `collect-skills-drift.mjs` together to the machine. `--uninstall` removes the job and leaves the files.
+
+```sh
+MC_URL=https://YOUR-DEPLOY.vercel.app MC_TOKEN=... ./scripts/install-skills-drift.sh
+tail ~/Library/Logs/mc-skills-drift.log   # a non-zero exit is logged here
+```
+
+From cron, call the same wrapper: `17 * * * * $HOME/.mission-control/run-skills-drift.sh >> $HOME/Library/Logs/mc-skills-drift.log 2>&1`. A token or URL must be a single line.
 
 `missing` is in the mirror and not in the report. `extra` is in the report and not in the mirror. `differs` is both, with different content SHAs. The POST response is `{ ok, host, dir, missing, extra, differs, driftCount }`. `driftCount` there is the number of rows in those three lists for this report. `upstream.driftCount` on `GET /api/skills` is the number of distinct skill names that disagree in any stored report. The same name on two hosts counts once.
 
@@ -432,4 +496,29 @@ Limits:
 
 `AK_SKILL_STALL_MINUTES` is the stall window. The default is 60. A non-integer, a value below 1, or a value above 10080 falls back to 60, so a bad setting does not hide stalls. More than three stalled runs roll into one `skillStalled` alert. The id starts with `skill-stalled:`.
 
-`renderLaneSkillPointers` builds the AGENTS.md block for skills whose trigger is `auto_inject`, which match the runtime, and whose scope admits the lane. Dispatch is not wired to it. The block is ordered by id and wrapped in `<!-- ak-skills:begin -->` and `<!-- ak-skills:end -->`. No matching skill returns an empty string, with no markers.
+`renderLaneSkillPointers` builds the AGENTS.md block for skills whose trigger is `auto_inject`, which match the runtime, and whose scope admits the lane. The block is ordered by id and wrapped in `<!-- ak-skills:begin -->` and `<!-- ak-skills:end -->`. No matching skill returns an empty string, with no markers.
+
+#### Dispatch and AGENTS.md
+
+What is wired: two read routes and a pure helper. What is not: no Agent Kontrol process opens a repo or writes an AGENTS.md. `agents/dispatcher/mc_dispatcher.py` does not call these routes. The Grok and Codex lane dispatcher lives outside this repo, so it has to make the call.
+
+- `GET /api/skills/pointers?lane=&runtime=&format=json|text` returns the block. `lane` and `runtime` are required. JSON is `{ demo, lane, runtime, empty, block }`. `format=text` returns the block as `text/plain`, or an empty body when nothing matches. Agent credentials need `skills:read`.
+- `POST /api/skills/pointers` takes `{ lane, runtime, agents_md }` and returns `{ demo, lane, runtime, empty, changed, content }`. `content` is the file text with the block inserted at the end, replaced in place, or removed when `empty` is true. Text outside the markers is untouched, CRLF files stay CRLF, and a second run reports `changed: false`. Duplicate blocks collapse into one. `agents_md` omitted or null means the file does not exist: `content` is null when there is nothing to write. A begin marker without an end, an end without a begin, or a nested begin is HTTP 400. The route stores nothing and writes no file. The same needs `skills:read`.
+- `applyPointerBlock(content, block)` in `src/lib/skills/agents-md.ts` is the helper behind POST.
+
+A dispatcher runs this in the target repo before the lane starts. It needs `jq`, `curl`, and `MC_URL`/`MC_TOKEN`. Use the lane name the skill scopes use and the runtime that will read the file. It stops without touching the file if the file exists and cannot be read, if the call fails, or if the server answers with an error:
+
+```bash
+f=AGENTS.md
+if [ -L "$f" ]; then f=$(readlink -f -- "$f") || exit 1; fi
+if [ -e "$f" ]; then req=$(jq -Rs --arg l "$LANE" --arg r "$RUNTIME" '{lane:$l,runtime:$r,agents_md:.}' "$f") || exit 1
+else req=$(jq -n --arg l "$LANE" --arg r "$RUNTIME" '{lane:$l,runtime:$r}'); fi
+res=$(curl -fsS -X POST "$MC_URL/api/skills/pointers" -H "Authorization: Bearer $MC_TOKEN" -H 'Content-Type: application/json' -d "$req") || exit 1
+if [ "$(jq -r '.changed' <<<"$res")" = true ]; then
+  tmp=$(mktemp "$(dirname "$f")/.agents-md.XXXXXX") || exit 1
+  jq -j '.content // empty' <<<"$res" > "$tmp" && cat "$tmp" > "$f" || { rm -f "$tmp"; exit 1; }
+  rm -f "$tmp"
+fi
+```
+
+The file is written only when `changed` is true, and it is built in a `mktemp` file first and then copied over the target, so a symlink and the file mode are kept. If the call fails the file is left as it was, so a lane still starts without pointers. Do not commit the result: the block is per-lane and belongs in the working tree.

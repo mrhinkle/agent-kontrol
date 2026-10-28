@@ -7,9 +7,9 @@ import { isRuntime, type Runtime, type SkillScope, type Trigger } from "./types"
 
 /**
  * Pointer block for a lane's AGENTS.md.
- * Dispatch is not wired here. An empty result is "" with no markers, so a
- * caller that already has a block should delete from the begin marker through
- * the end marker when this returns "".
+ * An empty result is "" with no markers. applyPointerBlock (agents-md.ts)
+ * inserts, replaces, or removes the block in a file; GET/POST
+ * /api/skills/pointers expose both to a dispatcher outside this repo.
  */
 
 export interface PointerSkill {

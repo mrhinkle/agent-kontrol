@@ -233,6 +233,10 @@ export interface SkillListItem {
   scope: SkillScope;
   triggerCount7d: number;
   lastRun: { at: string; agent: string } | null;
+  /** The newest slot the scheduler queued a task for. Null when the scheduler has not queued one. */
+  lastScheduledAt?: string | null;
+  /** The next minute the schedule is due, UTC. Null unless trigger is scheduled with a valid cron. */
+  nextDueAt?: string | null;
 }
 
 export interface SkillTriggerView {
