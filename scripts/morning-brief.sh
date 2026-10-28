@@ -91,11 +91,32 @@ filter_work_kinds() {
   printf '%s' "$filtered"
 }
 # end filter_work_kinds
-COORD_WORK_KINDS="$(cfg '.brief.coordinator.workKinds')"
-if [[ -n "$COORD_WORK_KINDS" ]]; then
-  COORD_WORK_KINDS="$(filter_work_kinds "$COORD_WORK_KINDS")"
-fi
-COORD_WORK_KINDS="${COORD_WORK_KINDS:-session_end|milestone|status}"
+# BEGIN read_work_kinds
+# Same two forms as readBriefSettings: a pipe-delimited string, or a JSON array
+# of strings. Array elements are not trimmed and are not split on |. Empty
+# after the never-work filter is the default three.
+read_work_kinds() {
+  local raw="$1" filtered="" kind
+  if [[ "$raw" == \[* ]] && jq -e 'type == "array"' >/dev/null 2>&1 <<<"$raw"; then
+    while IFS= read -r kind || [[ -n "$kind" ]]; do
+      case "$kind" in
+        ""|heartbeat|telemetry|turn_start|status_update|error) ;;
+        *) filtered="${filtered:+$filtered|}$kind" ;;
+      esac
+    done < <(jq -r '.[] | select(type == "string" and length > 0)' <<<"$raw")
+  else
+    filtered="$(filter_work_kinds "$raw")"
+  fi
+  printf '%s' "${filtered:-session_end|milestone|status}"
+}
+# END read_work_kinds
+COORD_WORK_KINDS_RAW="$(jq -r '
+  .brief.coordinator.workKinds
+  | if type == "array" then @json
+    elif type == "string" then .
+    else empty end
+' "$CONFIG_FILE")"
+COORD_WORK_KINDS="$(read_work_kinds "$COORD_WORK_KINDS_RAW")"
 DECISION_LABELS_JSON="$(jq -c '.brief.decisionLabels // []' "$CONFIG_FILE")"
 
 # BSD date (macOS) and GNU date both understood.

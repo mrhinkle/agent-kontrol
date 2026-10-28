@@ -17,7 +17,7 @@ import {
   type BriefStuckPr,
   type MorningBrief,
 } from "../../src/lib/brief";
-import type { BriefDecision } from "../../src/lib/decisions";
+import { partitionBrief, type BriefDecision, type Decision } from "../../src/lib/decisions";
 import { createCredential, resetCredentialsForTests } from "../../src/lib/credentials";
 import { setSqlForTests, type Row } from "../../src/lib/db";
 import { readBriefSettings } from "../../src/lib/progress-config";
@@ -1712,6 +1712,220 @@ describe("GET /api/brief", { concurrency: false }, () => {
     assert.equal(absent.merged_list?.[0]?.number, 1);
     assert.equal(absent.median_lead_hours, 99);
   });
+
+  it("a held legacy decisions row is unmeasured when the server has no sweep", () => {
+    const now = "2026-10-27T12:00:00Z";
+    const clock = { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] };
+    const cfg = { repo: "acme/app", label: "Acme", short: "app", blockedLabel: null };
+    const snap: RepoSnapshot = {
+      repo: "acme/app",
+      label: "Acme",
+      collected_at: now,
+      kind: "tick",
+      open_issues: 4,
+      open_prs: 1,
+      blocked_issues: 0,
+      merged_prs_24h: 2,
+      issues_closed_24h: 1,
+      issues_opened_24h: 3,
+      total_issues_created: 10,
+      total_issues_closed: 6,
+      total_prs_merged: 5,
+      review_rounds: null,
+      no_verdict_rate: null,
+      detail: { stuck_prs: [], merged: [] },
+    };
+    const complete = repoSection({ cfg, snap, baseline: null, windowHours: 24, nowIso: now });
+    assert.equal(complete.incomplete, false);
+    assert.equal(complete.merged_prs, 2);
+
+    for (const field of ["kind", "labels", "opened_at", "repo_short"] as const) {
+      const legacy = legacyDecision({ [field]: null });
+      const part = partitionBrief([legacy], now);
+      assert.deepEqual(part.incomplete_repos, ["acme/app"], field);
+      assert.deepEqual(part.decisions, [], field);
+      const joined = applyTableDecisions([complete], part.decisions, part.incomplete_repos);
+      assert.equal(joined[0].decisions, null, field);
+      assert.equal(joined[0].incomplete, false, field);
+      assert.equal(joined[0].merged_prs, 2, field);
+      assert.ok(joined[0].errors.includes("decisions incomplete"), field);
+      const brief = assembleBrief({
+        generatedAt: now,
+        windowHours: 24,
+        repoSource: "dashboard",
+        stuckPrHours: 48,
+        staleIssueDays: 21,
+        coordinator: { configured: false, agent_id: null },
+        repos: joined,
+      });
+      assert.equal(brief.totals.decisions, null, field);
+      assert.equal(brief.totals.merged_prs, 2, field);
+      assert.equal(brief.totals.stuck_prs, 0, field);
+      assert.ok(
+        brief.incomplete_repos.some((row) => row.repo === "acme/app" && row.errors.includes("decisions incomplete")),
+        field,
+      );
+      const text = formatBriefText(brief, clock);
+      assert.match(text, /DECISIONS FOR YOU: DATA INCOMPLETE\./, field);
+      assert.equal(text.includes("DECISIONS FOR YOU: none open."), false, field);
+      assert.equal(text.includes("Fleet totals stay unknown"), false, field);
+      assert.equal(/\bnull\b/.test(text), false, field);
+    }
+
+    const swept = section({
+      repo: "acme/app",
+      short: "app",
+      label: "Acme",
+      merged_prs: 2,
+      decisions: [decision("acme/app", 9, 50, "github sweep")],
+    });
+    const kept = applyTableDecisions([swept], [], ["acme/app"]);
+    assert.deepEqual(kept[0].decisions?.map((row) => row.number), [9]);
+    assert.equal(kept[0].errors.includes("decisions incomplete"), false);
+
+    const emptySweep = section({ repo: "acme/app", short: "app", label: "Acme", decisions: [] });
+    const keptEmpty = applyTableDecisions([emptySweep], [], ["acme/app"]);
+    assert.deepEqual(keptEmpty[0].decisions, []);
+    assert.equal(keptEmpty[0].errors.includes("decisions incomplete"), false);
+
+    const measured = applyTableDecisions([complete], [], []);
+    assert.deepEqual(measured[0].decisions, []);
+    assert.equal(measured[0].errors.includes("decisions incomplete"), false);
+    const none = assembleBrief({
+      generatedAt: now,
+      windowHours: 24,
+      repoSource: "dashboard",
+      stuckPrHours: 48,
+      staleIssueDays: 21,
+      coordinator: { configured: false, agent_id: null },
+      repos: measured,
+    });
+    assert.equal(none.totals.decisions, 0);
+    assert.deepEqual(none.incomplete_repos, []);
+    assert.match(formatBriefText(none, clock), /DECISIONS FOR YOU: none open\./);
+  });
+
+  it("a missing decisions relation or a failed decisions query is not an empty list", async () => {
+    const now = new Date("2026-10-27T12:00:00Z");
+    const clock = { clock: "Tue 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] };
+    const repo = "example-org/app-server";
+    const other = "example-org/web-studio";
+    const snapshots = [repo, other, "example-org/agent-harness"].map((name, index) => snapshotRow({
+      repo: name,
+      label: name,
+      collected_at: "2026-10-27T14:00:00.000Z",
+      open_issues: 3,
+      open_prs: 1,
+      merged_prs_24h: index === 0 ? 2 : 0,
+      issues_opened_24h: 1,
+      issues_closed_24h: 1,
+      detail: { stuck_prs: [], merged: [] },
+    }));
+    const legacy = {
+      id: 4,
+      key: `github:${repo}#4`,
+      source: "github-label",
+      repo,
+      repo_short: null,
+      number: 4,
+      url: `https://example.test/${repo}/issues/4`,
+      title: "legacy gate",
+      status: "open",
+      kind: null,
+      labels: null,
+      opened_at: null,
+      github_present: true,
+    };
+    const known = {
+      id: 8,
+      key: `github:${other}#8`,
+      source: "github-label",
+      repo: other,
+      repo_short: "web",
+      number: 8,
+      url: `https://example.test/${other}/issues/8`,
+      title: "needs a call",
+      status: "open",
+      kind: "issue",
+      labels: ["needs-owner"],
+      opened_at: "2026-10-20T12:00:00Z",
+      github_present: true,
+    };
+
+    installBriefSql(snapshots, [legacy, known]);
+    const held = await loadBrief("24h", now);
+    const heldRepo = held.repos.find((row) => row.repo === repo);
+    const knownRepo = held.repos.find((row) => row.repo === other);
+    assert.equal(heldRepo?.incomplete, false);
+    assert.equal(heldRepo?.merged_prs, 2);
+    assert.equal(heldRepo?.decisions, null);
+    assert.ok(heldRepo?.errors.includes("decisions incomplete"));
+    assert.deepEqual(knownRepo?.decisions?.map((row) => row.number), [8]);
+    assert.equal(held.totals.decisions, null);
+    assert.equal(held.totals.merged_prs, 2);
+    assert.ok(held.incomplete_repos.some((row) => row.repo === repo && row.errors.includes("decisions incomplete")));
+    assert.equal(held.incomplete_repos.some((row) => row.repo === other), false);
+    const heldText = formatBriefText(held, clock);
+    assert.match(heldText, /DECISIONS FOR YOU: DATA INCOMPLETE\./);
+    assert.match(heldText, /needs a call/);
+    assert.equal(heldText.includes("DECISIONS FOR YOU: none open."), false);
+    assert.equal(heldText.includes("Fleet totals stay unknown"), false);
+    assert.match(heldText, /2 PRs merged/);
+
+    for (const failure of ["missing", "fail"] as const) {
+      installBriefSql(snapshots, failure);
+      const brief = await loadBrief("24h", now);
+      assert.equal(brief.repos.every((row) => row.decisions === null), true, failure);
+      assert.equal(brief.repos.every((row) => row.incomplete === false), true, failure);
+      assert.equal(brief.repos.every((row) => row.errors.includes("decisions unavailable")), true, failure);
+      assert.equal(brief.totals.decisions, null, failure);
+      assert.equal(brief.totals.merged_prs, 2, failure);
+      assert.equal(brief.incomplete_repos.length, brief.repos.length, failure);
+      const text = formatBriefText(brief, clock);
+      assert.match(text, /DECISIONS FOR YOU: DATA INCOMPLETE\./, failure);
+      assert.equal(text.includes("DECISIONS FOR YOU: none open."), false, failure);
+      assert.equal(text.includes("Fleet totals stay unknown"), false, failure);
+    }
+
+    installBriefSql(snapshots, []);
+    const empty = await loadBrief("24h", now);
+    assert.equal(empty.repos.every((row) => Array.isArray(row.decisions) && row.decisions.length === 0), true);
+    assert.equal(empty.totals.decisions, 0);
+    assert.deepEqual(empty.incomplete_repos, []);
+    assert.match(formatBriefText(empty, clock), /DECISIONS FOR YOU: none open\./);
+  });
+
+  it("shell workKinds accepts the array form the TypeScript reader accepts", () => {
+    const script = fs.readFileSync("scripts/morning-brief.sh", "utf8");
+    const start = script.indexOf("filter_work_kinds() {");
+    const end = script.indexOf("# END read_work_kinds");
+    assert.ok(start >= 0 && end > start);
+    const fn = script.slice(start, end);
+    assert.match(script, /COORD_WORK_KINDS="\$\(read_work_kinds /);
+    const cases: unknown[] = [
+      ["milestone", "heartbeat"],
+      ["error"],
+      ["custom_work", "heartbeat"],
+      [" session_end "],
+      ["milestone", 3, "heartbeat"],
+      [],
+      "telemetry|turn_start|session_end",
+      "error|milestone|heartbeat",
+      "",
+    ];
+    const run = (raw: string) => execFileSync(
+      "bash",
+      ["-c", `${fn}\nread_work_kinds ${JSON.stringify(raw)}`],
+      { encoding: "utf8" },
+    );
+    for (const value of cases) {
+      const expected = readBriefSettings({
+        brief: { coordinator: { workKinds: value as never } },
+      }).coordinator.workKinds.join("|");
+      const raw = Array.isArray(value) ? JSON.stringify(value) : String(value);
+      assert.equal(run(raw), expected, JSON.stringify(value));
+    }
+  });
 });
 
 /** A repo_snapshots row. Nulls are unmeasured counts, not zeros. */
@@ -1739,6 +1953,64 @@ function snapshotRow(over: Partial<Row> & Pick<Row, "repo" | "collected_at">): R
  * Applies the brief's snapshot SQL to an in-memory table, including the
  * `open_issues is not null` predicate when the query still has it.
  */
+function legacyDecision(over: Partial<Decision>): Decision {
+  const opened = "2026-10-01T12:00:00Z";
+  return {
+    id: 1,
+    key: "github:acme/app#20",
+    source: "github-label",
+    repo: "acme/app",
+    repo_short: "app",
+    number: 20,
+    url: "https://github.com/acme/app/issues/20",
+    title: "legacy gate",
+    why: null,
+    options: null,
+    recommended: null,
+    requested_by: "collector",
+    status: "open",
+    decision: null,
+    decided_by: null,
+    decided_at: null,
+    defer_until: null,
+    kind: "issue",
+    labels: ["needs-owner"],
+    opened_at: opened,
+    github_present: true,
+    first_seen_at: opened,
+    last_seen_at: opened,
+    created_at: opened,
+    updated_at: opened,
+    age_days: 0,
+    ...over,
+  };
+}
+
+function installBriefSql(snapshots: Row[], decisions: Row[] | "missing" | "fail"): void {
+  env.DATABASE_URL = "postgres://brief:brief@127.0.0.1:9/brief_test";
+  setSqlForTests(async (strings, ...values) => {
+    const text = strings.join(" ");
+    if (text.includes("from watched_repos")) return [];
+    if (text.includes("from decisions")) {
+      if (decisions === "missing") {
+        throw Object.assign(new Error('relation "decisions" does not exist'), { code: "42P01" });
+      }
+      if (decisions === "fail") throw Object.assign(new Error("connection reset"), { code: "08006" });
+      return decisions;
+    }
+    if (text.includes("from agents") || text.includes("from events")) return [];
+    if (!text.includes("from repo_snapshots")) throw new Error(`unexpected sql: ${text}`);
+    const repos = new Set((values[0] as string[]) ?? []);
+    const best = new Map<string, Row>();
+    for (const row of snapshots) {
+      if (!repos.has(String(row.repo))) continue;
+      const prev = best.get(String(row.repo));
+      if (!prev || String(row.collected_at) > String(prev.collected_at)) best.set(String(row.repo), row);
+    }
+    return [...best.values()];
+  });
+}
+
 function installSnapshotSql(rows: Row[]): void {
   env.DATABASE_URL = "postgres://brief:brief@127.0.0.1:9/brief_test";
   setSqlForTests(async (strings, ...values) => {

@@ -452,29 +452,50 @@ export function repoSection(args: {
     blocked_label: blockedLabel,
     blocked_issues: blockedLabel ? snap.blocked_issues : null,
     stuck_prs: stuckFromDetail(detail, cfg.short),
-    decisions: [],
+    // The snapshot does not measure decisions. Null stays unmeasured until
+    // the table join replaces it. An empty array here would be a counted zero.
+    decisions: null,
     merged_list: mergedRows.list,
   };
 }
 
+const DECISION_INCOMPLETE = "decisions incomplete";
+const DECISION_UNAVAILABLE = "decisions unavailable";
+
+function withoutDecisionErrors(errors: readonly string[]): string[] {
+  return errors.filter((error) => error !== DECISION_INCOMPLETE && error !== DECISION_UNAVAILABLE);
+}
+
 /**
  * Same join as `morning-brief.sh`: a table row lands on the watched repo whose
- * `owner/name` matches. The short name is display only. An incomplete section,
- * or a repo the decisions API listed in `incomplete_repos`, keeps whatever it
- * already had (the script's GitHub sweep). This server has no sweep, so that
- * section's decisions stay empty until the collector fills the null columns.
+ * `owner/name` matches. The short name is display only.
+ *
+ * An array already on the section is a measurement (the script's GitHub sweep,
+ * including a measured empty list). A hold, or a decisions read that did not
+ * succeed, keeps that array. Null means this process did not sweep. Holding
+ * that section, or failing the read, leaves it null and records why. It does
+ * not become an empty list.
  */
 export function applyTableDecisions(
   repos: readonly BriefRepo[],
   table: readonly BriefDecision[],
   incompleteRepos: readonly string[],
+  measured = true,
 ): BriefRepo[] {
   const hold = new Set(incompleteRepos);
   return repos.map((section) => {
-    if (section.incomplete || hold.has(section.repo)) return section;
+    if (section.incomplete) return section;
+    const swept = section.decisions !== null;
+    if (!measured || hold.has(section.repo)) {
+      if (swept) return section;
+      const reason = measured ? DECISION_INCOMPLETE : DECISION_UNAVAILABLE;
+      const errors = section.errors.includes(reason) ? section.errors : [...section.errors, reason];
+      return { ...section, decisions: null, errors };
+    }
     return {
       ...section,
       decisions: table.filter((row) => row.repo === section.repo),
+      errors: withoutDecisionErrors(section.errors),
     };
   });
 }
@@ -502,7 +523,11 @@ export function assembleBrief(input: {
   coordinator: BriefCoordinator;
   repos: readonly BriefRepo[];
 }): MorningBrief {
-  const repos = [...input.repos];
+  const repos = input.repos.map((repo) => {
+    if (repo.incomplete || repo.decisions !== null) return repo;
+    if (repo.errors.includes(DECISION_INCOMPLETE) || repo.errors.includes(DECISION_UNAVAILABLE)) return repo;
+    return { ...repo, errors: [...repo.errors, DECISION_INCOMPLETE] };
+  });
   const counted = repos.filter((repo) => !repo.incomplete);
   const anyIncomplete = counted.length !== repos.length;
   // Known rows from counted repos stay on the lists. Incomplete repos do not
@@ -519,7 +544,12 @@ export function assembleBrief(input: {
     repo_source: input.repoSource,
     thresholds: { stuck_pr_hours: input.stuckPrHours, stale_issue_days: input.staleIssueDays },
     coordinator: input.coordinator,
-    incomplete_repos: repos.filter((repo) => repo.incomplete).map((repo) => ({ repo: repo.repo, errors: repo.errors })),
+    // A counted repo with null decisions is a decision hole, not a snapshot hole.
+    // Its counts stay in the totals. The error is how the JSON names the hole.
+    incomplete_repos: repos.flatMap((repo) => {
+      if (repo.incomplete || repo.decisions === null) return [{ repo: repo.repo, errors: repo.errors }];
+      return [];
+    }),
     totals: {
       merged_prs: measuredSum(counted, anyIncomplete, "merged_prs"),
       issues_opened: measuredSum(counted, anyIncomplete, "issues_opened"),
@@ -571,11 +601,18 @@ export function formatBriefText(
   const labels = opts?.decisionLabels ?? [];
   lines.push(`MORNING BRIEF \u2014 ${clock} \u2014 last ${brief.window_hours}h  (repos from ${brief.repo_source})`);
   lines.push("");
-  const incomplete = brief.incomplete_repos.length;
-  if (incomplete > 0) {
-    lines.push(`!! DATA INCOMPLETE for ${incomplete} of ${brief.totals.repos_total} repos. Fleet totals stay unknown until every watched repo is measured.`);
-    for (const repo of brief.incomplete_repos) {
+  const snapshotMisses = brief.repos.filter((repo) => repo.incomplete);
+  if (snapshotMisses.length > 0) {
+    lines.push(`!! DATA INCOMPLETE for ${snapshotMisses.length} of ${brief.totals.repos_total} repos. Fleet totals stay unknown until every watched repo is measured.`);
+    for (const repo of snapshotMisses) {
       lines.push(`   ${repo.repo}: ${repo.errors.join("; ")}`);
+    }
+    lines.push("");
+  }
+  const decisionGaps = brief.incomplete_repos.filter((row) => !snapshotMisses.some((repo) => repo.repo === row.repo));
+  if (decisionGaps.length > 0) {
+    for (const row of decisionGaps) {
+      lines.push(`   ${row.repo}: ${row.errors.join("; ")}`);
     }
     lines.push("");
   }
@@ -860,15 +897,19 @@ export async function loadBrief(window: BriefWindow, now = new Date()): Promise<
     if (!isMissingRelation(error)) throw error;
   }
 
+  // These stay unused unless the read succeeds. A throw must not publish them
+  // as a measured empty queue.
   let table: BriefDecision[] = [];
   let incompleteRepos: string[] = [];
+  let decisionsMeasured = false;
   try {
     const rows = await listDecisions({ status: "open", repo: null, source: null, limit: 1000, shape: "brief" });
     const part = partitionBrief(rows, nowIso);
     table = part.decisions;
     incompleteRepos = part.incomplete_repos;
-  } catch (error) {
-    if (!isMissingRelation(error)) throw error;
+    decisionsMeasured = true;
+  } catch {
+    decisionsMeasured = false;
   }
 
   const sections = applyTableDecisions(
@@ -881,6 +922,7 @@ export async function loadBrief(window: BriefWindow, now = new Date()): Promise<
     })),
     table,
     incompleteRepos,
+    decisionsMeasured,
   );
   const coordinator = await coordinatorFromDb(settings, nowIso);
   return assembleBrief({
