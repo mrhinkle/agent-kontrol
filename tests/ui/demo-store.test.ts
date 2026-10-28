@@ -27,6 +27,7 @@ import {
   demoRememberTool,
   demoReport,
   demoReportStatusTool,
+  demoSessionsForTests,
   demoStoreSize,
   demoStoreTouchCount,
   demoTaskQueueTool,
@@ -663,5 +664,121 @@ describe("demo store", () => {
     const tasksStillSample = await (await getTasks(new Request("http://x/api/tasks"))).json();
     assert.equal(JSON.stringify(tasksStillSample).includes("rest-dropped-f9"), false);
     assert.equal(JSON.stringify(tasksStillSample).includes("probe-task-f9"), false);
+  });
+
+  it("F10: report_status with a fresh session id cannot grow one agent's sessions without a cap", async () => {
+    let clock = 1_700_000_000_000;
+    setDemoClockForTests(() => clock);
+    const extra = 25;
+    const floodCount = DEMO_CAPS.sessionsPerAgent + extra;
+    for (let i = 0; i < floodCount; i++) {
+      clock += 1000;
+      await demoReportStatusTool({
+        agent_id: "flood",
+        session_id: `sess-${i}`,
+        title: `title-${i}`,
+      });
+    }
+    const flood = demoSessionsForTests().filter((session) => session.agent_id === "flood");
+    assert.equal(demoStoreSize().agents, 1);
+    assert.equal(flood.length, DEMO_CAPS.sessionsPerAgent);
+    assert.equal(demoStoreSize().sessions, DEMO_CAPS.sessionsPerAgent);
+    assert.equal(flood.some((session) => session.id === "sess-0"), false);
+    assert.equal(flood.some((session) => session.id === `sess-${floodCount - 1}`), true);
+
+    clock += 1000;
+    await demoReportStatusTool({
+      agent_id: "flood",
+      session_id: `sess-${floodCount - 1}`,
+      title: "still here",
+    });
+    assert.equal(
+      demoSessionsForTests().filter((session) => session.agent_id === "flood").length,
+      DEMO_CAPS.sessionsPerAgent,
+    );
+
+    for (let i = 0; i < DEMO_CAPS.sessionsPerAgent; i++) {
+      clock += 1000;
+      await demoReportStatusTool({
+        agent_id: "other",
+        session_id: `other-${i}`,
+        title: `other-${i}`,
+      });
+    }
+    assert.equal(demoStoreSize().sessions, DEMO_CAPS.sessionsPerAgent * 2);
+    assert.equal(demoSessionsForTests().filter((session) => session.agent_id === "flood").length, DEMO_CAPS.sessionsPerAgent);
+    assert.equal(demoSessionsForTests().filter((session) => session.agent_id === "other").length, DEMO_CAPS.sessionsPerAgent);
+
+    const fleet = await demoFleetStatusTool();
+    assert.match(fleet.content[0].text, /flood/);
+    assert.match(fleet.content[0].text, /still here/);
+    assert.match(fleet.content[0].text, new RegExp(`other-${DEMO_CAPS.sessionsPerAgent - 1}`));
+
+    const mcp = fs.readFileSync("docs/MCP.md", "utf8");
+    assert.match(mcp, /Sessions are capped per agent/);
+    assert.match(mcp, /does not start with that banner/);
+  });
+
+  it("F11: a task evicted at the cap still replays its idempotency key for 24 hours", async () => {
+    const actor = { actor_type: "agent" as const, actor_id: "cred-cap" };
+    setDemoClockForTests(() => 5_000);
+    const first = await demoCreateTask({
+      title: "original",
+      platform: "grok",
+      priority: 2,
+      actor,
+      idempotency_key: "K",
+    });
+    for (let i = 0; i < DEMO_CAPS.tasks; i++) {
+      await demoCreateTask({ title: `filler-${i}` });
+    }
+    assert.equal(demoStoreSize().tasks, DEMO_CAPS.tasks);
+    assert.equal(await demoGetTask(first.id), null);
+
+    const replay = await demoCreateTask({
+      title: "original",
+      platform: "grok",
+      priority: 2,
+      actor,
+      idempotency_key: "K",
+    });
+    assert.equal(replay.id, first.id);
+    assert.equal(replay.title, "original");
+    assert.equal(replay.status, "queued");
+    assert.equal(demoStoreSize().tasks, DEMO_CAPS.tasks);
+    const live = await demoListTasks({ status: "all", limit: DEMO_CAPS.tasks + 5 });
+    assert.equal(live.some((task) => task.id === first.id), false);
+    assert.equal(live.some((task) => task.title === "original"), false);
+
+    await assert.rejects(
+      () =>
+        demoCreateTask({
+          title: "different",
+          platform: "grok",
+          priority: 2,
+          actor,
+          idempotency_key: "K",
+        }),
+      (err: unknown) =>
+        err instanceof IdempotencyConflict &&
+        err.message === "This idempotency key was already used with different arguments.",
+    );
+    assert.equal(demoStoreSize().tasks, DEMO_CAPS.tasks);
+
+    setDemoClockForTests(() => 5_000 + IDEMPOTENCY_TTL_MS + 1);
+    const expired = await demoCreateTask({
+      title: "original",
+      platform: "grok",
+      priority: 2,
+      actor,
+      idempotency_key: "K",
+    });
+    assert.notEqual(expired.id, first.id);
+    assert.equal(demoStoreSize().tasks, DEMO_CAPS.tasks);
+    assert.equal((await demoGetTask(expired.id))?.title, "original");
+
+    const mcp = fs.readFileSync("docs/MCP.md", "utf8");
+    assert.match(mcp, /does not drop its idempotency key/);
+    assert.match(mcp, /returns the original result for 24 hours/);
   });
 });

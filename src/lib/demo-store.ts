@@ -8,7 +8,8 @@
  *
  * This module does not import the database. With DATABASE_URL set, callers
  * must not use it. Caps evict the oldest row so a public demo cannot grow
- * without a limit.
+ * without a limit. Sessions are capped per agent. An idempotency key stays
+ * until its own expiry: evicting the task row must not drop it.
  */
 import type { Actor } from "./actor";
 import { mcpToolError, memoryKeyError, type McpToolResult } from "./api-error";
@@ -35,13 +36,19 @@ function slugify(input: string): string {
 
 export const DEMO_BANNER = "[demo — in-memory, cleared when this process restarts]";
 
-/** Oldest row is dropped past these counts. Events are capped so reports cannot grow the process by themselves. */
+/**
+ * Oldest row is dropped past these counts. Events are capped so reports cannot
+ * grow the process by themselves. Sessions are capped per agent: fleet status
+ * keeps a handful, and a fresh session id on every report would otherwise
+ * retain every session for that agent.
+ */
 export const DEMO_CAPS = {
   tasks: 200,
   notes: 200,
   agents: 100,
   events: 400,
   idempotency: 200,
+  sessionsPerAgent: 5,
 } as const;
 
 const OFFLINE_AFTER_MS = 15 * 60 * 1000;
@@ -101,8 +108,23 @@ export function demoStoreTouchCount(): number {
   return touchCount;
 }
 
-export function demoStoreSize(): { tasks: number; notes: number; agents: number; events: number } {
-  return { tasks: tasks.length, notes: notes.length, agents: agents.size, events: events.length };
+export function demoStoreSize(): { tasks: number; notes: number; agents: number; events: number; sessions: number } {
+  return {
+    tasks: tasks.length,
+    notes: notes.length,
+    agents: agents.size,
+    events: events.length,
+    sessions: sessions.size,
+  };
+}
+
+/** Session ids currently retained. Tests use this to see per-agent eviction. */
+export function demoSessionsForTests(): { id: string; agent_id: string; updated_at: string }[] {
+  return [...sessions.values()].map((session) => ({
+    id: session.id,
+    agent_id: session.agent_id,
+    updated_at: session.updated_at,
+  }));
 }
 
 export function resetDemoStoreForTests(): void {
@@ -162,11 +184,29 @@ function evictOldestTask(): void {
       index = i;
     }
   }
-  const [removed] = tasks.splice(index, 1);
-  if (!removed) return;
-  for (const [key, row] of idempotency) {
-    if (row.task.id === removed.id) idempotency.delete(key);
+  tasks.splice(index, 1);
+  // Leave the idempotency row. A retry inside the 24 hour window has to
+  // replay the stored result after this task row is gone.
+}
+
+function sessionCount(agentId: string): number {
+  let count = 0;
+  for (const session of sessions.values()) {
+    if (session.agent_id === agentId) count += 1;
   }
+  return count;
+}
+
+/** Drops the least-recently updated session for one agent. Equal timestamps keep the earlier insert. */
+function evictOldestSession(agentId: string, protectId?: string): boolean {
+  let oldest: Session | null = null;
+  for (const session of sessions.values()) {
+    if (session.agent_id !== agentId || session.id === protectId) continue;
+    if (!oldest || session.updated_at < oldest.updated_at) oldest = session;
+  }
+  if (!oldest) return false;
+  sessions.delete(oldest.id);
+  return true;
 }
 
 function evictOldestNote(): void {
@@ -271,6 +311,9 @@ function applyReport(input: DemoReportInput): void {
     const isClosed = session?.status === "done" || session?.status === "failed";
     const reopens = input.kind === "session_start" || input.status === "active";
     if (!session) {
+      while (sessionCount(agentId) >= DEMO_CAPS.sessionsPerAgent) {
+        if (!evictOldestSession(agentId)) break;
+      }
       sessions.set(input.session_id, {
         id: input.session_id,
         agent_id: agentId,
@@ -282,6 +325,7 @@ function applyReport(input: DemoReportInput): void {
         updated_at: now,
       });
     } else if (!isClosed || reopens) {
+      const moved = session.agent_id !== agentId;
       session.agent_id = agentId;
       session.status = status;
       session.updated_at = now;
@@ -289,6 +333,11 @@ function applyReport(input: DemoReportInput): void {
       if (input.summary) session.summary = input.summary;
       if (input.kind === "session_end") session.ended_at = now;
       if (isClosed && reopens) session.ended_at = null;
+      if (moved) {
+        while (sessionCount(agentId) > DEMO_CAPS.sessionsPerAgent) {
+          if (!evictOldestSession(agentId, session.id)) break;
+        }
+      }
     }
   }
 
