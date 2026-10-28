@@ -8,7 +8,8 @@ import { randomUUID } from "node:crypto";
 import { Client } from "pg";
 import { sql } from "../src/lib/db";
 import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
-import { report, remember, recall, createTask, claimNextTask, listTasks } from "../src/lib/store";
+import { StaleWrite } from "../src/lib/revision";
+import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview } from "../src/lib/store";
 import { getWatchedRepos, replaceWatchedRepos } from "../src/lib/watched-repos";
 import type { RepoConfig } from "../src/lib/progress-config";
 import { getTrace, listTraces, pruneSpans, upsertSpans } from "../src/lib/trace-store";
@@ -50,6 +51,35 @@ async function main() {
   assert.equal(hits.length, 1, "case-insensitive search plus tag overlap");
   assert.ok(Array.isArray(hits[0].tags), "text[] comes back as an array");
 
+  // A microsecond timestamp stays in the row. The preview token is md5(row),
+  // computed in SQL, so the confirm matches that same value.
+  const memoryKey = `${tag}/k1`;
+  await sql()`update memory set updated_at = timestamptz '2026-10-28 12:00:00.123456+00' where key = ${memoryKey}`;
+  const micros = await sql()`select to_char(updated_at, 'US') as us from memory where key = ${memoryKey}`;
+  assert.equal(String(micros[0].us), "123456");
+  const memoryPreview = await readMemoryForPreview(memoryKey);
+  assert.ok(memoryPreview);
+  assert.match(memoryPreview.revision, /^[0-9a-f]{32}$/);
+  const confirmed = await remember({ content: `confirmed ${tag}`, key: memoryKey, expected_revision: memoryPreview.revision });
+  assert.equal(confirmed.content, `confirmed ${tag}`);
+  await assert.rejects(
+    () => remember({ content: `too late ${tag}`, key: memoryKey, expected_revision: memoryPreview.revision }),
+    (err: unknown) => err instanceof StaleWrite && err.currentRevision !== memoryPreview.revision,
+  );
+
+  const absentKey = `${tag}/absent`;
+  const raced = await Promise.allSettled([
+    remember({ content: `race-a ${tag}`, key: absentKey, expected_revision: "absent" }),
+    remember({ content: `race-b ${tag}`, key: absentKey, expected_revision: "absent" }),
+  ]);
+  assert.equal(raced.filter((item) => item.status === "fulfilled").length, 1);
+  const lost = raced.find((item) => item.status === "rejected");
+  assert.ok(lost && lost.status === "rejected");
+  assert.equal(lost.reason instanceof StaleWrite, true);
+  const absentCount = await sql()`select count(*)::int as n from memory where key = ${absentKey}`;
+  assert.equal(Number(absentCount[0].n), 1);
+  await sql()`delete from memory where key = ${absentKey}`;
+
   const task = await createTask({ title: `smoke ${tag}`, platform: `pgtest-${tag}`, priority: 2 } as never);
   const claimed = await claimNextTask({ platform: `pgtest-${tag}`, machine: "m1", agent_id: `${tag}-agent` });
   const again = await claimNextTask({ platform: `pgtest-${tag}`, machine: "m1", agent_id: `${tag}-agent` });
@@ -57,6 +87,15 @@ async function main() {
   assert.equal(again, null, "a task is never handed out twice");
   const all = await listTasks({ status: "claimed" });
   assert.ok(all.some((t) => t.id === task.id));
+
+  await sql()`update tasks set updated_at = timestamptz '2026-10-28 12:00:00.123456+00' where id = ${task.id}`;
+  const taskMicros = await sql()`select to_char(updated_at, 'US') as us from tasks where id = ${task.id}`;
+  assert.equal(String(taskMicros[0].us), "123456");
+  const taskPreview = await readTaskForPreview(Number(task.id));
+  assert.ok(taskPreview);
+  assert.match(taskPreview.revision, /^[0-9a-f]{32}$/);
+  const cancelled = await updateTask({ id: Number(task.id), status: "cancelled", expected_revision: taskPreview.revision });
+  assert.equal(cancelled.status, "cancelled");
 
 
   // Watched repos: fallback, ordered replace, removal, restoring order.

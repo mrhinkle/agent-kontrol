@@ -1,5 +1,6 @@
 import type { Actor } from "./actor";
 import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } from "./idempotency";
+import { StaleWrite, absentRevision } from "./revision";
 import { writeSessionNote } from "./session-memory";
 import { sql, type SqlTag } from "./db";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
@@ -53,6 +54,10 @@ export function slugify(input: string): string {
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+function isUniqueViolation(e: unknown): boolean {
+  return typeof e === "object" && e !== null && (e as { code?: unknown }).code === "23505";
 }
 
 /** Keep a connection loss typed so idempotency does not drop a claim that may have committed. */
@@ -283,6 +288,12 @@ export async function remember(input: {
   key?: string;
   tags?: string[];
   agent_id?: string;
+  /**
+   * Preview token. When set, a keyed write is one conditional statement:
+   * `md5(m::text)` must still match, or the insert lands only when the key
+   * is still absent. A miss writes nothing.
+   */
+  expected_revision?: string;
 }): Promise<MemoryItem> {
   const db = sql();
   const key = input.key ?? null;
@@ -290,34 +301,90 @@ export async function remember(input: {
   const tags = input.tags ?? [];
   const agentId = input.agent_id ?? null;
   const updatedAt = new Date().toISOString();
+  const expected = input.expected_revision;
 
   try {
-    if (key) {
+    if (expected === undefined) {
+      if (key) {
+        const rows = await db`
+          insert into memory (key, content, tags, agent_id, updated_at)
+          values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
+          on conflict (key) do update set
+            content = excluded.content,
+            tags = excluded.tags,
+            agent_id = excluded.agent_id,
+            updated_at = excluded.updated_at,
+            source = null,
+            facts_at = null
+          returning *
+        `;
+        if (!rows[0]) throw new Error("memory upsert returned no row");
+        return rows[0] as MemoryItem;
+      }
       const rows = await db`
         insert into memory (key, content, tags, agent_id, updated_at)
         values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
-        on conflict (key) do update set
-          content = excluded.content,
-          tags = excluded.tags,
-          agent_id = excluded.agent_id,
-          updated_at = excluded.updated_at,
-          source = null,
-          facts_at = null
         returning *
       `;
-      if (!rows[0]) throw new Error("memory upsert returned no row");
+      if (!rows[0]) throw new Error("memory insert returned no row");
       return rows[0] as MemoryItem;
     }
-    const rows = await db`
-      insert into memory (key, content, tags, agent_id, updated_at)
-      values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
-      returning *
-    `;
-    if (!rows[0]) throw new Error("memory insert returned no row");
-    return rows[0] as MemoryItem;
+
+    if (!key) {
+      if (expected !== absentRevision()) throw new StaleWrite(absentRevision());
+      const rows = await db`
+        insert into memory (key, content, tags, agent_id, updated_at)
+        values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
+        returning *
+      `;
+      if (!rows[0]) throw new Error("memory insert returned no row");
+      return rows[0] as MemoryItem;
+    }
+
+    if (expected === absentRevision()) {
+      const rows = await db`
+        insert into memory (key, content, tags, agent_id, updated_at)
+        values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
+        on conflict (key) do nothing
+        returning *
+      `;
+      if (rows[0]) return rows[0] as MemoryItem;
+    } else {
+      const rows = await db`
+        update memory m set
+          content = ${content},
+          tags = ${tags},
+          agent_id = ${agentId},
+          updated_at = ${updatedAt},
+          source = null,
+          facts_at = null
+        where m.key = ${key}
+          and md5(m::text) = ${expected}
+        returning *
+      `;
+      if (rows[0]) return rows[0] as MemoryItem;
+    }
   } catch (e) {
-    throw new Error(errMsg(e));
+    if (e instanceof StaleWrite) throw e;
+    if (expected === undefined || !key || !isUniqueViolation(e)) throw new Error(errMsg(e));
   }
+
+  const current = await memoryRevisionOf(key);
+  if (!current) throw new Error("Memory not found");
+  throw new StaleWrite(current);
+}
+
+/** The revision a new preview would return, from the same expression as the guard. */
+async function memoryRevisionOf(key: string): Promise<string | null> {
+  const db = sql();
+  const rows = await db`
+    select md5(m::text) as revision
+    from memory m
+    where m.key = ${key}
+    limit 1
+  `;
+  const revision = rows[0]?.revision;
+  return typeof revision === "string" ? revision : null;
 }
 
 export async function recall(input: {
@@ -997,6 +1064,12 @@ export async function updateTask(input: {
   cost_usd?: number;
   session_id?: string;
   assigned_agent?: string;
+  /**
+   * Preview token. When set, the update is one conditional statement:
+   * `md5(t::text)` must still match. A miss writes nothing. Omitted keeps
+   * the unconditional update.
+   */
+  expected_revision?: string;
 }): Promise<Task> {
   const db = sql();
   const now = new Date().toISOString();
@@ -1008,28 +1081,62 @@ export async function updateTask(input: {
   const hasCost = input.cost_usd !== undefined;
   const hasSession = input.session_id !== undefined;
   const hasAgent = input.assigned_agent !== undefined;
+  const expected = input.expected_revision;
 
+  let rows: Record<string, unknown>[] = [];
   try {
-    const rows = await db`
-      update tasks set
-        updated_at = ${now},
-        status = case when ${hasStatus} then ${status} else status end,
-        completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
-        result = case when ${hasResult} then ${input.result ?? null} else result end,
-        cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
-        session_id = case when ${hasSession} then ${input.session_id ?? null} else session_id end,
-        assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end
-      where id = ${input.id}
-      returning *
-    `;
-    if (!rows[0]) throw new Error("Task not found");
-    return asTask(rows[0] as Record<string, unknown>);
+    if (expected === undefined) {
+      rows = await db`
+        update tasks set
+          updated_at = ${now},
+          status = case when ${hasStatus} then ${status} else status end,
+          completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
+          result = case when ${hasResult} then ${input.result ?? null} else result end,
+          cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
+          session_id = case when ${hasSession} then ${input.session_id ?? null} else session_id end,
+          assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end
+        where id = ${input.id}
+        returning *
+      `;
+    } else {
+      rows = await db`
+        update tasks t set
+          updated_at = ${now},
+          status = case when ${hasStatus} then ${status} else status end,
+          completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
+          result = case when ${hasResult} then ${input.result ?? null} else result end,
+          cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
+          session_id = case when ${hasSession} then ${input.session_id ?? null} else session_id end,
+          assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end
+        where t.id = ${input.id}
+          and md5(t::text) = ${expected}
+        returning *
+      `;
+    }
   } catch (e) {
     throw new Error(errMsg(e));
   }
+  if (rows[0]) return asTask(rows[0]);
+  if (expected === undefined) throw new Error("Task not found");
+  const current = await taskRevisionOf(input.id);
+  if (!current) throw new Error("Task not found");
+  throw new StaleWrite(current);
 }
 
-/** Read one task. Dry-run previews use this so a cancel can show the row without updating it. */
+/** The revision a new task preview would return. Same expression as the guard. */
+async function taskRevisionOf(id: number): Promise<string | null> {
+  const db = sql();
+  const rows = await db`
+    select md5(t::text) as revision
+    from tasks t
+    where t.id = ${id}
+    limit 1
+  `;
+  const revision = rows[0]?.revision;
+  return typeof revision === "string" ? revision : null;
+}
+
+/** Read one task. Callers that confirm a preview use `readTaskForPreview` instead. */
 export async function getTask(id: number): Promise<Task | null> {
   const db = sql();
   try {
@@ -1041,8 +1148,32 @@ export async function getTask(id: number): Promise<Task | null> {
 }
 
 /**
- * Read the note stored at a key, if any. Dry-run previews use this so an
- * overwrite can show the current note without writing.
+ * The task and its revision from one statement. `md5(t::text)` is the whole
+ * row, including microseconds `updated_at` still has in the database.
+ */
+export async function readTaskForPreview(id: number): Promise<{ task: Task; revision: string } | null> {
+  const db = sql();
+  try {
+    const rows = await db`
+      select t.*, md5(t::text) as revision
+      from tasks t
+      where t.id = ${id}
+      limit 1
+    `;
+    const row = rows[0] as (Record<string, unknown> & { revision?: unknown }) | undefined;
+    if (!row) return null;
+    if (typeof row.revision !== "string") throw new Error("task preview returned no revision");
+    const { revision, ...rest } = row;
+    return { task: asTask(rest), revision };
+  } catch (e) {
+    if (e instanceof Error && e.message === "task preview returned no revision") throw e;
+    throw new Error(errMsg(e));
+  }
+}
+
+/**
+ * Read the note stored at a key, if any. Callers that confirm a preview use
+ * `readMemoryForPreview` so the row and the token come from one statement.
  */
 export async function findMemoryByKey(key: string): Promise<MemoryItem | null> {
   const db = sql();
@@ -1050,6 +1181,27 @@ export async function findMemoryByKey(key: string): Promise<MemoryItem | null> {
     const rows = await db`select * from memory where key = ${key} limit 1`;
     return (rows[0] as MemoryItem | undefined) ?? null;
   } catch (e) {
+    throw new Error(errMsg(e));
+  }
+}
+
+/** The note and its revision from one statement. No row → the caller uses `absent`. */
+export async function readMemoryForPreview(key: string): Promise<{ item: MemoryItem; revision: string } | null> {
+  const db = sql();
+  try {
+    const rows = await db`
+      select m.*, md5(m::text) as revision
+      from memory m
+      where m.key = ${key}
+      limit 1
+    `;
+    const row = rows[0] as (MemoryItem & { revision?: unknown }) | undefined;
+    if (!row) return null;
+    if (typeof row.revision !== "string") throw new Error("memory preview returned no revision");
+    const { revision, ...item } = row;
+    return { item, revision };
+  } catch (e) {
+    if (e instanceof Error && e.message === "memory preview returned no revision") throw e;
     throw new Error(errMsg(e));
   }
 }

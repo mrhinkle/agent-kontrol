@@ -211,13 +211,34 @@ export default function TasksPage() {
     setCancelling(true);
     setActionError(null);
     try {
-      const res = await fetch(`/api/tasks/${pendingCancel.id}`, {
+      const id = pendingCancel.id;
+      const expected = pendingCancel.preview.expected_revision;
+      const res = await fetch(`/api/tasks/${id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status: "cancelled" }),
+        body: JSON.stringify({
+          status: "cancelled",
+          ...(typeof expected === "string" ? { expected_revision: expected } : {}),
+        }),
       });
+      const body = (await res.json().catch(() => ({}))) as Partial<DryRunResult> & { error?: string };
+      if (res.status === 409 && body.error === "stale_write") {
+        const fresh = await fetch(`/api/tasks/${id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: "cancelled", dry_run: true }),
+        });
+        const preview = (await fresh.json().catch(() => ({}))) as Partial<DryRunResult> & { error?: string };
+        if (fresh.ok && preview.dry_run === true && Array.isArray(preview.changes)) {
+          setPendingCancel({ id, preview: preview as DryRunResult });
+          setActionError("This task changed since the preview. Review the new preview before cancelling.");
+          return;
+        }
+        setActionError(preview.error ?? "This task changed. Preview the cancel again.");
+        setPendingCancel(null);
+        return;
+      }
       if (!res.ok) {
-        const body = (await res.json().catch(() => ({}))) as { error?: string };
         setActionError(body.error ?? `Cancel failed (${res.status}).`);
         setPendingCancel(null);
         return;
