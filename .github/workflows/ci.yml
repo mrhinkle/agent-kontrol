@@ -37,8 +37,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        # The official image, from Amazon's public mirror: Docker Hub rate-limits anonymous pulls from shared runners.
-        image: public.ecr.aws/docker/library/postgres:16
+        # The official image, from Google's Docker Hub mirror: Docker Hub rate-limits anonymous pulls from shared
+        # runners, and Amazon's public ECR mirror began returning "Data limit exceeded" on 2026-10-28.
+        image: mirror.gcr.io/library/postgres:16
         env:
           POSTGRES_PASSWORD: mc
           POSTGRES_DB: mc
