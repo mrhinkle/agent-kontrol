@@ -126,12 +126,14 @@ export function filterSkills(skills: readonly SkillSummary[], q: string): SkillS
 }
 
 /** `?runtime=&q=` with empty values omitted. `all` is not sent. Runtime comes before q. */
-export function skillsQuery(input: { runtime?: string | null; q?: string | null }): string {
+export function skillsQuery(input: { runtime?: string | null; q?: string | null; category?: string | null }): string {
   const params = new URLSearchParams();
   const runtime = (input.runtime ?? "").trim();
   const q = (input.q ?? "").trim();
   if (runtime && runtime.toLowerCase() !== "all") params.set("runtime", runtime);
   if (q) params.set("q", q);
+  const category = (input.category ?? "").trim();
+  if (category && category.toLowerCase() !== "all") params.set("category", category);
   const text = params.toString();
   return text ? `?${text}` : "";
 }
@@ -140,12 +142,13 @@ export function skillDetailPath(id: string): string {
   return `/skills/${encodeURIComponent(id)}`;
 }
 
-export function formatVersion(version: string): string {
+export function formatVersion(version: string | null): string {
+  if (!version) return "—";
   return version.startsWith("v") || version.startsWith("V") ? version : `v${version}`;
 }
 
-export function shortSha(sha: string): string {
-  return sha.slice(0, 7);
+export function shortSha(sha: string | null): string {
+  return sha ? sha.slice(0, 7) : "—";
 }
 
 export function triggerLabel(trigger: Trigger): string {
@@ -200,4 +203,27 @@ export function isHttpUrl(value: string): boolean {
 
 function copyScope(scope: SkillScope): SkillScope {
   return { mode: scope.mode, lanes: [...scope.lanes] };
+}
+
+export const UNCATEGORIZED = "uncategorized";
+
+/** Distinct, sorted category labels across skills. A missing or blank category is not listed; the page offers Uncategorized separately. */
+export function categoryOptions(skills: readonly { category?: string | null }[]): string[] {
+  const seen = new Map<string, string>();
+  for (const skill of skills) {
+    const label = (skill.category ?? "").trim();
+    if (label && label.toLowerCase() !== UNCATEGORIZED && !seen.has(label.toLowerCase())) seen.set(label.toLowerCase(), label);
+  }
+  return [...seen.values()].sort((a, b) => a.localeCompare(b));
+}
+
+export function categoryLabel(category: string | null | undefined): string {
+  const label = (category ?? "").trim();
+  return label || "Uncategorized";
+}
+
+/** Count the entries of a sync result field that is an array on the wire. */
+export function countOf(value: unknown): number {
+  if (Array.isArray(value)) return value.length;
+  return typeof value === "number" ? value : 0;
 }

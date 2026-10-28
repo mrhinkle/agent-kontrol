@@ -18,9 +18,11 @@ export interface SkillSummary {
   id: string;
   name: string;
   description: string;
-  version: string;
+  version: string | null;
   sha: string;
   runtimes: string[];
+  category?: string | null;
+  tags?: string[];
   trigger: Trigger;
   scope: SkillScope;
   triggerCount7d: number;
@@ -30,8 +32,8 @@ export interface SkillSummary {
 
 export interface SkillUpstream {
   source: string;
-  sha: string;
-  syncedAt: string;
+  sha: string | null;
+  syncedAt: string | null;
   driftCount: number;
 }
 
@@ -53,10 +55,11 @@ export type TriggerRunStatus = "done" | "stalled" | "running";
 export interface SkillTriggerEvent {
   at: string;
   agent: string;
-  lane: string;
+  lane: string | null;
   started: boolean;
   ended: boolean;
   status: TriggerRunStatus;
+  outcome?: "done" | "failed" | null;
 }
 
 /** Detail payload. `runtimes` replaces the list's string array. Optional URL fields are rendered only when present. */
@@ -77,9 +80,11 @@ export interface SkillPatch {
   schedule?: string | null;
 }
 
+/** Counts derived from the API's added/changed/removed arrays. */
 export interface SkillSyncResult {
+  status: "ok" | "failed" | "busy";
   added: number;
   changed: number;
   removed: number;
-  sha: string;
+  errors: string[];
 }

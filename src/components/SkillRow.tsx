@@ -13,6 +13,7 @@ import {
   runtimePlatformId,
   showClaudeOnlyFlag,
   skillDetailPath,
+  categoryLabel,
 } from "./SkillHelpers";
 import { SkillScopeControl } from "./SkillScopeControl";
 import { SkillTriggerControl } from "./SkillTriggerControl";
@@ -168,6 +169,9 @@ export function SkillRow({
               {skill.name}
             </Link>
             <SkillRuntimeChips runtimes={skill.runtimes} />
+            <span className="rounded-full bg-white/5 px-2 py-0.5 text-[11px] text-gray-400 ring-1 ring-white/10" title="Category">
+              {categoryLabel(skill.category)}
+            </span>
             {flagged && (
               <span className="inline-flex items-center rounded-full bg-[#ffb020]/15 px-2 py-0.5 text-[11px] font-medium text-[#ffb020] ring-1 ring-[#ffb020]/40">
                 claude only — hidden from codex/grok

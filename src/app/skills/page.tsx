@@ -1,10 +1,10 @@
 "use client";
 
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { SkillRow } from "@/components/SkillRow";
 import { SkillUpstreamHeader } from "@/components/SkillUpstreamHeader";
-import { filterSkills, laneOptions, RUNTIME_FILTERS, skillsQuery } from "@/components/SkillHelpers";
+import { categoryOptions, filterSkills, laneOptions, RUNTIME_FILTERS, skillsQuery, UNCATEGORIZED } from "@/components/SkillHelpers";
 import { useSkills } from "@/components/use-skills";
 
 const field =
@@ -26,7 +26,15 @@ function SkillsList() {
   const [qInput, setQInput] = useState(initialQ);
   const [runtime, setRuntime] = useState(initialRuntime);
   const [q, setQ] = useState(initialQ.trim());
-  const { data, error, reload, mutateSkill, holdSkill } = useSkills({ q, runtime });
+  const [category, setCategory] = useState(params.get("category")?.trim() || "all");
+  const { data, error, reload, mutateSkill, holdSkill } = useSkills({ q, runtime, category });
+  // Keep every category seen so far: filtering by one must not remove the others from the menu.
+  const seenCategories = useRef(new Map<string, string>());
+  for (const label of categoryOptions(data?.skills ?? [])) seenCategories.current.set(label.toLowerCase(), label);
+  if (category !== "all" && category !== UNCATEGORIZED && !seenCategories.current.has(category.toLowerCase())) {
+    seenCategories.current.set(category.toLowerCase(), category);
+  }
+  const categories = [...seenCategories.current.values()].sort((a, b) => a.localeCompare(b));
 
   useEffect(() => {
     const timer = window.setTimeout(() => setQ(qInput.trim()), 300);
@@ -34,10 +42,10 @@ function SkillsList() {
   }, [qInput]);
 
   useEffect(() => {
-    const path = `/skills${skillsQuery({ q, runtime })}`;
+    const path = `/skills${skillsQuery({ q, runtime, category })}`;
     if (path === window.location.pathname + window.location.search) return;
     router.replace(path, { scroll: false });
-  }, [q, runtime, router]);
+  }, [q, runtime, category, router]);
 
   const skills = data?.skills ?? [];
   const visible = filterSkills(skills, qInput);
@@ -68,6 +76,18 @@ function SkillsList() {
                 {item === "all" ? "All" : item}
               </option>
             ))}
+          </select>
+        </label>
+        <label className="flex items-center gap-2 text-xs text-gray-500">
+          Category
+          <select value={category} aria-label="Category" onChange={(event) => setCategory(event.target.value)} className={`${field} max-w-[14rem]`}>
+            <option value="all">All</option>
+            {categories.map((item) => (
+              <option key={item} value={item}>
+                {item}
+              </option>
+            ))}
+            <option value={UNCATEGORIZED}>Uncategorized</option>
           </select>
         </label>
       </div>

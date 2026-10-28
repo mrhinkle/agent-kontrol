@@ -10,12 +10,12 @@ function isSkillsListResponse(value: unknown): value is SkillsListResponse {
   const upstream = body.upstream;
   if (!upstream || typeof upstream !== "object" || !Array.isArray(body.skills)) return false;
   const row = upstream as Record<string, unknown>;
-  return typeof row.source === "string" && typeof row.sha === "string" && typeof row.syncedAt === "string" && typeof row.driftCount === "number";
+  return typeof row.source === "string" && (row.sha === null || typeof row.sha === "string") && (row.syncedAt === null || typeof row.syncedAt === "string") && typeof row.driftCount === "number";
 }
 
 const POLL_MS = 15_000;
 
-export function useSkills({ q, runtime }: { q: string; runtime: string }): {
+export function useSkills({ q, runtime, category = "all" }: { q: string; runtime: string; category?: string }): {
   data: SkillsListResponse | null;
   error: string | null;
   loading: boolean;
@@ -32,7 +32,7 @@ export function useSkills({ q, runtime }: { q: string; runtime: string }): {
   const load = useCallback(async () => {
     const my = ++epoch.current;
     try {
-      const res = await fetch(`/api/skills${skillsQuery({ q, runtime })}`, { cache: "no-store" });
+      const res = await fetch(`/api/skills${skillsQuery({ q, runtime, category })}`, { cache: "no-store" });
       if (my !== epoch.current) return;
       if (!res.ok) {
         const body: unknown = await res.json().catch(() => null);

@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { TimeAgo } from "@/components/ui";
-import { readApiError, shortSha } from "./SkillHelpers";
+import { countOf, readApiError, shortSha } from "./SkillHelpers";
 import type { SkillSyncResult, SkillUpstream } from "./skills-types";
 
 const control =
@@ -24,13 +24,12 @@ export function SkillUpstreamHeader({ upstream, onSynced }: { upstream: SkillUps
         setError(readApiError(body, `Sync failed (${res.status})`));
         return;
       }
-      const parsed = body && typeof body === "object" ? (body as Partial<SkillSyncResult>) : {};
-      setResult({
-        added: typeof parsed.added === "number" ? parsed.added : 0,
-        changed: typeof parsed.changed === "number" ? parsed.changed : 0,
-        removed: typeof parsed.removed === "number" ? parsed.removed : 0,
-        sha: typeof parsed.sha === "string" ? parsed.sha : "",
-      });
+      const parsed = body && typeof body === "object" ? (body as Record<string, unknown>) : {};
+      const status = parsed.status === "failed" || parsed.status === "busy" ? parsed.status : "ok";
+      const errors = Array.isArray(parsed.errors)
+        ? parsed.errors.flatMap((e) => (e && typeof e === "object" && typeof (e as { message?: unknown }).message === "string" ? [(e as { message: string }).message] : []))
+        : [];
+      setResult({ status, added: countOf(parsed.added), changed: countOf(parsed.changed), removed: countOf(parsed.removed), errors });
       onSynced();
     } catch (e) {
       setResult(null);
@@ -46,7 +45,7 @@ export function SkillUpstreamHeader({ upstream, onSynced }: { upstream: SkillUps
     <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-sm text-gray-400">
       <p>
         Upstream: <span className="text-gray-200">{upstream.source}</span> @{" "}
-        <span className="mono text-gray-200" title={upstream.sha}>
+        <span className="mono text-gray-200" title={upstream.sha ?? undefined}>
           {shortSha(upstream.sha)}
         </span>{" "}
         (synced <TimeAgo iso={upstream.syncedAt} />)
@@ -54,10 +53,14 @@ export function SkillUpstreamHeader({ upstream, onSynced }: { upstream: SkillUps
       <button type="button" className={control} onClick={() => void sync()} disabled={pending}>
         {pending ? "Syncing…" : "Sync now"}
       </button>
-      {result && (
+      {result?.status === "ok" && (
         <span className="mono text-xs text-gray-300">
           +{result.added} ~{result.changed} −{result.removed}
         </span>
+      )}
+      {result?.status === "busy" && <span className="text-xs text-[#ffb020]">A sync is already running.</span>}
+      {result?.status === "failed" && (
+        <span className="text-xs text-red-400">Sync failed{result.errors[0] ? `: ${result.errors[0]}` : "."}</span>
       )}
       {error && <span className="text-xs text-red-400">{error}</span>}
       <span className={driftHot ? "font-medium text-[#ffb020]" : "text-gray-600"}>Drift: {upstream.driftCount}</span>
