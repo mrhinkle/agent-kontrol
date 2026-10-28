@@ -226,6 +226,30 @@ export function openApiDocument(): Json {
           required: ["error"],
           properties: { error: { type: "string" } },
         },
+        BriefAlert: {
+          type: "object",
+          required: ["key", "kind", "condition", "sent", "summary"],
+          properties: {
+            key: { type: "string" },
+            kind: { type: "string", enum: ["coordinator_silent", "zero_merge", "decision_age"] },
+            condition: { type: "string", enum: ["firing", "clear", "unknown"] },
+            sent: { type: "boolean" },
+            last_sent_at: { type: ["string", "null"], format: "date-time" },
+            summary: { type: "string" },
+          },
+        },
+        BriefAlerts: {
+          type: "object",
+          required: ["enabled", "delivery", "generated_at", "sent_count", "alerts"],
+          properties: {
+            enabled: { type: "boolean" },
+            delivery: { type: "string", enum: ["read", "disabled", "live"] },
+            generated_at: { type: "string", format: "date-time" },
+            sent_count: { type: "integer" },
+            alerts: { type: "array", items: ref("BriefAlert") },
+            note: { type: "string" },
+          },
+        },
         ReportInput: {
           type: "object",
           required: ["agent_id", "kind"],
@@ -1223,6 +1247,34 @@ export function openApiDocument(): Json {
                 "application/json": { schema: { type: "object", additionalProperties: true } },
               },
             },
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/brief/alerts": {
+        get: operation({
+          operationId: "getBriefAlerts",
+          tags: ["progress"],
+          summary: "Threshold alert conditions. Does not send.",
+          description:
+            "Auth matches GET /api/brief: session cookie, MC_TOKEN, or an agent credential with progress:read. Returns the coordinator-silence, zero-merge, and decision-age conditions. condition is firing, clear, or unknown. unknown means that source could not be read or the merge history does not cover the lookback; it is not a clear. sent is true only when a brief_alerts latch exists and cleared_at is null. This route never inserts a message. With no database every condition is unknown.",
+          security: cookieOrBearer,
+          responses: {
+            "200": jsonResponse("Current conditions and latch state.", ref("BriefAlerts")),
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/brief/alerts/evaluate": {
+        post: operation({
+          operationId: "evaluateBriefAlerts",
+          tags: ["progress"],
+          summary: "Evaluate threshold alerts and send newly claimed ones.",
+          description:
+            "Auth matches POST /api/progress/ingest: Authorization Bearer MC_TOKEN. An agent credential is 403, including one with progress:read. The body is ignored. When brief.alerts.enabled is false the conditions are still computed, sent_count is 0, delivery is disabled, and no brief_alerts row is claimed or cleared. When enabled, one operator message is inserted per alert whose claim statement returns a row. Coordinator silence re-claims after coordinatorRepeatHours. A zero-merge alert re-arms only after it clears. A decision alerts once per row. Unknown conditions are not claimed and do not clear an existing latch.",
+          security: bearerOnly,
+          responses: {
+            "200": jsonResponse("Conditions, plus sent_count for this call.", ref("BriefAlerts")),
             ...flatErrors,
           },
         }),

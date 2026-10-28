@@ -19,7 +19,7 @@ The `agent_credentials` table stores the label, the first 8 characters of the to
 | Dashboard UI and data routes (default) | Session cookie `mc_auth`, or `Authorization: Bearer <MC_TOKEN>` |
 | `GET` and `POST /api/decisions` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `decisions:write` |
 | `PATCH /api/decisions/:id` | Session cookie, `MC_TOKEN`, or an agent credential with `decisions:write` |
-| Ingest routes: `POST /api/v1/traces`, `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, `POST /api/usage/ingest` | `Authorization: Bearer <MC_TOKEN>`, or an agent credential whose scope covers the route (`status:write` for `POST /api/ingest`, `messages:write` for `POST /api/messages/reply`); the other ingest routes take `MC_TOKEN` only |
+| Ingest routes: `POST /api/v1/traces`, `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, `POST /api/usage/ingest`, `POST /api/brief/alerts/evaluate` | `Authorization: Bearer <MC_TOKEN>`, or an agent credential whose scope covers the route (`status:write` for `POST /api/ingest`, `messages:write` for `POST /api/messages/reply`); the other ingest routes, including alert evaluate, take `MC_TOKEN` only |
 | MCP transport: `/api/mcp` | `Authorization: Bearer <MC_TOKEN>`, an agent credential, or an OAuth access token (JWT) issued by this server |
 | Credential management: `GET`/`POST`/`DELETE /api/settings/credentials` | Dashboard session only |
 | Login, OAuth, and discovery: `/login`, `/api/login`, `/oauth/*`, `/.well-known/*` | No cookie gate; these routes enforce their own auth |
@@ -54,6 +54,8 @@ Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI
 | GET | `/api/progress` | Cookie or bearer | Everything the progress board needs |
 | GET | `/api/progress/digest` | Cookie or bearer | The board as plain text, for schedulers and terminals. A failure is the JSON error body, not plain text. |
 | GET | `/api/brief` | Cookie, bearer, or `progress:read` | Morning brief. `text/plain` by default; `Accept: application/json` for the object. `window` is `24h` (default) or `72h`. A failure is the JSON error body. |
+| GET | `/api/brief/alerts` | Cookie, bearer, or `progress:read` | Threshold conditions and whether each was sent. Does not send. |
+| POST | `/api/brief/alerts/evaluate` | Bearer `MC_TOKEN` only | Compute the same conditions. Sends only when `brief.alerts.enabled` is true. |
 | POST | `/api/progress/ingest` | Bearer | One collection tick from `scripts/collect-progress.sh` |
 | GET | `/api/decisions` | Cookie or bearer | Decision queue, oldest first, each row with `age_days`. `shape=brief` is the morning-brief `.decisions` list |
 | POST | `/api/decisions` | Cookie or bearer | Upsert one decision, or reconcile a collector sweep |
@@ -208,6 +210,22 @@ An empty `detail.merged` array is a measured empty window. The shipped list stay
 Coordinator liveness uses `brief.coordinator` in `progress.config.json`. `agentId` null omits the COORDINATOR section (`configured: false`). A configured agent is `working` only when the newest work event (`session_end`, `milestone`, or `status`, exact match, plus any other configured kind that is not in the excluded set) is within `maxSilenceHours`. The read is that newest configured work event, every `error` inside the silence window, and the single newest event of any kind. It is not the newest 200 other events. A burst of `turn_start` or `status_update` cannot hide a work event that is still inside the window, and it cannot hide the age of the newest work event once that event is older than the window. `workKinds` may be a pipe-delimited string or an array of strings. `scripts/morning-brief.sh` accepts both. `heartbeat`, `telemetry`, `turn_start`, `status_update`, and `error` do not count as work, even when `workKinds` names them and even when `last_seen_at` is seconds old. A list that contains only those kinds falls back to `session_end`, `milestone`, and `status`. The work-event query receives that filtered list, so a configured `error` cannot be the newest work row. `status_update` is not `status`. An `error` in the silence window with no work event is `FAILING`, and the count is every error in that window. The text adds `(telemetry seen Nh ago)` from `last_seen_at` when that timestamp exists, including `0`.
 
 `scripts/morning-brief.sh` remains the fallback. A scheduler should `curl` this route. `repo_source` is `dashboard` when the watched list came from the database and `config` when it came from `progress.config.json`.
+
+### Threshold alerts
+
+`GET /api/brief/alerts` reports the between-brief conditions. It does not insert a message. Auth matches `GET /api/brief` (`progress:read` for an agent credential). `POST /api/brief/alerts/evaluate` is the only sender. Auth matches `POST /api/progress/ingest`: `MC_TOKEN` bearer. An agent credential is `403`, including one that holds `progress:read`. The POST body is ignored.
+
+`brief.alerts` in `progress.config.json` holds the thresholds. `enabled` defaults to `false`. Only a boolean `true` turns delivery on. A missing block, `0`, or the string `"true"` stays off. While delivery is off, evaluate still computes the conditions, `sent_count` is `0`, `delivery` is `disabled`, and no `brief_alerts` row is claimed or cleared. The owner turns the switch on after the first decision-backlog clear. Until then the channel stays quiet.
+
+The three conditions, and no others:
+
+- Coordinator work-event silence past `brief.coordinator.maxSilenceHours`. The work kinds are the brief's: `heartbeat`, `telemetry`, `turn_start`, `status_update`, and `error` never count. The alert re-sends every `coordinatorRepeatHours` (default 12) while the silence holds, then clears when a work event arrives.
+- A watched repo with at least one merge in the prior `zeroMergeLookbackDays` (default 7) and no merge for `zeroMergeHours` (default 72). A merge at exactly 72h counts as quiet. A merge one minute newer does not. A repo with no merges in the prior 7 days does not alert. The alert fires once per quiet episode and re-arms only after the episode clears. A snapshot whose `detail.merged` does not cover the lookback is `unknown`, not clear.
+- An open decision whose `opened_at` (else `first_seen_at`) is strictly older than `decisionAgeDays` (default 14). One message per decision row, ever. A resolved, withdrawn, or deferred row does not alert. Exactly 14 days has not crossed the line.
+
+`condition` is `firing`, `clear`, or `unknown`. A failed read, a missing timestamp, or incomplete merge coverage is `unknown`. Unknown never sends and never clears a latch that is already sent. `sent` is true when `brief_alerts.cleared_at` is null for that key. Each send is one inbound row from `enqueueMessage` (`created_by` `brief-alerts`, actor fields from the caller) on the coordinator conversation, or `operator` when no coordinator is configured.
+
+The claim is one `INSERT ... ON CONFLICT ... RETURNING` statement. Two concurrent evaluates insert one message per alert. The progress collector does not call this route. The scheduler that curls the brief POSTs evaluate on its own tick. No other pushes.
 
 ### Decisions
 
