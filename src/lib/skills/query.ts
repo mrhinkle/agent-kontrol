@@ -1,5 +1,7 @@
 import { currentActor } from "../actor";
 import { skillNow } from "./clock";
+import { scheduleView } from "./schedule";
+import { listLastScheduledTasks, type ScheduledTaskRow } from "./schedule-store";
 import { driftNameCount } from "./drift";
 import { presentRun } from "./present";
 import { parseSettingsPatch } from "./settings";
@@ -68,11 +70,12 @@ export async function listSkillViews(filter: {
 }> {
   const now = skillNow();
   const since = new Date(now.getTime() - WEEK_MS).toISOString();
-  const [rows, settings, stats, upstream] = await Promise.all([
+  const [rows, settings, stats, upstream, scheduled] = await Promise.all([
     listSkillRows(),
     listSettings(),
     runStats(since),
     readUpstream(),
+    lastScheduledById(),
   ]);
   const settingsById = new Map(settings.map((row) => [row.skill_id, row]));
   const statsById = new Map(stats.map((row) => [row.skill_id, row]));
@@ -89,7 +92,7 @@ export async function listSkillViews(filter: {
         row.description.toLowerCase().includes(q)
       );
     })
-    .map((row) => toListItem(row, settingsById.get(row.id), statsById.get(row.id)))
+    .map((row) => toListItem(row, settingsById.get(row.id), statsById.get(row.id), scheduled.get(row.id)))
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   return { upstream, skills };
 }
@@ -97,15 +100,16 @@ export async function listSkillViews(filter: {
 export async function getSkillDetail(id: string): Promise<SkillDetail | null> {
   const row = await getSkillRow(id);
   if (!row) return null;
-  const [settings, stats, triggers] = await Promise.all([
+  const [settings, stats, triggers, scheduled] = await Promise.all([
     listSettings(),
     runStats(new Date(skillNow().getTime() - WEEK_MS).toISOString()),
     recentRuns(id, 50),
+    lastScheduledById(),
   ]);
   const setting = settings.find((item) => item.skill_id === id);
   const stat = stats.find((item) => item.skill_id === id);
   const now = skillNow();
-  const item = toListItem(row, setting, stat);
+  const item = toListItem(row, setting, stat, scheduled.get(id));
   return {
     ...item,
     body: row.body,
@@ -148,6 +152,7 @@ function toListItem(
   row: SkillRecord,
   setting: SettingsRecord | undefined,
   stat: { triggers_7d: number; last_agent: string | null; last_at: string | null } | undefined,
+  lastScheduled?: ScheduledTaskRow,
 ): SkillListItem {
   return {
     id: row.id,
@@ -162,5 +167,15 @@ function toListItem(
     scope: setting?.scope ?? DEFAULT_SCOPE,
     triggerCount7d: stat?.triggers_7d ?? 0,
     lastRun: stat?.last_at && stat.last_agent ? { at: stat.last_at, agent: stat.last_agent } : null,
+    ...scheduleView(setting, lastScheduled),
   };
+}
+
+/** The scheduler's newest task per skill. A failed read leaves lastScheduledAt null; it does not fail the skills list. */
+async function lastScheduledById(): Promise<Map<string, ScheduledTaskRow>> {
+  try {
+    return new Map((await listLastScheduledTasks()).map((row) => [row.skill_id, row]));
+  } catch {
+    return new Map();
+  }
 }
