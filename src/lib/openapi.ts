@@ -1472,6 +1472,29 @@ export function openApiDocument(): Json {
           },
         }),
       },
+      "/api/skills/export": {
+        get: operation({
+          operationId: "exportSkills",
+          tags: ["skills"],
+          summary: "Download a skill tree for one runtime.",
+          description:
+            "Operator route. An agent credential is denied, including one with skills:read or skills:write. Dashboard session or MC_TOKEN. runtime is required and is claude, codex, grok, hermes, or mini. lane is optional. Trigger off is omitted. A selected scope is omitted unless lane is set and admits it. category and q match list_skills. The body is a gzip-compressed tar. Paths are relative. A category or skill name that is not a safe folder is left out. A skill with no category is under uncategorized/. hermes uses <category>/<name>/SKILL.md. With no database the archive is the demo fixture under the same rules. A repeated runtime, lane, category, or q is 400 validation_failed.",
+          security: cookieOrBearer,
+          parameters: [
+            query("runtime", { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] }, "Runtime the tree is rendered for.", { required: true }),
+            query("lane", { type: "string" }, "When omitted, skills whose scope is selected are omitted."),
+            query("category", { type: "string" }, "Exact category, case-insensitive. uncategorized matches a null category."),
+            query("q", { type: "string" }, "Case-insensitive match on the skill id and the description."),
+          ],
+          responses: {
+            "200": {
+              description: "gzip-compressed tar of the rendered tree. x-ak-demo is true when no database is configured.",
+              content: { "application/gzip": { schema: { type: "string", contentEncoding: "gzip" } } },
+            },
+            ...flatErrors,
+          },
+        }),
+      },
       "/api/skills/sync": {
         post: operation({
           operationId: "syncSkills",

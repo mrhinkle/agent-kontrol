@@ -44,7 +44,7 @@ A tool that is not in the table below is denied for every caller, including `MC_
 
 `send_message` is the MCP form of operator `POST /api/messages`. That REST route stays off this table, so an agent credential still cannot call it. The tool requires `messages:write`. `delete_note` uses `memory:write`. There is no memory DELETE route. `requeue_task` uses `tasks:write`, the same scope as `PATCH /api/tasks/:id`.
 
-Collector and operator routes are not in this table. An agent credential cannot call them. `MC_TOKEN` and the dashboard session still can. That set is `POST /api/progress/ingest`, `POST /api/usage/ingest`, `GET /api/usage`, `POST /api/v1/traces`, `GET /api/traces`, `GET /api/traces/:traceId`, `POST /api/messages`, `PATCH /api/messages`, `GET /api/decisions`, `POST /api/decisions`, `PATCH /api/skills/:id`, `POST /api/skills/sync`, `POST /api/skills/drift`, and `GET`/`PUT /api/settings/repos`. `GET`/`POST`/`DELETE /api/settings/credentials` accepts only the dashboard session. `PATCH /api/decisions/:id` is the `decisions:write` row above. There is no MCP tool for decisions yet.
+Collector and operator routes are not in this table. An agent credential cannot call them. `MC_TOKEN` and the dashboard session still can. That set is `POST /api/progress/ingest`, `POST /api/usage/ingest`, `GET /api/usage`, `POST /api/v1/traces`, `GET /api/traces`, `GET /api/traces/:traceId`, `POST /api/messages`, `PATCH /api/messages`, `GET /api/decisions`, `POST /api/decisions`, `PATCH /api/skills/:id`, `POST /api/skills/sync`, `POST /api/skills/drift`, `GET /api/skills/export`, and `GET`/`PUT /api/settings/repos`. `GET`/`POST`/`DELETE /api/settings/credentials` accepts only the dashboard session. `PATCH /api/decisions/:id` is the `decisions:write` row above. There is no MCP tool for decisions yet.
 
 `check_inbox` and `GET /api/messages?ack=true` can mark inbox rows delivered. That side effect is part of `messages:read`, which is how the inbox already worked.
 
@@ -287,6 +287,8 @@ Return the mirrored SKILL.md, or one reference file. The header states the conte
 
 A missing skill, a removed skill, and a skill whose trigger is `off` are the same `not_found` result: `Skill is not available.`
 
+When `runtime` is `hermes`, the instruction text includes a Hermes `SKILL.md`. The frontmatter is `name`, `description`, and `version`, plus `author`, `license`, `platforms`, `metadata.hermes.tags`, `metadata.hermes.related_skills`, and `prerequisites` when the stored skill has them. `version` is the stored version, or the content SHA when the skill has none. Tags are the store's tags, written at `metadata.hermes.tags`. A field the store does not have is omitted. `runtime` `claude`, `mini`, or omitted keeps the previous text: the preamble and the body, with no Hermes frontmatter. `runtime` `codex` or `grok` puts an Agent Skills `SKILL.md` (`name`, `description`, and `license`, `compatibility`, `metadata`, or `allowed-tools` only when the stored frontmatter already has them) in that same preamble. `run_skill` uses the same document on start.
+
 ### run_skill
 
 Start a skill run, or finish one. This is one tool on purpose. A second `report_skill_done` tool would write the same row under a second name and a second chance to get the actor check wrong. The agent executes the instructions. Agent Kontrol stores the start, the end, and an optional note. It does not run the skill.
@@ -427,7 +429,9 @@ Reference files are text only. A file over 256 KB, or a file that would push the
 
 ### REST
 
-`GET /api/skills` and `GET /api/skills/:id` require `skills:read` for an agent credential. `PATCH /api/skills/:id`, `POST /api/skills/sync`, and `POST /api/skills/drift` are not in the agent scope table. A dashboard session or `MC_TOKEN` can call them. An agent credential cannot, including one that holds `skills:write`.
+`GET /api/skills` and `GET /api/skills/:id` require `skills:read` for an agent credential. `PATCH /api/skills/:id`, `POST /api/skills/sync`, `POST /api/skills/drift`, and `GET /api/skills/export` are not in the agent scope table. A dashboard session or `MC_TOKEN` can call them. An agent credential cannot, including one that holds `skills:write`.
+
+`GET /api/skills/export?runtime=hermes&lane=` downloads a gzip tar of the tree for that runtime. The filter matches `list_skills`: trigger `off` is omitted, and a selected scope is omitted unless `lane` admits it. Hermes files are `<category>/<name>/SKILL.md`, with references beside that file. No category is the folder `uncategorized`. A path with `..` or an absolute path is not written. See [API.md](API.md#skill-export).
 
 `GET /api/skills?runtime=&q=&category=` returns `{ demo, upstream, skills }`. Each skill's `runtimes` is an array of names. Each skill also has `category` (string or null) and `tags` (array of strings), copied from SKILL.md frontmatter. `category` is one trimmed string. `tags` is a list of trimmed strings. A scalar string tag is kept as a one-element list. A missing key, a blank string, or any other shape is null or `[]`. Declared text is stored as written. It is not checked against the 16-value list in master-skills `TAXONOMY.md`. `category` on the query string is an exact case-insensitive match. The value `uncategorized` matches a null category. `GET /api/skills/:id` returns that same skill with `runtimes` as an object of booleans, plus `body`, `references` (paths only), `schedule`, and `triggers` (newest first, at most 50). An unknown runtime is HTTP 400. An unknown id is HTTP 404.
 

@@ -80,11 +80,12 @@ const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   // dashboard uses the session. An agent credential can change a decision
   // only when it holds decisions:write.
   { method: "PATCH", path: /^\/api\/decisions\/[^/]+$/, scope: "decisions:write" },
-  // GET only. PATCH, POST /api/skills/sync, and POST /api/skills/drift are
-  // operator routes: an agent must not be able to turn a skill on, sync, or
-  // file a drift report. The lookahead keeps those two paths off skills:read.
+  // GET only. PATCH, POST /api/skills/sync, POST /api/skills/drift, and
+  // GET /api/skills/export are operator routes: an agent must not be able to
+  // turn a skill on, sync, file a drift report, or download the skill tree.
+  // The lookahead keeps those paths off skills:read.
   { method: "GET", path: /^\/api\/skills$/, scope: "skills:read" },
-  { method: "GET", path: /^\/api\/skills\/(?!sync$|drift$)[^/]+$/, scope: "skills:read" },
+  { method: "GET", path: /^\/api\/skills\/(?!sync$|drift$|export$)[^/]+$/, scope: "skills:read" },
   // Read-only: renders the pointer block, and POST only transforms the text sent.
   { method: "POST", path: /^\/api\/skills\/pointers$/, scope: "skills:read" },
 ];

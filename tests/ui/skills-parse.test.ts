@@ -456,7 +456,7 @@ describe("skill scopes, alerts, and the digest", () => {
     const text = formatDigest(demoProgress("7d"));
     assert.match(text, /Only triggers routed through Agent Kontrol are counted/);
     const openapi = fs.readFileSync("src/lib/openapi.ts", "utf8");
-    for (const path of ["/api/skills\"", "/api/skills/sync", "/api/skills/drift", "/api/skills/{id}"]) {
+    for (const path of ["/api/skills\"", "/api/skills/sync", "/api/skills/drift", "/api/skills/export", "/api/skills/{id}"]) {
       assert.ok(openapi.includes(path), path);
     }
   });

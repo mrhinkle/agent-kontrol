@@ -3,6 +3,7 @@ import { isConfigured } from "../db";
 import { demoDetail, demoList, demoReference, demoSkillRows } from "./demo";
 import { scopeAdmits } from "./settings";
 import { skillContentSha, shortSha } from "./sha";
+import { presentSkillDocument } from "./present";
 import { finishSkillRun, gateSkill, renderReferenceText, renderSkillText, startSkillRun } from "./runs";
 import { isUuid } from "./store";
 import { isRuntime, type Runtime } from "./types";
@@ -170,12 +171,27 @@ function demoGet(args: { id: string; path?: string; runtime?: string; lane?: str
   }
   const detail = demoDetail(args.id);
   const runtime = args.runtime && isRuntime(args.runtime) ? args.runtime : null;
+  const document = presentSkillDocument(
+    {
+      id: skill.id,
+      name: skill.id,
+      description: skill.description,
+      version: skill.version,
+      sha,
+      body: detail?.body ?? skill.body,
+      category: skill.category,
+      tags: skill.tags,
+      references: skill.references,
+      frontmatter: {},
+    },
+    runtime,
+  );
   const lines = [
     `# ${skill.id}`,
     `Pinned SHA: ${sha}`,
     runtime ? `Runtime: ${runtime}` : "Runtime: not filtered",
     "",
-    detail?.body ?? skill.body,
+    document,
   ];
   return text(lines.join("\n"));
 }

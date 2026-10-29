@@ -3,6 +3,7 @@ import { currentActor, DASHBOARD_ACTOR_ID, LEGACY_ACTOR_ID, type Actor } from ".
 import { upsertSpans } from "../trace-store";
 import type { SpanInput } from "../traces";
 import { skillNow } from "./clock";
+import { presentSkillDocument } from "./present";
 import { scopeAdmits } from "./settings";
 import { completeRun, deleteRun, getRun, getSkillRow, insertRun, listSettings } from "./store";
 import {
@@ -66,7 +67,7 @@ export function renderSkillText(skill: SkillRecord, runtime: Runtime | null): st
     "",
     runtime ? PREAMBLE[runtime] : "Follow this skill in your own session. Agent Kontrol does not execute it.",
     "",
-    skill.body.trimEnd(),
+    presentSkillDocument(skill, runtime),
     "",
     "References (fetch with get_skill):",
   ];
