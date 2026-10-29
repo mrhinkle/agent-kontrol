@@ -112,6 +112,8 @@ function body(schema: Json): Json {
 const cookieOrBearer = [{ cookieAuth: [] }, { bearerAuth: [] }];
 const bearerOnly = [{ bearerAuth: [] }];
 const sessionOnly = [{ cookieAuth: [] }];
+/** Dashboard session or MC_TOKEN. Not the generic bearer that accepts an agent credential. */
+const operatorSessionOrMcToken = [{ cookieAuth: [] }, { mcToken: [] }];
 
 /** Server-set. A request body cannot write these. */
 const actorType: Json = {
@@ -202,6 +204,12 @@ export function openApiDocument(): Json {
           type: "http",
           scheme: "bearer",
           description: "MC_TOKEN, an akc_ agent credential, or an OAuth access token on the MCP transport.",
+        },
+        mcToken: {
+          type: "http",
+          scheme: "bearer",
+          bearerFormat: "MC_TOKEN",
+          description: "Operator MC_TOKEN. An agent credential and an OAuth access token are not accepted on operations that use this scheme.",
         },
       },
       schemas: {
@@ -1468,6 +1476,29 @@ export function openApiDocument(): Json {
           }),
           responses: {
             "200": jsonResponse("demo, lane, runtime, empty, changed, and content (string or null).", { type: "object" }),
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/skill-bundles": {
+        get: operation({
+          operationId: "exportSkills",
+          tags: ["skills"],
+          summary: "Download a skill tree for one runtime.",
+          description:
+            "Operator only. Authenticate with a dashboard session or MC_TOKEN. An agent credential is denied, including one with skills:read or skills:write. runtime is required and is claude, codex, grok, hermes, or mini. lane is optional. Visibility is the list_skills check. Trigger off is omitted. A trigger other than off, on_request, auto_inject, or scheduled is treated as off and listed with reason invalid trigger. A selected scope is omitted unless lane is set and admits it. category and q match list_skills. The body is a gzip-compressed tar. Paths are relative. The directory is the skill id, which is the upstream directory slug. The frontmatter name is a display string and may differ. The folder is the id. Category is a Hermes folder only. Claude, Codex, Grok, and mini leave category out of the path, so a category value does not omit the skill for those runtimes. A Hermes category or a skill id that does not already match ^[a-z0-9][a-z0-9-_]*$ is omitted and listed. The stored text is left as it is. When two skills would write one archive path, every one of those skills is omitted and listed. A reference that is unsafe, that collides case-insensitively, or that does not fit a ustar name and prefix is omitted and listed with its path, and the skill is still exported. A skill whose SKILL.md cannot be written is omitted as a whole. Each omission is {skill, path?, reason}. When the list is not empty, manifest.json at the archive root contains every entry. The x-ak-skipped header carries count, the first 20 entries, and the text see manifest.json. The header is at most 4 KB. The archive contains each path once. A skill with no category is under uncategorized/ in the Hermes layout. hermes uses <category>/<id>/SKILL.md. With no database the archive is the demo fixture under the same rules. A repeated runtime, lane, category, or q is 400 validation_failed.",
+          security: operatorSessionOrMcToken,
+          parameters: [
+            query("runtime", { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] }, "Runtime the tree is rendered for.", { required: true }),
+            query("lane", { type: "string" }, "When omitted, skills whose scope is selected are omitted."),
+            query("category", { type: "string" }, "Exact category, case-insensitive. uncategorized matches a null category."),
+            query("q", { type: "string" }, "Case-insensitive match on the skill id and the description."),
+          ],
+          responses: {
+            "200": {
+              description: "gzip-compressed tar of the rendered tree. x-ak-demo is true when no database is configured.",
+              content: { "application/gzip": { schema: { type: "string", contentEncoding: "gzip" } } },
+            },
             ...flatErrors,
           },
         }),

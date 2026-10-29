@@ -70,6 +70,11 @@ export interface SkillRecord {
 export interface SkillSettingsRecord {
   skill_id: string;
   trigger: Trigger;
+  /**
+   * True when the stored trigger was not one of TRIGGERS.
+   * `trigger` is off in that case. Absent on rows that were not read from storage.
+   */
+  triggerInvalid?: boolean;
   scope: SkillScope;
   schedule: string | null;
   updated_by: string | null;

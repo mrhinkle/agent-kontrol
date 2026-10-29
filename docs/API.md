@@ -21,6 +21,7 @@ The `agent_credentials` table stores the label, the first 8 characters of the to
 | `PATCH /api/decisions/:id` | Session cookie, `MC_TOKEN`, or an agent credential with `decisions:write` |
 | Ingest routes: `POST /api/v1/traces`, `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, `POST /api/usage/ingest` | `Authorization: Bearer <MC_TOKEN>`, or an agent credential whose scope covers the route (`status:write` for `POST /api/ingest`, `messages:write` for `POST /api/messages/reply`); the other ingest routes take `MC_TOKEN` only |
 | MCP transport: `/api/mcp` | `Authorization: Bearer <MC_TOKEN>`, an agent credential, or an OAuth access token (JWT) issued by this server |
+| `GET /api/skill-bundles` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `skills:read` or `skills:write` |
 | Credential management: `GET`/`POST`/`DELETE /api/settings/credentials` | Dashboard session only |
 | Login, OAuth, and discovery: `/login`, `/api/login`, `/oauth/*`, `/.well-known/*` | No cookie gate; these routes enforce their own auth |
 | Public agent docs: `GET /llms.txt`, `GET /docs/mcp.md`, `GET /docs/api.md`, `GET /docs/agents.md` | None. Any other `/docs` name stays behind the dashboard gate |
@@ -72,6 +73,7 @@ Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI
 | GET | `/api/traces/:traceId` | Cookie or bearer | The spans of one trace |
 | GET | `/api/usage` | Cookie or bearer | Usage ledger |
 | POST | `/api/usage/ingest` | Bearer | Ingest usage facts |
+| GET | `/api/skill-bundles` | Session or MC_TOKEN | Download a gzip tar of the skill tree for one runtime. Operator only |
 | POST | `/api/login` | Own (rate-limited) | Dashboard password login |
 
 ### OAuth and discovery routes
@@ -268,6 +270,20 @@ See [Telemetry and traces](TELEMETRY.md) for the full contract.
 - `POST /api/v1/traces` — bearer `MC_TOKEN` — an OTLP/HTTP JSON export. Answers `200 { partialSuccess: { rejectedSpans?, errorMessage? } }`. `415` for protobuf, `413` over 2 MB, `401` for a bad token.
 - `GET /api/traces?agent=&errors=1&before=&limit=&cursor=&fields=` — `{ demo, traces: TraceSummary[] }`. Default limit is 50, maximum 200. Sort is `started_at` descending, then `trace_id` ascending when a page was requested. `fields` may name `trace_id`, `agent_id`, `root_name`, `started_at`, `ended_at`, `span_count`, `error_count`, `open_count`, `input_tokens`, `output_tokens`, `cost_usd`. `trace_id` is always returned. See [List pages](#list-pages).
 - `GET /api/traces/:traceId` — `{ demo, spans: Span[] }`. With a database, an unknown or pruned trace is `404` `not_found`. Demo mode returns `200` and an empty `spans` list.
+
+### Skill bundles
+
+`GET /api/skill-bundles?runtime=hermes&lane=` returns a gzip-compressed tar (`application/gzip`, `content-disposition` attachment). The caller is a dashboard session or `MC_TOKEN`. An agent credential is `403`, including one with `skills:read` or `skills:write`. `GET /api/skills/:id` is unchanged, including when the id is `export`.
+
+`runtime` is required: `claude`, `codex`, `grok`, `hermes`, or `mini`. `lane`, `category`, and `q` are optional. The set of skills is the same set `list_skills` would show. Export calls that same visibility check. Trigger `off` is omitted. A trigger other than `off`, `on_request`, `auto_inject`, or `scheduled` is treated as off and listed with reason `invalid trigger`. A selected scope is omitted unless `lane` admits it, and the skill has to list that runtime. `category` is an exact case-insensitive match. `uncategorized` matches a null category. `q` matches the skill id and the description.
+
+The archive directory is the skill id. That id is the upstream directory slug, and it is the canonical folder name. The frontmatter `name` is a display string and may differ from the id. It is written into the document. The folder is the id. Category is a Hermes folder only: Hermes paths are `<category>/<id>/SKILL.md`, and a null or blank category is the folder `uncategorized`. Claude and mini use `skills/<id>/SKILL.md`. Codex and Grok use `.agents/skills/<id>/SKILL.md`. Those layouts leave category out of the path, so a category value does not omit the skill there. Reference files sit next to `SKILL.md`.
+
+A Hermes category or a skill id that does not already match `^[a-z0-9][a-z0-9-_]*$` is omitted. The stored value is left as it is. A path with `..` or an absolute path is omitted. When more than one skill would write the same archive path, every one of those skills is omitted. A reference that is unsafe, that collides with another reference in the same skill under a case-insensitive comparison, or that does not fit a ustar name and prefix is omitted, and the skill is still exported. A skill whose `SKILL.md` cannot be written is omitted as a whole.
+
+Every omission is one entry `{skill, path?, reason}`. `path` is set for a reference. When the list is not empty, `manifest.json` at the archive root contains every entry. The `x-ak-skipped` header carries `count`, the first 20 entries, and the text `see manifest.json`. The header is at most 4 KB. A longer list keeps the count and drops header entries until it fits. Each archive path appears once.
+
+With no database the archive is the demo fixture and the response sets `x-ak-demo: true`. A missing or unknown `runtime`, or a repeated `runtime`, `lane`, `category`, or `q`, is `400`.
 
 ### Login
 
