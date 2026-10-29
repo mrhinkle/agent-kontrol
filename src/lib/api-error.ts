@@ -77,6 +77,12 @@ export const API_ERRORS = {
     fix: "GET the list again and send that version with your change.",
     retryable: false,
   },
+  writeback_in_progress: {
+    status: 409,
+    message: "A write-back is in progress for this decision.",
+    fix: "Wait for the write-back to finish, then reload. The claim expires after 180 seconds.",
+    retryable: true,
+  },
   stale_write: {
     status: 409,
     message: "stale_write",

@@ -2,7 +2,7 @@
  * Process-local store for demo mode (no DATABASE_URL).
  *
  * The five MCP write tools record here for the life of this process.
- * get_fleet_status, recall, and get_task_queue read it back. The data is
+ * get_fleet_status, recall, get_task_queue, and list_activity read it back. The data is
  * gone when the process exits. Every successful tool response from this
  * module carries DEMO_BANNER so a client cannot treat it as durable.
  *
@@ -11,7 +11,16 @@
  * without a limit. Sessions are capped per agent. An idempotency key stays
  * until its own expiry: evicting the task row must not drop it.
  */
-import type { Actor } from "./actor";
+import { currentActor, type Actor } from "./actor";
+import {
+  activityDetail,
+  activityRow,
+  attachReceipt,
+  readReceipt,
+  withReceipt,
+  type ActivityRow,
+  type Receipt,
+} from "./activity";
 import { mcpToolError, memoryKeyError, type McpToolResult } from "./api-error";
 import { diffMemoryWrite, diffTaskUpdate, readDryRun, type MemoryWriteInput } from "./dry-run";
 import { requeueBlock } from "./requeue";
@@ -83,11 +92,15 @@ interface DemoAgent {
 interface IdemRow {
   hash: string;
   task: Task;
+  /** Kept on the key so event-cap eviction does not drop a replay's receipt. */
+  receipt: Receipt;
   expiresAt: number;
   storedAt: number;
 }
 
 let nowFn: () => number = () => Date.now();
+/** Test-only. A task-status write rolls back both the row and the event. */
+let activityFault: "after-write" | "after-event" | null = null;
 let touchCount = 0;
 let tail: Promise<void> = Promise.resolve();
 let nextTaskId = 1;
@@ -106,6 +119,8 @@ const idempotency = new Map<string, IdemRow>();
 interface MessageIdemRow {
   hash: string;
   message: Message;
+  /** Kept on the key so event-cap eviction does not drop a replay's receipt. */
+  receipt: Receipt;
   expiresAt: number;
   storedAt: number;
 }
@@ -116,6 +131,15 @@ const messageIdempotency = new Map<string, MessageIdemRow>();
 /** Tests move the 24 hour idempotency window. Production never calls this. */
 export function setDemoClockForTests(fn: (() => number) | null): void {
   nowFn = fn ?? (() => Date.now());
+}
+
+/**
+ * Fail a task-status write after the row changes, or after the event is
+ * pushed. Both leave the store as it was. Production never calls this.
+ * On the SQL path the same two failures are one statement: neither commits.
+ */
+export function setActivityFaultForTests(fault: "after-write" | "after-event" | null): void {
+  activityFault = fault;
 }
 
 /** How many times a demo-store operation has run. The configured path must not change this. */
@@ -143,6 +167,7 @@ export function demoSessionsForTests(): { id: string; agent_id: string; updated_
 }
 
 export function resetDemoStoreForTests(): void {
+  activityFault = null;
   agents.clear();
   sessions.clear();
   events.length = 0;
@@ -288,6 +313,70 @@ function actorFields(actor: Actor | null | undefined): { actor_type: Task["actor
   return { actor_type: actor.actor_type, actor_id: actor.actor_id };
 }
 
+function receiptOf(event: Event): Receipt {
+  return { id: String(event.id), kind: event.kind, at: event.created_at };
+}
+
+/** An audit row that is not a task-status change. No fault hook. */
+function pushActivity(kind: string, title: string, tool: string, extra: Record<string, unknown>): Receipt {
+  const event: Event = {
+    id: nextEventId++,
+    agent_id: "",
+    session_id: null,
+    kind,
+    title,
+    detail: activityDetail(tool, currentActor(), extra),
+    created_at: iso(nowFn()),
+  };
+  events.push(event);
+  evictEvents();
+  return receiptOf(event);
+}
+
+function restoreTask(task: Task, snapshot: Task): void {
+  task.status = snapshot.status;
+  task.assigned_agent = snapshot.assigned_agent;
+  task.claimed_at = snapshot.claimed_at;
+  task.updated_at = snapshot.updated_at;
+  task.completed_at = snapshot.completed_at;
+  task.result = snapshot.result;
+  task.cost_usd = snapshot.cost_usd;
+  task.session_id = snapshot.session_id;
+  task.actor_type = snapshot.actor_type;
+  task.actor_id = snapshot.actor_id;
+}
+
+/**
+ * The event is pushed in the same turn as the task mutation. A fault undoes
+ * both, in either order, before the caller observes the write.
+ */
+function finishTaskActivity(task: Task, snapshot: Task, kind: string, title: string, tool: string, extra: Record<string, unknown>): Receipt {
+  if (activityFault === "after-write") {
+    restoreTask(task, snapshot);
+    activityFault = null;
+    throw new Error("activity fault after write");
+  }
+  const event: Event = {
+    id: nextEventId++,
+    agent_id: "",
+    session_id: null,
+    kind,
+    title,
+    detail: activityDetail(tool, currentActor(), extra),
+    created_at: iso(nowFn()),
+  };
+  events.push(event);
+  evictEvents();
+  if (activityFault === "after-event") {
+    const index = events.findIndex((row) => row.id === event.id);
+    if (index >= 0) events.splice(index, 1);
+    restoreTask(task, snapshot);
+    activityFault = null;
+    throw new Error("activity fault after event");
+  }
+  return receiptOf(event);
+}
+
 export interface DemoReportInput {
   agent_id: string;
   platform?: string;
@@ -302,7 +391,7 @@ export interface DemoReportInput {
   status?: string;
 }
 
-function applyReport(input: DemoReportInput): void {
+function applyReport(input: DemoReportInput): Receipt {
   touch();
   const now = iso(nowFn());
   const agentId = slugify(input.agent_id);
@@ -359,7 +448,7 @@ function applyReport(input: DemoReportInput): void {
     }
   }
 
-  events.push({
+  const event: Event = {
     id: nextEventId++,
     agent_id: agentId,
     session_id: input.session_id ?? null,
@@ -367,13 +456,45 @@ function applyReport(input: DemoReportInput): void {
     title: input.title ?? null,
     detail: input.detail ?? null,
     created_at: now,
-  });
+  };
+  events.push(event);
   evictEvents();
+  return { id: String(event.id), kind: event.kind, at: event.created_at };
 }
 
-export function demoReport(input: DemoReportInput): Promise<void> {
+export function demoReport(input: DemoReportInput): Promise<Receipt> {
+  return enqueue(async () => applyReport(input));
+}
+
+export interface DemoActivityFilter {
+  actor: string | null;
+  kind: string | null;
+  since: string | null;
+  until: string | null;
+}
+
+/** In-memory events. The caller pages them. Empty until a demo write records one. */
+export function demoListActivity(filter: DemoActivityFilter): Promise<ActivityRow[]> {
   return enqueue(async () => {
-    applyReport(input);
+    touch();
+    const rows = events.filter((event) => {
+      const detail = event.detail;
+      const actorId = detail && detail.actor_id != null && detail.actor_id !== "" ? String(detail.actor_id) : null;
+      if (filter.actor && actorId !== filter.actor) return false;
+      if (filter.kind && event.kind !== filter.kind) return false;
+      if (filter.since && event.created_at < filter.since) return false;
+      if (filter.until && event.created_at > filter.until) return false;
+      return true;
+    });
+    return rows.map((event) => activityRow({
+      id: event.id,
+      agent_id: event.agent_id,
+      session_id: event.session_id,
+      kind: event.kind,
+      title: event.title,
+      detail: event.detail,
+      created_at: event.created_at,
+    }));
   });
 }
 
@@ -445,7 +566,11 @@ function rememberUnlocked(input: DemoRememberInput): MemoryItem {
       existing.tags = tags;
       existing.agent_id = agentId;
       existing.updated_at = now;
-      return { ...existing, tags: [...existing.tags] };
+      const saved = { ...existing, tags: [...existing.tags] };
+      return attachReceipt(saved, pushActivity("remember", `Stored memory #${saved.id}`, "remember", {
+        memory_id: String(saved.id),
+        memory_key: saved.key,
+      }));
     }
   }
   if (notes.length >= DEMO_CAPS.notes) evictOldestNote();
@@ -459,7 +584,11 @@ function rememberUnlocked(input: DemoRememberInput): MemoryItem {
     updated_at: now,
   };
   notes.push(item);
-  return { ...item, tags: [...item.tags] };
+  const saved = { ...item, tags: [...item.tags] };
+  return attachReceipt(saved, pushActivity("remember", `Stored memory #${saved.id}`, "remember", {
+    memory_id: String(saved.id),
+    memory_key: saved.key,
+  }));
 }
 
 export function demoRemember(input: DemoRememberInput): Promise<MemoryItem> {
@@ -571,7 +700,7 @@ function createTaskUnlocked(input: DemoCreateTaskInput): Task {
     const row = idempotency.get(mapKey);
     if (row && row.expiresAt > nowMs) {
       if (row.hash !== hash) throw new IdempotencyConflict(MISMATCH);
-      return cloneTask(row.task);
+      return attachReceipt(cloneTask(row.task), row.receipt);
     }
   }
 
@@ -601,11 +730,21 @@ function createTaskUnlocked(input: DemoCreateTaskInput): Task {
     completed_at: null,
   };
   tasks.push(task);
+  const saved = cloneTask(task);
+  const receipt = pushActivity("create_task", `Task #${saved.id} queued`, "create_task", {
+    task_id: String(saved.id),
+  });
   if (mapKey && hash) {
-    idempotency.set(mapKey, { hash, task: cloneTask(task), expiresAt: nowMs + IDEMPOTENCY_TTL_MS, storedAt: nowMs });
+    idempotency.set(mapKey, {
+      hash,
+      task: cloneTask(task),
+      receipt: { id: receipt.id, kind: receipt.kind, at: receipt.at },
+      expiresAt: nowMs + IDEMPOTENCY_TTL_MS,
+      storedAt: nowMs,
+    });
     evictIdempotency();
   }
-  return cloneTask(task);
+  return attachReceipt(saved, receipt);
 }
 
 export function demoCreateTask(input: DemoCreateTaskInput): Promise<Task> {
@@ -667,11 +806,20 @@ export function demoClaimNextTask(input: {
       const status = current?.status;
       await Promise.resolve();
       if (!current || status !== "queued") continue;
+      const snapshot = cloneTask(current);
       current.status = "claimed";
       current.assigned_agent = input.agent_id;
       current.claimed_at = now;
       current.updated_at = now;
-      return cloneTask(current);
+      const receipt = finishTaskActivity(
+        current,
+        snapshot,
+        "task_claimed",
+        `Claimed task #${current.id}: ${current.title}`,
+        "claim_task",
+        { task_id: String(current.id), status: current.status, assigned_agent: current.assigned_agent },
+      );
+      return attachReceipt(cloneTask(current), receipt);
     }
     return null;
   });
@@ -686,10 +834,13 @@ function updateTaskUnlocked(input: {
   assigned_agent?: string;
   /** Set only when the caller passes an authenticated actor. Omitted leaves the columns. */
   actor?: Actor | null;
+  eventKind?: string;
+  activityTool?: string;
 }): Task {
   touch();
   const task = tasks.find((row) => row.id === input.id);
   if (!task) throw new Error("Task not found");
+  const snapshot = cloneTask(task);
   const now = iso(nowFn());
   task.updated_at = now;
   if (input.status !== undefined && input.status !== null) {
@@ -706,7 +857,17 @@ function updateTaskUnlocked(input: {
     task.actor_type = input.actor.actor_type;
     task.actor_id = input.actor.actor_id;
   }
-  return cloneTask(task);
+  const kind = input.eventKind ?? "task_updated";
+  const tool = input.activityTool ?? "update_task";
+  const receipt = finishTaskActivity(
+    task,
+    snapshot,
+    kind,
+    `Task #${task.id} → ${task.status}: ${task.title}`,
+    tool,
+    { task_id: String(task.id), status: task.status },
+  );
+  return attachReceipt(cloneTask(task), receipt);
 }
 
 export function demoUpdateTask(input: {
@@ -801,7 +962,8 @@ export async function demoReportStatusTool(args: {
   project?: string;
   summary?: string;
 }): Promise<McpToolResult> {
-  await demoReport({
+  const actor = currentActor();
+  const receipt = await demoReport({
     agent_id: args.agent_id,
     platform: args.platform,
     machine: args.machine,
@@ -812,8 +974,9 @@ export async function demoReportStatusTool(args: {
     title: args.title,
     project: args.project,
     summary: args.summary ?? args.title,
+    detail: activityDetail("report_status", actor, {}),
   });
-  return { content: [{ type: "text", text: withDemoLabel("Status reported to Agent Kontrol.") }] };
+  return withReceipt(withDemoLabel("Status reported to Agent Kontrol."), receipt);
 }
 
 export async function demoFleetStatusTool(): Promise<McpToolResult> {
@@ -839,9 +1002,10 @@ export async function demoRememberTool(args: {
     return { content: [{ type: "text", text: JSON.stringify(preview) }] };
   }
   const item = await demoRemember(args);
-  return {
-    content: [{ type: "text", text: withDemoLabel(`Stored memory #${item.id}${item.key ? ` (key: ${item.key})` : ""}.`) }],
-  };
+  return withReceipt(
+    withDemoLabel(`Stored memory #${item.id}${item.key ? ` (key: ${item.key})` : ""}.`),
+    readReceipt(item),
+  );
 }
 
 export async function demoRecallTool(args: DemoRecallInput): Promise<McpToolResult> {
@@ -867,9 +1031,10 @@ export async function demoCreateTaskTool(
     idempotency_key: args.idempotency_key,
     actor,
   });
-  return {
-    content: [{ type: "text", text: withDemoLabel(`Task #${task.id} queued for ${task.platform} (priority ${task.priority}).`) }],
-  };
+  return withReceipt(
+    withDemoLabel(`Task #${task.id} queued for ${task.platform} (priority ${task.priority}).`),
+    readReceipt(task),
+  );
 }
 
 export async function demoTaskQueueTool(args: { status?: string }): Promise<McpToolResult> {
@@ -884,7 +1049,7 @@ export async function demoClaimTaskTool(args: {
 }): Promise<McpToolResult> {
   const task = await demoClaimNextTask(args);
   if (!task) return { content: [{ type: "text", text: withDemoLabel(DEMO_EMPTY_CLAIM) }] };
-  return { content: [{ type: "text", text: formatClaim(task) }] };
+  return withReceipt(formatClaim(task), readReceipt(task));
 }
 
 export async function demoUpdateTaskTool(args: {
@@ -922,7 +1087,7 @@ export async function demoUpdateTaskTool(args: {
       detail: { task_id: task.id },
     });
   }
-  return { content: [{ type: "text", text: withDemoLabel(`Task #${task.id} updated (${task.status}).`) }] };
+  return withReceipt(withDemoLabel(`Task #${task.id} updated (${task.status}).`), readReceipt(task));
 }
 
 function cloneMessage(message: Message): Message {
@@ -978,7 +1143,7 @@ export function demoSendMessage(input: {
       const row = messageIdempotency.get(mapKey);
       if (row && row.expiresAt > nowMs) {
         if (row.hash !== hash) throw new IdempotencyConflict(MISMATCH);
-        return { kind: "message", message: cloneMessage(row.message) };
+        return { kind: "message", message: attachReceipt(cloneMessage(row.message), row.receipt) };
       }
     }
 
@@ -1002,16 +1167,20 @@ export function demoSendMessage(input: {
       read_by_dashboard_at: null,
     };
     messages.push(message);
+    const receipt = pushActivity("send_message", `Message #${id} sent to ${slug}`, "send_message", {
+      message_id: String(id),
+    });
     if (mapKey && hash) {
       messageIdempotency.set(mapKey, {
         hash,
         message: cloneMessage(message),
+        receipt: { id: receipt.id, kind: receipt.kind, at: receipt.at },
         expiresAt: nowMs + IDEMPOTENCY_TTL_MS,
         storedAt: nowMs,
       });
       evictMessageIdempotency();
     }
-    return { kind: "message", message: cloneMessage(message) };
+    return { kind: "message", message: attachReceipt(cloneMessage(message), receipt) };
   });
 }
 
@@ -1043,7 +1212,13 @@ export function demoRequeueTask(input: {
     if (input.expectedRevision !== undefined && revision !== input.expectedRevision) {
       throw new StaleWrite(revision);
     }
-    const updated = updateTaskUnlocked({ id: task.id, status: "queued", actor: input.actor });
+    const updated = updateTaskUnlocked({
+      id: task.id,
+      status: "queued",
+      actor: input.actor,
+      eventKind: "task_requeued",
+      activityTool: "requeue_task",
+    });
     return { kind: "task", task: updated };
   });
 }
@@ -1063,13 +1238,18 @@ export function demoDeleteMemory(input: {
     touch();
     const index = notes.findIndex((note) => note.key === input.key);
     if (index < 0) return { kind: "missing" };
-    const item = notes[index];
-    const revision = memoryRevision(item);
-    if (input.dryRun) return { kind: "preview", item: { ...item, tags: [...item.tags] }, revision };
+    const current = notes[index];
+    const revision = memoryRevision(current);
+    if (input.dryRun) return { kind: "preview", item: { ...current, tags: [...current.tags] }, revision };
     if (input.expectedRevision !== undefined && revision !== input.expectedRevision) {
       throw new StaleWrite(revision);
     }
     const [removed] = notes.splice(index, 1);
-    return { kind: "deleted", item: { ...removed, tags: [...removed.tags] } };
+    const item = { ...removed, tags: [...removed.tags] };
+    const receipt = pushActivity("delete_note", `Deleted memory key "${input.key}"`, "delete_note", {
+      memory_id: String(item.id),
+      memory_key: input.key,
+    });
+    return { kind: "deleted", item: attachReceipt(item, receipt) };
   });
 }

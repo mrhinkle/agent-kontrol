@@ -1,6 +1,7 @@
 import { createMcpHandler, withMcpAuth } from "mcp-handler";
 import { z } from "zod";
 import { actorFromPrincipal, currentActor, runWithActor } from "@/lib/actor";
+import { activityDetail, readReceipt, withReceipt } from "@/lib/activity";
 import { apiError, memoryKeyError, toolResultFromCaught, type McpToolResult } from "@/lib/api-error";
 import { secretsMatch, verifyAccessToken } from "@/lib/authcrypto";
 import { resolveAgentCredential } from "@/lib/credentials";
@@ -13,7 +14,7 @@ import {
   demoReportStatusTool,
   demoTaskQueueTool,
 } from "@/lib/demo-store";
-import { recallResult, taskQueueResult } from "@/lib/list-read";
+import { listActivityResult, recallResult, taskQueueResult } from "@/lib/list-read";
 import { evaluateMcpMessages, insufficientScopeBody, principalFromMcpAuth } from "@/lib/scopes";
 import { rememberForTool, updateTaskForTool } from "@/lib/dry-run-actions";
 import { claimNextTask, createTask, fetchMessages, fleet, replyFromAgent, report } from "@/lib/store";
@@ -22,6 +23,7 @@ import { formatDigest } from "@/lib/progress-digest";
 import { morningBriefText } from "@/lib/brief";
 import { OPERATOR } from "@/lib/operator";
 import { demoProgress } from "@/lib/demo-progress";
+import { listDecisionsTool, requestDecisionTool, resolveDecisionTool } from "@/lib/decision-resolve";
 import { getSkillTool, listSkillsTool, runSkillTool } from "@/lib/skills/mcp";
 import { deleteNoteTool, requeueTaskTool, sendMessageTool } from "@/lib/operator-actions";
 
@@ -80,7 +82,8 @@ const handler = createMcpHandler(
       },
       async (args) => guardTool("report_status", async () => {
         if (!isConfigured()) return demoReportStatusTool(args);
-        await report({
+        const actor = currentActor();
+        const receipt = await report({
           agent_id: args.agent_id,
           platform: args.platform,
           machine: args.machine,
@@ -91,8 +94,9 @@ const handler = createMcpHandler(
           title: args.title,
           project: args.project,
           summary: args.summary ?? args.title,
+          detail: activityDetail("report_status", actor, {}),
         });
-        return { content: [{ type: "text", text: "Status reported to Agent Kontrol." }] };
+        return withReceipt("Status reported to Agent Kontrol.", receipt);
       }),
     );
 
@@ -312,15 +316,9 @@ const handler = createMcpHandler(
             actor: currentActor(),
             idempotency_key: args.idempotency_key,
           });
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Reply #${msg.id} delivered to Agent Kontrol` +
-                  (msg.thread_id ? ` (thread ${msg.thread_id}).` : "."),
-              },
-            ],
-          };
+          const text = `Reply #${msg.id} delivered to Agent Kontrol` +
+            (msg.thread_id ? ` (thread ${msg.thread_id}).` : ".");
+          return withReceipt(text, readReceipt(msg));
         }),
       );
     }
@@ -362,11 +360,8 @@ const handler = createMcpHandler(
           idempotency_key: args.idempotency_key,
           actor: currentActor(),
         });
-        return {
-          content: [
-            { type: "text", text: `Task #${task.id} queued for ${task.platform} (priority ${task.priority}).` },
-          ],
-        };
+        const text = `Task #${task.id} queued for ${task.platform} (priority ${task.priority}).`;
+        return withReceipt(text, readReceipt(task));
       }),
     );
 
@@ -413,19 +408,13 @@ const handler = createMcpHandler(
         if (!task) {
           return { content: [{ type: "text", text: "No queued tasks for your platform." }] };
         }
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `Claimed task #${task.id}: ${task.title}\n` +
-                (task.project ? `Project: ${task.project}\n` : "") +
-                (task.reviewer_platform ? `Review by: ${task.reviewer_platform} when done\n` : "") +
-                `Instructions:\n${task.description ?? task.title}\n\n` +
-                `When finished, call update_task (id: ${task.id}) with status 'done' or 'failed' and a result summary.`,
-            },
-          ],
-        };
+        const text =
+          `Claimed task #${task.id}: ${task.title}\n` +
+          (task.project ? `Project: ${task.project}\n` : "") +
+          (task.reviewer_platform ? `Review by: ${task.reviewer_platform} when done\n` : "") +
+          `Instructions:\n${task.description ?? task.title}\n\n` +
+          `When finished, call update_task (id: ${task.id}) with status 'done' or 'failed' and a result summary.`;
+        return withReceipt(text, readReceipt(task));
       }),
     );
 
@@ -506,6 +495,85 @@ const handler = createMcpHandler(
       async (args) => guardTool("run_skill", () => runSkillTool(args)),
     );
 
+    // Decision tools. request and list do not resolve. resolve_decision is
+    // decisions:write, so an agent that can only file a decision cannot close it.
+    // The handlers below forward only the fields in each inputSchema.
+    server.registerTool(
+      "request_decision",
+      {
+        title: "Request a decision",
+        annotations: WRITE,
+        description:
+          "File a decision for the owner. The key is agent:<your id>:<slug>. Sending the same slug again updates the open row and does not reopen a decided one. You cannot choose the key, the repo, or the issue number.",
+        inputSchema: {
+          slug: z.string().describe("Short lowercase id, unique for you. The same slug updates the same row."),
+          title: z.string().describe("What the owner is deciding."),
+          why: z.string().optional().describe("Why this needs the owner."),
+          options: z
+            .array(z.object({ id: z.string(), label: z.string() }))
+            .max(20)
+            .optional()
+            .describe("Choices. Each has an id and a label."),
+          recommended: z.string().optional().describe("Option id you recommend. Must be one of options when options are sent."),
+        },
+      },
+      async (args) => guardTool("request_decision", () => requestDecisionTool({
+        slug: args.slug,
+        title: args.title,
+        why: args.why,
+        options: args.options,
+        recommended: args.recommended,
+      })),
+    );
+
+    server.registerTool(
+      "list_decisions",
+      {
+        title: "List decisions",
+        annotations: READ_ONLY,
+        description:
+          "Read the decision queue. This does not change a row. status defaults to open, which also includes deferrals whose date has passed.",
+        inputSchema: {
+          status: z.enum(["open", "decided", "deferred", "withdrawn", "all"]).optional(),
+          repo: z.string().optional().describe("owner/name. Omit for every repo."),
+          limit: z.number().int().min(1).max(1000).optional(),
+        },
+      },
+      async (args) => guardTool("list_decisions", () => listDecisionsTool({
+        status: args.status,
+        repo: args.repo,
+        limit: args.limit,
+      })),
+    );
+
+    server.registerTool(
+      "resolve_decision",
+      {
+        title: "Resolve a decision",
+        annotations: WRITE,
+        description:
+          "Decide, defer, or withdraw a decision. Requires decisions:write or the dashboard. An agent that filed the decision cannot call this with only decisions:request. Send expected_revision from the row you loaded. expected_updated_at is accepted and is not the concurrency token. The GitHub comment goes to the issue named by the row key.",
+        inputSchema: {
+          id: z.number().int().positive(),
+          status: z.enum(["open", "decided", "deferred", "withdrawn"]),
+          decision: z.string().optional().describe("Required when status is decided, unless option_id names a choice."),
+          defer_until: z.string().optional().describe("Required when status is deferred. A date is the end of that UTC day. A past date is rejected."),
+          option_id: z.string().optional().describe("One of the row's option ids."),
+          expected_updated_at: z.string().optional().describe("Accepted for older clients. Not compared."),
+          expected_revision: z.number().int().nonnegative().optional().describe("revision from the row you loaded. A mismatch is stale."),
+        },
+      },
+      async (args) => guardTool("resolve_decision", () => resolveDecisionTool({
+        id: args.id,
+        status: args.status,
+        decision: args.decision,
+        defer_until: args.defer_until,
+        option_id: args.option_id,
+        expected_updated_at: args.expected_updated_at,
+        expected_revision: args.expected_revision,
+      })),
+    );
+
     server.registerTool(
       "send_message",
       {
@@ -566,6 +634,26 @@ const handler = createMcpHandler(
         },
       },
       async (args) => guardTool("delete_note", () => deleteNoteTool(args)),
+    );
+
+    server.registerTool(
+      "list_activity",
+      {
+        title: "List activity",
+        annotations: READ_ONLY,
+        description:
+          "List write receipts and other events, newest first. Filter by actor (the authenticated actor id), kind, since, and until. since and until are inclusive ISO timestamps. limit, cursor, and fields match the other lists: limit is 1 to 200, cursor is the opaque next_cursor, and fields is a comma-separated allowlist. Operator only, the same boundary as traces. An agent credential is denied, including one with fleet:read. MC_TOKEN and an OAuth access token can call it. With no database, this reads the in-memory demo log.",
+        inputSchema: {
+          actor: z.string().optional().describe("Exact actor_id. Omit to include every actor."),
+          kind: z.string().optional().describe("Exact event kind, such as task_updated or status."),
+          since: z.string().optional().describe("Inclusive ISO timestamp. Rows at or after this instant."),
+          until: z.string().optional().describe("Inclusive ISO timestamp. Rows in this millisecond and earlier."),
+          limit: z.number().optional().describe("Maximum rows, from 1 to 200. Defaults to 50. Passing limit or cursor adds a next_cursor line."),
+          cursor: z.string().optional().describe("Opaque cursor from a previous next_cursor line."),
+          fields: z.string().optional().describe("Comma-separated allowlisted fields. id is always included. One JSON object per line."),
+        },
+      },
+      async (args) => guardTool("list_activity", () => listActivityResult(args, isConfigured())),
     );
   },
   {},

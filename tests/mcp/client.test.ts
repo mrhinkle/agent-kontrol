@@ -20,7 +20,7 @@ if (!baseUrl || !token) {
   throw new Error("AK_MCP_BASE_URL and AK_MCP_TOKEN are required; run npm run test:mcp");
 }
 
-/** The 18 tools in docs/MCP.md. Names are stable for the 1.x line. */
+/** The 22 tools in docs/MCP.md. Names are stable for the 1.x line. */
 const DOCUMENTED_TOOLS = [
   "report_status",
   "get_fleet_status",
@@ -37,14 +37,18 @@ const DOCUMENTED_TOOLS = [
   "list_skills",
   "get_skill",
   "run_skill",
+  "request_decision",
+  "list_decisions",
+  "resolve_decision",
   "send_message",
   "requeue_task",
   "delete_note",
+  "list_activity",
 ] as const;
 
 /**
  * The server still registers this deprecated alias (docs/MCP.md). The live
- * list is the 18 documented names plus this one alias, and nothing else.
+ * list is the 22 documented names plus this one alias, and nothing else.
  */
 const DEPRECATED_ALIAS = "reply_to_mark";
 
@@ -158,7 +162,7 @@ describe("MCP client against demo mode", { concurrency: 1 }, () => {
     }
   });
 
-  it("lists exactly the 18 documented tools plus the reply_to_mark alias", async () => {
+  it("lists exactly the 22 documented tools plus the reply_to_mark alias", async () => {
     const listed = await client.listTools();
     const nextCursor = (listed as { nextCursor?: unknown }).nextCursor;
     assert.equal(
@@ -178,7 +182,7 @@ describe("MCP client against demo mode", { concurrency: 1 }, () => {
     for (const name of expected) {
       assert.equal(counts.get(name), 1, `${name} should appear once`);
     }
-    assert.equal(names.length, 19);
+    assert.equal(names.length, 23);
     const morning = listed.tools.find((tool) => tool.name === "get_morning_brief");
     assert.equal(morning?.annotations?.readOnlyHint, true);
     assert.equal(morning?.annotations?.destructiveHint, false);

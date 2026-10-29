@@ -1,8 +1,10 @@
+import { ActivityQueryError, activityQueryToolError, parseActivityFilters } from "./activity";
 import { memoryKeyError, type McpToolResult } from "./api-error";
 import { demoMemory, demoTasks } from "./demo-data";
 import {
   DEMO_BANNER,
   DEMO_CAPS,
+  demoListActivity,
   demoListTasks,
   demoRecall,
   demoRecallTool,
@@ -10,6 +12,8 @@ import {
 } from "./demo-store";
 import { demoSpans, demoSummary } from "./demo-traces";
 import {
+  ACTIVITY_LIST,
+  activityKeyset,
   listParamToolError,
   ListParamError,
   memoryKeyset,
@@ -23,7 +27,7 @@ import {
   type Page,
   type ParsedList,
 } from "./list-params";
-import { listTasks, recall } from "./store";
+import { listActivity, listTasks, recall } from "./store";
 import { listTraces } from "./trace-store";
 import type { MemoryItem, Task } from "./types";
 import type { TraceSummary } from "./traces";
@@ -127,6 +131,73 @@ export async function loadTracePage(
     if (!(Date.parse(summary.started_at) < cut)) rows = [];
   }
   return pageRows(rows as unknown as Row[], input.parsed);
+}
+
+export async function loadActivityPage(
+  source: "database" | "demo-store",
+  input: {
+    actor: string | null;
+    kind: string | null;
+    since: string | null;
+    until: string | null;
+    parsed: ParsedList;
+  },
+): Promise<Page<Row>> {
+  if (source === "database") {
+    const cursor = input.parsed.cursor ? activityKeyset(input.parsed.cursor) : null;
+    const rows = await listActivity({
+      actor: input.actor,
+      kind: input.kind,
+      since: input.since,
+      until: input.until,
+      limit: input.parsed.paging ? input.parsed.take + 1 : input.parsed.take,
+      cursorCreatedAt: cursor?.createdAt ?? null,
+      cursorId: cursor?.id ?? null,
+    });
+    return splitPage(rows as unknown as Row[], input.parsed);
+  }
+  const rows = await demoListActivity({
+    actor: input.actor,
+    kind: input.kind,
+    since: input.since,
+    until: input.until,
+  });
+  return pageRows(rows as unknown as Row[], input.parsed);
+}
+
+function activityLine(row: Row): string {
+  const title = row.title ? ` ${String(row.title)}` : "";
+  const actor = row.actor_id == null || row.actor_id === "" ? "-" : String(row.actor_id);
+  return `- [${String(row.created_at)}] ${String(row.kind)}${title} actor=${actor} #${String(row.id)}`;
+}
+
+export interface ActivityListArgs {
+  actor?: string;
+  kind?: string;
+  since?: string;
+  until?: string;
+  limit?: unknown;
+  cursor?: unknown;
+  fields?: unknown;
+}
+
+export async function listActivityResult(args: ActivityListArgs, configured: boolean): Promise<McpToolResult> {
+  let filters: ReturnType<typeof parseActivityFilters>;
+  try {
+    filters = parseActivityFilters(args);
+  } catch (err) {
+    if (err instanceof ActivityQueryError) return activityQueryToolError(err);
+    throw err;
+  }
+  try {
+    const parsedList = parseToolList(ACTIVITY_LIST, args);
+    const page = await loadActivityPage(configured ? "database" : "demo-store", { ...filters, parsed: parsedList });
+    const text = pageText(page.rows, parsedList.fields, "No activity.", activityLine);
+    return { content: [{ type: "text", text: finishText(text, !configured, page.paging, page.next_cursor) }] };
+  } catch (err) {
+    if (err instanceof ListParamError) return listParamToolError(err);
+    throw err;
+  }
 }
 
 function taskLine(task: Task): string {

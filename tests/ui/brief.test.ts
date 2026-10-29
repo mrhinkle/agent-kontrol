@@ -503,9 +503,13 @@ describe("GET /api/brief", { concurrency: false }, () => {
       "list_skills",
       "get_skill",
       "run_skill",
+      "request_decision",
+      "list_decisions",
+      "resolve_decision",
       "send_message",
       "requeue_task",
       "delete_note",
+      "list_activity",
     ]);
     assert.equal(registered.filter((name) => name === "get_morning_brief").length, 1);
     assert.equal([...src.matchAll(/name: "reply_to_mark"/g)].length, 1);
@@ -2315,6 +2319,8 @@ describe("GET /api/brief", { concurrency: false }, () => {
       setSqlForTests(async (strings, ...values) => {
         const text = strings.join(" ");
         if (text.includes("from watched_repos")) return [];
+        // No saved owners: getWatchedRepos stays on the file list these fixtures use.
+        if (text.includes("from watched_owners")) return [];
         if (text.includes("from decisions")) {
           for (let i = 0; i < strings.length - 1; i++) {
             if (/\blimit\s*$/.test(strings[i])) seen.limit = Number(values[i]);
@@ -2496,33 +2502,37 @@ function snapshotRow(over: Partial<Row> & Pick<Row, "repo" | "collected_at">): R
 function legacyDecision(over: Partial<Decision>): Decision {
   const opened = "2026-10-01T12:00:00Z";
   return {
-    id: 1,
-    key: "github:acme/app#20",
-    source: "github-label",
-    repo: "acme/app",
-    repo_short: "app",
-    number: 20,
-    url: "https://github.com/acme/app/issues/20",
-    title: "legacy gate",
-    why: null,
-    options: null,
-    recommended: null,
-    requested_by: "collector",
-    status: "open",
-    decision: null,
-    decided_by: null,
-    decided_at: null,
-    defer_until: null,
-    kind: "issue",
-    labels: ["needs-owner"],
-    opened_at: opened,
-    github_present: true,
-    first_seen_at: opened,
-    last_seen_at: opened,
-    created_at: opened,
-    updated_at: opened,
-    age_days: 0,
-    ...over,
+    id: over.id ?? 1,
+    key: over.key ?? "github:acme/app#20",
+    source: over.source ?? "github-label",
+    repo: over.repo === undefined ? "acme/app" : over.repo,
+    repo_short: over.repo_short === undefined ? "app" : over.repo_short,
+    number: over.number === undefined ? 20 : over.number,
+    url: over.url === undefined ? "https://github.com/acme/app/issues/20" : over.url,
+    title: over.title ?? "legacy gate",
+    why: over.why === undefined ? null : over.why,
+    options: over.options === undefined ? null : over.options,
+    recommended: over.recommended === undefined ? null : over.recommended,
+    requested_by: over.requested_by === undefined ? "collector" : over.requested_by,
+    status: over.status ?? "open",
+    decision: over.decision === undefined ? null : over.decision,
+    decided_by: over.decided_by === undefined ? null : over.decided_by,
+    decided_at: over.decided_at === undefined ? null : over.decided_at,
+    defer_until: over.defer_until === undefined ? null : over.defer_until,
+    kind: over.kind === undefined ? "issue" : over.kind,
+    labels: over.labels === undefined ? ["needs-owner"] : over.labels,
+    opened_at: over.opened_at === undefined ? opened : over.opened_at,
+    github_present: over.github_present === undefined ? true : over.github_present,
+    first_seen_at: over.first_seen_at ?? opened,
+    last_seen_at: over.last_seen_at ?? opened,
+    created_at: over.created_at ?? opened,
+    updated_at: over.updated_at ?? opened,
+    age_days: over.age_days ?? 0,
+    revision: over.revision ?? 0,
+    actor_type: over.actor_type === undefined ? null : over.actor_type,
+    actor_id: over.actor_id === undefined ? null : over.actor_id,
+    chosen_option: over.chosen_option === undefined ? null : over.chosen_option,
+    writeback: over.writeback === undefined ? null : over.writeback,
   };
 }
 
@@ -2531,6 +2541,8 @@ function installBriefSql(snapshots: Row[], decisions: Row[] | "missing" | "fail"
   setSqlForTests(async (strings, ...values) => {
     const text = strings.join(" ");
     if (text.includes("from watched_repos")) return [];
+    // No saved owners: getWatchedRepos stays on the file list these fixtures use.
+    if (text.includes("from watched_owners")) return [];
     if (text.includes("from decisions")) {
       if (decisions === "missing") {
         throw Object.assign(new Error('relation "decisions" does not exist'), { code: "42P01" });
@@ -2556,6 +2568,8 @@ function installSnapshotSql(rows: Row[]): void {
   setSqlForTests(async (strings, ...values) => {
     const text = strings.join(" ");
     if (text.includes("from watched_repos")) return [];
+    // No saved owners: getWatchedRepos stays on the file list these fixtures use.
+    if (text.includes("from watched_owners")) return [];
     if (text.includes("from decisions")) return [];
     if (!text.includes("from repo_snapshots")) throw new Error(`unexpected sql: ${text}`);
     const repos = new Set((values[0] as string[]) ?? []);

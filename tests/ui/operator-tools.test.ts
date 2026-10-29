@@ -347,11 +347,14 @@ describe("operator MCP tools", () => {
       "list_skills",
       "get_skill",
       "run_skill",
+      "request_decision",
+      "list_decisions",
+      "resolve_decision",
     ];
     const registered = [...src.matchAll(/registerTool\(\s*"([^"]+)"/g)].map((match) => match[1]);
     assert.deepEqual(registered.slice(0, previous.length), previous);
-    assert.deepEqual(registered.slice(previous.length), ["send_message", "requeue_task", "delete_note"]);
-    assert.equal(src.match(/server\.registerTool\(/g)?.length, 18);
+    assert.deepEqual(registered.slice(previous.length), ["send_message", "requeue_task", "delete_note", "list_activity"]);
+    assert.equal(src.match(/server\.registerTool\(/g)?.length, 22);
     assert.match(src, /title: "Send message",\n\s+annotations: WRITE,/);
     assert.match(src, /title: "Requeue task",\n\s+annotations: WRITE,/);
     assert.match(src, /title: "Delete note",\n\s+annotations: WRITE_DESTRUCTIVE,/);

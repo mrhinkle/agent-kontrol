@@ -141,7 +141,7 @@ elif [[ "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_TOKEN:-}" ]]; the
   # response falls back to the local file.
   if body="$(curl -fsS -m 20 -H "Authorization: Bearer $MC_TOKEN" "${MC_URL%/}/api/settings/repos" 2>/dev/null)" \
      && echo "$body" | jq -e '.repos|type=="array"' >/dev/null 2>&1; then
-    REPOS_JSON="$(echo "$body" | jq -c '[.repos[] | {repo, label, short, blockedLabel}]')"
+    REPOS_JSON="$(echo "$body" | jq -c '[.repos[] | select(.shown != false) | {repo, label, short, blockedLabel}]')"
     REPO_SOURCE="dashboard"
   fi
 fi
