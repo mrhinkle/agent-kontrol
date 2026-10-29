@@ -793,25 +793,30 @@ function uniqueEventRows(rows: Row[]): Row[] {
  * of reprinting an older complete snapshot as current. `beforeIso` is only the
  * 72h baseline cutoff, chosen separately from the latest row. `id desc` breaks
  * a tie when two rows share `collected_at`.
+ *
+ * `owner/name` is case-insensitive. `lower(repo)` keeps history stored under
+ * another casing, and `distinct on (lower(repo))` keeps one newest row for
+ * that repo. The map key is the lowercased name.
  */
 async function snapshotsAt(repos: string[], beforeIso: string | null): Promise<Map<string, RepoSnapshot>> {
   if (repos.length === 0) return new Map();
+  const names = repos.map((repo) => repo.toLowerCase());
   const db = sql();
   const rows = beforeIso
     ? await db`
-        select distinct on (repo) *
+        select distinct on (lower(repo)) *
         from repo_snapshots
-        where repo = any(${repos}::text[])
+        where lower(repo) = any(${names}::text[])
           and collected_at <= ${beforeIso}
-        order by repo, collected_at desc, id desc
+        order by lower(repo), collected_at desc, id desc
       `
     : await db`
-        select distinct on (repo) *
+        select distinct on (lower(repo)) *
         from repo_snapshots
-        where repo = any(${repos}::text[])
-        order by repo, collected_at desc, id desc
+        where lower(repo) = any(${names}::text[])
+        order by lower(repo), collected_at desc, id desc
       `;
-  return new Map((rows as Row[]).map((row) => [String(row.repo), toSnapshot(row)]));
+  return new Map((rows as Row[]).map((row) => [String(row.repo).toLowerCase(), toSnapshot(row)]));
 }
 
 export async function coordinatorFromDb(settings: BriefSettings, nowIso: string): Promise<BriefCoordinator> {
@@ -967,8 +972,8 @@ export async function loadBrief(
   const sections = applyTableDecisions(
     watched.repos.map((cfg) => repoSection({
       cfg,
-      snap: latest.get(cfg.repo) ?? null,
-      baseline: baseline.get(cfg.repo) ?? null,
+      snap: latest.get(cfg.repo.toLowerCase()) ?? null,
+      baseline: baseline.get(cfg.repo.toLowerCase()) ?? null,
       windowHours: hours,
       nowIso,
     })),

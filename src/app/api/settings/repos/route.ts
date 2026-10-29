@@ -3,9 +3,12 @@ import { enforceApi } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { diffRepoList, readDryRun } from "@/lib/dry-run";
+import { repoIdentity } from "@/lib/owner-discovery";
 import { REPOS } from "@/lib/progress-config";
-import { MAX_REPOS, retainedAutoShortErrors, validateRepoList, type RepoError, type RepoInput } from "@/lib/repo-validation";
-import { getWatchedRepos, listVersion, loadTrackedRepos, replaceWatchedRepos, setRepoOverride } from "@/lib/watched-repos";
+import { repoErrorFields, retainedAutoShortErrorsForSave, validateReposForSave } from "@/lib/repo-save";
+import type { RepoInput } from "@/lib/repo-validation";
+import { readRepoSettings, reposForReplaceDiff } from "@/lib/settings-read";
+import { loadTrackedRepos, replaceWatchedRepos, setRepoOverride } from "@/lib/watched-repos";
 
 export const dynamic = "force-dynamic";
 
@@ -20,7 +23,9 @@ export const dynamic = "force-dynamic";
  *      If `version` (from the GET the caller started from) is sent and the list has
  *      changed since, answers 409 { code: "stale" } instead of overwriting someone
  *      else's change. A real save checks that version again under the discovery
- *      write lock, in the same transaction as the replace. `dry_run: true` returns that diff and writes nothing.
+ *      write lock, in the same transaction as the replace. `dry_run: true` diffs
+ *      the stored rows (empty when `source` is `file`), includes `source`, and
+ *      writes nothing. With no database the diff stays against the file list.
  *      Any other `dry_run` value is 400 and also writes nothing.
  *      Rows with origin "auto" are kept when the body omits them. Omitting one
  *      whose fields were overridden resets label, short, color, and blocked
@@ -36,54 +41,19 @@ export const dynamic = "force-dynamic";
  * route (it is not in the scope table). The collector uses MC_TOKEN.
  */
 async function current() {
-  const { source, repos } = await getWatchedRepos(REPOS);
-  return { source, writable: isConfigured(), max: MAX_REPOS, version: listVersion(repos), repos };
-}
-
-function repoFields(errors: RepoError[]): Record<string, string> {
-  const fields: Record<string, string> = {};
-  for (const row of errors) {
-    const key = row.index < 0 ? row.field : `${row.index}.${row.field}`;
-    fields[key] = fields[key] ? `${fields[key]} ${row.message}` : row.message;
-  }
-  return fields;
+  return readRepoSettings();
 }
 
 // Log the real error server-side; the response stays generic so database details never reach the browser.
-/**
- * An empty list still means "add at least one repo", unless auto-discovered
- * rows are already stored. Those stay, so the operator can clear every
- * hand-added override without wiping discovery.
- */
-async function validateForSave(raw: unknown) {
-  if (Array.isArray(raw) && raw.length === 0 && isConfigured()) {
-    try {
-      const tracked = await loadTrackedRepos();
-      if (tracked.some((repo) => repo.origin === "auto")) {
-        return { ok: true as const, repos: [] as RepoInput[] };
-      }
-    } catch {
-      // Fall through to the ordinary "at least one repo" error.
-    }
-  }
-  return validateRepoList(raw);
-}
-
 /** 400 when a submitted short name belongs to an auto row this save will keep. */
 async function rejectRetainedShorts(repos: RepoInput[]): Promise<Response | null> {
-  if (!isConfigured() || repos.length === 0) return null;
-  try {
-    const collisions = retainedAutoShortErrors(repos, await loadTrackedRepos());
-    if (collisions.length === 0) return null;
-    return apiError("repo_list_invalid", {
-      message: collisions[0]?.message ?? "The repo list is invalid.",
-      fields: repoFields(collisions),
-      extra: { errors: collisions },
-    });
-  } catch {
-    // A store error surfaces on the write. A concurrent unique violation is 409.
-    return null;
-  }
+  const collisions = await retainedAutoShortErrorsForSave(repos);
+  if (!collisions) return null;
+  return apiError("repo_list_invalid", {
+    message: collisions[0]?.message ?? "The repo list is invalid.",
+    fields: repoErrorFields(collisions),
+    extra: { errors: collisions },
+  });
 }
 
 function failure(e: unknown, what: string) {
@@ -120,11 +90,11 @@ export async function PUT(req: Request) {
     });
   }
   const rawRepos = (body as { repos?: unknown } | null)?.repos;
-  const checked = await validateForSave(rawRepos);
+  const checked = await validateReposForSave(rawRepos);
   if (!checked.ok) {
     return apiError("repo_list_invalid", {
       message: checked.errors[0]?.message ?? "The repo list is invalid.",
-      fields: repoFields(checked.errors),
+      fields: repoErrorFields(checked.errors),
       extra: { errors: checked.errors },
     });
   }
@@ -141,7 +111,7 @@ export async function PUT(req: Request) {
     if (dry.dryRun) {
       try {
         const cur = await current();
-        return NextResponse.json(diffRepoList(cur.repos, checked.repos, false));
+        return NextResponse.json(diffRepoList(reposForReplaceDiff(cur), checked.repos, false));
       } catch (e) {
         return failure(e, "load settings");
       }
@@ -158,7 +128,10 @@ export async function PUT(req: Request) {
       return apiError("stale");
     }
     if (dry.dryRun) {
-      return NextResponse.json(diffRepoList(cur.repos, checked.repos, true));
+      return NextResponse.json({
+        ...diffRepoList(reposForReplaceDiff(cur), checked.repos, true),
+        source: cur.source,
+      });
     }
     // A mismatch above is enough for a dry run. A real save checks again
     // under the discovery write lock, after a pin or hide may have landed.
@@ -227,7 +200,7 @@ export async function PATCH(req: Request) {
   };
   if (!isConfigured()) {
     if (dry.dryRun) {
-      const found = REPOS.find((item) => item.repo === repo);
+      const found = REPOS.find((item) => repoIdentity(item.repo) === repoIdentity(repo));
       if (!found) return repoNotFound();
       const before = { pinned: false, hidden: false };
       const after = {
@@ -251,7 +224,7 @@ export async function PATCH(req: Request) {
   }
   try {
     const tracked = await loadTrackedRepos();
-    const found = tracked.find((item) => item.repo === repo);
+    const found = tracked.find((item) => repoIdentity(item.repo) === repoIdentity(repo));
     if (!found) return repoNotFound();
     const after = {
       pinned: patch.pinned ?? found.pinned,

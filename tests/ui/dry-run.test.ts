@@ -207,7 +207,8 @@ describe("dry run diffs", () => {
     const recased = diffRepoList([STORED], [{ ...STORED, repo: "Acme/App" }]);
     assert.deepEqual(
       recased.changes.map((change) => change.op),
-      ["remove", "add"],
+      [],
+      "a case-only rename is the same repo",
     );
   });
 

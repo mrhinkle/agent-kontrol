@@ -42,6 +42,52 @@ export function writebackLockUnexpired(lock: unknown, lockAt: unknown, nowMs = D
   if (Number.isNaN(at)) return true;
   return nowMs - at < WRITEBACK_LOCK_LEASE_SECONDS * 1000;
 }
+
+/** Milliseconds of a timestamp, or null when the value is missing or not a time. */
+function timeMs(value: unknown): number | null {
+  if (value == null || value === "") return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (value instanceof Date) {
+    const at = value.getTime();
+    return Number.isFinite(at) ? at : null;
+  }
+  const at = Date.parse(String(value));
+  return Number.isFinite(at) ? at : null;
+}
+
+/**
+ * Strictly older than the claim lease. Equal to the lease is still inside.
+ * One timestamp. The retry population uses `nullWritebackRetryDue`.
+ */
+export function nullWritebackPastLease(at: unknown, nowMs = Date.now()): boolean {
+  const ms = timeMs(at);
+  if (ms == null) return false;
+  return nowMs - ms > WRITEBACK_LOCK_LEASE_SECONDS * 1000;
+}
+
+/**
+ * A decided row with a null write-back stamp joins `writeback=not_written`
+ * on this predicate, the same one as the list SQL:
+ * the claim is absent or `writeback_lock_at` is strictly older than the
+ * lease, and coalesce(`writeback_lock_at`, `decided_at`, `updated_at`) is too.
+ * A collector upsert refreshes `updated_at` and leaves the other two columns
+ * alone, so `updated_at` by itself is not the age clock.
+ */
+export function nullWritebackRetryDue(
+  row: {
+    writeback_lock?: unknown;
+    writeback_lock_at?: unknown;
+    decided_at?: unknown;
+    updated_at?: unknown;
+  },
+  nowMs = Date.now(),
+): boolean {
+  const lockAbsent = row.writeback_lock == null;
+  if (!lockAbsent && !nullWritebackPastLease(row.writeback_lock_at, nowMs)) return false;
+  const clock = timeMs(row.writeback_lock_at) ?? timeMs(row.decided_at) ?? timeMs(row.updated_at);
+  return nullWritebackPastLease(clock, nowMs);
+}
+
 export type DecisionStatus = (typeof DECISION_STATUSES)[number];
 
 export const LIST_STATUSES = [...DECISION_STATUSES, "all"] as const;
@@ -186,7 +232,8 @@ export interface DecisionStore {
   /**
    * Stamp writeback only when the row is still `decided` at `revision`.
    * A token requires that claim as well and clears the lock.
-   * A null token is the give-up stamp: same revision and status, lock left for its owner.
+   * A null token is the give-up stamp when no live claim holds the row.
+   * A lock still inside the lease refuses the stamp so the writer is not fenced.
    */
   setWriteback(id: number, writeback: "written" | "not_written", revision: number, token: string | null): Promise<Record<string, unknown> | null>;
   /**
@@ -208,6 +255,11 @@ export function setDecisionStoreForTests(store: DecisionStore | null): void {
 /** True when a database or a test store will keep the row. */
 export function decisionPersistenceOn(): boolean {
   return isConfigured() || testStore !== null;
+}
+
+/** True when route tests substituted the queue. Callers must not hit SQL then. */
+export function usingDecisionTestStore(): boolean {
+  return testStore !== null;
 }
 
 export interface ReconcileInput {
@@ -842,6 +894,10 @@ export async function setDecisionWriteback(
         where id = ${id}
           and status = 'decided'
           and revision = ${revision}
+          and (
+            writeback_lock is null
+            or writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+          )
         returning *
       `;
   return rows[0] ? presentDecision(rows[0], now) : null;
@@ -890,6 +946,16 @@ export async function listDecisions(query: {
       ${brief} is true
       or ${query.writeback ?? null}::text is null
       or writeback = ${query.writeback ?? null}
+      or (
+        ${query.writeback ?? null}::text = 'not_written'
+        and status = 'decided'
+        and writeback is null
+        and (
+          writeback_lock is null
+          or writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+        )
+        and coalesce(writeback_lock_at, decided_at, updated_at) < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+      )
     )
     order by first_seen_at asc, id asc
     limit ${query.limit}

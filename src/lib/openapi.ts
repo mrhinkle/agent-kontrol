@@ -13,6 +13,8 @@ import { USAGE_SOURCES } from "@/lib/usage-types";
 import { USAGE_WINDOWS } from "@/lib/usage-window";
 import { ACTIVITY_LIST, LIST_MAX } from "./list-params";
 import { RUNTIMES } from "./skills/types";
+import { WATCH_STATUSES } from "./watch";
+import { WATCH_SOURCES } from "./watch-sources";
 
 /**
  * OpenAPI 3.1 for the documented REST routes.
@@ -173,6 +175,17 @@ const staleWrite: Json = jsonResponse(
   },
 );
 
+const discoveryListedRepo: Json = {
+  type: "object",
+  required: ["name", "isArchived", "isFork"],
+  properties: {
+    name: { type: "string" },
+    pushedAt: { type: ["string", "null"], format: "date-time" },
+    isArchived: { type: "boolean" },
+    isFork: { type: "boolean" },
+  },
+};
+
 const flatErrors: Json = {
   "400": jsonResponse("The body is not JSON, a required field is missing, or a field failed validation.", ref("Error")),
   "401": jsonResponse("The credential is missing or not valid.", ref("Error")),
@@ -209,6 +222,7 @@ export function openApiDocument(): Json {
       { name: "skills" },
       { name: "auth" },
       { name: "mcp" },
+      { name: "watch" },
     ],
     components: {
       securitySchemes: {
@@ -223,6 +237,13 @@ export function openApiDocument(): Json {
           scheme: "bearer",
           bearerFormat: "MC_TOKEN",
           description: "Operator MC_TOKEN. An agent credential and an OAuth access token are not accepted on operations that use this scheme.",
+        },
+        agentCredential: {
+          type: "http",
+          scheme: "bearer",
+          bearerFormat: "akc_",
+          description:
+            "Per-agent akc_ credential. MC_TOKEN, the dashboard session, an OAuth access token, and a dev-open caller are not accepted on operations that use this scheme.",
         },
       },
       schemas: {
@@ -364,6 +385,28 @@ export function openApiDocument(): Json {
             owners: { type: "array", maxItems: MAX_OWNERS, items: ref("WatchedOwnerInput") },
           },
         },
+        OwnerDiscoveryOk: {
+          type: "object",
+          required: ["owner", "ok", "swept_at", "repos"],
+          properties: {
+            owner: { type: "string" },
+            ok: { const: true },
+            error: { type: ["string", "null"] },
+            truncated: { type: "boolean" },
+            swept_at: { type: "string", format: "date-time" },
+            repos: { type: "array", items: discoveryListedRepo },
+          },
+        },
+        OwnerDiscoveryFailed: {
+          type: "object",
+          required: ["owner", "ok", "swept_at"],
+          properties: {
+            owner: { type: "string" },
+            ok: { const: false },
+            error: { type: ["string", "null"] },
+            swept_at: { type: "string", format: "date-time" },
+          },
+        },
         OwnerDiscovery: {
           type: "object",
           required: ["results"],
@@ -373,24 +416,24 @@ export function openApiDocument(): Json {
               items: {
                 type: "object",
                 required: ["owner", "ok", "swept_at"],
+                discriminator: {
+                  propertyName: "ok",
+                  mapping: {
+                    true: "#/components/schemas/OwnerDiscoveryOk",
+                    false: "#/components/schemas/OwnerDiscoveryFailed",
+                  },
+                },
+                oneOf: [ref("OwnerDiscoveryOk"), ref("OwnerDiscoveryFailed")],
                 properties: {
                   owner: { type: "string" },
                   ok: { type: "boolean" },
                   error: { type: ["string", "null"] },
                   truncated: { type: "boolean", description: "True when gh repo list hit the 1000-repo cap. Seen repos are updated. Others are not marked gone." },
-                  swept_at: { type: "string", format: "date-time", description: "Required. Collector time just before gh repo list. A sweep that is not newer than last_discovered_at is ignored." },
+                  swept_at: { type: "string", format: "date-time", description: "Required RFC 3339 collector time just before gh repo list. More than 5 minutes in the future is 400. A sweep that is not newer than last_discovered_at is skipped." },
                   repos: {
                     type: "array",
-                    items: {
-                      type: "object",
-                      required: ["name", "isArchived", "isFork"],
-                      properties: {
-                        name: { type: "string" },
-                        pushedAt: { type: ["string", "null"], format: "date-time" },
-                        isArchived: { type: "boolean" },
-                        isFork: { type: "boolean" },
-                      },
-                    },
+                    description: "Required when ok is true.",
+                    items: discoveryListedRepo,
                   },
                 },
               },
@@ -725,6 +768,24 @@ export function openApiDocument(): Json {
             note: { type: "string" },
           },
         },
+        // Only PUT /api/settings/repos adds source. The other dry-run routes return DryRunResult.
+        RepoDryRunResult: {
+          description: "PUT /api/settings/repos with dry_run true. DryRunResult plus where the watched list came from.",
+          allOf: [
+            ref("DryRunResult"),
+            {
+              type: "object",
+              properties: {
+                source: {
+                  type: "string",
+                  enum: ["database", "file"],
+                  description:
+                    "When a database is connected and source is file, that baseline is the empty stored list, not the file fallback.",
+                },
+              },
+            },
+          ],
+        },
         Decision: {
           type: "object",
           required: [
@@ -875,7 +936,14 @@ export function openApiDocument(): Json {
             status: { type: "string", enum: [...DECISION_STATUSES] },
             decision: { type: ["string", "null"] },
             decided_by: { type: ["string", "null"], description: "Ignored. The stored actor comes from the principal." },
-            defer_until: { type: ["string", "null"], format: "date-time" },
+            defer_until: {
+              description: "An ISO 8601 date-time, or a YYYY-MM-DD date. A date is the end of that UTC day. Null clears it when status is not deferred.",
+              oneOf: [
+                { type: "string", format: "date-time" },
+                { type: "string", format: "date" },
+                { type: "null" },
+              ],
+            },
             option_id: { type: "string" },
             expected_updated_at: { type: "string", format: "date-time", description: "Accepted for older clients. Not compared." },
             expected_revision: { type: "integer", minimum: 0, description: "revision from the row you loaded. A mismatch is 409 stale." },
@@ -901,6 +969,41 @@ export function openApiDocument(): Json {
               items: { type: "string", enum: [...SCOPES] },
             },
             expires_at: { type: ["string", "null"], format: "date-time" },
+          },
+        },
+        WatchBeatWrite: {
+          type: "object",
+          additionalProperties: false,
+          required: ["source", "status", "detail", "beat_at"],
+          properties: {
+            source: { type: "string", enum: [...WATCH_SOURCES] },
+            status: { type: "string", enum: [...WATCH_STATUSES] },
+            detail: {
+              type: "string",
+              description: "At most 500 Unicode code points. Empty is allowed.",
+            },
+            beat_at: {
+              type: "string",
+              format: "date-time",
+              description:
+                "Finite RFC 3339 instant with an explicit Z or ±HH:MM offset. The sender clock does not decide freshness.",
+            },
+          },
+        },
+        WatchBeat: {
+          type: "object",
+          required: ["source", "status", "detail", "beat_at", "received_at", "age_s"],
+          properties: {
+            source: { type: "string", enum: [...WATCH_SOURCES] },
+            status: { type: "string", enum: [...WATCH_STATUSES] },
+            detail: { type: "string" },
+            beat_at: { type: "string", format: "date-time" },
+            received_at: { type: "string", format: "date-time" },
+            age_s: {
+              type: "integer",
+              minimum: 0,
+              description: "Whole seconds from the database clock to received_at, never below 0. Not derived from beat_at.",
+            },
           },
         },
       },
@@ -1263,7 +1366,7 @@ export function openApiDocument(): Json {
             query(
               "writeback",
               { type: "string", enum: ["written", "not_written"] },
-              "When set, only rows with this write-back stamp. Ignored when shape is brief.",
+              "written keeps only written rows. not_written keeps rows stamped not_written and a decided row whose writeback is still null, whose write-back claim is absent or older than the 180 second write-back lease, and whose writeback_lock_at, else decided_at, else updated_at, is older than that lease. Ignored when shape is brief.",
             ),
           ],
           responses: {
@@ -1539,12 +1642,12 @@ export function openApiDocument(): Json {
           tags: ["settings"],
           summary: "Replace the watched-repo list, or preview that replace.",
           description:
-            "dry_run true returns the diff against the list GET would show (adds, removes, updates, reorders) and writes nothing. An omitted auto row is not a remove. When that row has fieldsOverridden true, the diff reports an update that resets label, short, color, and blocked label to the discovery defaults. A stale version is still 409. The version is checked again under the discovery write lock in the same transaction as the replace. A pin or hide that changed the list is 409 stale and is kept. With no database, a dry run returns that diff with would_write false instead of 409. A non-boolean dry_run is 400 and writes nothing.",
+            "dry_run true returns the diff against the stored rows the save would replace (adds, removes, updates, reorders) and writes nothing. The preview includes source. When a database is connected and source is file, that baseline is the empty stored list, not the file fallback. With no database, the diff stays against the file list. An omitted auto row is not a remove. When that row has fieldsOverridden true, the diff reports an update that resets label, short, color, and blocked label to the discovery defaults. A stale version is still 409. The version is checked again under the discovery write lock in the same transaction as the replace. A pin or hide that changed the list is 409 stale and is kept. With no database, a dry run returns that diff with would_write false instead of 409. A non-boolean dry_run is 400 and writes nothing.",
           security: cookieOrBearer,
           requestBody: body(ref("RepoList")),
           responses: {
             "200": jsonResponse("The stored list, or a preview that writes nothing.", {
-              oneOf: [ref("WatchedRepos"), ref("DryRunResult")],
+              oneOf: [ref("WatchedRepos"), ref("RepoDryRunResult")],
             }),
             "400": jsonResponse("The list failed validation. errors is unchanged.", {
               allOf: [ref("Error"), { type: "object", properties: { errors: { type: "array" } } }],
@@ -1617,7 +1720,7 @@ export function openApiDocument(): Json {
           tags: ["settings"],
           summary: "Apply one collector tick of gh repo list results.",
           description:
-            "Auth matches PUT /api/settings/repos. A result with ok false, a rate-limit error, or zero repos records last_error and does not change tracked repos. A truncated list updates the repos it saw, does not mark the others gone, and stores a warning on last_error while still setting last_discovered_at. An unknown owner is an error on that result and does not fail the batch. A duplicate owner in one request is 400 and writes nothing. A missing swept_at is 400. A repo name that is not safe to store fails that owner's sweep and writes no repo changes. One owner's metadata update and repo changes commit together, under one global advisory lock shared by every owner, after reloading tracked repos. The lock is not held during gh repo list. swept_at orders overlapping ticks: a sweep that is not newer than last_discovered_at writes nothing. A short-name unique violation replans once and then is 409 with results plus added, updated, and marked_gone as empty arrays on the response and on each result. Discovery does not change pin, hide, label, short, color, origin, fieldsOverridden, or the actor who saved the owner. No database, or a missing watched_owners table, is 409 and includes results plus added, updated, and marked_gone as empty arrays on the response and on each result.",
+            "Auth matches PUT /api/settings/repos. A result with ok false, a rate-limit error, or zero repos records last_error and does not change tracked repos. A truncated list updates the repos it saw, does not mark the others gone, and stores a warning on last_error while still setting last_discovered_at. An unknown owner is an error on that result and does not fail the batch. A duplicate owner in one request is 400 and writes nothing. A missing swept_at, a swept_at that is not RFC 3339, or a swept_at more than 5 minutes in the future is 400. pushedAt must be RFC 3339 or null; anything else is 400. Repo names that differ only by case in one result are 400. A repo name that is not safe to store fails that owner's sweep and writes no repo changes. New-repo activity uses swept_at, not the server clock. One owner's metadata update and repo changes commit together, under one global advisory lock shared by every owner, after reloading tracked repos. The lock is not held during gh repo list. swept_at orders overlapping ticks: a sweep that is not newer than last_discovered_at returns ok true with skipped stale and writes nothing. A short-name unique violation replans once and then is 409 with results plus added, updated, and marked_gone as empty arrays on the response and on each result. Discovery does not change pin, hide, label, short, color, origin, fieldsOverridden, or the actor who saved the owner. An existing repo is matched case-insensitively and keeps its stored casing. No database, or a missing watched_owners table, is 409 and includes results plus added, updated, and marked_gone as empty arrays on the response and on each result.",
           security: cookieOrBearer,
           requestBody: body(ref("OwnerDiscovery")),
           responses: {
@@ -1634,6 +1737,7 @@ export function openApiDocument(): Json {
                       owner: { type: "string" },
                       ok: { type: "boolean" },
                       error: { type: ["string", "null"] },
+                      skipped: { type: "string", enum: ["stale", "owner_removed", "rule_changed"], description: "stale is HTTP 200 with ok true and writes nothing. owner_removed and rule_changed stay ok false." },
                       added: { type: "integer" },
                       updated: { type: "integer" },
                       marked_gone: { type: "integer" },
@@ -1999,6 +2103,50 @@ export function openApiDocument(): Json {
             "200": jsonResponse("The updated skill, or a demo no-op.", { type: "object" }),
             ...flatErrors,
             "404": jsonResponse("Unknown or removed skill when a database is connected.", ref("Error")),
+          },
+        }),
+      },
+      "/api/watch/beat": {
+        post: operation({
+          operationId: "postWatchBeat",
+          tags: ["watch"],
+          summary: "Store one host liveness beat.",
+          description:
+            "Verified akc_ credential with watch:write only. MC_TOKEN, the dashboard session, an OAuth access token, and a dev-open caller are 401. A valid credential without watch:write is 403 insufficient_scope. The credential store being unreachable is 503 credential_store_unavailable. WATCH_SOURCE_CREDENTIAL_IDS_JSON must map the body's source to this credential's row id; a missing, empty, or otherwise invalid map is 503, and a credential bound to a different source is 403 with no write. Content-Type must be the single media type application/json, optionally with parameters (415 for a missing value, a comma, or any other type). The body is measured before parsing and rejected at 413 above 8 KiB; Content-Length is not trusted. received_at and age_s are rejected. beat_at is the sender's instant and may be old or in the future. received_at and age_s come from the database on read. No database is 503, never a demo ack.",
+          security: [{ agentCredential: [] }],
+          requestBody: body(ref("WatchBeatWrite")),
+          responses: {
+            "200": jsonResponse("The beat replaced the row for that source.", {
+              type: "object",
+              required: ["ok"],
+              properties: { ok: { type: "boolean", const: true } },
+            }),
+            ...flatErrors,
+            "413": jsonResponse("The body is larger than 8 KiB.", ref("Error")),
+            "415": jsonResponse("Content-Type is not application/json.", ref("Error")),
+            "503": jsonResponse(
+              "The credential store is unreachable, source binding is not configured, or the beat table is unavailable.",
+              ref("Error"),
+            ),
+          },
+        }),
+      },
+      "/api/watch/beats": {
+        get: operation({
+          operationId: "listWatchBeats",
+          tags: ["watch"],
+          summary: "List host liveness beats.",
+          description:
+            "Verified akc_ credential with watch:read only. MC_TOKEN, the dashboard session, an OAuth access token, and a dev-open caller are 401. A valid credential without watch:read is 403 insufficient_scope. No source binding. age_s is the database clock minus received_at. Cache-Control is no-store. With no database, or when the query fails, the response is 503. It is not an empty list and not demo data. An empty beats array means the table was read and has no rows.",
+          security: [{ agentCredential: [] }],
+          responses: {
+            "200": jsonResponse("Rows ordered by source. Cache-Control: no-store.", {
+              type: "object",
+              required: ["beats"],
+              properties: { beats: { type: "array", items: ref("WatchBeat") } },
+            }),
+            ...flatErrors,
+            "503": jsonResponse("The credential store or the beat table is unavailable.", ref("Error")),
           },
         }),
       },

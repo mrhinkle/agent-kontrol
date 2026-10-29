@@ -317,6 +317,15 @@ function receiptOf(event: Event): Receipt {
   return { id: String(event.id), kind: event.kind, at: event.created_at };
 }
 
+/**
+ * Same in-memory events list the other demo write tools use.
+ * Decision tools call this when no database is configured, and when tests
+ * substituted the decision store, so a fake DATABASE_URL does not insert.
+ */
+export function recordDemoActivity(kind: string, title: string, extra: Record<string, unknown> = {}): Receipt {
+  return pushActivity(kind, title, kind, extra);
+}
+
 /** An audit row that is not a task-status change. No fault hook. */
 function pushActivity(kind: string, title: string, tool: string, extra: Record<string, unknown>): Receipt {
   const event: Event = {

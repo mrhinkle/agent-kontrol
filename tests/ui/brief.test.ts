@@ -510,6 +510,8 @@ describe("GET /api/brief", { concurrency: false }, () => {
       "requeue_task",
       "delete_note",
       "list_activity",
+      "get_settings",
+      "set_watched_repos",
     ]);
     assert.equal(registered.filter((name) => name === "get_morning_brief").length, 1);
     assert.equal([...src.matchAll(/name: "reply_to_mark"/g)].length, 1);
@@ -2472,6 +2474,49 @@ describe("GET /api/brief", { concurrency: false }, () => {
       assert.equal(run(raw), expected, JSON.stringify(value));
     }
   });
+
+  it("a snapshot stored under another casing still fills the watched repo", async () => {
+    env.DATABASE_URL = "postgres://brief:brief@127.0.0.1:9/brief_test";
+    const watched = "acme/app";
+    const stored = "Acme/App";
+    setSqlForTests(async (strings, ...values) => {
+      const text = strings.join(" ");
+      if (text.includes("from watched_owners")) return [];
+      if (text.includes("from watched_repos")) {
+        return [{
+          repo: watched,
+          label: "App",
+          short: "app",
+          color: "#000000",
+          blocked_label: null,
+          position: 0,
+          origin: "manual",
+          pinned: false,
+          hidden: false,
+          gone: false,
+        }];
+      }
+      if (text.includes("from decisions")) return [];
+      if (text.includes("from agents") || text.includes("from events")) return [];
+      if (!text.includes("from repo_snapshots")) throw new Error(`unexpected sql: ${text}`);
+      return newestSnapshots(text, values, [snapshotRow({
+        repo: stored,
+        collected_at: "2026-10-27T14:00:00.000Z",
+        open_issues: 3,
+        open_prs: 1,
+        merged_prs_24h: 4,
+        issues_opened_24h: 2,
+        issues_closed_24h: 1,
+        detail: { stuck_prs: [], merged: [] },
+      })]);
+    });
+    const brief = await loadBrief("24h", new Date("2026-10-27T15:00:00Z"));
+    assert.equal(brief.repos.length, 1);
+    assert.equal(brief.repos[0]?.repo, watched);
+    assert.equal(brief.repos[0]?.incomplete, false);
+    assert.equal(brief.repos[0]?.merged_prs, 4);
+    assert.equal(brief.repos[0]?.open_issues, 3);
+  });
 });
 
 /** A repo_snapshots row. Nulls are unmeasured counts, not zeros. */
@@ -2552,14 +2597,7 @@ function installBriefSql(snapshots: Row[], decisions: Row[] | "missing" | "fail"
     }
     if (text.includes("from agents") || text.includes("from events")) return [];
     if (!text.includes("from repo_snapshots")) throw new Error(`unexpected sql: ${text}`);
-    const repos = new Set((values[0] as string[]) ?? []);
-    const best = new Map<string, Row>();
-    for (const row of snapshots) {
-      if (!repos.has(String(row.repo))) continue;
-      const prev = best.get(String(row.repo));
-      if (!prev || String(row.collected_at) > String(prev.collected_at)) best.set(String(row.repo), row);
-    }
-    return [...best.values()];
+    return newestSnapshots(text, values, snapshots);
   });
 }
 
@@ -2572,8 +2610,7 @@ function installSnapshotSql(rows: Row[]): void {
     if (text.includes("from watched_owners")) return [];
     if (text.includes("from decisions")) return [];
     if (!text.includes("from repo_snapshots")) throw new Error(`unexpected sql: ${text}`);
-    const repos = new Set((values[0] as string[]) ?? []);
-    let pool = rows.filter((row) => repos.has(String(row.repo)));
+    let pool = rows;
     if (/open_issues\s+is\s+not\s+null/i.test(text)) {
       pool = pool.filter((row) => row.open_issues !== null && row.open_issues !== undefined);
     }
@@ -2581,14 +2618,24 @@ function installSnapshotSql(rows: Row[]): void {
       const before = String(values[1]);
       pool = pool.filter((row) => String(row.collected_at) <= before);
     }
-    const best = new Map<string, Row>();
-    for (const row of pool) {
-      const key = String(row.repo);
-      const prev = best.get(key);
-      if (!prev || String(row.collected_at) > String(prev.collected_at)) best.set(key, row);
-    }
-    return [...best.values()];
+    return newestSnapshots(text, values, pool);
   });
+}
+
+/** Applies `repo = any` or `lower(repo) = any`, keeping the newest row per identity. */
+function newestSnapshots(text: string, values: unknown[], rows: Row[]): Row[] {
+  const folded = /lower\s*\(\s*repo\s*\)/i.test(text);
+  const raw = (values[0] as string[]) ?? [];
+  const wanted = new Set(raw.map((repo) => (folded ? repo.toLowerCase() : repo)));
+  const best = new Map<string, Row>();
+  for (const row of rows) {
+    const repo = String(row.repo);
+    const key = folded ? repo.toLowerCase() : repo;
+    if (!wanted.has(key)) continue;
+    const prev = best.get(key);
+    if (!prev || String(row.collected_at) > String(prev.collected_at)) best.set(key, row);
+  }
+  return [...best.values()];
 }
 
 /**

@@ -128,35 +128,41 @@ function toSnapshot(row: Row): RepoSnapshot {
  * retroactively how deep the queue was on a past Tuesday — so they must not win
  * "latest" just by having a later timestamp than the last tick. `open_issues is
  * not null` is the marker of a row that actually swept the repo.
+ *
+ * `distinct on (lower(repo))` folds case variants of one `owner/name` onto the
+ * newest live row. The map key is that lowercased name.
  */
 async function latestPerRepo(): Promise<Map<string, RepoSnapshot>> {
   const db = sql();
   const rows = (await db`
-    select distinct on (repo) *
+    select distinct on (lower(repo)) *
     from repo_snapshots
     where open_issues is not null
-    order by repo, collected_at desc
+    order by lower(repo), collected_at desc
   `) as Row[];
-  return new Map(rows.map((r) => [String(r.repo), toSnapshot(r)]));
+  return new Map(rows.map((r) => [String(r.repo).toLowerCase(), toSnapshot(r)]));
 }
 
 /** Newest snapshot per repo at or before `ts` — the window's starting line. */
 async function baselinePerRepo(ts: string): Promise<Map<string, RepoSnapshot>> {
   const db = sql();
   const rows = (await db`
-    select distinct on (repo) *
+    select distinct on (lower(repo)) *
     from repo_snapshots
     where collected_at <= ${ts}
-    order by repo, collected_at desc
+    order by lower(repo), collected_at desc
   `) as Row[];
-  return new Map(rows.map((r) => [String(r.repo), toSnapshot(r)]));
+  return new Map(rows.map((r) => [String(r.repo).toLowerCase(), toSnapshot(r)]));
 }
 
-/** One point per repo per UTC day: the day's last tick. */
+/**
+ * One point per repo per UTC day: the day's last tick.
+ * Case variants of one repo share the day's newest tick.
+ */
 async function dailyHistory(sinceIso: string): Promise<HistoryPoint[]> {
   const db = sql();
   const rows = (await db`
-    select distinct on (repo, (collected_at at time zone 'utc')::date)
+    select distinct on (lower(repo), (collected_at at time zone 'utc')::date)
       repo,
       to_char((collected_at at time zone 'utc')::date, 'YYYY-MM-DD') as date,
       total_issues_created,
@@ -164,7 +170,7 @@ async function dailyHistory(sinceIso: string): Promise<HistoryPoint[]> {
     from repo_snapshots
     where collected_at >= ${sinceIso}
       and total_issues_created is not null
-    order by repo, (collected_at at time zone 'utc')::date, collected_at desc
+    order by lower(repo), (collected_at at time zone 'utc')::date, collected_at desc
   `) as Row[];
 
   return rows
@@ -180,6 +186,19 @@ async function dailyHistory(sinceIso: string): Promise<HistoryPoint[]> {
       };
     })
     .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.repo.localeCompare(b.repo)));
+}
+
+/**
+ * History points keep the stored casing of the winning tick. The board and
+ * the chart join them to the watched row, so a matched repo uses that row's name.
+ */
+function alignHistoryRepos(history: HistoryPoint[], watched: { repo: string }[]): HistoryPoint[] {
+  const canon = new Map(watched.map((cfg) => [cfg.repo.toLowerCase(), cfg.repo]));
+  return history.map((point) => {
+    const repo = canon.get(point.repo.toLowerCase());
+    if (!repo || repo === point.repo) return point;
+    return { ...point, repo };
+  });
 }
 
 /** Agent spend inside the window, from the existing task ledger. */
@@ -355,9 +374,10 @@ export async function progress(window: TimeWindow): Promise<Omit<ProgressRespons
   const slackMs = Math.max(6 * 3_600_000, days * 86_400_000 * 0.2);
 
   const watched = (await getWatchedRepos(REPOS)).repos.filter(visibleOnBoard);
+  const namedHistory = alignHistoryRepos(history, watched);
   const repos: RepoProgress[] = watched.map((cfg) => {
-    const now = latest.get(cfg.repo);
-    const then = baseline.get(cfg.repo);
+    const now = latest.get(cfg.repo.toLowerCase());
+    const then = baseline.get(cfg.repo.toLowerCase());
     const thenUsable = then !== undefined && targetMs - new Date(then.collected_at).getTime() <= slackMs;
     if (thenUsable && then && (!baselineAt || then.collected_at > baselineAt)) baselineAt = then.collected_at;
 
@@ -445,8 +465,8 @@ export async function progress(window: TimeWindow): Promise<Omit<ProgressRespons
     window_complete: days === 1 ? lastSync !== null : windowComplete && baselineAt !== null,
     repos,
     totals,
-    history,
-    alerts: buildAlerts(repos, history, skills?.stalled ?? []),
+    history: namedHistory,
+    alerts: buildAlerts(repos, namedHistory, skills?.stalled ?? []),
     ...(skills ? { skills } : {}),
   };
 }

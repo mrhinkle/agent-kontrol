@@ -17,19 +17,28 @@ import { StaleWrite } from "../src/lib/revision";
 import { readReceipt } from "../src/lib/activity";
 import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview, findAgent, deleteMemory, slugify } from "../src/lib/store";
 import { updateTaskForTool } from "../src/lib/dry-run-actions";
-import { getWatchedRepos, replaceWatchedRepos } from "../src/lib/watched-repos";
+import { runWithActor } from "../src/lib/actor";
+import { GET as getRepoSettings, PUT as putRepoSettings } from "../src/app/api/settings/repos/route";
+import { readRepoSettings } from "../src/lib/settings-read";
+import { getSettingsTool, setWatchedReposTool } from "../src/lib/settings-tools";
+import { getWatchedRepos, listVersion, replaceWatchedRepos, setRepoOverride } from "../src/lib/watched-repos";
+import { applyOwnerDiscovery } from "../src/lib/watched-owners";
 import type { RepoConfig } from "../src/lib/progress-config";
 import { getTrace, listTraces, pruneSpans, upsertSpans } from "../src/lib/trace-store";
 import { pruneAutomaticNotes, upsertAutomaticNote } from "../src/lib/session-memory";
 import type { SpanInput } from "../src/lib/traces";
 import {
   ageDays,
+  claimDecisionWriteback,
+  getDecision,
   listDecisions,
   patchDecision,
   reconcileDecisions,
   partitionBrief,
+  setDecisionWriteback,
   toBriefDecisions,
   upsertDecision,
+  WRITEBACK_LOCK_LEASE_SECONDS,
   type UpsertInput,
 } from "../src/lib/decisions";
 import { finishSyncRun, markSkillRemoved, SyncLeaseLost, upsertSettings, upsertSkill } from "../src/lib/skills/store";
@@ -184,6 +193,7 @@ async function main() {
   assert.equal(got.repos[1].blockedLabel, "blocked");
   await sql()`delete from watched_repos`;
   assert.equal((await getWatchedRepos(fallback)).source, "file");
+  await testRepoSettingsVersionAndReceipt(tag);
 
   // Traces: upsert merges an open span with its close, lists summarize, prune removes old rows.
   const traceId = randomUUID().replace(/-/g, "");
@@ -353,8 +363,12 @@ async function main() {
   await testSkillLeaseFence(tag);
   await testSkillSchedule(tag);
   await testWatchBeats(tag);
+  await testWatchBeatRoute(tag);
   await testListCursors(tag);
   await testBriefAlerts(tag);
+  await testZeroMergeCaseFold(tag);
+  await testDecisionWritebackHardening(tag);
+  await testRepoCaseIdentity(tag);
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
 }
@@ -1416,6 +1430,151 @@ async function testWatchBeats(tag: string): Promise<void> {
 }
 
 /**
+ * Persisted round trip through the watch routes. Rejected writes leave the
+ * stored row unchanged. age_s follows received_at, not an old or future beat_at.
+ */
+async function testWatchBeatRoute(tag: string): Promise<void> {
+  const { POST } = await import("../src/app/api/watch/beat/route");
+  const { GET } = await import("../src/app/api/watch/beats/route");
+  const { createCredential } = await import("../src/lib/credentials");
+  const savedBinding = process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON;
+  const ids: string[] = [];
+
+  async function stored(source: string) {
+    const rows = await sql()`
+      select status, detail, beat_at::text as beat_at, received_at::text as received_at
+      from watch_beats where source = ${source}
+    `;
+    return rows[0] ?? null;
+  }
+
+  try {
+    await sql()`delete from watch_beats where source in ('mini', 'macbook', 'watcher')`;
+    const mini = await createCredential({ label: `${tag} mini`, scopes: ["watch:write", "watch:read"] });
+    const mac = await createCredential({ label: `${tag} mac`, scopes: ["watch:write"] });
+    assert.equal(mini.ok, true);
+    assert.equal(mac.ok, true);
+    if (!mini.ok || !mac.ok) return;
+    ids.push(mini.credential.id, mac.credential.id);
+    process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON = JSON.stringify({
+      mini: [mini.credential.id],
+      macbook: [mac.credential.id],
+    });
+
+    const oldBeat = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString();
+    const futureBeat = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    const post = (token: string, body: unknown, extra: Record<string, string> = {}) => POST(new Request("http://localhost/api/watch/beat", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json", ...extra },
+      body: JSON.stringify(body),
+    }));
+
+    const wrote = await post(mini.token, {
+      source: "mini",
+      status: "ok",
+      detail: "scheduler healthy",
+      beat_at: oldBeat,
+    });
+    assert.equal(wrote.status, 200);
+    assert.deepEqual(await wrote.json(), { ok: true });
+
+    const listed = await GET(new Request("http://localhost/api/watch/beats", {
+      headers: { authorization: `Bearer ${mini.token}` },
+    }));
+    assert.equal(listed.status, 200);
+    assert.equal(listed.headers.get("cache-control"), "no-store");
+    const body = await listed.json() as { beats: { source: string; beat_at: string; received_at: string; age_s: number; detail: string }[] };
+    const row = body.beats.find((beat) => beat.source === "mini");
+    assert.ok(row);
+    assert.equal(Date.parse(row.beat_at), Date.parse(oldBeat));
+    assert.equal(row.detail, "scheduler healthy");
+    assert.equal(typeof row.age_s, "number");
+    assert.ok(row.age_s >= 0 && row.age_s < 60);
+    assert.ok(Math.abs(Date.now() - Date.parse(row.received_at)) < 60_000);
+
+    const before = await stored("mini");
+    const rejected: unknown[] = [
+      { source: "macbook", status: "failing", detail: "wrong host", beat_at: futureBeat },
+      { source: "watcher", status: "failing", detail: "wrong host", beat_at: futureBeat },
+      { source: "mini", status: "ok", detail: "bad clock", beat_at: "2026-10-27T12:00:00" },
+      { source: "mini", status: "ok", detail: "client clock", beat_at: oldBeat, received_at: oldBeat },
+      { source: "mini", status: "ok", detail: "client age", beat_at: oldBeat, age_s: 1 },
+    ];
+    for (const payload of rejected) {
+      const res = await post(mini.token, payload);
+      assert.ok(res.status === 400 || res.status === 403, `expected 400 or 403, got ${res.status}`);
+      assert.deepEqual(await stored("mini"), before);
+    }
+
+    const bound = process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON;
+    for (const raw of ["{}", JSON.stringify({ mini: [] }), JSON.stringify({ mini: [], macbook: [] })]) {
+      process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON = raw;
+      const res = await post(mini.token, {
+        source: "mini",
+        status: "failing",
+        detail: "empty binding must not land",
+        beat_at: futureBeat,
+      });
+      assert.equal(res.status, 503, raw);
+      assert.deepEqual(await stored("mini"), before);
+    }
+    for (const contentType of [
+      "application/json, text/plain",
+      "application/json+x",
+      "application/jsonx",
+      "text/json",
+      "",
+    ]) {
+      const res = await post(mini.token, {
+        source: "mini",
+        status: "failing",
+        detail: "bad content type must not land",
+        beat_at: futureBeat,
+      }, { "content-type": contentType });
+      assert.equal(res.status, 415, JSON.stringify(contentType));
+      assert.deepEqual(await stored("mini"), before);
+    }
+    const missingType = await POST(new Request("http://localhost/api/watch/beat", {
+      method: "POST",
+      headers: { authorization: `Bearer ${mini.token}` },
+      body: JSON.stringify({
+        source: "mini",
+        status: "failing",
+        detail: "missing content type must not land",
+        beat_at: futureBeat,
+      }),
+    }));
+    assert.equal(missingType.status, 415);
+    assert.deepEqual(await stored("mini"), before);
+    process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON = bound;
+
+    const ahead = await post(mini.token, {
+      source: "mini",
+      status: "held",
+      detail: "sender ahead",
+      beat_at: futureBeat,
+    });
+    assert.equal(ahead.status, 200);
+    const again = await GET(new Request("http://localhost/api/watch/beats", {
+      headers: { authorization: `Bearer ${mini.token}` },
+    }));
+    const fresh = (await again.json() as { beats: { source: string; beat_at: string; age_s: number; status: string }[] })
+      .beats.find((beat) => beat.source === "mini");
+    assert.ok(fresh);
+    assert.equal(fresh.status, "held");
+    assert.equal(Date.parse(fresh.beat_at), Date.parse(futureBeat));
+    assert.ok(fresh.age_s >= 0 && fresh.age_s < 60);
+  } finally {
+    if (savedBinding === undefined) delete process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON;
+    else process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON = savedBinding;
+    if (ids.length > 0) {
+      await sql()`delete from agent_credentials where id in (${ids[0]}, ${ids[1] ?? ids[0]})`;
+    }
+    await sql()`delete from watch_beats where source in ('mini', 'macbook', 'watcher')`;
+  }
+}
+
+/**
  * Keyset pages on Postgres. An insert ahead of the cursor must not repeat or
  * skip a row, and two timestamps that differ only after the millisecond still
  * page in id order.
@@ -1781,6 +1940,621 @@ async function testBriefAlerts(tag: string): Promise<void> {
     setBeforeClaimForTests(null);
     setBriefSettingsForTests(null);
     await cleanup();
+  }
+}
+
+/**
+ * Snapshot rows stored as `PgCase/A…` count for the watched row `pgcase/a…`.
+ * One quiet window sends one lowercase latch. A second evaluate sends nothing.
+ * A sent latch under the stored casing is not cleared as absent.
+ */
+async function testZeroMergeCaseFold(tag: string): Promise<void> {
+  const slug = tag.replace(/\W/g, "").slice(-12);
+  const watched = `pgcase/a${slug}`;
+  const stored = `PgCase/A${slug}`;
+  const key = `zero-merge:${watched}`;
+  const oldKey = `zero-merge:${stored}`;
+  const now = new Date("2026-10-28T12:00:00.000Z");
+  const hour = 3_600_000;
+  const minute = 60_000;
+  const iso = (delta: number) => new Date(now.getTime() + delta).toISOString();
+  const settings: BriefSettings = {
+    decisionLabels: ["needs-owner"],
+    stuckPrHours: 48,
+    staleIssueDays: 21,
+    coordinator: { agentId: null, maxSilenceHours: 3, workKinds: ["session_end"] },
+    alerts: {
+      enabled: true,
+      coordinatorRepeatHours: 12,
+      zeroMergeHours: 72,
+      zeroMergeLookbackDays: 7,
+      decisionAgeDays: 14,
+    },
+  };
+  const cleanup = async () => {
+    await sql()`delete from messages where created_by = 'brief-alerts' and body like ${"%" + slug + "%"}`;
+    await sql()`delete from brief_alerts where key = ${key} or key = ${oldKey}`;
+    await sql()`delete from repo_snapshots where lower(repo) = lower(${watched})`;
+    await sql()`delete from watched_repos where lower(repo) = lower(${watched})`;
+  };
+  await cleanup();
+  try {
+    await sql()`
+      insert into watched_repos (repo, label, short, color, position)
+      values (${watched}, 'Case', ${`c${slug}`.slice(0, 12)}, '#000000', 0)
+    `;
+    await sql()`
+      insert into repo_snapshots (repo, collected_at, detail)
+      values (
+        ${stored},
+        ${iso(0)}::timestamptz,
+        ${JSON.stringify({ merged: [{ merged_at: iso(-72 * hour) }] })}::jsonb
+      )
+    `;
+    const count = async () => {
+      const rows = await sql()`
+        select count(*)::int as n from messages
+        where created_by = 'brief-alerts' and position(${`brief-alert ${key}\n`} in body) > 0
+      `;
+      return Number(rows[0].n);
+    };
+    const first = await evaluateAlerts({ now, settings });
+    assert.equal(first.alerts.find((alert) => alert.key === key)?.condition, "firing");
+    assert.equal(first.alerts.some((alert) => alert.key === oldKey), false);
+    assert.equal(await count(), 1, "quiet history under another casing sends one lowercase alert");
+
+    const second = await evaluateAlerts({ now: new Date(now.getTime() + minute), settings });
+    assert.equal(second.alerts.find((alert) => alert.key === key)?.condition, "firing");
+    assert.equal(await count(), 1, "a second evaluate sends nothing more");
+
+    await sql()`
+      insert into brief_alerts (key, first_sent_at, last_sent_at)
+      values (${oldKey}, ${iso(-hour)}::timestamptz, ${iso(-hour)}::timestamptz)
+    `;
+    const later = new Date(now.getTime() + 2 * minute);
+    await evaluateAlerts({ now: later, settings });
+    const kept = await sql()`select cleared_at from brief_alerts where key = ${oldKey}`;
+    assert.equal(kept.length, 1);
+    assert.equal(kept[0]?.cleared_at ?? null, null, "a case-variant latch of a visible repo is not cleared");
+  } finally {
+    setBriefSettingsForTests(null);
+    await cleanup();
+  }
+}
+
+/** Case-insensitive repo identity and a swept_at activity cutoff, on real SQL. */
+async function testRepoCaseIdentity(tag: string): Promise<void> {
+  const slug = tag.replace(/\D/g, "").slice(-10);
+  const owner = `pgc${slug}`;
+  const stored = `${owner}/app`;
+  const short = `s${slug}`.slice(0, 12);
+  const brand = `Bn${slug}`;
+  try {
+    await sql()`insert into watched_owners (owner, activity_days) values (${owner}, 30)`;
+    await sql()`
+      insert into watched_repos (repo, label, short, color, position, origin)
+      values (${stored}, 'App', ${short}, '#2563eb', 0, 'manual')
+    `;
+    const outcome = await applyOwnerDiscovery(
+      { owner, activityDays: 30, includeForks: false, includeArchived: false },
+      [],
+      {
+        repos: [
+          { name: "App", pushedAt: "2026-01-15T00:00:00.000Z", isFork: false, isArchived: false },
+          { name: brand, pushedAt: "2026-01-01T00:00:00.000Z", isFork: false, isArchived: false },
+          { name: `Old${slug}`, pushedAt: "2025-12-31T23:59:59.999Z", isFork: false, isArchived: false },
+        ],
+        error: null,
+        sweptAt: "2026-01-31T00:00:00.000Z",
+      },
+      new Date("2026-10-29T00:00:00.000Z"),
+    );
+    assert.equal(outcome.failure, null, outcome.failure ?? "");
+    const rows = await sql()`
+      select repo, pinned
+      from watched_repos
+      where lower(repo) like ${`${owner.toLowerCase()}/%`}
+      order by repo
+    `;
+    const names = rows.map((row) => String(row.repo));
+    assert.deepEqual(names.filter((name) => name.toLowerCase() === stored.toLowerCase()), [stored]);
+    assert.ok(names.includes(`${owner}/${brand}`), `expected GitHub casing, saw ${names.join(", ")}`);
+    assert.equal(names.some((name) => name.toLowerCase().includes("old")), false);
+    const pinned = await setRepoOverride(stored.toUpperCase(), { pinned: true });
+    assert.equal(pinned, true);
+    const after = await sql()`
+      select repo, pinned from watched_repos where lower(repo) = lower(${stored})
+    `;
+    assert.equal(after.length, 1);
+    assert.equal(after[0]?.repo, stored);
+    assert.equal(after[0]?.pinned, true);
+  } finally {
+    await sql()`delete from watched_repos where lower(repo) like ${`${owner.toLowerCase()}/%`}`;
+    await sql()`delete from watched_owners where owner = ${owner}`;
+  }
+}
+
+/**
+ * Claim, stamp, and reopen predicates, plus the crash-window retry population.
+ * Tagged by repo so the delete cannot touch another test's rows.
+ */
+async function testDecisionWritebackHardening(tag: string) {
+  const repo = `pgtest/h${tag.replace(/\W/g, "")}`;
+  const key = (n: number) => `github:${repo}#${n}`;
+  const drop = () => sql()`delete from decisions where repo = ${repo}`;
+  const body = (n: number): UpsertInput => ({
+    key: key(n),
+    source: "github-label",
+    repo,
+    repo_short: "app",
+    number: n,
+    url: null,
+    title: `harden ${n}`,
+    why: null,
+    options: null,
+    recommended: null,
+    requested_by: "owner",
+    kind: "issue",
+    labels: ["needs-owner"],
+    opened_at: "2026-07-21T12:00:00.000Z",
+    first_seen_at: "2026-07-21T12:00:00.000Z",
+    github_present: true,
+    force: false,
+  });
+  const decide = async (id: number, revision: number) => {
+    const row = await patchDecision(id, {
+      status: "decided",
+      decision: "ship",
+      setDecision: true,
+      decided_by: "mark",
+      setDecidedBy: true,
+      defer_until: null,
+      setDefer: false,
+      guardTerminal: true,
+      expectedRevision: revision,
+    });
+    assert.ok(row);
+    assert.equal(row.status, "decided");
+    return row;
+  };
+
+  await drop();
+  try {
+    const seeded = await upsertDecision(body(1));
+    const decided = await decide(seeded.decision.id, seeded.decision.revision);
+    const claim = await claimDecisionWriteback(decided.id, decided.revision);
+    assert.ok(claim);
+    assert.equal(claim.revision, decided.revision + 1);
+    const locked = await sql()`
+      select writeback_lock, writeback, revision, status from decisions where id = ${decided.id}
+    `;
+    assert.equal(locked[0].writeback_lock, claim.token);
+    assert.equal(locked[0].writeback, null);
+    assert.equal(Number(locked[0].revision), claim.revision);
+
+    assert.equal(await claimDecisionWriteback(decided.id, decided.revision), null);
+    assert.equal(await claimDecisionWriteback(decided.id, claim.revision), null);
+    assert.equal(await setDecisionWriteback(decided.id, "written", claim.revision, "wrong-token"), null);
+    assert.equal(await setDecisionWriteback(decided.id, "not_written", claim.revision, null), null);
+    const fenced = await sql()`
+      select writeback_lock, writeback, revision from decisions where id = ${decided.id}
+    `;
+    assert.equal(fenced[0].writeback_lock, claim.token);
+    assert.equal(fenced[0].writeback, null);
+    assert.equal(Number(fenced[0].revision), claim.revision);
+
+    const reopened = await patchDecision(decided.id, {
+      status: "open",
+      setDecision: false,
+      setDecidedBy: false,
+      defer_until: null,
+      setDefer: false,
+      guardTerminal: true,
+      expectedRevision: claim.revision,
+    });
+    assert.equal(reopened, null);
+    assert.equal((await getDecision(decided.id))?.status, "decided");
+
+    const stamped = await setDecisionWriteback(decided.id, "written", claim.revision, claim.token);
+    assert.equal(stamped?.writeback, "written");
+    assert.equal(stamped?.revision, claim.revision + 1);
+    const cleared = await sql()`select writeback_lock from decisions where id = ${decided.id}`;
+    assert.equal(cleared[0].writeback_lock, null);
+
+    const takeoverSeed = await upsertDecision(body(2));
+    const takeoverDecided = await decide(takeoverSeed.decision.id, takeoverSeed.decision.revision);
+    const firstClaim = await claimDecisionWriteback(takeoverDecided.id, takeoverDecided.revision);
+    assert.ok(firstClaim);
+    await sql()`
+      update decisions
+      set writeback_lock_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 1})
+      where id = ${takeoverDecided.id}
+    `;
+    const took = await claimDecisionWriteback(takeoverDecided.id, firstClaim.revision);
+    assert.ok(took);
+    assert.notEqual(took.token, firstClaim.token);
+    assert.equal(took.revision, firstClaim.revision + 1);
+
+    const reopenSeed = await upsertDecision(body(3));
+    const reopenDecided = await decide(reopenSeed.decision.id, reopenSeed.decision.revision);
+    const reopenClaim = await claimDecisionWriteback(reopenDecided.id, reopenDecided.revision);
+    assert.ok(reopenClaim);
+    await sql()`
+      update decisions
+      set writeback_lock_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 1})
+      where id = ${reopenDecided.id}
+    `;
+    const opened = await patchDecision(reopenDecided.id, {
+      status: "open",
+      setDecision: false,
+      setDecidedBy: false,
+      defer_until: null,
+      setDefer: false,
+      guardTerminal: true,
+      expectedRevision: reopenClaim.revision,
+    });
+    assert.equal(opened?.status, "open");
+    const openedLock = await sql()`select writeback_lock, status from decisions where id = ${reopenDecided.id}`;
+    assert.equal(openedLock[0].writeback_lock, null);
+    assert.equal(openedLock[0].status, "open");
+
+    const insideSeed = await upsertDecision(body(4));
+    const outsideSeed = await upsertDecision(body(5));
+    const stampedSeed = await upsertDecision(body(6));
+    const writtenSeed = await upsertDecision(body(7));
+    const inside = await decide(insideSeed.decision.id, insideSeed.decision.revision);
+    const outside = await decide(outsideSeed.decision.id, outsideSeed.decision.revision);
+    const freshStamp = await decide(stampedSeed.decision.id, stampedSeed.decision.revision);
+    const written = await decide(writtenSeed.decision.id, writtenSeed.decision.revision);
+    await sql()`
+      update decisions
+      set writeback = null,
+          writeback_lock = null,
+          writeback_lock_at = null,
+          decided_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS - 30}),
+          updated_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS - 30})
+      where id = ${inside.id}
+    `;
+    await sql()`
+      update decisions
+      set writeback = null,
+          writeback_lock = null,
+          writeback_lock_at = null,
+          decided_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30}),
+          updated_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30})
+      where id = ${outside.id}
+    `;
+    await sql()`
+      update decisions set writeback = 'not_written', updated_at = now() where id = ${freshStamp.id}
+    `;
+    await sql()`
+      update decisions
+      set writeback = 'written',
+          updated_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30})
+      where id = ${written.id}
+    `;
+
+    // A claimed row whose process died before the stamp. The collector
+    // upserts the still-labeled row and refreshes updated_at. The lock
+    // timestamp and decided_at stay, so an expired claim is still due.
+    const expiredSeed = await upsertDecision(body(8));
+    const expiredDecided = await decide(expiredSeed.decision.id, expiredSeed.decision.revision);
+    const expiredClaim = await claimDecisionWriteback(expiredDecided.id, expiredDecided.revision);
+    assert.ok(expiredClaim);
+    await sql()`
+      update decisions
+      set writeback_lock_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30}),
+          decided_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30})
+      where id = ${expiredDecided.id}
+    `;
+    const expiredAgain = await upsertDecision(body(8));
+    assert.equal(expiredAgain.decision.id, expiredDecided.id);
+    assert.equal(expiredAgain.status_held, true);
+    assert.equal(expiredAgain.decision.writeback, null);
+    const expiredRow = await sql()`
+      select writeback_lock, writeback,
+        writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as lock_old,
+        decided_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as decided_old,
+        updated_at >= now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as updated_fresh
+      from decisions where id = ${expiredDecided.id}
+    `;
+    assert.equal(expiredRow[0].writeback_lock, expiredClaim.token);
+    assert.equal(expiredRow[0].writeback, null);
+    assert.equal(expiredRow[0].lock_old === true || expiredRow[0].lock_old === "t", true);
+    assert.equal(expiredRow[0].decided_old === true || expiredRow[0].decided_old === "t", true);
+    assert.equal(expiredRow[0].updated_fresh === true || expiredRow[0].updated_fresh === "t", true);
+
+    // Same crash, but the claim is still inside its lease. The collector
+    // refresh must not put that row in the retry population.
+    const liveSeed = await upsertDecision(body(9));
+    const liveDecided = await decide(liveSeed.decision.id, liveSeed.decision.revision);
+    const liveClaim = await claimDecisionWriteback(liveDecided.id, liveDecided.revision);
+    assert.ok(liveClaim);
+    await sql()`
+      update decisions
+      set writeback_lock_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS - 30}),
+          decided_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30})
+      where id = ${liveDecided.id}
+    `;
+    const liveAgain = await upsertDecision(body(9));
+    assert.equal(liveAgain.decision.id, liveDecided.id);
+    assert.equal(liveAgain.decision.writeback, null);
+    const liveRow = await sql()`
+      select writeback_lock,
+        writeback_lock_at >= now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as lock_live,
+        updated_at >= now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as updated_fresh
+      from decisions where id = ${liveDecided.id}
+    `;
+    assert.equal(liveRow[0].writeback_lock, liveClaim.token);
+    assert.equal(liveRow[0].lock_live === true || liveRow[0].lock_live === "t", true);
+    assert.equal(liveRow[0].updated_fresh === true || liveRow[0].updated_fresh === "t", true);
+
+    const flags = await sql()`
+      select id,
+        (
+          writeback = 'not_written'
+          or (
+            status = 'decided'
+            and writeback is null
+            and (
+              writeback_lock is null
+              or writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+            )
+            and coalesce(writeback_lock_at, decided_at, updated_at) < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+          )
+        ) as due
+      from decisions
+      where repo = ${repo} and status = 'decided'
+    `;
+    const due = new Map(flags.map((row) => [Number(row.id), row.due === true || row.due === "t"]));
+    assert.equal(due.get(inside.id), false, "a null writeback inside the lease is not due");
+    assert.equal(due.get(outside.id), true, "a null writeback older than the lease is due");
+    assert.equal(due.get(freshStamp.id), true, "not_written stays due at any age");
+    assert.equal(due.get(written.id), false, "written is not a retry");
+    assert.equal(due.get(expiredDecided.id), true, "an expired claim stays due after a collector upsert refreshes updated_at");
+    assert.equal(due.get(liveDecided.id), false, "a live claim stays out of the retry population after a collector upsert");
+    const listed = await listDecisions({
+      status: "decided",
+      repo,
+      source: null,
+      limit: 100,
+      shape: "row",
+      writeback: "not_written",
+    });
+    assert.deepEqual(
+      listed.map((row) => row.id).sort((a, b) => a - b),
+      [...due.entries()].filter(([, isDue]) => isDue).map(([id]) => id).sort((a, b) => a - b),
+    );
+  } finally {
+    await drop();
+  }
+}
+
+/**
+ * An empty configured database reports the stored-list version, so the first
+ * save that sends it is not stale. The dry run diffs that empty list. A
+ * receipt insert that fails rolls the replace back. A normal write leaves
+ * one receipt and the new list. REST PUT still writes no receipt.
+ */
+async function testRepoSettingsVersionAndReceipt(tag: string): Promise<void> {
+  const digits = tag.replace(/\D/g, "").slice(-8);
+  const shortA = `a${digits}`.slice(0, 12);
+  const shortB = `b${digits}`.slice(0, 12);
+  const repoA = `pgr${digits}/a`;
+  const repoB = `pgr${digits}/b`;
+  const row = (name: string, short: string, label: string) => ({
+    repo: name,
+    label,
+    short,
+    color: "#112233",
+    blockedLabel: null as string | null,
+  });
+  const actor = { actor_type: "agent" as const, actor_id: "mc-token" };
+  const savedPassword = process.env.MC_DASHBOARD_PASSWORD;
+  const savedToken = process.env.MC_TOKEN;
+  delete process.env.MC_DASHBOARD_PASSWORD;
+  delete process.env.MC_TOKEN;
+  const detailOf = (value: unknown): { version?: string; tool?: string; actor_id?: string } => {
+    if (typeof value === "string") return JSON.parse(value) as { version?: string; tool?: string; actor_id?: string };
+    if (value && typeof value === "object") return value as { version?: string; tool?: string; actor_id?: string };
+    return {};
+  };
+  const dropTrigger = async () => {
+    await sql()`drop trigger if exists ak_test_fail_repo_event on events`;
+    await sql()`drop function if exists ak_test_fail_repo_event()`;
+  };
+  const floor = await sql()`select coalesce(max(id), 0)::bigint as id from events`;
+  const floorId = String(floor[0].id);
+  try {
+    const owners = await sql()`select count(*)::int as n from watched_owners`;
+    const repos = await sql()`select count(*)::int as n from watched_repos`;
+    assert.equal(Number(owners[0].n), 0, "version test starts with no owners");
+    assert.equal(Number(repos[0].n), 0, "version test starts with no repos");
+
+    await sql()`
+      insert into watched_repos (repo, label, short, color, blocked_label, position, origin, pinned, hidden, fields_overridden)
+      values ('acme/kept', 'Kept', 'kept', '#abcdef', 'wait', 0, 'auto', true, false, true)
+    `;
+    const fixed = await readRepoSettings();
+    assert.equal(fixed.source, "database");
+    assert.equal(fixed.version, listVersion(fixed.repos));
+    assert.equal(fixed.version, "fc16e23e1910c991", "a populated list keeps the pre-change fingerprint");
+    await sql()`delete from watched_repos where repo = 'acme/kept'`;
+
+    const settings = await readRepoSettings();
+    assert.equal(settings.source, "file");
+    assert.equal(settings.version, listVersion([]));
+    assert.equal(settings.version, "4f53cda18c2baa0c");
+    assert.notEqual(settings.version, listVersion(settings.repos));
+    const toolBody = JSON.parse((await getSettingsTool()).content[0].text) as {
+      repos: { version: string; source: string };
+    };
+    assert.equal(toolBody.repos.version, settings.version);
+    assert.equal(toolBody.repos.source, "file");
+
+    const preview = await setWatchedReposTool({ repos: [row(repoA, shortA, "A")], dry_run: true });
+    assert.equal(preview.isError, undefined, preview.content[0]?.text);
+    const diff = JSON.parse(preview.content[0].text) as {
+      source?: string;
+      added: string[];
+      removed: string[];
+      version: string;
+      would_write: boolean;
+    };
+    assert.equal(diff.source, "file");
+    assert.equal(diff.version, settings.version);
+    assert.deepEqual(diff.added, [repoA]);
+    assert.deepEqual(diff.removed, []);
+    assert.equal(diff.would_write, true);
+
+    const saved = await runWithActor(actor, () => setWatchedReposTool({
+      repos: [row(repoA, shortA, "A")],
+      expected_version: settings.version,
+    }));
+    assert.equal(saved.isError, undefined, saved.content[0]?.text);
+    assert.equal(saved.content[0].text.split("receipt:").length - 1, 1);
+    const after = await readRepoSettings();
+    assert.equal(after.source, "database");
+    assert.deepEqual(after.repos.map((item) => item.repo), [repoA]);
+    const receiptRows = await sql()`
+      select id::text as id, detail
+      from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+      order by id asc
+    `;
+    assert.equal(receiptRows.length, 1, "a normal write leaves exactly one receipt");
+    const detail = detailOf(receiptRows[0].detail);
+    assert.equal(detail.version, after.version);
+    assert.equal(detail.tool, "set_watched_repos");
+    assert.equal(detail.actor_id, "mc-token");
+    await sql()`delete from watched_repos where repo = ${repoA}`;
+    await sql()`delete from events where id = ${String(receiptRows[0].id)}::bigint`;
+
+    const got = await getRepoSettings(new Request("http://localhost/api/settings/repos"));
+    assert.equal(got.status, 200);
+    const gotBody = await got.json() as { source: string; version: string; repos: { repo: string }[] };
+    assert.equal(gotBody.source, "file");
+    assert.equal(gotBody.version, "4f53cda18c2baa0c");
+    assert.ok(gotBody.repos.length > 0);
+    const restPreview = await putRepoSettings(new Request("http://localhost/api/settings/repos", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repos: [row(repoB, shortB, "B")], version: gotBody.version, dry_run: true }),
+    }));
+    assert.equal(restPreview.status, 200);
+    const restDiff = await restPreview.json() as {
+      source?: string;
+      would_write: boolean;
+      changes: { op: string; summary: string }[];
+    };
+    assert.equal(restDiff.source, "file");
+    assert.equal(restDiff.would_write, true);
+    assert.equal(restDiff.changes.some((change) => change.op === "remove"), false);
+    assert.equal(restDiff.changes.some((change) => change.op === "add" && change.summary.includes(repoB)), true);
+    const restPut = await putRepoSettings(new Request("http://localhost/api/settings/repos", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repos: [row(repoB, shortB, "B")], version: gotBody.version }),
+    }));
+    const restText = await restPut.text();
+    assert.equal(restPut.status, 200, restText);
+    const restSaved = JSON.parse(restText) as { source: string; repos: { repo: string }[]; version: string };
+    assert.equal(restSaved.source, "database");
+    assert.deepEqual(restSaved.repos.map((item) => item.repo), [repoB]);
+    assert.notEqual(restSaved.version, gotBody.version);
+    const restEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+    `;
+    assert.equal(Number(restEvents[0].n), 0, "REST PUT writes no receipt");
+    await sql()`delete from watched_repos where repo = ${repoB}`;
+
+    await replaceWatchedRepos([row(repoA, shortA, "Kept")]);
+    const populated = await readRepoSettings();
+    assert.equal(populated.source, "database");
+    assert.equal(populated.version, listVersion(populated.repos));
+    const beforeRows = await sql()`select repo, label from watched_repos where repo = ${repoA}`;
+    const eventsBeforeFail = await sql()`
+      select count(*)::int as n from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+    `;
+    await sql()`
+      create or replace function ak_test_fail_repo_event()
+      returns trigger
+      language plpgsql
+      as $fn$
+      begin
+        if new.kind = 'set_watched_repos' then
+          raise exception 'simulated events insert failure';
+        end if;
+        return new;
+      end;
+      $fn$
+    `;
+    await sql()`drop trigger if exists ak_test_fail_repo_event on events`;
+    await sql()`
+      create trigger ak_test_fail_repo_event
+      before insert on events
+      for each row
+      execute procedure ak_test_fail_repo_event()
+    `;
+    const current = await readRepoSettings();
+    await assert.rejects(
+      () => runWithActor(actor, () => setWatchedReposTool({
+        repos: [row(repoB, shortB, "B")],
+        expected_version: current.version,
+      })),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const afterFail = await sql()`
+      select repo, label from watched_repos
+      where repo = ${repoA} or repo = ${repoB}
+      order by repo
+    `;
+    assert.deepEqual(afterFail.map((item) => String(item.repo)), [repoA]);
+    assert.equal(String(afterFail[0].label), String(beforeRows[0].label));
+    const eventsAfterFail = await sql()`
+      select count(*)::int as n from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+    `;
+    assert.equal(Number(eventsAfterFail[0].n), Number(eventsBeforeFail[0].n), "a failed receipt leaves the list and the event log unchanged");
+
+    await dropTrigger();
+    const retryVersion = (await readRepoSettings()).version;
+    const retried = await runWithActor(actor, () => setWatchedReposTool({
+      repos: [row(repoB, shortB, "B")],
+      expected_version: retryVersion,
+    }));
+    assert.equal(retried.isError, undefined, retried.content[0]?.text);
+    const finalRows = await sql()`select repo from watched_repos where repo = ${repoA} or repo = ${repoB} order by repo`;
+    assert.deepEqual(finalRows.map((item) => String(item.repo)), [repoB]);
+    const finalEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+    `;
+    assert.equal(Number(finalEvents[0].n), Number(eventsBeforeFail[0].n) + 1, "the recovered write leaves exactly one receipt");
+
+    const stale = await replaceWatchedRepos(
+      [row(repoA, shortA, "A")],
+      "not-the-version",
+      { kind: "set_watched_repos", title: "Watched repos replaced" },
+    );
+    assert.equal(stale.ok, false);
+    const staleEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+    `;
+    assert.equal(Number(staleEvents[0].n), Number(eventsBeforeFail[0].n) + 1, "a stale replace inserts no receipt");
+    const stillB = await sql()`select repo from watched_repos where repo = ${repoB}`;
+    assert.equal(stillB.length, 1);
+  } finally {
+    await dropTrigger();
+    await sql()`delete from watched_repos where repo = ${repoA} or repo = ${repoB} or repo = 'acme/kept'`;
+    await sql()`delete from events where kind = 'set_watched_repos' and id > ${floorId}::bigint`;
+    if (savedPassword === undefined) delete process.env.MC_DASHBOARD_PASSWORD;
+    else process.env.MC_DASHBOARD_PASSWORD = savedPassword;
+    if (savedToken === undefined) delete process.env.MC_TOKEN;
+    else process.env.MC_TOKEN = savedToken;
   }
 }
 

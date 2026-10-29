@@ -4,9 +4,10 @@
  * One table maps every agent-facing MCP tool and every agent-facing REST
  * route to exactly one scope. `requireScope` is the only allow decision.
  * A tool name that is not registered is denied for every principal.
- * `list_activity` is registered and is not in the table: an agent credential
- * is denied, and the legacy MC_TOKEN, the dashboard session, and OAuth can
- * call it. A REST route that is not in the table is denied for an agent
+ * `list_activity`, `get_settings`, and `set_watched_repos` are registered and
+ * are not in the table: an agent credential is denied, and the legacy
+ * MC_TOKEN, the dashboard session, and OAuth can call them. A REST route
+ * that is not in the table is denied for an agent
  * credential; the legacy MC_TOKEN, the dashboard session, and OAuth keep the
  * access they already had.
  *
@@ -29,6 +30,8 @@ export const SCOPES = [
   "decisions:write",
   "skills:read",
   "skills:write",
+  "watch:read",
+  "watch:write",
 ] as const;
 
 export type Scope = (typeof SCOPES)[number];
@@ -105,6 +108,12 @@ const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   { method: "GET", path: /^\/api\/skills\/(?!sync$|drift$)[^/]+$/, scope: "skills:read" },
   // Read-only: renders the pointer block, and POST only transforms the text sent.
   { method: "POST", path: /^\/api\/skills\/pointers$/, scope: "skills:read" },
+  // The scope an agent credential needs. The watch handlers reject every
+  // other principal with 401 before they consult this table. requireScope
+  // still treats legacy, session, OAuth, and dev-open as unrestricted, so
+  // authorizeRoute alone is not the guard for these two paths.
+  { method: "POST", path: /^\/api\/watch\/beat$/, scope: "watch:write" },
+  { method: "GET", path: /^\/api\/watch\/beats$/, scope: "watch:read" },
 ];
 
 export type Principal =
@@ -168,7 +177,11 @@ export function requireScope(principal: Principal, scope: Scope | null): ScopeDe
  * dev-open) are allowed. An unknown name is still denied for every
  * principal, including those.
  */
-const OPERATOR_TOOLS: ReadonlySet<string> = new Set(["list_activity"]);
+const OPERATOR_TOOLS: ReadonlySet<string> = new Set([
+  "list_activity",
+  "get_settings",
+  "set_watched_repos",
+]);
 
 /** Tool calls fail closed for every principal when the name is not mapped. */
 export function authorizeTool(principal: Principal, tool: string): ScopeDecision {

@@ -4,6 +4,7 @@ import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } fr
 import { StaleWrite, absentRevision } from "./revision";
 import { writeSessionNote } from "./session-memory";
 import { sql, type SqlTag } from "./db";
+import { insertToolReceipt } from "./tool-receipt";
 import { stampSortAt } from "./list-params";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
 import { asUnknownWriteOutcome } from "./write-outcome";
@@ -1675,6 +1676,23 @@ export async function readMemoryForPreview(key: string): Promise<{ item: MemoryI
   } catch (e) {
     if (e instanceof Error && e.message === "memory preview returned no revision") throw e;
     throw new Error(errMsg(e));
+  }
+}
+
+/**
+ * One events row for a write that already committed in its own statement.
+ * Decision tools use this after the row is stored. The kind is the tool name.
+ * A write that must roll back with its receipt calls `insertToolReceipt` on its own transaction instead.
+ */
+export async function recordToolReceipt(input: {
+  kind: string;
+  title: string;
+  extra?: Record<string, unknown>;
+}): Promise<Receipt | null> {
+  try {
+    return await insertToolReceipt(sql(), input);
+  } catch (e) {
+    throw new Error(`recordToolReceipt: ${errMsg(e)}`);
   }
 }
 

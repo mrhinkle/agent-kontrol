@@ -4,7 +4,7 @@ import { describe, it } from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { DecisionList } from "../../src/components/DecisionQueue";
-import { decisionQueueVisible } from "../../src/lib/decision-page";
+import { decisionAwaitingWriteback, decisionQueueVisible } from "../../src/lib/decision-page";
 import type { Decision } from "../../src/lib/decisions";
 
 function row(over: Partial<Decision> & Pick<Decision, "id" | "title" | "status">): Decision {
@@ -68,11 +68,25 @@ describe("decisions page", () => {
       decision: "wait",
       writeback: "written",
     });
-    const visible = mod.decisionsForPage(open, [missed, written]) as Decision[];
-    assert.deepEqual(visible.map((item) => item.title), ["Ship the schema", "Still open"]);
+    const crashed = row({
+      id: 4,
+      title: "Crashed before the stamp",
+      status: "decided",
+      decision: "hold",
+      writeback: null,
+      first_seen_at: "2026-09-01T00:00:00.000Z",
+    });
+    assert.equal(decisionAwaitingWriteback(crashed), true);
+    assert.equal(decisionAwaitingWriteback(written), false);
+    assert.equal(decisionAwaitingWriteback(open[0]), false);
+    const visible = mod.decisionsForPage(open, [missed, written, crashed]) as Decision[];
+    assert.deepEqual(visible.map((item) => item.title), ["Crashed before the stamp", "Ship the schema", "Still open"]);
     const html = renderToStaticMarkup(React.createElement(DecisionList, { decisions: visible }));
     assert.match(html, /not written back/);
     assert.match(html, /Retry write-back/);
+    assert.equal(html.split("Retry write-back").length - 1, 2);
+    const openOnly = renderToStaticMarkup(React.createElement(DecisionList, { decisions: open }));
+    assert.equal(openOnly.includes("Retry write-back"), false);
     assert.match(html, /Ship the schema/);
     assert.match(html, /Still open/);
     assert.equal(html.includes("Already posted"), false);

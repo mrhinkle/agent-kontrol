@@ -11,7 +11,9 @@
 
 import type { Actor } from "./actor";
 import { currentActor } from "./actor";
+import { withReceipt, type Receipt } from "./activity";
 import { mcpToolError, type McpToolResult } from "./api-error";
+import { isConfigured } from "./db";
 import { parseDeferInstant, readOptions } from "./decision-format";
 import { writeDecisionBack, type WritebackOutcome } from "./decision-writeback";
 import {
@@ -23,10 +25,13 @@ import {
   patchDecision,
   listDecisions,
   upsertDecision,
+  usingDecisionTestStore,
   type Decision,
   type DecisionStatus,
   type ParseFail,
 } from "./decisions";
+import { recordDemoActivity } from "./demo-store";
+import { recordToolReceipt } from "./store";
 
 const SLUG_RE = /^[a-z0-9][a-z0-9_-]{0,64}$/;
 const CONTROL = /[\u0000-\u001f\u007f]/;
@@ -287,6 +292,18 @@ function text(value: string): McpToolResult {
   return { content: [{ type: "text", text: value }] };
 }
 
+/**
+ * Receipt after the decision row is stored. Validation, stale, conflict, and
+ * writeback_in_progress return before this. A test store, or no database,
+ * uses the same in-memory events list as the other demo write tools.
+ */
+async function receiptFor(kind: "request_decision" | "resolve_decision", decision: Decision): Promise<Receipt | null> {
+  const title = decision.title.slice(0, 200);
+  const extra = { decision_id: decision.id, key: decision.key, status: decision.status };
+  if (!isConfigured() || usingDecisionTestStore()) return recordDemoActivity(kind, title, extra);
+  return recordToolReceipt({ kind, title, extra });
+}
+
 export async function requestDecisionTool(args: {
   slug: string;
   title: string;
@@ -335,7 +352,8 @@ export async function requestDecisionTool(args: {
     github_present: null,
     force: false,
   });
-  return text(JSON.stringify({ status_held: result.status_held, decision: result.decision }));
+  const receipt = await receiptFor("request_decision", result.decision);
+  return withReceipt(JSON.stringify({ status_held: result.status_held, decision: result.decision }), receipt);
 }
 
 export async function listDecisionsTool(args: {
@@ -376,5 +394,6 @@ export async function resolveDecisionTool(args: {
   if (!parsed.ok) return mcpToolError(parsed.code, { message: parsed.message, fields: parsed.fields });
   const outcome = await resolveDecision({ ...parsed.value, id: args.id, actor });
   if (!outcome.ok) return mcpToolError(outcome.code, { message: outcome.message, fields: outcome.fields });
-  return text(JSON.stringify({ decision: outcome.decision }));
+  const receipt = await receiptFor("resolve_decision", outcome.decision);
+  return withReceipt(JSON.stringify({ decision: outcome.decision }), receipt);
 }

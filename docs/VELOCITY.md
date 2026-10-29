@@ -208,6 +208,39 @@ Implementer; rework, not first drafts, is where tokens go.
 - Deciding for the owner. The queue shows age, cost of delay and the requester's recommended
   option; the answer is typed by a person.
 
+## Host watcher
+
+The brief's coordinator check is a work event (`session_end`, `milestone`, or `status`). The host watcher is a different measurement. It reads `GET /api/watch/beats` and judges whether the Mini and MacBook dead-man observations were received, using the server's `age_s`. It does not prove the coordinator did any work, and it does not replace the threshold alerts. `scripts/watch.config.json` lists the expected sources. The check walks that list, not only the rows that came back.
+
+For each enabled source:
+
+- Missing from a successful read: `source-missing`.
+- `status` of `stale`, `failing`, `paused`, or `unknown`: `unhealthy:<status>`, at any age.
+- `status` of `ok` or `held` with `age_s` greater than that source's `max_age_s`: `stale`. `age_s` equal to the limit is within the limit. `held` is the producer's own hold. This check does not decide whether the hold was authorized.
+- Any other returned source is ignored. `watcher` is this monitor's own beat, so it is left out of the host loop.
+
+Mini is enabled at 2700 seconds. MacBook is listed at 93600 seconds and left disabled until that producer is installed. Mark sets `enabled` to true when the producer is in place. The limits are config, not secrets. `beat_at` is stored as the sender sent it, including a clock two days behind or two days ahead. `age_s` is the only age.
+
+A successful read is a JSON object whose `beats` field is an array. Each row has string `source`, `status`, `detail`, `beat_at`, and `received_at`, and a finite, non-negative numeric `age_s`. A non-2xx response, a 10 second timeout, malformed JSON, a non-object body, a `beats` value that is not an array, a bad field type, or two rows for the same source fails the whole read. The check tries once more after 30 seconds. A retry that succeeds is evaluated as a normal read and can still alert. Two failures raise only `api-unreachable`. They do not invent a per-host failure and they do not clear a latch.
+
+Slack and Telegram are independent. Each attempt times out at 10 seconds. Slack succeeds on HTTP 2xx, and only when the webhook starts with `https://hooks.slack.com/services/`. Telegram succeeds on HTTP 2xx and a JSON body with `ok` set to true. The bot token and chat id must match the shapes the script checks, or that channel fails closed and no request is sent. A timeout, a non-2xx status, a body that is not that JSON, or `ok: false` is a failed delivery on that channel only. Logs drop webhook URLs, bot tokens, authorization headers, and raw provider bodies.
+
+The alert key is `<destination>|<source>|<condition>` with condition `source-missing`, `stale`, or `unhealthy:<status>`. A failed read uses `<destination>|api-unreachable` and no host key. A new condition is a new key. A failed send stays pending on the original key and is tried on the next run. A successful send suppresses that key for 12 hours while the condition holds. The boundary is inclusive at the end: a run at `lastDeliveredAt + 12h` sends again, and a run one millisecond earlier does not. When a later successful read shows that source healthy, each destination that received the alert gets one recovery, and that recovery closes only its key. A destination that never received it gets no recovery. A failed read does not clear those keys. A failed store of this monitor's own beat uses `<destination>|beat-post-failed` the same way.
+
+The process exits nonzero when any expected source is unhealthy, the read failed, a delivery failed, or the watcher beat did not store. Suppression drops the repeat message. The exit status stays nonzero.
+
+There is no detection SLA. The schedule is `7,17,27,37,47,57 * * * *` UTC. That asks GitHub for a run every ten minutes. GitHub can delay a run, skip a run, or turn schedules off on a public repository after 60 days without a person pushing or dispatching the workflow. Six runs an hour is about 4,320 runs in 30 days before a retry. Hosted minutes are free on a public repository and come out of the included quota on a private one. Mark accepts that cost before activation.
+
+Dedup state is a small JSON document of keys and delivery timestamps. It holds no credentials and no raw API or provider payloads. The Actions cache is best effort. On a live run the workflow restores with the prefix `watch-state-v1-` and saves a new immutable key `watch-state-v1-<run_id>-<run_attempt>`, including after a nonzero evaluation, then the job exits with that evaluation's code. A dry-run or disabled run does not restore or save, so it never creates a cache entry. A missing, evicted, or corrupt cache is unknown history: current faults alert again, and no recovery is invented. A crash after a successful send and before the save can deliver the same message once more. Cache quota can drop the entry. Those are the limits.
+
+After evaluation the run POSTs `/api/watch/beat` as source `watcher`. The credential is a dedicated `akc_` key with `watch:read` and `watch:write`, bound only to `watcher`, passed from the `WATCH_AK_KEY` secret into the live step. It is not written to the log. `beat_at` is this run's clock. `status` is this monitor's own read and delivery health (`ok` or `failing`), which is separate from the Mini and the MacBook. A failed store fails the run and is reported on the configured channels.
+
+Reverse watch is the other half of the pair, and this repo only states the contract. A Mini integration tracked outside this repo reads `age_s` for source `watcher` and alerts when that beat is missing or older than 3600 seconds. It says one thing when the API could not be read and a different thing when the API answered and the watcher was silent. Nothing here shows that the Mini side is installed. Until that is demonstrated, the two checks are not coverage for each other.
+
+Activation is Mark's. Merging the workflow leaves it dark. The live step receives notification secrets and `WATCH_AK_KEY` only when `github.ref` is `refs/heads/<default branch>` and the repository variable `WATCH_ENABLED` is `true`. `github.ref` includes the `refs/heads/` prefix, so the comparison uses that full ref. Any other `workflow_dispatch`, and every run while `WATCH_ENABLED` is unset, takes the dry-run step: `node scripts/watch-check.mjs --dry-run` with no fixture. That step receives no secret context. Workflow permissions are exactly `contents: read`. Cache restore and save use the runner's scoped cache token. The job token cannot push. Both cache steps carry the same live gate, so a dry-run or disabled run never restores or saves a cache entry. `--dry-run` performs no network I/O to Agent Kontrol, Slack, or Telegram. `--fixture <path>` reads a beats document from a path under the working directory or the system temp directory, evaluates it, and prints the decisions. It sends nothing, posts no beat, and writes no state. A path outside those directories is rejected and left unopened. With no `--fixture`, the process prints `dry-run: no fixture, nothing evaluated` and exits 0.
+
+Rollback is: set `WATCH_ENABLED` to `false`, disable the workflow, let an in-flight run finish, then revoke the watcher credential. Tell the Mini reverse-watch the shutdown was intentional. Leave the existing dead-man in place.
+
 ## Rollout order
 
 Reordered 2026-10-25 after cross-vendor review (GLM 5.3, Kimi K3): the failure that motivated
