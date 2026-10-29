@@ -891,10 +891,11 @@ describe("idempotency keys", { concurrency: false }, () => {
     assert.equal(claim?.scope, `agent:${created.credential.id}:reply_to_operator`);
   });
 
-  it("registers idempotency_key on create_task and both reply tools", () => {
+  it("registers idempotency_key on create_task, the shared reply schema, and send_message", () => {
     const src = fs.readFileSync("src/app/api/[transport]/route.ts", "utf8");
     const matches = src.match(/idempotency_key: z/g) ?? [];
-    assert.equal(matches.length, 2);
+    // create_task, the reply loop (reply_to_operator and reply_to_mark share one schema), and send_message.
+    assert.equal(matches.length, 3);
     assert.match(src, /idempotency_key: args\.idempotency_key/);
   });
 

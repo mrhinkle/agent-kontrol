@@ -484,6 +484,9 @@ describe("GET /api/brief", { concurrency: false }, () => {
       "list_skills",
       "get_skill",
       "run_skill",
+      "send_message",
+      "requeue_task",
+      "delete_note",
     ]);
     assert.equal(registered.filter((name) => name === "get_morning_brief").length, 1);
     assert.equal([...src.matchAll(/name: "reply_to_mark"/g)].length, 1);

@@ -1160,10 +1160,19 @@ export async function updateTask(input: {
    * the unconditional update.
    */
   expected_revision?: string;
+  /**
+   * Set only by a caller that knows the authenticated actor. Omitted leaves
+   * actor_type and actor_id alone, so a status update does not rewrite the
+   * creator. requeue_task passes it. created_by never does.
+   */
+  actor?: Actor | null;
 }): Promise<Task> {
   const db = sql();
   const now = new Date().toISOString();
   const hasStatus = input.status !== undefined && input.status !== null;
+  const hasActor = input.actor != null;
+  const actorType = input.actor?.actor_type ?? null;
+  const actorId = input.actor?.actor_id ?? null;
   const status = input.status ?? null;
   const complete =
     input.status === "done" || input.status === "failed" || input.status === "cancelled";
@@ -1184,7 +1193,9 @@ export async function updateTask(input: {
           result = case when ${hasResult} then ${input.result ?? null} else result end,
           cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
           session_id = case when ${hasSession} then ${input.session_id ?? null} else session_id end,
-          assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end
+          assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end,
+          actor_type = case when ${hasActor} then ${actorType} else actor_type end,
+          actor_id = case when ${hasActor} then ${actorId} else actor_id end
         where id = ${input.id}
         returning *
       `;
@@ -1197,7 +1208,9 @@ export async function updateTask(input: {
           result = case when ${hasResult} then ${input.result ?? null} else result end,
           cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
           session_id = case when ${hasSession} then ${input.session_id ?? null} else session_id end,
-          assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end
+          assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end,
+          actor_type = case when ${hasActor} then ${actorType} else actor_type end,
+          actor_id = case when ${hasActor} then ${actorId} else actor_id end
         where t.id = ${input.id}
           and md5(t::text) = ${expected}
         returning *
@@ -1294,4 +1307,51 @@ export async function readMemoryForPreview(key: string): Promise<{ item: MemoryI
     if (e instanceof Error && e.message === "memory preview returned no revision") throw e;
     throw new Error(errMsg(e));
   }
+}
+
+/**
+ * Look up an agent that has already reported. Does not insert.
+ * The id is slugified the same way report() stores it. An empty slug is absent.
+ */
+export async function findAgent(agentId: string): Promise<{ id: string } | null> {
+  const id = slugify(agentId);
+  if (!id) return null;
+  const db = sql();
+  try {
+    const rows = await db`select id from agents where id = ${id} limit 1`;
+    const found = rows[0]?.id;
+    return typeof found === "string" ? { id: found } : null;
+  } catch (e) {
+    throw new Error(errMsg(e));
+  }
+}
+
+/**
+ * Delete one memory row. One statement. When expected_revision is set, the
+ * delete matches md5(m::text) from the same row, so a stale preview writes
+ * nothing. Omitting the token deletes whatever is stored at the key.
+ */
+export async function deleteMemory(input: { key: string; expected_revision?: string }): Promise<MemoryItem> {
+  const db = sql();
+  const expected = input.expected_revision;
+  let rows: Record<string, unknown>[] = [];
+  try {
+    if (expected === undefined) {
+      rows = await db`delete from memory where key = ${input.key} returning *`;
+    } else {
+      rows = await db`
+        delete from memory m
+        where m.key = ${input.key}
+          and md5(m::text) = ${expected}
+        returning *
+      `;
+    }
+  } catch (e) {
+    rethrowStore(e);
+  }
+  if (rows[0]) return rows[0] as unknown as MemoryItem;
+  if (expected === undefined) throw new Error("Memory not found");
+  const current = await memoryRevisionOf(input.key);
+  if (!current) throw new Error("Memory not found");
+  throw new StaleWrite(current);
 }

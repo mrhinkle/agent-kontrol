@@ -12,8 +12,10 @@ export type DryRunAction =
   | "replace_owners"
   | "cancel_task"
   | "update_task"
+  | "requeue_task"
   | "overwrite_memory"
-  | "insert_memory";
+  | "insert_memory"
+  | "delete_memory";
 
 export interface DryRunChange {
   op: "add" | "remove" | "update" | "reorder" | "overwrite" | "insert";
@@ -405,6 +407,81 @@ export function diffMemoryWrite(
           summary: `Overwrite memory #${existing.id} key "${existing.key}". Would replace ${fieldText}.`,
           before,
           after,
+        },
+      ],
+      affected: [before],
+    },
+    expectedRevision,
+  );
+}
+
+/**
+ * Preview of requeue_task. Status becomes queued. assigned_agent and
+ * completed_at stay. updated_at is filled in when the write runs.
+ * Actor columns change only when the confirm has an authenticated actor.
+ */
+export function diffTaskRequeue(
+  task: Task,
+  expectedRevision: string,
+  actor?: { actor_type: string; actor_id: string } | null,
+): DryRunResult {
+  const before: Record<string, unknown> = {
+    status: task.status,
+    assigned_agent: task.assigned_agent,
+    updated_at: task.updated_at,
+  };
+  const after: Record<string, unknown> = {
+    status: "queued",
+    assigned_agent: task.assigned_agent,
+    updated_at: "(set when the write runs)",
+  };
+  if (actor) {
+    before.actor_type = task.actor_type;
+    before.actor_id = task.actor_id;
+    after.actor_type = actor.actor_type;
+    after.actor_id = actor.actor_id;
+  }
+  return withRevision(
+    {
+      dry_run: true,
+      applied: false,
+      would_write: true,
+      action: "requeue_task",
+      changes: [
+        {
+          op: "update",
+          summary: `Task #${task.id} "${task.title}": status ${task.status} → queued.`,
+          before,
+          after,
+        },
+      ],
+      affected: [{ ...task }],
+    },
+    expectedRevision,
+  );
+}
+
+/** Preview of delete_note. The row is removed. Nothing is written on preview. */
+export function diffMemoryDelete(item: MemoryItem, expectedRevision: string): DryRunResult {
+  const before: Record<string, unknown> = {
+    id: item.id,
+    key: item.key,
+    content: item.content,
+    tags: Array.isArray(item.tags) ? item.tags : [],
+    agent_id: item.agent_id,
+  };
+  return withRevision(
+    {
+      dry_run: true,
+      applied: false,
+      would_write: true,
+      action: "delete_memory",
+      changes: [
+        {
+          op: "remove",
+          summary: `Delete memory #${item.id} key "${item.key ?? ""}".`,
+          before,
+          after: null,
         },
       ],
       affected: [before],
