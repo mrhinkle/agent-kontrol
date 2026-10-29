@@ -71,8 +71,13 @@ worktree, you merge or delete it.
      missing file with an empty block stays missing. A symlinked, directory,
      special, non-UTF-8, or over-1 MB `AGENTS.md`, or one with an unpaired or
      nested marker, fails the task. The write goes to a temp file in the same
-     folder and is swapped in with `os.replace`; the file is read again just
-     before the swap and the swap is refused if it changed.
+     folder (exclusive create; the process umask is never changed) and is
+     swapped in with `os.replace`; the file is read again just before the swap
+     and the swap is refused if it changed. Known limit: POSIX has no
+     compare-and-swap rename, so an edit that lands between that last read and
+     the swap (or the unlink, when cleanup removes a file the dispatcher
+     created) is overwritten. The same applies to cleanup. This is why the
+     worktree must be reserved for the dispatcher while a task runs.
 3. Run: headless CLI in the worktree. The prompt tells the worker the block is
    temporary dispatch metadata not to edit, stage, or commit.
    - `claude -p "<prompt>" --output-format json --permission-mode acceptEdits`
