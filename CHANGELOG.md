@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Documentation
+
+- README: a 90-second narrated demo (Fleet, History, Progress and the Gibson 3D view) in `docs/demo/`, with captions.
+
 ### Added
 
 - Morning brief API (#64): `GET /api/brief?window=24h|72h` returns the brief as `text/plain` (or the `scripts/morning-brief.sh --json` object when `Accept: application/json`). MCP tool `get_morning_brief` (`progress:read`, read-only) returns the same text. Counts, stuck PRs, and lead time come from `repo_snapshots.detail`. Decisions join on `owner/name`. Coordinator liveness is a work event, never a heartbeat. The script stays the fallback. `scripts/collect-progress.sh` writes the brief detail keys and still posts the tick if that extra sweep fails.
