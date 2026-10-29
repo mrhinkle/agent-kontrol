@@ -4,9 +4,10 @@
  * One table maps every agent-facing MCP tool and every agent-facing REST
  * route to exactly one scope. `requireScope` is the only allow decision.
  * A tool name that is not registered is denied for every principal.
- * `list_activity` is registered and is not in the table: an agent credential
- * is denied, and the legacy MC_TOKEN, the dashboard session, and OAuth can
- * call it. A REST route that is not in the table is denied for an agent
+ * `list_activity`, `get_settings`, and `set_watched_repos` are registered and
+ * are not in the table: an agent credential is denied, and the legacy
+ * MC_TOKEN, the dashboard session, and OAuth can call them. A REST route
+ * that is not in the table is denied for an agent
  * credential; the legacy MC_TOKEN, the dashboard session, and OAuth keep the
  * access they already had.
  *
@@ -176,7 +177,11 @@ export function requireScope(principal: Principal, scope: Scope | null): ScopeDe
  * dev-open) are allowed. An unknown name is still denied for every
  * principal, including those.
  */
-const OPERATOR_TOOLS: ReadonlySet<string> = new Set(["list_activity"]);
+const OPERATOR_TOOLS: ReadonlySet<string> = new Set([
+  "list_activity",
+  "get_settings",
+  "set_watched_repos",
+]);
 
 /** Tool calls fail closed for every principal when the name is not mapped. */
 export function authorizeTool(principal: Principal, tool: string): ScopeDecision {
