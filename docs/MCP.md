@@ -648,13 +648,13 @@ Limits:
 
 #### Dispatch and AGENTS.md
 
-What is wired: two read routes and a pure helper. What is not: no Agent Kontrol process opens a repo or writes an AGENTS.md. `agents/dispatcher/mc_dispatcher.py` does not call these routes. The Grok and Codex lane dispatcher lives outside this repo, so it has to make the call.
+What is wired: two read routes, a pure helper, and the repo dispatcher. `agents/dispatcher/mc_dispatcher.py` calls `GET /api/skills/pointers` for every task, with `lane` set to `task.project` and `runtime` set from the platform (`claude-code` → `claude`, `codex` → `codex`, `grok` → `grok`). It writes the block into the worktree's AGENTS.md before the worker starts and takes it out again before review. It sends no file content, so it does not use POST. A task now needs a `project` that is a linked git worktree under `MC_WORKDIR`, and one task runs per worktree at a time; see `agents/dispatcher/README.md`. The Grok and Codex lane dispatcher in the fleet scripts lives outside this repo and still has to make the call itself.
 
 - `GET /api/skills/pointers?lane=&runtime=&format=json|text` returns the block. `lane` and `runtime` are required. JSON is `{ demo, lane, runtime, empty, block }`. `format=text` returns the block as `text/plain`, or an empty body when nothing matches. Agent credentials need `skills:read`.
 - `POST /api/skills/pointers` takes `{ lane, runtime, agents_md }` and returns `{ demo, lane, runtime, empty, changed, content }`. `content` is the file text with the block inserted at the end, replaced in place, or removed when `empty` is true. Text outside the markers is untouched, CRLF files stay CRLF, and a second run reports `changed: false`. Duplicate blocks collapse into one. `agents_md` omitted or null means the file does not exist: `content` is null when there is nothing to write. A begin marker without an end, an end without a begin, or a nested begin is HTTP 400. The route stores nothing and writes no file. The same needs `skills:read`.
-- `applyPointerBlock(content, block)` in `src/lib/skills/agents-md.ts` is the helper behind POST.
+- `applyPointerBlock(content, block)` in `src/lib/skills/agents-md.ts` is the helper behind POST. `agents/dispatcher/ak_pointers.py` is a stdlib Python port with the same marker rules, used by the repo dispatcher.
 
-A dispatcher runs this in the target repo before the lane starts. It needs `jq`, `curl`, and `MC_URL`/`MC_TOKEN`. Use the lane name the skill scopes use and the runtime that will read the file. It stops without touching the file if the file exists and cannot be read, if the call fails, or if the server answers with an error:
+A dispatcher outside this repo can run this in the target repo before the lane starts. It needs `jq`, `curl`, and `MC_URL`/`MC_TOKEN`. Use the lane name the skill scopes use and the runtime that will read the file. It stops without touching the file if the file exists and cannot be read, if the call fails, or if the server answers with an error:
 
 ```bash
 f=AGENTS.md
