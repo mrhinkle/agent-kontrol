@@ -357,6 +357,7 @@ async function main() {
   await testSkillLeaseFence(tag);
   await testSkillSchedule(tag);
   await testWatchBeats(tag);
+  await testWatchBeatRoute(tag);
   await testListCursors(tag);
   await testBriefAlerts(tag);
   await testDecisionWritebackHardening(tag);
@@ -1417,6 +1418,151 @@ async function testWatchBeats(tag: string): Promise<void> {
     if (process.env.DATABASE_URL !== previousUrl) process.env.DATABASE_URL = previousUrl;
     await restoreWatchBeatsName();
     await sql()`delete from watch_beats`;
+  }
+}
+
+/**
+ * Persisted round trip through the watch routes. Rejected writes leave the
+ * stored row unchanged. age_s follows received_at, not an old or future beat_at.
+ */
+async function testWatchBeatRoute(tag: string): Promise<void> {
+  const { POST } = await import("../src/app/api/watch/beat/route");
+  const { GET } = await import("../src/app/api/watch/beats/route");
+  const { createCredential } = await import("../src/lib/credentials");
+  const savedBinding = process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON;
+  const ids: string[] = [];
+
+  async function stored(source: string) {
+    const rows = await sql()`
+      select status, detail, beat_at::text as beat_at, received_at::text as received_at
+      from watch_beats where source = ${source}
+    `;
+    return rows[0] ?? null;
+  }
+
+  try {
+    await sql()`delete from watch_beats where source in ('mini', 'macbook', 'watcher')`;
+    const mini = await createCredential({ label: `${tag} mini`, scopes: ["watch:write", "watch:read"] });
+    const mac = await createCredential({ label: `${tag} mac`, scopes: ["watch:write"] });
+    assert.equal(mini.ok, true);
+    assert.equal(mac.ok, true);
+    if (!mini.ok || !mac.ok) return;
+    ids.push(mini.credential.id, mac.credential.id);
+    process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON = JSON.stringify({
+      mini: [mini.credential.id],
+      macbook: [mac.credential.id],
+    });
+
+    const oldBeat = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString();
+    const futureBeat = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    const post = (token: string, body: unknown, extra: Record<string, string> = {}) => POST(new Request("http://localhost/api/watch/beat", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json", ...extra },
+      body: JSON.stringify(body),
+    }));
+
+    const wrote = await post(mini.token, {
+      source: "mini",
+      status: "ok",
+      detail: "scheduler healthy",
+      beat_at: oldBeat,
+    });
+    assert.equal(wrote.status, 200);
+    assert.deepEqual(await wrote.json(), { ok: true });
+
+    const listed = await GET(new Request("http://localhost/api/watch/beats", {
+      headers: { authorization: `Bearer ${mini.token}` },
+    }));
+    assert.equal(listed.status, 200);
+    assert.equal(listed.headers.get("cache-control"), "no-store");
+    const body = await listed.json() as { beats: { source: string; beat_at: string; received_at: string; age_s: number; detail: string }[] };
+    const row = body.beats.find((beat) => beat.source === "mini");
+    assert.ok(row);
+    assert.equal(Date.parse(row.beat_at), Date.parse(oldBeat));
+    assert.equal(row.detail, "scheduler healthy");
+    assert.equal(typeof row.age_s, "number");
+    assert.ok(row.age_s >= 0 && row.age_s < 60);
+    assert.ok(Math.abs(Date.now() - Date.parse(row.received_at)) < 60_000);
+
+    const before = await stored("mini");
+    const rejected: unknown[] = [
+      { source: "macbook", status: "failing", detail: "wrong host", beat_at: futureBeat },
+      { source: "watcher", status: "failing", detail: "wrong host", beat_at: futureBeat },
+      { source: "mini", status: "ok", detail: "bad clock", beat_at: "2026-10-27T12:00:00" },
+      { source: "mini", status: "ok", detail: "client clock", beat_at: oldBeat, received_at: oldBeat },
+      { source: "mini", status: "ok", detail: "client age", beat_at: oldBeat, age_s: 1 },
+    ];
+    for (const payload of rejected) {
+      const res = await post(mini.token, payload);
+      assert.ok(res.status === 400 || res.status === 403, `expected 400 or 403, got ${res.status}`);
+      assert.deepEqual(await stored("mini"), before);
+    }
+
+    const bound = process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON;
+    for (const raw of ["{}", JSON.stringify({ mini: [] }), JSON.stringify({ mini: [], macbook: [] })]) {
+      process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON = raw;
+      const res = await post(mini.token, {
+        source: "mini",
+        status: "failing",
+        detail: "empty binding must not land",
+        beat_at: futureBeat,
+      });
+      assert.equal(res.status, 503, raw);
+      assert.deepEqual(await stored("mini"), before);
+    }
+    for (const contentType of [
+      "application/json, text/plain",
+      "application/json+x",
+      "application/jsonx",
+      "text/json",
+      "",
+    ]) {
+      const res = await post(mini.token, {
+        source: "mini",
+        status: "failing",
+        detail: "bad content type must not land",
+        beat_at: futureBeat,
+      }, { "content-type": contentType });
+      assert.equal(res.status, 415, JSON.stringify(contentType));
+      assert.deepEqual(await stored("mini"), before);
+    }
+    const missingType = await POST(new Request("http://localhost/api/watch/beat", {
+      method: "POST",
+      headers: { authorization: `Bearer ${mini.token}` },
+      body: JSON.stringify({
+        source: "mini",
+        status: "failing",
+        detail: "missing content type must not land",
+        beat_at: futureBeat,
+      }),
+    }));
+    assert.equal(missingType.status, 415);
+    assert.deepEqual(await stored("mini"), before);
+    process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON = bound;
+
+    const ahead = await post(mini.token, {
+      source: "mini",
+      status: "held",
+      detail: "sender ahead",
+      beat_at: futureBeat,
+    });
+    assert.equal(ahead.status, 200);
+    const again = await GET(new Request("http://localhost/api/watch/beats", {
+      headers: { authorization: `Bearer ${mini.token}` },
+    }));
+    const fresh = (await again.json() as { beats: { source: string; beat_at: string; age_s: number; status: string }[] })
+      .beats.find((beat) => beat.source === "mini");
+    assert.ok(fresh);
+    assert.equal(fresh.status, "held");
+    assert.equal(Date.parse(fresh.beat_at), Date.parse(futureBeat));
+    assert.ok(fresh.age_s >= 0 && fresh.age_s < 60);
+  } finally {
+    if (savedBinding === undefined) delete process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON;
+    else process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON = savedBinding;
+    if (ids.length > 0) {
+      await sql()`delete from agent_credentials where id in (${ids[0]}, ${ids[1] ?? ids[0]})`;
+    }
+    await sql()`delete from watch_beats where source in ('mini', 'macbook', 'watcher')`;
   }
 }
 

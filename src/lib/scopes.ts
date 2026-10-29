@@ -29,6 +29,8 @@ export const SCOPES = [
   "decisions:write",
   "skills:read",
   "skills:write",
+  "watch:read",
+  "watch:write",
 ] as const;
 
 export type Scope = (typeof SCOPES)[number];
@@ -105,6 +107,12 @@ const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   { method: "GET", path: /^\/api\/skills\/(?!sync$|drift$)[^/]+$/, scope: "skills:read" },
   // Read-only: renders the pointer block, and POST only transforms the text sent.
   { method: "POST", path: /^\/api\/skills\/pointers$/, scope: "skills:read" },
+  // The scope an agent credential needs. The watch handlers reject every
+  // other principal with 401 before they consult this table. requireScope
+  // still treats legacy, session, OAuth, and dev-open as unrestricted, so
+  // authorizeRoute alone is not the guard for these two paths.
+  { method: "POST", path: /^\/api\/watch\/beat$/, scope: "watch:write" },
+  { method: "GET", path: /^\/api\/watch\/beats$/, scope: "watch:read" },
 ];
 
 export type Principal =
