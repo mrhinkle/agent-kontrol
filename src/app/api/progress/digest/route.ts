@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { enforceApi } from "@/lib/auth";
+import { publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { isWindow, type TimeWindow } from "@/lib/progress-config";
 import { progress } from "@/lib/progress-store";
@@ -15,6 +17,8 @@ export const maxDuration = 30;
  * own gate (session cookie or MC_TOKEN bearer), handled in middleware.
  */
 export async function GET(req: Request) {
+  const denied = await enforceApi(req);
+  if (denied) return denied;
   const param = new URL(req.url).searchParams.get("window");
   const window: TimeWindow = isWindow(param) ? param : "24h";
 
@@ -26,6 +30,6 @@ export async function GET(req: Request) {
       headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "private, max-age=0, s-maxage=60" },
     });
   } catch (e) {
-    return new NextResponse(`error: ${(e as Error).message}`, { status: 500 });
+    return publicError("[progress] digest failed", e, "Could not build the digest.");
   }
 }

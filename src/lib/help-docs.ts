@@ -16,7 +16,7 @@ export interface HelpDoc {
 export const HELP_DOCS: HelpDoc[] = [
   { slug: "deploy", title: "Deploy and operate", file: "docs/DEPLOY.md", blurb: "One-line install, deployment targets, environment variables, upgrades." },
   { slug: "agents", title: "Connect agents", file: "docs/AGENTS.md", blurb: "Every adapter and what each one can do." },
-  { slug: "mcp", title: "MCP tools", file: "docs/MCP.md", blurb: "The 11 tools and how to connect an MCP host." },
+  { slug: "mcp", title: "MCP tools", file: "docs/MCP.md", blurb: "The 24 tools and how to connect an MCP host." },
   { slug: "api", title: "REST API", file: "docs/API.md", blurb: "Routes, authentication, request shapes." },
   { slug: "database", title: "Database", file: "docs/DATABASE.md", blurb: "Neon or any Postgres, and how the driver is chosen." },
   { slug: "architecture", title: "Architecture", file: "docs/ARCHITECTURE.md", blurb: "Data flow, tables, and a map of the code." },

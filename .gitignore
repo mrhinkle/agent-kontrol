@@ -1,4 +1,5 @@
-node_modules/
+# Directory, or a symlink of the same name (worktrees link node_modules).
+node_modules
 .next/
 out/
 .env
@@ -15,6 +16,9 @@ _xfer/
 # Token economics local store / fixtures output
 .data/
 fixtures/hermes-slim.tgz
+
+# Watcher dedup state. GitHub Actions cache holds this. Never commit it.
+.watch-state/
 
 # Local prototype / agent scratch (do not ship)
 .data/

@@ -1,4 +1,5 @@
 import { sql } from "./db";
+import { LIST_MAX, stampSortAt } from "./list-params";
 import { retentionDays, type SpanInput, type SpanRow, type TraceSummary } from "./traces";
 
 /** Postgres returns timestamps as Date or string depending on the driver. */
@@ -74,38 +75,20 @@ export async function upsertSpans(spans: SpanInput[]): Promise<void> {
 export interface TraceFilter {
   agent?: string | null;
   errorsOnly?: boolean;
-  /** Return traces that started before this ISO time (for paging). */
+  /** Return traces that started before this ISO time. */
   before?: string | null;
   limit?: number;
+  /** Set when the caller asked for a page. Adds the trace_id tiebreak and a sort stamp. */
+  keyset?: boolean;
+  /** Millisecond started_at and trace id of the last row already returned. */
+  cursor?: { startedAt: string; id: string } | null;
 }
 
-export async function listTraces(f: TraceFilter = {}): Promise<TraceSummary[]> {
-  const limit = Math.min(Math.max(f.limit ?? 50, 1), 100);
-  const rows = await sql()`
-    select
-      trace_id,
-      (array_agg(agent_id order by started_at))[1] as agent_id,
-      (array_agg(name order by (parent_span_id is null) desc, started_at))[1] as root_name,
-      min(started_at) as started_at,
-      case when count(*) filter (where ended_at is null) > 0 then null else max(ended_at) end as ended_at,
-      count(*)::int as span_count,
-      (count(*) filter (where status = 'error'))::int as error_count,
-      (count(*) filter (where ended_at is null))::int as open_count,
-      coalesce(sum(input_tokens), 0)::text as input_tokens,
-      coalesce(sum(output_tokens), 0)::text as output_tokens,
-      coalesce(sum(cost_usd), 0)::text as cost_usd
-    from spans
-    where (${f.agent ?? null}::text is null or agent_id = ${f.agent ?? null}::text)
-    group by trace_id
-    having (${f.errorsOnly === true}::boolean = false or count(*) filter (where status = 'error') > 0)
-      and min(started_at) < coalesce(${f.before ?? null}::timestamptz, 'infinity'::timestamptz)
-    order by min(started_at) desc
-    limit ${limit}
-  `;
-  return rows.map((r) => ({
-    trace_id: r.trace_id,
-    agent_id: r.agent_id,
-    root_name: r.root_name,
+function asSummary(r: Record<string, unknown>): TraceSummary {
+  const summary: TraceSummary = {
+    trace_id: String(r.trace_id),
+    agent_id: String(r.agent_id),
+    root_name: String(r.root_name),
     started_at: iso(r.started_at) as string,
     ended_at: iso(r.ended_at),
     span_count: num(r.span_count),
@@ -114,7 +97,78 @@ export async function listTraces(f: TraceFilter = {}): Promise<TraceSummary[]> {
     input_tokens: num(r.input_tokens),
     output_tokens: num(r.output_tokens),
     cost_usd: num(r.cost_usd),
-  }));
+  };
+  if (typeof r.list_sort_at === "string") stampSortAt(summary, r.list_sort_at);
+  return summary;
+}
+
+export async function listTraces(f: TraceFilter = {}): Promise<TraceSummary[]> {
+  // One past the documented maximum so a full page of 200 can peek for next_cursor.
+  const limit = Math.min(Math.max(f.limit ?? 50, 1), LIST_MAX + 1);
+  if (!f.keyset) {
+    const rows = await sql()`
+      select
+        trace_id,
+        (array_agg(agent_id order by started_at))[1] as agent_id,
+        (array_agg(name order by (parent_span_id is null) desc, started_at))[1] as root_name,
+        min(started_at) as started_at,
+        case when count(*) filter (where ended_at is null) > 0 then null else max(ended_at) end as ended_at,
+        count(*)::int as span_count,
+        (count(*) filter (where status = 'error'))::int as error_count,
+        (count(*) filter (where ended_at is null))::int as open_count,
+        coalesce(sum(input_tokens), 0)::text as input_tokens,
+        coalesce(sum(output_tokens), 0)::text as output_tokens,
+        coalesce(sum(cost_usd), 0)::text as cost_usd
+      from spans
+      where (${f.agent ?? null}::text is null or agent_id = ${f.agent ?? null}::text)
+      group by trace_id
+      having (${f.errorsOnly === true}::boolean = false or count(*) filter (where status = 'error') > 0)
+        and min(started_at) < coalesce(${f.before ?? null}::timestamptz, 'infinity'::timestamptz)
+      order by min(started_at) desc
+      limit ${limit}
+    `;
+    return rows.map((row) => asSummary(row));
+  }
+  const hasCursor = f.cursor != null;
+  const startedAt = f.cursor?.startedAt ?? "1970-01-01T00:00:00.000Z";
+  const cursorId = f.cursor?.id ?? "00000000000000000000000000000000";
+  // Keyset predicate matches pageRows: started_at desc, truncated to
+  // milliseconds, then trace_id ascending.
+  const rows = await sql()`
+    with grouped as (
+      select
+        trace_id,
+        (array_agg(agent_id order by started_at))[1] as agent_id,
+        (array_agg(name order by (parent_span_id is null) desc, started_at))[1] as root_name,
+        min(started_at) as started_at,
+        case when count(*) filter (where ended_at is null) > 0 then null else max(ended_at) end as ended_at,
+        count(*)::int as span_count,
+        (count(*) filter (where status = 'error'))::int as error_count,
+        (count(*) filter (where ended_at is null))::int as open_count,
+        coalesce(sum(input_tokens), 0)::text as input_tokens,
+        coalesce(sum(output_tokens), 0)::text as output_tokens,
+        coalesce(sum(cost_usd), 0)::text as cost_usd
+      from spans
+      where (${f.agent ?? null}::text is null or agent_id = ${f.agent ?? null}::text)
+      group by trace_id
+      having (${f.errorsOnly === true}::boolean = false or count(*) filter (where status = 'error') > 0)
+        and min(started_at) < coalesce(${f.before ?? null}::timestamptz, 'infinity'::timestamptz)
+    )
+    select grouped.*,
+      to_char(date_trunc('milliseconds', started_at) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as list_sort_at
+    from grouped
+    where (
+      ${hasCursor}::boolean = false
+      or date_trunc('milliseconds', started_at) < ${startedAt}::timestamptz
+      or (
+        date_trunc('milliseconds', started_at) = ${startedAt}::timestamptz
+        and trace_id > ${cursorId}
+      )
+    )
+    order by date_trunc('milliseconds', started_at) desc, trace_id asc
+    limit ${limit}
+  `;
+  return rows.map((row) => asSummary(row));
 }
 
 export async function getTrace(traceId: string): Promise<SpanRow[]> {
