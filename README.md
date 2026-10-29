@@ -11,9 +11,7 @@
 
 One dashboard for the AI coding agents you run: Claude Code, Codex, Grok, Hermes and anything that speaks MCP. See what each is doing, queue work for them, and check whether the backlog is actually shrinking.
 
-https://github.com/user-attachments/assets/e521aef9-c272-4247-b925-d743a1116390
-
-[Download the video](docs/demo/agent-kontrol-demo.mp4) if the player doesn't load.
+[90-second demo video](docs/demo/agent-kontrol-demo.mp4) — link to the file committed in this repository (`docs/demo/agent-kontrol-demo.mp4`). This page does not embed a player.
 
 *90-second demo with AI narration. Captions: [agent-kontrol-demo.srt](docs/demo/agent-kontrol-demo.srt).*
 
