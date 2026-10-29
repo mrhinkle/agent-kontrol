@@ -48,6 +48,7 @@ export interface RuntimeCompatibility {
   grok: boolean;
   hermes: boolean;
   mini: boolean;
+  nemoclaw: boolean;
 }
 
 export type TriggerRunStatus = "done" | "stalled" | "running";

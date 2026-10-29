@@ -88,7 +88,7 @@ export const skillDetailFixture: SkillDetail = {
   schedule: null,
   body: "# verify-gibson\n\nProve the change works before opening a PR.\n\n- Run the repo's gates.\n- Read the diff.\n",
   references: [{ path: "playbook.md" }, { path: "checks.sh" }],
-  runtimes: { claude: true, codex: true, grok: true, hermes: false, mini: false },
+  runtimes: { claude: true, codex: true, grok: true, hermes: false, mini: false, nemoclaw: false },
   sourceUrl: "https://github.com/mrhinkle/master-skills/blob/a1b2c3d4e5f6789012345678901234567890abcd/skills/verify-gibson/SKILL.md",
   triggers: [
     {

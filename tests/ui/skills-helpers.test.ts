@@ -107,7 +107,7 @@ describe("skills helpers", () => {
     assert.equal(skillSourceUrl({ url: "javascript:alert(1)" }), null);
     assert.equal(skillSourceUrl({ name: "verify-gibson" }), null);
     assert.equal(showHermesClaudeOnlyNote(skillDetailFixture.runtimes), true);
-    assert.equal(showHermesClaudeOnlyNote({ claude: false, codex: false, grok: false, hermes: false, mini: true }), false);
+    assert.equal(showHermesClaudeOnlyNote({ claude: false, codex: false, grok: false, hermes: false, mini: true, nemoclaw: false }), false);
     const stalled = skillDetailFixture.triggers.find((trigger) => trigger.status === "stalled");
     assert.equal(stalled?.ended, false);
     assert.equal(stalled?.started, true);

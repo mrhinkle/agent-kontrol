@@ -7,9 +7,9 @@ export const TRIGGER_OPTIONS: { value: Trigger; label: string }[] = [
   { value: "scheduled", label: "Scheduled" },
 ];
 
-export const RUNTIME_FILTERS = ["all", "claude", "codex", "grok", "hermes", "mini"] as const;
+export const RUNTIME_FILTERS = ["all", "claude", "codex", "grok", "hermes", "mini", "nemoclaw"] as const;
 
-export const RUNTIME_KEYS = ["claude", "codex", "grok", "hermes", "mini"] as const;
+export const RUNTIME_KEYS = ["claude", "codex", "grok", "hermes", "mini", "nemoclaw"] as const;
 
 const PLATFORM_BY_RUNTIME: Record<string, string> = {
   claude: "claude-code",
