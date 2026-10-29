@@ -325,13 +325,18 @@ async function claim(text: string, values: unknown[]): Promise<Row[]> {
   return exclusive(() => applyClaim(text, values));
 }
 
-function snapshotsFor(values: unknown[]): Row[] {
+function snapshotsFor(text: string, values: unknown[]): Row[] {
   const repos = values.find((value) => Array.isArray(value)) as string[] | undefined;
+  const folded = /lower\s*\(\s*repo\s*\)/i.test(text);
   const times = isoValues(values).map((value) => Date.parse(value)).filter((value) => !Number.isNaN(value)).sort((a, b) => a - b);
   const sinceMs = times.length >= 2 ? times[0] : null;
   const nowMs = times.length >= 1 ? times[times.length - 1] : null;
   return world.snapshots.filter((snap) => {
-    if (repos && !repos.includes(snap.repo)) return false;
+    if (repos) {
+      const wanted = folded ? repos.map((repo) => String(repo).toLowerCase()) : repos.map(String);
+      const name = folded ? snap.repo.toLowerCase() : snap.repo;
+      if (!wanted.includes(name)) return false;
+    }
     const atMs = Date.parse(snap.collected_at);
     if (sinceMs != null && atMs < sinceMs) return false;
     if (nowMs != null && atMs > nowMs) return false;
@@ -469,7 +474,7 @@ const sqlFake: SqlTag = async (strings, ...values) => {
   }
   if (/from\s+repo_snapshots\b/i.test(text)) {
     if (world.fail.has("snapshots")) throw new Error("snapshots down");
-    return snapshotsFor(values);
+    return snapshotsFor(text, values);
   }
   if (/from\s+decisions\b/i.test(text)) {
     if (world.fail.has("decisions")) throw new Error("decisions down");
@@ -1405,5 +1410,38 @@ describe("threshold alerts", { concurrency: false }, () => {
     assert.equal(cleared.sent_count, 0);
     assert.notEqual(world.alerts.get(key)?.cleared ?? null, null);
     assert.equal(messagesFor(key).length, 1);
+  });
+
+  it("a case-variant snapshot fires one lowercase zero-merge alert and does not repeat", async () => {
+    useDb();
+    const on = settings({ enabled: true, agentId: null });
+    watch("acme/app", 0);
+    snap("Acme/App", at(T, 0), [{ merged_at: at(T, -72 * H) }]);
+
+    const first = await evaluateAlerts({ now: T, settings: on });
+    assert.equal(hit(first, "zero-merge:acme/app").condition, "firing");
+    assert.equal(first.alerts.some((alert) => alert.key === "zero-merge:Acme/App"), false);
+    assert.equal(messagesFor("zero-merge:acme/app").length, 1);
+    assert.equal(messagesFor("zero-merge:Acme/App").length, 0);
+
+    const second = await evaluateAlerts({ now: new Date(T.getTime() + M), settings: on });
+    assert.equal(hit(second, "zero-merge:acme/app").condition, "firing");
+    assert.equal(second.sent_count, 0);
+    assert.equal(messagesFor("zero-merge:acme/app").length, 1);
+  });
+
+  it("a case-variant zero-merge latch of a visible repo is not cleared as absent", async () => {
+    useDb();
+    const on = settings({ enabled: true, agentId: null });
+    const oldKey = "zero-merge:Acme/App";
+    watch("acme/app", 0);
+    snap("Acme/App", at(T, 0), [{ merged_at: at(T, -72 * H) }]);
+    world.alerts.set(oldKey, { first: at(T, -D), last: at(T, -H), cleared: null });
+
+    const later = new Date(T.getTime() + 1000);
+    const evaluated = await evaluateAlerts({ now: later, settings: on });
+    assert.equal(hit(evaluated, "zero-merge:acme/app").condition, "firing");
+    assert.equal(world.alerts.get(oldKey)?.cleared ?? null, null);
+    assert.equal(world.alerts.has(oldKey), true);
   });
 });

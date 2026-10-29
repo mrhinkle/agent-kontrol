@@ -908,7 +908,14 @@ export function openApiDocument(): Json {
             status: { type: "string", enum: [...DECISION_STATUSES] },
             decision: { type: ["string", "null"] },
             decided_by: { type: ["string", "null"], description: "Ignored. The stored actor comes from the principal." },
-            defer_until: { type: ["string", "null"], format: "date-time" },
+            defer_until: {
+              description: "An ISO 8601 date-time, or a YYYY-MM-DD date. A date is the end of that UTC day. Null clears it when status is not deferred.",
+              oneOf: [
+                { type: "string", format: "date-time" },
+                { type: "string", format: "date" },
+                { type: "null" },
+              ],
+            },
             option_id: { type: "string" },
             expected_updated_at: { type: "string", format: "date-time", description: "Accepted for older clients. Not compared." },
             expected_revision: { type: "integer", minimum: 0, description: "revision from the row you loaded. A mismatch is 409 stale." },
@@ -1296,7 +1303,7 @@ export function openApiDocument(): Json {
             query(
               "writeback",
               { type: "string", enum: ["written", "not_written"] },
-              "When set, only rows with this write-back stamp. Ignored when shape is brief.",
+              "written keeps only written rows. not_written keeps rows stamped not_written and a decided row whose writeback is still null, whose write-back claim is absent or older than the 180 second write-back lease, and whose writeback_lock_at, else decided_at, else updated_at, is older than that lease. Ignored when shape is brief.",
             ),
           ],
           responses: {

@@ -12,7 +12,11 @@
  * A zero-merge latch whose repo is no longer in the visible set is cleared
  * on the enabled live path, after the watched-repo read and the latch read
  * both succeeded, using the same clear statement and its compute-instant
- * guard. A failed watched-repo read clears nothing. `readAlerts` does not clear.
+ * guard. The latch key is `zero-merge:` plus the repo lowercased. The
+ * snapshot read matches `lower(repo)`, and a latch is absent only when that
+ * lowercased repo is not in the visible set, so another casing of a visible
+ * repo is not cleared. A failed watched-repo read clears nothing.
+ * `readAlerts` does not clear.
  *
  * The claim is one INSERT ... ON CONFLICT statement. It carries the compute
  * instant. Episode and repeat claims re-arm a cleared latch only when
@@ -159,6 +163,15 @@ function item(draft: Draft, sent: boolean | null, lastSent: string | null): Aler
 
 function unknownDraft(key: string, kind: AlertKind, summary: string): Draft {
   return { key, kind, condition: "unknown", summary };
+}
+
+/** Latch identity for a watched repo. GitHub treats `owner/name` as case-insensitive. */
+function zeroMergeKey(repo: string): string {
+  return `zero-merge:${repo.toLowerCase()}`;
+}
+
+function zeroMergeRepo(key: string): string {
+  return key.slice("zero-merge:".length).toLowerCase();
 }
 
 function unmeasured(settings: BriefSettings, now: Date, delivery: AlertDelivery, note: string): AlertEvaluation {
@@ -321,20 +334,21 @@ async function readMerges(settings: BriefSettings, now: Date): Promise<MergeRead
   }
   const nowIso = toSecondIso(now);
   const since = new Date(now.getTime() - hourMs(settings.alerts.zeroMergeLookbackDays * 24 + settings.alerts.zeroMergeHours));
+  const names = repos.map((repo) => repo.repo.toLowerCase());
   let rows: Record<string, unknown>[];
   try {
     rows = await sql()`
       select repo, collected_at, detail
       from repo_snapshots
-      where repo = any(${repos.map((repo) => repo.repo)}::text[])
+      where lower(repo) = any(${names}::text[])
         and collected_at <= ${nowIso}::timestamptz
         and collected_at >= ${toSecondIso(since)}::timestamptz
-      order by repo, collected_at desc
+      order by lower(repo), collected_at desc
     `;
   } catch {
     return {
       drafts: repos.map((repo) => unknownDraft(
-        `zero-merge:${repo.repo}`,
+        zeroMergeKey(repo.repo),
         "zero_merge",
         `${repo.label} merges could not be read.`,
       )),
@@ -343,7 +357,7 @@ async function readMerges(settings: BriefSettings, now: Date): Promise<MergeRead
   }
   const byRepo = new Map<string, MergeSnap[]>();
   for (const row of rows) {
-    const name = String(row.repo);
+    const name = String(row.repo).toLowerCase();
     const collectedAt = stamp(row.collected_at instanceof Date ? row.collected_at.toISOString() : row.collected_at);
     if (Number.isNaN(collectedAt) || collectedAt > now.getTime()) continue;
     const detail = row.detail;
@@ -357,8 +371,8 @@ async function readMerges(settings: BriefSettings, now: Date): Promise<MergeRead
   return {
     reposRead: true,
     drafts: repos.map((repo) => {
-    const key = `zero-merge:${repo.repo}`;
-    const snaps = byRepo.get(repo.repo) ?? [];
+    const key = zeroMergeKey(repo.repo);
+    const snaps = byRepo.get(repo.repo.toLowerCase()) ?? [];
     const condition = classifyZeroMerge(snaps, now.getTime(), settings.alerts);
     if (condition === "unknown") {
       return unknownDraft(key, "zero_merge", `${repo.label} merge history is incomplete.`);
@@ -441,10 +455,11 @@ async function compute(settings: BriefSettings, now: Date): Promise<{ drafts: Dr
 /**
  * Clears uncleared zero-merge latches whose repo was not evaluated.
  * Uses `clearLatch`, so a latch sent at this same instant stays.
+ * A case-variant key of a repo still in the visible set is not absent.
  */
 async function clearAbsentZeroMergeLatches(drafts: Draft[], nowIso: string): Promise<AlertFailure[]> {
-  const evaluated = new Set(
-    drafts.filter((draft) => draft.key.startsWith("zero-merge:")).map((draft) => draft.key),
+  const visible = new Set(
+    drafts.filter((draft) => draft.key.startsWith("zero-merge:")).map((draft) => zeroMergeRepo(draft.key)),
   );
   let rows: Record<string, unknown>[];
   try {
@@ -460,7 +475,7 @@ async function clearAbsentZeroMergeLatches(drafts: Draft[], nowIso: string): Pro
   const failures: AlertFailure[] = [];
   for (const row of rows) {
     const key = String(row.key);
-    if (!key.startsWith("zero-merge:") || evaluated.has(key)) continue;
+    if (!key.startsWith("zero-merge:") || visible.has(zeroMergeRepo(key))) continue;
     if (row.cleared_at != null) continue;
     try {
       await clearLatch(key, nowIso);

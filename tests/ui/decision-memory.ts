@@ -1,4 +1,4 @@
-import { writebackLockUnexpired, type DecisionStore, type ListStatus, type PatchInput, type UpsertInput } from "../../src/lib/decisions";
+import { nullWritebackRetryDue, writebackLockUnexpired, type DecisionStore, type ListStatus, type PatchInput, type UpsertInput } from "../../src/lib/decisions";
 
 /** In-memory queue with the same hold, stale, and terminal rules as the SQL. */
 export function createMemoryDecisionStore(): DecisionStore & {
@@ -56,7 +56,20 @@ export function createMemoryDecisionStore(): DecisionStore & {
       }).filter((row) => {
         if (query.repo && row.repo !== query.repo) return false;
         if (query.shape !== "brief" && query.source && row.source !== query.source) return false;
-        if (query.shape !== "brief" && query.writeback && row.writeback !== query.writeback) return false;
+        if (query.shape !== "brief" && query.writeback) {
+          if (row.writeback === query.writeback) return true;
+          // A crash between the decision commit and the not_written stamp
+          // leaves writeback null. The age clock matches the list SQL:
+          // no live claim, then coalesce(writeback_lock_at, decided_at, updated_at).
+          // A collector upsert refreshes updated_at and leaves the other two.
+          if (
+            query.writeback === "not_written"
+            && row.status === "decided"
+            && row.writeback == null
+            && nullWritebackRetryDue(row)
+          ) return true;
+          return false;
+        }
         return true;
       });
       matched.sort((a, b) => String(a.first_seen_at).localeCompare(String(b.first_seen_at)) || Number(a.id) - Number(b.id));
@@ -204,6 +217,10 @@ export function createMemoryDecisionStore(): DecisionStore & {
         if (row.writeback_lock !== token) return null;
         row.writeback_lock = null;
         row.writeback_lock_at = null;
+      } else if (writebackLockUnexpired(row.writeback_lock, row.writeback_lock_at)) {
+        // A live claim still owns this revision. Stamping not_written would
+        // bump revision and fence that writer.
+        return null;
       }
       row.writeback = writeback;
       row.updated_at = stamp(row.updated_at);

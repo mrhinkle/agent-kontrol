@@ -340,6 +340,20 @@ describe("OpenAPI document", () => {
     assert.equal(patch?.requestBody?.content["application/json"].schema.$ref, "#/components/schemas/PatchDecision");
     assert.match(patch?.description ?? "", /decisions:write/);
     assert.equal((schemaOf(doc, "PatchDecision").properties?.status as { enum: string[] }).enum.includes("decided"), true);
+    const defer = schemaOf(doc, "PatchDecision").properties?.defer_until as {
+      format?: string;
+      oneOf?: { type?: string; format?: string }[];
+    };
+    assert.equal(defer.format, undefined);
+    assert.deepEqual(
+      (defer.oneOf ?? []).map((item) => item.format ?? item.type),
+      ["date-time", "date", "null"],
+    );
+    const storedDefer = schemaOf(doc, "Decision").properties?.defer_until as { format?: string; oneOf?: unknown };
+    assert.equal(storedDefer.format, "date-time");
+    assert.equal(storedDefer.oneOf, undefined);
+    const writebackParam = list.parameters?.find((item) => item.name === "writeback");
+    assert.match(JSON.stringify(writebackParam ?? {}), /180 second write-back lease/);
 
     const decisions = fs.readFileSync("src/lib/decisions.ts", "utf8");
     for (const name of ["Decision", "BriefDecision"]) {

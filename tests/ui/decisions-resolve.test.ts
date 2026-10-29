@@ -5,15 +5,20 @@ import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import type { McpToolResult } from "../../src/lib/api-error";
 import { actorFromPrincipal, runWithActor } from "../../src/lib/actor";
 import { authCookieValue } from "../../src/lib/authcrypto";
 import { createCredential, resetCredentialsForTests } from "../../src/lib/credentials";
 import { DecisionCard, DecisionList } from "../../src/components/DecisionQueue";
 import { DECISION_MARKER, buildDecisionComment, decisionSourceHref } from "../../src/lib/decision-format";
-import { listDecisionsTool, requestDecisionTool } from "../../src/lib/decision-resolve";
+import { listDecisionsTool, requestDecisionTool, resolveDecisionTool } from "../../src/lib/decision-resolve";
+import { demoListActivity, resetDemoStoreForTests } from "../../src/lib/demo-store";
 import {
+  claimDecisionWriteback,
   listDecisions,
+  nullWritebackPastLease,
   parseListQuery,
+  patchDecision as patchStoredDecision,
   presentDecision,
   setDecisionStoreForTests,
   setDecisionWriteback,
@@ -23,7 +28,7 @@ import {
   type DecisionStore,
   type UpsertInput,
 } from "../../src/lib/decisions";
-import { GitHubWriteError, GITHUB_FETCH_TIMEOUT_MS, type GitHubWriteClient, clearGitHubWriteClientForTests, setGitHubWriteClientForTests, setWritebackLockWaitForTests, writeDecisionBack } from "../../src/lib/decision-writeback";
+import { GitHubWriteError, GITHUB_FETCH_TIMEOUT_MS, type GitHubWriteClient, clearGitHubWriteClientForTests, setGitHubWriteClientForTests, setWritebackLockWaitForTests, setWritebackProcessLockForTests, writeDecisionBack } from "../../src/lib/decision-writeback";
 import { authorizeTool } from "../../src/lib/scopes";
 import { createMemoryDecisionStore } from "./decision-memory";
 
@@ -49,6 +54,15 @@ let fetchCalls = 0;
 function handles(): Handle[] {
   const get = (process as unknown as { _getActiveHandles?: () => Handle[] })._getActiveHandles;
   return get ? get() : [];
+}
+
+function hasReceiptLine(text: string): boolean {
+  return text.split("\n").some((line) => line.startsWith("receipt: "));
+}
+
+function receiptObject(result: McpToolResult): unknown {
+  const structured = result.structuredContent as { receipt?: unknown } | undefined;
+  return structured?.receipt;
 }
 
 function mcpToolText(raw: string): string {
@@ -110,6 +124,7 @@ afterEach(() => {
   setDecisionStoreForTests(null);
   clearGitHubWriteClientForTests();
   setWritebackLockWaitForTests(null);
+  setWritebackProcessLockForTests(null);
   resetCredentialsForTests();
   globalThis.fetch = originalFetch;
   restoreEnv();
@@ -261,7 +276,8 @@ describe("decision resolve", { concurrency: false }, () => {
       force: true,
     });
     assert.equal(requested.status, 200, requested.text.slice(0, 400));
-    assert.match(requested.text, /Demo mode; decision not stored/);
+    assert.equal(mcpToolText(requested.text), "Demo mode; decision not stored.");
+    assert.equal(hasReceiptLine(mcpToolText(requested.text)), false);
 
     const listed = await mcp(asker, "list_decisions", {});
     assert.equal(listed.status, 200, listed.text.slice(0, 400));
@@ -286,7 +302,8 @@ describe("decision resolve", { concurrency: false }, () => {
 
     const toolResolve = await mcp(writer, "resolve_decision", { id: 4, status: "withdrawn" });
     assert.equal(toolResolve.status, 200, toolResolve.text.slice(0, 400));
-    assert.match(toolResolve.text, /Demo mode; decision not resolved/);
+    assert.equal(mcpToolText(toolResolve.text), "Demo mode; decision not resolved.");
+    assert.equal(hasReceiptLine(mcpToolText(toolResolve.text)), false);
 
     env.MC_DASHBOARD_PASSWORD = "secret";
     const cookie = await authCookieValue("secret");
@@ -307,7 +324,7 @@ describe("decision resolve", { concurrency: false }, () => {
       options: [{ id: "a", label: "A" }],
       recommended: "a",
     }));
-    const opened = JSON.parse(first.content[0].text) as { decision: Decision; status_held: boolean };
+    const opened = JSON.parse(first.content[0].text.split("\n")[0]) as { decision: Decision; status_held: boolean };
     assert.equal(opened.status_held, false);
     assert.equal(opened.decision.status, "open");
     assert.equal(opened.decision.key, "agent:cred-9:pick");
@@ -333,7 +350,7 @@ describe("decision resolve", { concurrency: false }, () => {
       title: "Pick again",
       why: "try to reopen",
     }));
-    const again = JSON.parse(second.content[0].text) as { decision: Decision; status_held: boolean };
+    const again = JSON.parse(second.content[0].text.split("\n")[0]) as { decision: Decision; status_held: boolean };
     assert.equal(again.status_held, true);
     assert.equal(again.decision.id, opened.decision.id);
     assert.equal(again.decision.status, "decided");
@@ -1276,7 +1293,7 @@ describe("decision resolve", { concurrency: false }, () => {
     assert.match(github.comments[0].body, /ship the new answer/);
   });
 
-  it("a claim that cannot be acquired stamps writeback not_written", async () => {
+  it("a live write-back claim is not stamped not_written", async () => {
     const store = createMemoryDecisionStore();
     setDecisionStoreForTests(store);
     clearGitHubWriteClientForTests();
@@ -1288,7 +1305,6 @@ describe("decision resolve", { concurrency: false }, () => {
     });
     assert.equal(decidedRes.status, 200, await decidedRes.clone().text());
     const decided = (await decidedRes.json() as { decision: Decision }).decision;
-    assert.equal(decided.writeback, "not_written");
     const stored = store.rows.find((item) => item.id === row.id);
     assert.ok(stored);
     stored.writeback = null;
@@ -1306,14 +1322,346 @@ describe("decision resolve", { concurrency: false }, () => {
       decision: decided.decision,
       revision,
     });
-    assert.equal(outcome.status, "not_written");
-    assert.equal(stored.writeback, "not_written");
+    assert.equal(outcome.status, "superseded");
+    assert.equal(stored.writeback, null);
+    assert.equal(stored.writeback_lock, "busy-token");
+    assert.equal(stored.revision, revision);
     assert.equal(stored.status, "decided");
     assert.equal(github.comments.length, 0);
+    const refused = await setDecisionWriteback(row.id, "not_written", revision, null);
+    assert.equal(refused, null);
+    assert.equal(stored.revision, revision);
+
+    stored.writeback_lock_at = new Date(Date.now() - (WRITEBACK_LOCK_LEASE_SECONDS + 1) * 1000).toISOString();
+    const expired = await setDecisionWriteback(row.id, "not_written", revision, null);
+    assert.equal(expired?.writeback, "not_written");
+    assert.equal(stored.writeback_lock, "busy-token");
+  });
+
+  it("a slow writer holding a live claim is not fenced by a concurrent retry", async () => {
+    const store = createMemoryDecisionStore();
+    setDecisionStoreForTests(store);
+    setWritebackProcessLockForTests(false);
+    setWritebackLockWaitForTests(50);
+    const row = await seed({ key: "github:acme/widgets#83" });
+    const github = new FakeGitHub();
+    let release: () => void = () => {};
+    const entered = new Promise<void>((resolve) => {
+      github.getIssue = async (repo, number) => {
+        github.calls.push({ method: "get", repo, number });
+        resolve();
+        await new Promise<void>((done) => {
+          release = done;
+        });
+        return { state: github.state, labels: github.labels.map((label) => ({ ...label })) };
+      };
+    });
+    install(github);
+    const deciding = patch(row.id, {
+      status: "decided",
+      decision: "ship the slow answer",
+      expected_updated_at: row.updated_at,
+    });
+    try {
+      await entered;
+      const during = store.rows.find((item) => item.id === row.id);
+      assert.ok(during);
+      assert.equal(during.writeback, null);
+      assert.equal(typeof during.writeback_lock, "string");
+      const revisionDuring = Number(during.revision);
+      const lock = during.writeback_lock;
+      const retry = await writeDecisionBack({
+        id: row.id,
+        key: String(during.key),
+        actor_id: during.actor_id == null ? null : String(during.actor_id),
+        decided_at: during.decided_at == null ? null : String(during.decided_at),
+        decision: during.decision == null ? null : String(during.decision),
+        revision: revisionDuring,
+      });
+      assert.notEqual(retry.status, "written");
+      assert.equal(during.writeback, null);
+      assert.equal(during.revision, revisionDuring);
+      assert.equal(during.writeback_lock, lock);
+      assert.equal(github.comments.length, 0);
+    } finally {
+      release();
+    }
+    const res = await deciding;
+    assert.equal(res.status, 200, await res.clone().text());
+    const body = await res.json() as { decision: Decision };
+    assert.equal(body.decision.writeback, "written");
+    assert.equal(github.comments.length, 1);
+    assert.match(github.comments[0].body, /ship the slow answer/);
+    const stored = store.rows.find((item) => item.id === row.id);
+    assert.equal(stored?.writeback, "written");
+    assert.equal(stored?.writeback_lock ?? null, null);
+  });
+
+  it("includes a null writeback in the retry population only after the lease", async () => {
+    const t0 = 1_700_000_000_000;
+    const leaseMs = WRITEBACK_LOCK_LEASE_SECONDS * 1000;
+    assert.equal(nullWritebackPastLease(new Date(t0 - leaseMs).toISOString(), t0), false);
+    assert.equal(nullWritebackPastLease(new Date(t0 - leaseMs - 1).toISOString(), t0), true);
+    assert.equal(nullWritebackPastLease(new Date(t0 - leaseMs + 1).toISOString(), t0), false);
+    assert.equal(nullWritebackPastLease("not-a-date", t0), false);
+
+    const store = createMemoryDecisionStore();
+    setDecisionStoreForTests(store);
+    clearGitHubWriteClientForTests();
+    const inside = await seed({ key: "github:acme/widgets#90", title: "Inside" });
+    const outside = await seed({ key: "github:acme/widgets#91", title: "Outside" });
+    const stamped = await seed({ key: "github:acme/widgets#92", title: "Stamped" });
+    const posted = await seed({ key: "github:acme/widgets#93", title: "Posted" });
+    for (const item of [inside, outside, stamped, posted]) {
+      const res = await patch(item.id, {
+        status: "decided",
+        decision: "ship",
+        expected_updated_at: item.updated_at,
+      });
+      assert.equal(res.status, 200, await res.clone().text());
+    }
+    const now = Date.now();
+    const rowOf = (id: number) => {
+      const found = store.rows.find((item) => item.id === id);
+      assert.ok(found);
+      return found;
+    };
+    const insideRow = rowOf(inside.id);
+    insideRow.writeback = null;
+    insideRow.writeback_lock = null;
+    insideRow.writeback_lock_at = null;
+    insideRow.decided_at = new Date(now - leaseMs + 5_000).toISOString();
+    insideRow.updated_at = insideRow.decided_at;
+    const outsideRow = rowOf(outside.id);
+    outsideRow.writeback = null;
+    outsideRow.writeback_lock = null;
+    outsideRow.writeback_lock_at = null;
+    outsideRow.decided_at = new Date(now - leaseMs - 5_000).toISOString();
+    outsideRow.updated_at = outsideRow.decided_at;
+    const postedRow = rowOf(posted.id);
+    postedRow.writeback = "written";
+    postedRow.updated_at = new Date(now - leaseMs - 5_000).toISOString();
+
     const parsed = parseListQuery(new URLSearchParams("status=decided&writeback=not_written"));
     assert.equal(parsed.ok, true);
     if (!parsed.ok) return;
     const pending = await listDecisions(parsed);
-    assert.deepEqual(pending.map((item) => item.id), [row.id]);
+    assert.deepEqual(pending.map((item) => item.title).sort(), ["Outside", "Stamped"]);
+  });
+
+  it("keeps an expired claim in the retry population after a collector upsert refreshes updated_at", async () => {
+    const store = createMemoryDecisionStore();
+    setDecisionStoreForTests(store);
+    clearGitHubWriteClientForTests();
+    const leaseMs = WRITEBACK_LOCK_LEASE_SECONDS * 1000;
+    const past = new Date(Date.now() - leaseMs - 30_000).toISOString();
+    const liveAt = new Date(Date.now() - 30_000).toISOString();
+
+    async function crashedClaim(key: string, title: string, number: number, lockAt: string) {
+      const row = await seed({ key, title, number });
+      const decided = await patchStoredDecision(row.id, {
+        status: "decided",
+        decision: "ship",
+        setDecision: true,
+        decided_by: "mark",
+        setDecidedBy: true,
+        defer_until: null,
+        setDefer: false,
+        guardTerminal: true,
+        expectedRevision: row.revision,
+      });
+      assert.ok(decided);
+      assert.equal(decided.writeback, null);
+      const claim = await claimDecisionWriteback(decided.id, decided.revision);
+      assert.ok(claim);
+      const stored = store.rows.find((item) => item.id === row.id);
+      assert.ok(stored);
+      assert.equal(stored.writeback ?? null, null);
+      assert.equal(stored.writeback_lock, claim.token);
+      stored.writeback_lock_at = lockAt;
+      stored.decided_at = past;
+      const touchedAt = String(stored.updated_at);
+      const again = await upsertDecision({
+        key,
+        source: "github-label",
+        repo: "evil/other",
+        repo_short: "evil",
+        number,
+        url: null,
+        title,
+        why: "The page and the collector disagree.",
+        options: [
+          { id: "ship", label: "Ship the columns" },
+          { id: "wait", label: "Wait" },
+        ],
+        recommended: "wait",
+        requested_by: "collector",
+        kind: "issue",
+        labels: ["bug", "needs-owner", "decision"],
+        opened_at: "2026-10-01T00:00:00.000Z",
+        first_seen_at: "2026-10-01T00:00:00.000Z",
+        github_present: true,
+        force: false,
+      });
+      assert.equal(again.status_held, true);
+      assert.equal(again.decision.writeback, null);
+      assert.notEqual(again.decision.updated_at, touchedAt);
+      assert.equal(stored.writeback_lock, claim.token);
+      assert.equal(stored.writeback_lock_at, lockAt);
+      assert.equal(stored.decided_at, past);
+      assert.equal(stored.writeback ?? null, null);
+      return row.id;
+    }
+
+    const expiredId = await crashedClaim("github:acme/widgets#101", "Expired claim", 101, past);
+    const liveId = await crashedClaim("github:acme/widgets#102", "Live claim", 102, liveAt);
+    const parsed = parseListQuery(new URLSearchParams("status=decided&writeback=not_written"));
+    assert.equal(parsed.ok, true);
+    if (!parsed.ok) return;
+    const pending = await listDecisions(parsed);
+    const ids = pending.map((item) => item.id);
+    assert.equal(ids.includes(expiredId), true);
+    assert.equal(ids.includes(liveId), false);
+  });
+
+  it("request_decision and resolve_decision emit a receipt only after a successful write", async () => {
+    resetDemoStoreForTests();
+    const store = createMemoryDecisionStore();
+    setDecisionStoreForTests(store);
+    clearGitHubWriteClientForTests();
+    const actor = { actor_type: "agent" as const, actor_id: "cred-receipt" };
+
+    const bad = await runWithActor(actor, () => requestDecisionTool({ slug: "Not A Slug", title: "Pick one" }));
+    assert.equal(bad.isError, true);
+    assert.equal(hasReceiptLine(bad.content[0].text), false);
+    assert.equal((await demoListActivity({ actor: actor.actor_id, kind: "request_decision", since: null, until: null })).length, 0);
+
+    const requested = await runWithActor(actor, () => requestDecisionTool({ slug: "pick", title: "Pick one" }));
+    assert.equal(requested.isError, undefined);
+    const requestedBody = JSON.parse(requested.content[0].text.split("\n")[0]) as { decision: Decision };
+    const requestLine = requested.content[0].text.split("\n").at(-1) ?? "";
+    assert.match(requestLine, /^receipt: \{/);
+    const requestReceipt = JSON.parse(requestLine.slice("receipt: ".length)) as { id: string; kind: string; at: string };
+    assert.equal(requestReceipt.kind, "request_decision");
+    assert.deepEqual(receiptObject(requested), requestReceipt);
+    const requestEvents = await demoListActivity({ actor: actor.actor_id, kind: "request_decision", since: null, until: null });
+    assert.equal(requestEvents.length, 1);
+    assert.equal(String(requestEvents[0].id), requestReceipt.id);
+    assert.equal(requestEvents[0].detail?.actor_id, actor.actor_id);
+
+    const listed = await listDecisionsTool({ status: "open" });
+    assert.equal(hasReceiptLine(listed.content[0].text), false);
+    assert.equal(listed.structuredContent, undefined);
+
+    const stale = await runWithActor(actor, () => resolveDecisionTool({
+      id: requestedBody.decision.id,
+      status: "withdrawn",
+      expected_revision: requestedBody.decision.revision + 9,
+    }));
+    assert.equal(stale.isError, true);
+    assert.match(stale.content[0].text, /stale/);
+    assert.equal(hasReceiptLine(stale.content[0].text), false);
+
+    const conflict = await runWithActor(actor, () => resolveDecisionTool({
+      id: requestedBody.decision.id,
+      status: "decided",
+      decision: "",
+    }));
+    assert.equal(conflict.isError, true);
+    assert.match(conflict.content[0].text, /validation_failed|decision/);
+    assert.equal(hasReceiptLine(conflict.content[0].text), false);
+
+    const decided = await runWithActor(actor, () => resolveDecisionTool({
+      id: requestedBody.decision.id,
+      status: "decided",
+      decision: "ship",
+      expected_revision: requestedBody.decision.revision,
+    }));
+    assert.equal(decided.isError, undefined);
+    const decidedBody = JSON.parse(decided.content[0].text.split("\n")[0]) as { decision: Decision };
+    assert.equal(decidedBody.decision.status, "decided");
+    assert.equal(decidedBody.decision.writeback, null);
+    const decideLine = decided.content[0].text.split("\n").at(-1) ?? "";
+    assert.match(decideLine, /^receipt: \{/);
+    const decideReceipt = JSON.parse(decideLine.slice("receipt: ".length)) as { id: string; kind: string; at: string };
+    assert.equal(decideReceipt.kind, "resolve_decision");
+    assert.deepEqual(receiptObject(decided), decideReceipt);
+    assert.notEqual(decideReceipt.id, requestReceipt.id);
+
+    const again = await runWithActor(actor, () => resolveDecisionTool({
+      id: requestedBody.decision.id,
+      status: "decided",
+      decision: "ship again",
+      expected_revision: decidedBody.decision.revision,
+    }));
+    assert.equal(again.isError, true);
+    assert.match(again.content[0].text, /conflict/);
+    assert.equal(hasReceiptLine(again.content[0].text), false);
+
+    const githubRow = await seed({ key: "github:acme/widgets#94", title: "Needs a comment" });
+    const missed = await runWithActor(actor, () => resolveDecisionTool({
+      id: githubRow.id,
+      status: "decided",
+      decision: "ship",
+      expected_revision: githubRow.revision,
+    }));
+    assert.equal(missed.isError, undefined);
+    const missedBody = JSON.parse(missed.content[0].text.split("\n")[0]) as { decision: Decision };
+    assert.equal(missedBody.decision.writeback, "not_written");
+    const missedLine = missed.content[0].text.split("\n").at(-1) ?? "";
+    assert.match(missedLine, /^receipt: \{/);
+    const missedReceipt = JSON.parse(missedLine.slice("receipt: ".length)) as { kind: string };
+    assert.equal(missedReceipt.kind, "resolve_decision");
+    assert.deepEqual(receiptObject(missed), JSON.parse(missedLine.slice("receipt: ".length)));
+
+    const resolveEvents = await demoListActivity({ actor: actor.actor_id, kind: "resolve_decision", since: null, until: null });
+    assert.equal(resolveEvents.length, 2);
+    assert.equal(String(resolveEvents.find((event) => String(event.id) === decideReceipt.id)?.id), decideReceipt.id);
+  });
+
+  it("resolve_decision writes no receipt while a live write-back claim blocks a reopen", async () => {
+    resetDemoStoreForTests();
+    const store = createMemoryDecisionStore();
+    setDecisionStoreForTests(store);
+    const row = await seed({ key: "github:acme/widgets#84" });
+    const github = new FakeGitHub();
+    let release: () => void = () => {};
+    const entered = new Promise<void>((resolve) => {
+      github.getIssue = async (repo, number) => {
+        github.calls.push({ method: "get", repo, number });
+        resolve();
+        await new Promise<void>((done) => {
+          release = done;
+        });
+        return { state: github.state, labels: github.labels.map((label) => ({ ...label })) };
+      };
+    });
+    install(github);
+    const deciding = patch(row.id, {
+      status: "decided",
+      decision: "ship",
+      expected_updated_at: row.updated_at,
+    });
+    const actor = { actor_type: "human" as const, actor_id: "mark" };
+    try {
+      await entered;
+      const during = store.rows.find((item) => item.id === row.id);
+      assert.ok(during);
+      const blocked = await runWithActor(actor, () => resolveDecisionTool({
+        id: row.id,
+        status: "open",
+        expected_revision: Number(during.revision),
+      }));
+      assert.equal(blocked.isError, true);
+      assert.match(blocked.content[0].text, /writeback_in_progress/);
+      assert.equal(hasReceiptLine(blocked.content[0].text), false);
+      assert.equal(blocked.structuredContent, undefined);
+      const events = await demoListActivity({ actor: null, kind: "resolve_decision", since: null, until: null });
+      assert.equal(events.length, 0);
+    } finally {
+      release();
+    }
+    const res = await deciding;
+    assert.equal(res.status, 200, await res.clone().text());
   });
 });
