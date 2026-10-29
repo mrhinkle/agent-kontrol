@@ -24,6 +24,8 @@ export const SCOPES = [
   "messages:read",
   "messages:write",
   "progress:read",
+  "decisions:read",
+  "decisions:request",
   "decisions:write",
   "skills:read",
   "skills:write",
@@ -55,6 +57,9 @@ export const TOOL_SCOPES: Record<string, Scope> = {
   list_skills: "skills:read",
   get_skill: "skills:read",
   run_skill: "skills:write",
+  list_decisions: "decisions:read",
+  request_decision: "decisions:request",
+  resolve_decision: "decisions:write",
   send_message: "messages:write",
   requeue_task: "tasks:write",
   delete_note: "memory:write",
@@ -90,6 +95,7 @@ const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   // dashboard uses the session. An agent credential can change a decision
   // only when it holds decisions:write.
   { method: "PATCH", path: /^\/api\/decisions\/[^/]+$/, scope: "decisions:write" },
+  { method: "POST", path: /^\/api\/decisions\/[^/]+\/writeback$/, scope: "decisions:write" },
   // GET only. PATCH, POST /api/skills/sync, POST /api/skills/drift, and
   // GET /api/skill-bundles are operator routes: an agent must not be able to
   // turn a skill on, sync, file a drift report, or download the skill tree.

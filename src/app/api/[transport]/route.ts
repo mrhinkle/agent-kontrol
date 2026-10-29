@@ -23,6 +23,7 @@ import { formatDigest } from "@/lib/progress-digest";
 import { morningBriefText } from "@/lib/brief";
 import { OPERATOR } from "@/lib/operator";
 import { demoProgress } from "@/lib/demo-progress";
+import { listDecisionsTool, requestDecisionTool, resolveDecisionTool } from "@/lib/decision-resolve";
 import { getSkillTool, listSkillsTool, runSkillTool } from "@/lib/skills/mcp";
 import { deleteNoteTool, requeueTaskTool, sendMessageTool } from "@/lib/operator-actions";
 
@@ -492,6 +493,85 @@ const handler = createMcpHandler(
         },
       },
       async (args) => guardTool("run_skill", () => runSkillTool(args)),
+    );
+
+    // Decision tools. request and list do not resolve. resolve_decision is
+    // decisions:write, so an agent that can only file a decision cannot close it.
+    // The handlers below forward only the fields in each inputSchema.
+    server.registerTool(
+      "request_decision",
+      {
+        title: "Request a decision",
+        annotations: WRITE,
+        description:
+          "File a decision for the owner. The key is agent:<your id>:<slug>. Sending the same slug again updates the open row and does not reopen a decided one. You cannot choose the key, the repo, or the issue number.",
+        inputSchema: {
+          slug: z.string().describe("Short lowercase id, unique for you. The same slug updates the same row."),
+          title: z.string().describe("What the owner is deciding."),
+          why: z.string().optional().describe("Why this needs the owner."),
+          options: z
+            .array(z.object({ id: z.string(), label: z.string() }))
+            .max(20)
+            .optional()
+            .describe("Choices. Each has an id and a label."),
+          recommended: z.string().optional().describe("Option id you recommend. Must be one of options when options are sent."),
+        },
+      },
+      async (args) => guardTool("request_decision", () => requestDecisionTool({
+        slug: args.slug,
+        title: args.title,
+        why: args.why,
+        options: args.options,
+        recommended: args.recommended,
+      })),
+    );
+
+    server.registerTool(
+      "list_decisions",
+      {
+        title: "List decisions",
+        annotations: READ_ONLY,
+        description:
+          "Read the decision queue. This does not change a row. status defaults to open, which also includes deferrals whose date has passed.",
+        inputSchema: {
+          status: z.enum(["open", "decided", "deferred", "withdrawn", "all"]).optional(),
+          repo: z.string().optional().describe("owner/name. Omit for every repo."),
+          limit: z.number().int().min(1).max(1000).optional(),
+        },
+      },
+      async (args) => guardTool("list_decisions", () => listDecisionsTool({
+        status: args.status,
+        repo: args.repo,
+        limit: args.limit,
+      })),
+    );
+
+    server.registerTool(
+      "resolve_decision",
+      {
+        title: "Resolve a decision",
+        annotations: WRITE,
+        description:
+          "Decide, defer, or withdraw a decision. Requires decisions:write or the dashboard. An agent that filed the decision cannot call this with only decisions:request. Send expected_revision from the row you loaded. expected_updated_at is accepted and is not the concurrency token. The GitHub comment goes to the issue named by the row key.",
+        inputSchema: {
+          id: z.number().int().positive(),
+          status: z.enum(["open", "decided", "deferred", "withdrawn"]),
+          decision: z.string().optional().describe("Required when status is decided, unless option_id names a choice."),
+          defer_until: z.string().optional().describe("Required when status is deferred. A date is the end of that UTC day. A past date is rejected."),
+          option_id: z.string().optional().describe("One of the row's option ids."),
+          expected_updated_at: z.string().optional().describe("Accepted for older clients. Not compared."),
+          expected_revision: z.number().int().nonnegative().optional().describe("revision from the row you loaded. A mismatch is stale."),
+        },
+      },
+      async (args) => guardTool("resolve_decision", () => resolveDecisionTool({
+        id: args.id,
+        status: args.status,
+        decision: args.decision,
+        defer_until: args.defer_until,
+        option_id: args.option_id,
+        expected_updated_at: args.expected_updated_at,
+        expected_revision: args.expected_revision,
+      })),
     );
 
     server.registerTool(

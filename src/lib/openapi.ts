@@ -753,7 +753,12 @@ export function openApiDocument(): Json {
             "last_seen_at",
             "created_at",
             "updated_at",
+            "revision",
             "age_days",
+            "actor_type",
+            "actor_id",
+            "chosen_option",
+            "writeback",
           ],
           properties: {
             id: { type: "integer" },
@@ -781,7 +786,20 @@ export function openApiDocument(): Json {
             last_seen_at: { type: "string", format: "date-time" },
             created_at: { type: "string", format: "date-time" },
             updated_at: { type: "string", format: "date-time" },
+            revision: {
+              type: "integer",
+              minimum: 0,
+              description: "Optimistic concurrency token. Increments on every mutation. Not a timestamp.",
+            },
             age_days: { type: "integer", description: "Whole days from opened_at, else first_seen_at, to now." },
+            actor_type: { type: ["string", "null"], enum: ["human", "agent", null] },
+            actor_id: { type: ["string", "null"] },
+            chosen_option: { type: ["string", "null"] },
+            writeback: {
+              type: ["string", "null"],
+              enum: ["written", "not_written", null],
+              description: "Null when the row has no GitHub target, or before it is decided. not_written means the row is decided and the GitHub comment did not land.",
+            },
           },
         },
         BriefDecision: {
@@ -852,12 +870,23 @@ export function openApiDocument(): Json {
           type: "object",
           minProperties: 1,
           description:
-            "At least one field. status decided requires non-empty decision text and sets decided_at to now. status deferred requires defer_until. status open clears decision, decided_by, decided_at, and defer_until. status withdrawn sets github_present false. decided_by is taken from this body, not from the credential.",
+            "At least one of status, decision, decided_by, or defer_until. status decided requires decision text or option_id and sets decided_at to now. status deferred requires defer_until in the future. A date-only defer_until is the end of that UTC day. A past or impossible date is 400 validation_failed. status open clears the answer. status withdrawn sets github_present false. decided_by in this body is ignored. The stored decided_by and actor fields come from the principal, and are null for dev-open. expected_revision must match the row or the response is 409 stale. expected_updated_at is accepted and is not compared. Deciding, deferring, or withdrawing a decided or withdrawn row is 409 conflict. Reopening while an unexpired write-back claim holds the row is 409 writeback_in_progress.",
           properties: {
             status: { type: "string", enum: [...DECISION_STATUSES] },
             decision: { type: ["string", "null"] },
-            decided_by: { type: ["string", "null"] },
+            decided_by: { type: ["string", "null"], description: "Ignored. The stored actor comes from the principal." },
             defer_until: { type: ["string", "null"], format: "date-time" },
+            option_id: { type: "string" },
+            expected_updated_at: { type: "string", format: "date-time", description: "Accepted for older clients. Not compared." },
+            expected_revision: { type: "integer", minimum: 0, description: "revision from the row you loaded. A mismatch is 409 stale." },
+          },
+        },
+        RetryDecisionWriteback: {
+          type: "object",
+          description: "Retry the GitHub comment for a decided row. Does not decide the row again. expected_revision is the concurrency token. expected_updated_at is accepted and is not compared.",
+          properties: {
+            expected_updated_at: { type: "string", format: "date-time" },
+            expected_revision: { type: "integer", minimum: 0 },
           },
         },
         CreateCredential: {
@@ -1231,6 +1260,11 @@ export function openApiDocument(): Json {
               { type: "integer", minimum: 1, maximum: 1000, default: 500 },
               "Maximum rows. Default 500. Maximum 1000.",
             ),
+            query(
+              "writeback",
+              { type: "string", enum: ["written", "not_written"] },
+              "When set, only rows with this write-back stamp. Ignored when shape is brief.",
+            ),
           ],
           responses: {
             "200": jsonResponse("Queue rows, the morning-brief list, or an empty demo list.", {
@@ -1273,7 +1307,7 @@ export function openApiDocument(): Json {
           tags: ["decisions"],
           summary: "Upsert one decision, or reconcile a collector sweep.",
           description:
-            "Dashboard session or MC_TOKEN. An agent credential is denied, including one that holds decisions:write, with 403 and code insufficient_scope. Send either a decision (key, source, title) or { reconcile }, not both. A non-JSON body is 400 invalid_json. A missing key, source, or title is 400 missing_field. Any other rejected field is 400 validation_failed. With no database the response is ok, demo, and note, and the row is dropped.",
+            "Dashboard session or MC_TOKEN. An agent credential is denied, including one that holds decisions:write, with 403 and code insufficient_scope. Send either a decision (key, source, title) or { reconcile }, not both. A non-JSON body is 400 invalid_json. A missing key, source, or title is 400 missing_field. Any other rejected field is 400 validation_failed. force true while an unexpired write-back claim holds a decided or deferred row is 409 writeback_in_progress and does not change the row. With no database the response is ok, demo, and note, and the row is dropped.",
           security: cookieOrBearer,
           requestBody: body({ oneOf: [ref("DecisionUpsert"), ref("DecisionReconcile")] }),
           responses: {
@@ -1321,7 +1355,7 @@ export function openApiDocument(): Json {
           tags: ["decisions"],
           summary: "Record a decision, a deferral, or a withdrawal.",
           description:
-            "Dashboard session, MC_TOKEN, or an agent credential with decisions:write. An agent credential without that scope is 403 insufficient_scope. decided_by comes from the body, not from the credential. This records the row only. It does not comment on the GitHub issue or remove the label. A non-integer id is 400 validation_failed. A non-JSON body is 400 invalid_json. A body with none of status, decision, decided_by, or defer_until is 400 missing_field. An unknown id, when a database is connected, is 404 not_found and error stays Decision not found. Demo mode does not look the id up.",
+            "Dashboard session, MC_TOKEN, or an agent credential with decisions:write. An agent credential without that scope is 403 insufficient_scope. decided_by in the body is ignored. The stored actor is the principal, or null for dev-open. status decided records the row and then comments on the GitHub issue named by the row key and removes the decision labels. A failed write-back still decides the row and sets writeback to not_written. A past or invalid defer_until is 400 validation_failed. expected_revision that does not match is 409 stale. expected_updated_at is accepted and is not compared. A decided or withdrawn row is 409 conflict, including a body that omits status. status open is the reopen, except while an unexpired write-back claim holds the row, which is 409 writeback_in_progress. A non-integer id is 400 validation_failed. A non-JSON body is 400 invalid_json. A body with none of status, decision, decided_by, or defer_until is 400 missing_field. An unknown id, when a database is connected, is 404 not_found and error stays Decision not found. Demo mode does not look the id up.",
           security: cookieOrBearer,
           parameters: [pathParam("id", "Decision id.", { type: "integer", minimum: 1 })],
           requestBody: body(ref("PatchDecision")),
@@ -1351,6 +1385,47 @@ export function openApiDocument(): Json {
               "No decision has this id when a database is connected. code is not_found and error is Decision not found.",
               ref("Error"),
             ),
+            "409": jsonResponse(
+              "code stale when expected_revision does not match. code conflict when the row is already decided or withdrawn. code writeback_in_progress when an unexpired write-back claim holds the row.",
+              ref("Error"),
+            ),
+          },
+        }),
+      },
+      "/api/decisions/{id}/writeback": {
+        post: operation({
+          operationId: "retryDecisionWriteback",
+          tags: ["decisions"],
+          summary: "Retry the GitHub comment for a decided row.",
+          description:
+            "Dashboard session, MC_TOKEN, or an agent credential with decisions:write. An agent credential without that scope is 403 insufficient_scope. Posts the decision comment unless an existing comment contains the full canonical text for this row, then removes decision labels. A marker alone does not count. Concurrent retries share a per-row lock. The issue is the one named by the row key. Does not decide the row again. A row that is not decided is 409 conflict. expected_revision that does not match is 409 stale. expected_updated_at is accepted and is not compared. No token, a GitHub 403 or 404, a network error, or a closed issue leaves writeback not_written. Demo mode does not look the id up.",
+          security: cookieOrBearer,
+          parameters: [pathParam("id", "Decision id.", { type: "integer", minimum: 1 })],
+          requestBody: body(ref("RetryDecisionWriteback")),
+          responses: {
+            "200": jsonResponse("The row after the retry, or a demo acknowledgement.", {
+              oneOf: [
+                {
+                  type: "object",
+                  required: ["ok", "demo"],
+                  properties: {
+                    ok: { type: "boolean", const: true },
+                    demo: { type: "boolean", const: true },
+                  },
+                },
+                {
+                  type: "object",
+                  required: ["ok", "decision"],
+                  properties: {
+                    ok: { type: "boolean", const: true },
+                    decision: ref("Decision"),
+                  },
+                },
+              ],
+            }),
+            ...flatErrors,
+            "404": jsonResponse("No decision has this id when a database is connected.", ref("Error")),
+            "409": jsonResponse("code stale or code conflict.", ref("Error")),
           },
         }),
       },

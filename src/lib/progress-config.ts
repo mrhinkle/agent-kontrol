@@ -148,6 +148,9 @@ export const THRESHOLDS = {
   skillStallMinutes: 60,
 } as const;
 
+/** Label patterns that mark an owner decision. A trailing `*` matches a prefix. */
+export const DECISION_LABEL_PATTERNS: readonly string[] = config.brief.decisionLabels;
+
 export const WINDOWS = ["24h", "7d", "30d", "90d"] as const;
 export type TimeWindow = (typeof WINDOWS)[number];
 
