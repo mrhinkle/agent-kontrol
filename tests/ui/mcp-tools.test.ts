@@ -7,7 +7,7 @@ const src = fs.readFileSync("src/app/api/[transport]/route.ts", "utf8");
 
 describe("MCP tool names", () => {
   it("registers the documented tools", () => {
-    for (const name of ["report_status", "get_fleet_status", "get_progress_digest", "get_morning_brief", "remember", "recall", "check_inbox", "reply_to_operator", "create_task", "get_task_queue", "claim_task", "update_task", "list_skills", "get_skill", "run_skill"]) {
+    for (const name of ["report_status", "get_fleet_status", "get_progress_digest", "get_morning_brief", "remember", "recall", "check_inbox", "reply_to_operator", "create_task", "get_task_queue", "claim_task", "update_task", "list_skills", "get_skill", "run_skill", "send_message", "requeue_task", "delete_note"]) {
       assert.ok(src.includes(`"${name}"`), `missing tool ${name}`);
     }
   });
@@ -15,8 +15,8 @@ describe("MCP tool names", () => {
   it("declares an annotations block on every registered tool", () => {
     // One call site per tool, plus one for the reply_to_* loop (reply_to_operator and reply_to_mark).
     const calls = src.match(/server\.registerTool\(/g)?.length ?? 0;
-    // Fails if registrations are renamed away from server.registerTool( and the count drops to zero.
-    assert.ok(calls >= 13, `expected at least 13 registerTool call sites, found ${calls}`);
+    // 18 call sites: 15 previous tools (the reply alias shares one call) plus send_message, requeue_task, delete_note.
+    assert.equal(calls, 18, `expected 18 registerTool call sites, found ${calls}`);
     const annotated = src.match(/^\s+annotations: (READ_ONLY|WRITE|WRITE_IDEMPOTENT|WRITE_DESTRUCTIVE),$/gm)?.length ?? 0;
     assert.equal(annotated, calls, "every registerTool call needs annotations");
     for (const hint of ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"]) {

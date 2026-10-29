@@ -52,6 +52,9 @@ export const TOOL_SCOPES: Record<string, Scope> = {
   list_skills: "skills:read",
   get_skill: "skills:read",
   run_skill: "skills:write",
+  send_message: "messages:write",
+  requeue_task: "tasks:write",
+  delete_note: "memory:write",
 };
 
 /**
