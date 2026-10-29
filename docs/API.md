@@ -25,6 +25,7 @@ The `agent_credentials` table stores the label, the first 8 characters of the to
 | MCP transport: `/api/mcp` | `Authorization: Bearer <MC_TOKEN>`, an agent credential, or an OAuth access token (JWT) issued by this server |
 | `GET /api/skill-bundles` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `skills:read` or `skills:write` |
 | Credential management: `GET`/`POST`/`DELETE /api/settings/credentials` | Dashboard session only |
+| `POST /api/watch/beat`, `GET /api/watch/beats` | Verified `akc_` credential only. `watch:write` for the POST, `watch:read` for the GET. `MC_TOKEN`, the dashboard session, an OAuth access token, and a caller allowed only because the dashboard password is unset are `401` |
 | Login, OAuth, and discovery: `/login`, `/api/login`, `/oauth/*`, `/.well-known/*` | No cookie gate; these routes enforce their own auth |
 | Public agent docs: `GET /llms.txt`, `GET /docs/mcp.md`, `GET /docs/api.md`, `GET /docs/agents.md` | None. Any other `/docs` name stays behind the dashboard gate |
 
@@ -34,7 +35,7 @@ Ingest routes answer `401 {"error":"unauthorized"}` without a valid bearer token
 { "error": "The credential does not have the tasks:write scope.", "code": "insufficient_scope", "fix": "Use a credential that has the tasks:write scope", "retryable": false }
 ```
 
-The scope for each agent route is listed in [MCP.md](MCP.md). A route that is not in that table is denied to agent credentials. `MC_TOKEN` and the dashboard session can still call it. OAuth on `/api/mcp` is unchanged: a verified access token can call every mapped tool.
+The scope for each agent route is listed in [MCP.md](MCP.md). A route that is not in that table is denied to agent credentials. `MC_TOKEN` and the dashboard session can still call it, except `POST /api/watch/beat` and `GET /api/watch/beats`: those two accept only a verified `akc_` credential, and the other principals are `401`. OAuth on `/api/mcp` is unchanged: a verified access token can call every mapped tool.
 
 If `MC_DASHBOARD_PASSWORD` is unset, the gate is open in local development and on deploys with no `DATABASE_URL` (demo mode). A production build with `DATABASE_URL` set answers `503` on gated routes until the password is set.
 
@@ -85,6 +86,8 @@ Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI
 | POST | `/api/usage/ingest` | Bearer | Ingest usage facts |
 | GET | `/api/skill-bundles` | Session or MC_TOKEN | Download a gzip tar of the skill tree for one runtime. Operator only |
 | POST | `/api/login` | Own (rate-limited) | Dashboard password login |
+| POST | `/api/watch/beat` | `akc_` `watch:write` | Store one host liveness beat. The credential must be bound to `source` |
+| GET | `/api/watch/beats` | `akc_` `watch:read` | Every host beat, with `age_s` from the database clock. `Cache-Control: no-store` |
 
 ### OAuth and discovery routes
 
@@ -239,6 +242,22 @@ The three conditions, and no others:
 
 The claim is one `INSERT ... ON CONFLICT ... RETURNING` statement. It stores a random `claim_token` and the evaluation's compute instant. Episode and repeat claims re-arm a cleared latch only when `cleared_at` is null or older than that instant. A clear sets `cleared_at` to its own compute instant only when `cleared_at` is null and `last_sent_at` is older than that instant, so a delayed clear cannot overwrite a newer claim. A decision claim is `INSERT ... SELECT ... WHERE EXISTS` an open decision still old enough at the compute instant, `ON CONFLICT DO NOTHING`, so a decision resolved after compute is not alerted. An event that lands between compute and claim, with no concurrent evaluation, can still produce one alert; the next evaluation clears it. A failed message insert restores the previous row only where that token still matches and `cleared_at` is still the null the claim wrote, so a concurrent clear stays cleared. Two concurrent evaluates insert one message per alert. The progress collector does not call this route. The scheduler that curls the brief POSTs evaluate on its own tick. No other pushes.
 
+### Watch beats
+
+`POST /api/watch/beat` stores one row per host. The body is `{ "source", "status", "detail", "beat_at" }`. `source` is `mini`, `macbook`, or `watcher`. `status` is `ok`, `held`, `paused`, `stale`, `failing`, or `unknown`. `detail` is a string of at most 500 Unicode code points. `beat_at` is a finite RFC 3339 timestamp with an explicit `Z` or `±HH:MM` offset. An old or future `beat_at` is stored as sent. It does not make the beat stale or fresh.
+
+`received_at` is the database clock at the last successful insert or conflict update. The client must not send `received_at` or `age_s`. A body that includes either is `400` and writes nothing. Any other unexpected field is `400`. A body that is not a JSON object, a missing field, an unknown `source` or `status`, a `detail` over 500 code points, or a `beat_at` without an explicit offset is `400`. `Content-Type` must be `application/json` (`415` otherwise, including a missing type). The server counts the bytes it reads and answers `413` above 8 KiB. It does not trust `Content-Length` by itself. Every rejection leaves the table unchanged.
+
+The caller is a verified `akc_` credential with `watch:write`. `MC_TOKEN`, the `mc_auth` cookie, an OAuth access token, and a dev-open caller are `401` even when that credential would be allowed on another route. A valid credential without `watch:write` is `403` `insufficient_scope`. An unknown, expired, or revoked credential is `401`. If the credential store cannot be read, the answer is `503` `{ "error": "credential_store_unavailable" }`.
+
+`WATCH_SOURCE_CREDENTIAL_IDS_JSON` maps `mini`, `macbook`, and `watcher` to arrays of credential row UUIDs (the `id` from Settings, not the label and not an agent id). Several UUIDs per source are how a credential is rotated. A UUID listed under two sources, an unknown name, an empty array, a value that is not a UUID, or a document that is missing or not valid JSON makes every POST `503`. A credential that is not in the requested source's list is `403` and the row is not changed. A valid dashboard cookie sent on the same request does not widen that list.
+
+A successful POST is `200` `{ "ok": true }`.
+
+`GET /api/watch/beats` needs `watch:read` and no source binding. The body is `{ "beats": [{ "source", "status", "detail", "beat_at", "received_at", "age_s" }] }`. `age_s` is `max(0, floor(database_now - received_at))` in whole seconds. The response sends `Cache-Control: no-store` and the route is dynamic. With no `DATABASE_URL`, or when the query fails, the answer is `503`. It is not `{ "beats": [] }` and it is not demo data. `{ "beats": [] }` means the table was read and had no rows.
+
+`scripts/watch-beat.sh` reads one JSON object from stdin and POSTs it. Set `WATCH_API_URL` to the full `https://` URL (loopback `http://` is only for `localhost`, `127.0.0.1`, and `::1`) and `WATCH_CREDENTIAL` to the `akc_` token. The script always exits 0. A missing setting, bad stdin, DNS or TLS failure, timeout, refused connection, non-2xx response, or a 2xx body that is not `{ "ok": true }` prints one short line and does not print the credential, the Authorization header, the response body, or the curl command. It does not queue or replay.
+
 ### Decisions
 
 The morning brief's decisions list comes from this table when every brief-eligible row for that repo has `kind`, `labels`, `opened_at`, and `repo_short`. Those rows are `source` `github-label`, `status` not `withdrawn`, and `github_present` not `false` (a null `github_present` still counts as present). `repo` is `owner/name`. `repo_short` is the config short name and is display only. The brief joins a row onto a watched repo by `owner/name`, so two repos that share a short name do not both receive the row. `age_hours` drops fractional seconds before `Z`, subtracts the unix times, and divides by 3600. `age_days` is `floor(age_hours / 24)` from `opened_at` (GitHub `createdAt`). GitHub `createdAt` is stored as `opened_at` and, on insert only, as `first_seen_at`.
@@ -365,8 +384,8 @@ OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this sha
 | `task_not_claimable` | 409 | no | Defined, not returned. See above. |
 | `memory_key_invalid` | 400 | no | MCP `remember` or `recall` when `key` is empty, longer than 200 characters, or contains a control character. |
 | `repo_list_invalid` | 400 | no | `PUT /api/settings/repos` when the list fails validation. `errors` is unchanged. |
-| `payload_too_large` | 413 | no | `POST /api/v1/traces` over 2 MB. |
-| `unsupported_media_type` | 415 | no | `POST /api/v1/traces` when the body is not JSON. |
+| `payload_too_large` | 413 | no | `POST /api/v1/traces` over 2 MB, or `POST /api/watch/beat` over 8 KiB. |
+| `unsupported_media_type` | 415 | no | `POST /api/v1/traces` or `POST /api/watch/beat` when the body is not `application/json`. |
 | `setup_required` | 503 | no | Messaging routes or `POST /api/usage/ingest` when those tables are missing, or a production `/api/*` request when a database is set and `MC_DASHBOARD_PASSWORD` is not (other pages are `text/plain`). `GET /api/usage` stays HTTP 200 with `setup_required: true` and no `code`. Messaging and usage-ingest bodies keep `setup_required` and `message`. |
 | `internal_error` | 500 | yes | Anything else that failed while handling the request. `GET /api/progress/digest` uses this JSON body too. Success from that route stays `text/plain`. |
 
@@ -398,6 +417,7 @@ With no `DATABASE_URL` set (demo mode):
 - Ingest routes answer `{"ok": true, "demo": true}` and drop the data. `POST /api/decisions` does the same and adds `note`. `PATCH /api/decisions/:id` answers `{ "ok": true, "demo": true }` and does not look the id up.
 - MCP `report_status`, `remember`, `create_task`, `claim_task`, and `update_task` store in memory for this process. `get_fleet_status`, `recall`, `get_task_queue`, and `list_activity` read that store. `GET /api/activity` reads the same in-memory event log. Successful text starts with `[demo — in-memory, cleared when this process restarts]`. The store is cleared when the process restarts. Those rows are not mixed into the sample data on the other GET routes.
 - REST `POST` and `PATCH` in demo mode still answer `{ "ok": true, "demo": true }` (memory adds `note`) and do not write the in-memory store.
+- `POST /api/watch/beat` and `GET /api/watch/beats` do not. With no `DATABASE_URL` they answer `503` and do not acknowledge a beat. An empty `beats` array is only a successful read of a table with no rows.
 
 ## Versioning
 

@@ -41,8 +41,12 @@ A tool name that is not registered is denied for every caller, including `MC_TOK
 | `decisions:write` | `resolve_decision` | `PATCH /api/decisions/:id`, `POST /api/decisions/:id/writeback` |
 | `skills:read` | `list_skills`, `get_skill` | `GET /api/skills`, `GET /api/skills/:id` |
 | `skills:write` | `run_skill` | — (no REST route; the agent calls `run_skill`) |
+| `watch:read` | — (no MCP tool) | `GET /api/watch/beats` |
+| `watch:write` | — (no MCP tool) | `POST /api/watch/beat` |
 
 `reply_to_mark` is the deprecated alias of `reply_to_operator` and requires the same scope.
+
+`POST /api/watch/beat` and `GET /api/watch/beats` accept only a verified `akc_` credential. `MC_TOKEN`, the dashboard session, and an OAuth access token are `401` on those two routes. `watch:write` may update only the source whose credential-id list in `WATCH_SOURCE_CREDENTIAL_IDS_JSON` contains that credential's row id. `watch:read` is not bound to a source.
 
 `send_message` is the MCP form of operator `POST /api/messages`. That REST route stays off this table, so an agent credential still cannot call it. The tool requires `messages:write`. `delete_note` uses `memory:write`. There is no memory DELETE route. `requeue_task` uses `tasks:write`, the same scope as `PATCH /api/tasks/:id`. `list_activity` and `GET /api/activity` are operator-only, the same boundary as traces. No agent scope grants them, including `fleet:read`. `MC_TOKEN` and an OAuth access token can call `list_activity`. The dashboard session and `MC_TOKEN` can call `GET /api/activity`.
 
