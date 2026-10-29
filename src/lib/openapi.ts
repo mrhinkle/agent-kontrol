@@ -10,6 +10,8 @@ import { INGEST_KINDS } from "@/lib/store";
 import { TASK_STATUSES } from "@/lib/types";
 import { USAGE_SOURCES } from "@/lib/usage-types";
 import { USAGE_WINDOWS } from "@/lib/usage-window";
+import { LIST_MAX } from "./list-params";
+import { RUNTIMES } from "./skills/types";
 
 /**
  * OpenAPI 3.1 for the documented REST routes.
@@ -56,6 +58,36 @@ function query(name: string, schema: Json, description: string, opts?: { require
   return { name, in: "query", required: opts?.required === true, schema, description };
 }
 
+function listLimit(defaultLimit: number): Json {
+  return { type: "integer", minimum: 1, maximum: LIST_MAX, default: defaultLimit };
+}
+
+const listCursor = query(
+  "cursor",
+  { type: "string" },
+  "Opaque keyset cursor from next_cursor. A tampered or mismatched cursor is 400 validation_failed. It does not restart at the first page.",
+);
+
+const listFields = query(
+  "fields",
+  { type: "string" },
+  "Comma-separated allowlisted names. The id is always returned (trace_id on traces). An unknown name, an empty name, or text that is not an allowlisted name is 400. Omitted returns the same columns as before. Names are not read from the database as SQL.",
+);
+
+function listLimitParam(defaultLimit: number): Json {
+  return query(
+    "limit",
+    listLimit(defaultLimit),
+    `Maximum rows, from 1 to ${LIST_MAX}. Default ${defaultLimit}. Above ${LIST_MAX}, zero, a negative, or a non-integer is 400. Passing limit or cursor adds next_cursor. Omitting both leaves the body without that field.`,
+  );
+}
+
+const nextCursor: Json = {
+  type: ["string", "null"],
+  description:
+    "Present only when the request passed limit or cursor. Null when there is no further page. Opaque; send it back as cursor.",
+};
+
 function pathParam(name: string, description: string, schema: Json = { type: "string" }): Json {
   return { name, in: "path", required: true, schema, description };
 }
@@ -81,6 +113,8 @@ function body(schema: Json): Json {
 const cookieOrBearer = [{ cookieAuth: [] }, { bearerAuth: [] }];
 const bearerOnly = [{ bearerAuth: [] }];
 const sessionOnly = [{ cookieAuth: [] }];
+/** Dashboard session or MC_TOKEN. Not the generic bearer that accepts an agent credential. */
+const operatorSessionOrMcToken = [{ cookieAuth: [] }, { mcToken: [] }];
 
 /** Server-set. A request body cannot write these. */
 const actorType: Json = {
@@ -101,6 +135,32 @@ const dryRunFlag: Json = {
   description:
     "When true, return what would change and write nothing. Omitted or false applies the write. Any other JSON type is 400 and writes nothing.",
 };
+
+const expectedRevision: Json = {
+  type: "string",
+  minLength: 1,
+  maxLength: 200,
+  description:
+    "Optional token from the dry-run preview. For a memory row or a task it is the md5 of the whole row, computed in SQL on that same read. A memory key with no row uses the literal absent. When it no longer matches, the route answers 409 stale_write with current_revision and writes nothing. Omit it to keep the previous unconditional write. An empty string, a non-string, or a value longer than 200 characters is 400 and writes nothing.",
+};
+
+const staleWrite: Json = jsonResponse(
+  "expected_revision does not match the current row. error and code are stale_write. current_revision is the token a new preview would return. Nothing was written.",
+  {
+    allOf: [
+      ref("Error"),
+      {
+        type: "object",
+        required: ["current_revision"],
+        properties: {
+          error: { type: "string", const: "stale_write" },
+          code: { type: "string", const: "stale_write" },
+          current_revision: { type: "string" },
+        },
+      },
+    ],
+  },
+);
 
 const flatErrors: Json = {
   "400": jsonResponse("The body is not JSON, a required field is missing, or a field failed validation.", ref("Error")),
@@ -145,6 +205,12 @@ export function openApiDocument(): Json {
           type: "http",
           scheme: "bearer",
           description: "MC_TOKEN, an akc_ agent credential, or an OAuth access token on the MCP transport.",
+        },
+        mcToken: {
+          type: "http",
+          scheme: "bearer",
+          bearerFormat: "MC_TOKEN",
+          description: "Operator MC_TOKEN. An agent credential and an OAuth access token are not accepted on operations that use this scheme.",
         },
       },
       schemas: {
@@ -341,6 +407,7 @@ export function openApiDocument(): Json {
             assigned_agent: { type: "string" },
             agent_id: { type: "string" },
             dry_run: dryRunFlag,
+            expected_revision: expectedRevision,
           },
         },
         Task: {
@@ -453,6 +520,7 @@ export function openApiDocument(): Json {
             tags: { type: "array", items: { type: "string" } },
             agent_id: { type: ["string", "null"] },
             dry_run: dryRunFlag,
+            expected_revision: expectedRevision,
           },
         },
         DryRunChange: {
@@ -478,6 +546,11 @@ export function openApiDocument(): Json {
             },
             changes: { type: "array", items: ref("DryRunChange") },
             affected: { type: "array", items: { type: "object", additionalProperties: true } },
+            expected_revision: {
+              type: "string",
+              description:
+                "Token to send back as expected_revision. The md5 of the row from the same read, or the literal absent when a memory key has no row.",
+            },
             note: { type: "string" },
           },
         },
@@ -700,14 +773,17 @@ export function openApiDocument(): Json {
           parameters: [
             query("query", { type: "string" }, "Free-text search."),
             query("tag", { type: "string" }, "One tag."),
-            query("limit", { type: "integer", default: 50 }, "Maximum notes. Default 50."),
+            listLimitParam(50),
+            listCursor,
+            listFields,
           ],
           responses: {
-            "200": jsonResponse("Matching notes, newest update first.", {
+            "200": jsonResponse("Matching notes, newest update first. next_cursor is absent unless limit or cursor was passed.", {
               type: "object",
               properties: {
                 demo: { type: "boolean" },
                 items: { type: "array", items: ref("MemoryItem") },
+                next_cursor: nextCursor,
               },
             }),
             ...flatErrors,
@@ -718,7 +794,7 @@ export function openApiDocument(): Json {
           tags: ["memory"],
           summary: "Store a note, or preview the write.",
           description:
-            "The REST twin of MCP remember. An agent credential needs memory:write. dry_run true returns the insert or the key overwrite and writes nothing. action is overwrite_memory when the key already exists, otherwise insert_memory. A non-boolean dry_run is 400 and writes nothing. With no database, a dry run still describes the note and sets would_write to false.",
+            "The REST twin of MCP remember. An agent credential needs memory:write. dry_run true returns the insert or the key overwrite and writes nothing. action is overwrite_memory when the key already exists, otherwise insert_memory. The preview includes expected_revision, the md5 of the row from that same read, or the literal absent when the key has no row. Sending that token makes the write conditional: a mismatch is 409 stale_write with current_revision and writes nothing. When expected_revision is present and the key is already gone, the route answers 404 not_found and writes nothing. Omitting expected_revision keeps the unconditional write. A non-boolean dry_run, or an expected_revision that is empty, non-string, or longer than 200 characters, is 400 and writes nothing. With no database, a dry run still describes the note and sets would_write to false. A confirm that omits expected_revision still answers the demo acknowledgement and does not store the note.",
           security: cookieOrBearer,
           requestBody: body(ref("RememberInput")),
           responses: {
@@ -739,6 +815,11 @@ export function openApiDocument(): Json {
               ],
             }),
             ...flatErrors,
+            "404": jsonResponse(
+              "No memory row has this key when expected_revision is present. code is not_found and error is not found. A missing key with no expected_revision still inserts.",
+              ref("Error"),
+            ),
+            "409": staleWrite,
           },
         }),
       },
@@ -770,7 +851,7 @@ export function openApiDocument(): Json {
           tags: ["messages"],
           summary: "Operator enqueues an inbound message.",
           description:
-            "The server sets actor_type and actor_id from the authenticated credential. created_by is a label and does not set those fields. When MC_DASHBOARD_PASSWORD is unset and the request presents no credential, both actor fields are null. Optional header Idempotency-Key.",
+            "The server sets actor_type and actor_id from the authenticated credential. created_by is a label and does not set those fields. When MC_DASHBOARD_PASSWORD is unset and the request presents no credential, both actor fields are null. body is at most 8000 characters. A longer body is 400 validation_failed and stores nothing. Optional header Idempotency-Key.",
           security: cookieOrBearer,
           parameters: [idempotencyHeader],
           requestBody: body({
@@ -778,7 +859,7 @@ export function openApiDocument(): Json {
             required: ["agent_id", "body"],
             properties: {
               agent_id: { type: "string" },
-              body: { type: "string" },
+              body: { type: "string", maxLength: 8000 },
               created_by: { type: "string" },
             },
           }),
@@ -864,14 +945,17 @@ export function openApiDocument(): Json {
               { type: "string", enum: ["open", "all", ...TASK_STATUSES] },
               "open, all, or one status. Default all on this route.",
             ),
-            query("limit", { type: "integer" }, "Maximum rows."),
+            listLimitParam(100),
+            listCursor,
+            listFields,
           ],
           responses: {
-            "200": jsonResponse("Tasks. actor_type and actor_id are server-set.", {
+            "200": jsonResponse("Tasks. actor_type and actor_id are server-set. next_cursor is absent unless limit or cursor was passed.", {
               type: "object",
               properties: {
                 demo: { type: "boolean" },
                 tasks: { type: "array", items: ref("Task") },
+                next_cursor: nextCursor,
               },
             }),
             ...flatErrors,
@@ -925,7 +1009,7 @@ export function openApiDocument(): Json {
           tags: ["tasks"],
           summary: "Report progress, cancel a task, or preview that write.",
           description:
-            "dry_run true returns the affected task and the field diff and writes nothing. action is cancel_task when status is cancelled, otherwise update_task. A missing id is still 404. A non-boolean dry_run is 400 and writes nothing. With no database, a dry run returns would_write false.",
+            "dry_run true returns the affected task and the field diff and writes nothing. action is cancel_task when status is cancelled, otherwise update_task. The preview includes expected_revision. Sending that token makes the update conditional: a mismatch is 409 stale_write with current_revision and writes nothing, including no activity event. Omitting expected_revision keeps the unconditional update. A missing id is still 404. A non-boolean dry_run, or an expected_revision that is empty, non-string, or longer than 200 characters, is 400 and writes nothing. With no database, a dry run returns would_write false. A confirm that omits expected_revision still answers the demo acknowledgement and does not update a task.",
           security: cookieOrBearer,
           parameters: [pathParam("id", "Task id.", { type: "integer" })],
           requestBody: body(ref("PatchTask")),
@@ -945,7 +1029,8 @@ export function openApiDocument(): Json {
               ],
             }),
             ...flatErrors,
-            "404": jsonResponse("No task has this id when a database is connected.", ref("Error")),
+            "404": jsonResponse("No task has this id when a database is connected. Also when expected_revision is present and the id is already gone.", ref("Error")),
+            "409": staleWrite,
           },
         }),
       },
@@ -1128,6 +1213,29 @@ export function openApiDocument(): Json {
           },
         }),
       },
+      "/api/brief": {
+        get: operation({
+          operationId: "getMorningBrief",
+          tags: ["progress"],
+          summary: "Morning brief. Plain text by default; JSON when Accept asks for it.",
+          description:
+            "window is 24h (default) or 72h. Any other value, an empty value, a repeated window, or a key such as window[] is 400 validation_failed. The body is text/plain unless Accept lists application/json with a q strictly greater than the effective quality of text/plain (its own q, else text/*, else */*). Equal quality stays text. Accept */* alone stays text. A success response sends Vary: Accept. Errors are the JSON error body even when the client asked for text. Auth matches the other data routes: session cookie, MC_TOKEN, or an agent credential with progress:read. An akc_ token is checked even when MC_DASHBOARD_PASSWORD is unset. Counts, stuck PRs, and lead time come from repo_snapshots. A 72h median uses detail.merged timestamps and is not the stored 24h median. Decisions join on owner/name. A repo in the decisions incomplete_repos list has decisions null and is named on the brief's incomplete_repos. A missing decisions relation or a failed decisions query is decisions unavailable, not an empty list. The route does not call GitHub.",
+          security: cookieOrBearer,
+          parameters: [
+            query("window", { type: "string", enum: ["24h", "72h"] }, "24h or 72h. Default 24h. Anything else is 400."),
+          ],
+          responses: {
+            "200": {
+              description: "The brief. text/plain is the default. application/json is the morning-brief object.",
+              content: {
+                "text/plain": { schema: { type: "string" } },
+                "application/json": { schema: { type: "object", additionalProperties: true } },
+              },
+            },
+            ...flatErrors,
+          },
+        }),
+      },
       "/api/progress/ingest": {
         post: operation({
           operationId: "ingestProgress",
@@ -1260,10 +1368,19 @@ export function openApiDocument(): Json {
             query("agent", { type: "string" }, "Filter by agent id."),
             query("errors", { type: "string", enum: ["1"] }, "When 1, only traces with an error."),
             query("before", { type: "string", format: "date-time" }, "Return traces before this instant."),
-            query("limit", { type: "integer" }, "Maximum rows. Default 50."),
+            listLimitParam(50),
+            listCursor,
+            listFields,
           ],
           responses: {
-            "200": jsonResponse("demo and traces.", { type: "object" }),
+            "200": jsonResponse("demo and traces. next_cursor is absent unless limit or cursor was passed.", {
+              type: "object",
+              properties: {
+                demo: { type: "boolean" },
+                traces: { type: "array", items: { type: "object" } },
+                next_cursor: nextCursor,
+              },
+            }),
             ...flatErrors,
           },
         }),
@@ -1311,7 +1428,7 @@ export function openApiDocument(): Json {
             "Agent credentials need skills:read. runtime filters to skills compatible with that runtime. An unknown runtime is 400 validation_failed. q matches name and description, case-insensitive. category is an exact case-insensitive match on the stored category. The value uncategorized matches a null category. The taxonomy is not enforced. Each skill includes category (string or null) and tags (string array), plus lastScheduledAt and nextDueAt (ISO strings or null). Removed skills are omitted. With no database the body is demo true and a fixture list.",
           security: cookieOrBearer,
           parameters: [
-            query("runtime", { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] }, "Compatible runtime. Omit to return every skill."),
+            query("runtime", { type: "string", enum: [...RUNTIMES] }, "Compatible runtime. Omit to return every skill."),
             query("q", { type: "string" }, "Case-insensitive match on name and description."),
             query("category", { type: "string" }, "Exact category, case-insensitive. uncategorized matches a null category."),
           ],
@@ -1331,7 +1448,7 @@ export function openApiDocument(): Json {
           security: cookieOrBearer,
           parameters: [
             query("lane", { type: "string" }, "Lane name. Selected-scope skills match only an exact lane.", { required: true }),
-            query("runtime", { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] }, "Runtime that will read the file.", { required: true }),
+            query("runtime", { type: "string", enum: [...RUNTIMES] }, "Runtime that will read the file.", { required: true }),
             query("format", { type: "string", enum: ["json", "text"] }, "json (default) or text."),
           ],
           responses: {
@@ -1354,12 +1471,35 @@ export function openApiDocument(): Json {
             required: ["lane", "runtime"],
             properties: {
               lane: { type: "string" },
-              runtime: { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] },
+              runtime: { type: "string", enum: [...RUNTIMES] },
               agents_md: { type: ["string", "null"] },
             },
           }),
           responses: {
             "200": jsonResponse("demo, lane, runtime, empty, changed, and content (string or null).", { type: "object" }),
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/skill-bundles": {
+        get: operation({
+          operationId: "exportSkills",
+          tags: ["skills"],
+          summary: "Download a skill tree for one runtime.",
+          description:
+            "Operator only. Authenticate with a dashboard session or MC_TOKEN. An agent credential is denied, including one with skills:read or skills:write. runtime is required and is claude, codex, grok, hermes, mini, or nemoclaw. lane is optional. Visibility is the list_skills check. Trigger off is omitted. A trigger other than off, on_request, auto_inject, or scheduled is treated as off and listed with reason invalid trigger. A selected scope is omitted unless lane is set and admits it. category and q match list_skills. The body is a gzip-compressed tar. Paths are relative. The directory is the skill id, which is the upstream directory slug. The frontmatter name is a display string and may differ. The folder is the id. Category is a Hermes folder only. Claude, Codex, Grok, mini, and NemoClaw leave category out of the path, so a category value does not omit the skill for those runtimes. NemoClaw uses .agents/skills/<id>/SKILL.md. Its frontmatter is name and description, plus license, user_invocable, and metadata.author or metadata.tags only when the stored file already has them. A Hermes category or a skill id that does not already match ^[a-z0-9][a-z0-9-_]*$ is omitted and listed. The stored text is left as it is. When two skills would write one archive path, every one of those skills is omitted and listed. A reference that is unsafe, that collides case-insensitively, or that does not fit a ustar name and prefix is omitted and listed with its path, and the skill is still exported. A skill whose SKILL.md cannot be written is omitted as a whole. Each omission is {skill, path?, reason}. When the list is not empty, manifest.json at the archive root contains every entry. The x-ak-skipped header carries count, the first 20 entries, and the text see manifest.json. The header is at most 4 KB. The archive contains each path once. A skill with no category is under uncategorized/ in the Hermes layout. hermes uses <category>/<id>/SKILL.md. With no database the archive is the demo fixture under the same rules. A repeated runtime, lane, category, or q is 400 validation_failed.",
+          security: operatorSessionOrMcToken,
+          parameters: [
+            query("runtime", { type: "string", enum: [...RUNTIMES] }, "Runtime the tree is rendered for.", { required: true }),
+            query("lane", { type: "string" }, "When omitted, skills whose scope is selected are omitted."),
+            query("category", { type: "string" }, "Exact category, case-insensitive. uncategorized matches a null category."),
+            query("q", { type: "string" }, "Case-insensitive match on the skill id and the description."),
+          ],
+          responses: {
+            "200": {
+              description: "gzip-compressed tar of the rendered tree. x-ak-demo is true when no database is configured.",
+              content: { "application/gzip": { schema: { type: "string", contentEncoding: "gzip" } } },
+            },
             ...flatErrors,
           },
         }),

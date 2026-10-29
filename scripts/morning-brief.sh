@@ -6,6 +6,8 @@
 #   scripts/morning-brief.sh                 # text, last 24h, repos from the dashboard or config
 #   scripts/morning-brief.sh --window 72     # a Monday brief that covers the weekend
 #   scripts/morning-brief.sh --json          # the same facts as JSON (for /api/brief and tests)
+# The scheduler should curl GET /api/brief (text/plain; Accept: application/json
+# for the object). This script is the fallback when that route is down.
 #   scripts/morning-brief.sh --repo owner/a --repo owner/b   # override the repo list
 #   scripts/morning-brief.sh --no-dashboard  # never call MC_URL; GitHub only
 #
@@ -71,10 +73,50 @@ STUCK_PR_HOURS="$(cfg '.brief.stuckPrHours')";      STUCK_PR_HOURS="${STUCK_PR_H
 STALE_ISSUE_DAYS="$(cfg '.brief.staleIssueDays')";  STALE_ISSUE_DAYS="${STALE_ISSUE_DAYS:-21}"
 COORD_ID="$(cfg '.brief.coordinator.agentId')"
 COORD_MAX_H="$(cfg '.brief.coordinator.maxSilenceHours')"; COORD_MAX_H="${COORD_MAX_H:-3}"
-COORD_WORK_KINDS="$(cfg '.brief.coordinator.workKinds')"
 # Work means output: a round ended, a milestone or status was posted. turn_start and error
-# are activity without output and do not count (docs/VELOCITY.md).
-COORD_WORK_KINDS="${COORD_WORK_KINDS:-session_end|milestone|status}"
+# are activity without output and do not count (docs/VELOCITY.md). A configured list cannot
+# put heartbeat, telemetry, turn_start, status_update, or error back in.
+filter_work_kinds() {
+  local raw="$1" kind filtered=""
+  local -a kinds=()
+  IFS='|' read -ra kinds <<< "$raw"
+  for kind in "${kinds[@]}"; do
+    kind="${kind#"${kind%%[![:space:]]*}"}"
+    kind="${kind%"${kind##*[![:space:]]}"}"
+    case "$kind" in
+      ""|heartbeat|telemetry|turn_start|status_update|error) ;;
+      *) filtered="${filtered:+$filtered|}$kind" ;;
+    esac
+  done
+  printf '%s' "$filtered"
+}
+# end filter_work_kinds
+# BEGIN read_work_kinds
+# Same two forms as readBriefSettings: a pipe-delimited string, or a JSON array
+# of strings. Array elements are not trimmed and are not split on |. Empty
+# after the never-work filter is the default three.
+read_work_kinds() {
+  local raw="$1" filtered="" kind
+  if [[ "$raw" == \[* ]] && jq -e 'type == "array"' >/dev/null 2>&1 <<<"$raw"; then
+    while IFS= read -r kind || [[ -n "$kind" ]]; do
+      case "$kind" in
+        ""|heartbeat|telemetry|turn_start|status_update|error) ;;
+        *) filtered="${filtered:+$filtered|}$kind" ;;
+      esac
+    done < <(jq -r '.[] | select(type == "string" and length > 0)' <<<"$raw")
+  else
+    filtered="$(filter_work_kinds "$raw")"
+  fi
+  printf '%s' "${filtered:-session_end|milestone|status}"
+}
+# END read_work_kinds
+COORD_WORK_KINDS_RAW="$(jq -r '
+  .brief.coordinator.workKinds
+  | if type == "array" then @json
+    elif type == "string" then .
+    else empty end
+' "$CONFIG_FILE")"
+COORD_WORK_KINDS="$(read_work_kinds "$COORD_WORK_KINDS_RAW")"
 DECISION_LABELS_JSON="$(jq -c '.brief.decisionLabels // []' "$CONFIG_FILE")"
 
 # BSD date (macOS) and GNU date both understood.
@@ -290,27 +332,43 @@ if [[ "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_TOKEN:-}" ]]; then
 fi
 
 # ------------------------------------------------------------------- assemble
-brief="$(jq -n --arg at "$NOW_ISO" --argjson window "$WINDOW_H" --arg repo_source "$REPO_SOURCE" \
-            --argjson repos "$repo_results" --argjson coordinator "$coordinator" \
-            --argjson stuck_h "$STUCK_PR_HOURS" --argjson stale_d "$STALE_ISSUE_DAYS" '
-  {
+# BEGIN brief-assemble-jq
+BRIEF_ASSEMBLE_JQ='
+  def measured_sum($rows; $incomplete; $field):
+    if $incomplete or ($rows | any(.[$field] == null)) then null
+    else ([$rows[].[$field]] | add // 0)
+    end;
+  def measured_len($rows; $incomplete; $field):
+    if $incomplete or ($rows | any(.[$field] == null)) then null
+    else ([$rows[].[$field] | length] | add // 0)
+    end;
+  ([$repos[] | select(.incomplete | not)]) as $ok
+  | ($repos | any(.incomplete)) as $incomplete
+  | {
     generated_at: $at, window_hours: $window, repo_source: $repo_source,
     thresholds: {stuck_pr_hours: $stuck_h, stale_issue_days: $stale_d},
     coordinator: $coordinator,
     incomplete_repos: [$repos[] | select(.incomplete) | {repo, errors}],
-    totals: ([$repos[] | select(.incomplete | not)] as $ok | {
-      merged_prs: ([$ok[].merged_prs] | add // 0),
-      issues_opened: ([$ok[].issues_opened] | add // 0),
-      issues_closed: ([$ok[].issues_closed] | add // 0),
-      net_backlog: ([$ok[].net_backlog] | add // 0),
-      stuck_prs: ([$ok[].stuck_prs | length] | add // 0),
-      decisions: ([$ok[].decisions | length] | add // 0),
+    totals: {
+      merged_prs: measured_sum($ok; $incomplete; "merged_prs"),
+      issues_opened: measured_sum($ok; $incomplete; "issues_opened"),
+      issues_closed: measured_sum($ok; $incomplete; "issues_closed"),
+      net_backlog: measured_sum($ok; $incomplete; "net_backlog"),
+      open_issues: measured_sum($ok; $incomplete; "open_issues"),
+      open_prs: measured_sum($ok; $incomplete; "open_prs"),
+      stuck_prs: measured_len($ok; $incomplete; "stuck_prs"),
+      decisions: measured_len($ok; $incomplete; "decisions"),
       repos_counted: ($ok|length), repos_total: ($repos|length)
-    }),
+    },
     repos: $repos,
-    stuck_prs: ([$repos[] | select(.incomplete | not) | .stuck_prs[]] | sort_by(-.age_hours)),
-    decisions: ([$repos[] | select(.incomplete | not) | .decisions[]] | sort_by(-.age_hours))
-  }')"
+    stuck_prs: ([$repos[] | select(.incomplete | not) | (.stuck_prs // [])[]] | sort_by(-.age_hours)),
+    decisions: ([$repos[] | select(.incomplete | not) | (.decisions // [])[]] | sort_by(-.age_hours))
+  }'
+# END brief-assemble-jq
+brief="$(jq -n --arg at "$NOW_ISO" --argjson window "$WINDOW_H" --arg repo_source "$REPO_SOURCE" \
+            --argjson repos "$repo_results" --argjson coordinator "$coordinator" \
+            --argjson stuck_h "$STUCK_PR_HOURS" --argjson stale_d "$STALE_ISSUE_DAYS" \
+            "$BRIEF_ASSEMBLE_JQ")"
 
 n_incomplete="$(jq '.incomplete_repos|length' <<<"$brief")"
 if [[ "$AS_JSON" -eq 1 ]]; then
@@ -328,16 +386,32 @@ t_merged="$(jq -r .totals.merged_prs <<<"$brief")"
 t_closed="$(jq -r .totals.issues_closed <<<"$brief")"
 t_opened="$(jq -r .totals.issues_opened <<<"$brief")"
 t_net="$(jq -r .totals.net_backlog <<<"$brief")"
-if   [[ "$t_net" -gt 0 ]]; then verdict="the queue grew by $t_net"
-elif [[ "$t_net" -lt 0 ]]; then verdict="the queue shrank by ${t_net#-}"
-else verdict="the queue held level"; fi
-rc="$(jq -r .totals.repos_counted <<<"$brief")"; rt="$(jq -r .totals.repos_total <<<"$brief")"
+t_open_issues="$(jq -r .totals.open_issues <<<"$brief")"
+t_open_prs="$(jq -r .totals.open_prs <<<"$brief")"
+rt="$(jq -r .totals.repos_total <<<"$brief")"
 if [[ "$n_incomplete" -gt 0 ]]; then
-  echo "!! DATA INCOMPLETE for $n_incomplete of $rt repos; totals below cover $rc repos only."
+  echo "!! DATA INCOMPLETE for $n_incomplete of $rt repos. Fleet totals stay unknown until every watched repo is measured."
   jq -r '.incomplete_repos[] | "   \(.repo): \(.errors | join("; "))"' <<<"$brief"
   echo
 fi
-echo "$t_merged PRs merged, $t_closed issues closed, $t_opened opened — $verdict."
+# BEGIN counts_heading
+counts_heading() {
+  local merged="$1" closed="$2" opened="$3" net="$4" open_issues="$5" open_prs="$6"
+  if [[ "$merged" == "null" || "$closed" == "null" || "$opened" == "null" || "$net" == "null" ]]; then
+    printf '%s\n' "PRs merged, issues closed, and issues opened: DATA INCOMPLETE."
+  else
+    local verdict
+    if   [[ "$net" -gt 0 ]]; then verdict="the queue grew by $net"
+    elif [[ "$net" -lt 0 ]]; then verdict="the queue shrank by ${net#-}"
+    else verdict="the queue held level"; fi
+    printf '%s\n' "$merged PRs merged, $closed issues closed, $opened opened — $verdict."
+  fi
+  if [[ "$open_issues" == "null" || "$open_prs" == "null" ]]; then
+    printf '%s\n' "Open issues and open PRs: DATA INCOMPLETE."
+  fi
+}
+# END counts_heading
+counts_heading "$t_merged" "$t_closed" "$t_opened" "$t_net" "$t_open_issues" "$t_open_prs"
 echo
 
 coord_conf="$(jq -r .coordinator.configured <<<"$brief")"
@@ -355,34 +429,79 @@ jq -r '.repos[] | if .incomplete then [ "!! " + .label, "-", "-", "-", "-", "-",
                    (if .net_backlog > 0 then "+\(.net_backlog)" else (.net_backlog|tostring) end),
                    .open_issues,
                    (if .stale_ratio == null then "-" else "\(.stale_ratio * 100 | floor)%" end),
-                   (.stuck_prs|length),
+                   (if .stuck_prs == null then "-" else (.stuck_prs|length|tostring) end),
                    (if .median_lead_hours == null then "-" else "\(.median_lead_hours * 10 | floor / 10)h" end) ] end | @tsv' <<<"$brief" \
 | while IFS=$'\t' read -r l m i n o s k h; do printf '%-14s %7s %9s %6s %6s %6s %6s %8s\n' "${l:0:14}" "$m" "$i" "$n" "$o" "$s" "$k" "$h"; done
 echo "  stale = open issue untouched ${STALE_ISSUE_DAYS}d+ · stuck = non-draft PR open ${STUCK_PR_HOURS}h+ or blocked/dirty · lead-med = median hours PR open→merge"
 echo
 
+# A null total is an incomplete repo or a counted repo that did not measure
+# the list. "none" is only a measured zero. Known rows are still printed.
+# BEGIN stuck_heading
+stuck_heading() {
+  local n_stuck="$1"
+  if [[ "$n_stuck" == "null" ]]; then
+    printf '%s\n' "STUCK PRs: DATA INCOMPLETE."
+  elif [[ "$n_stuck" -eq 0 ]]; then
+    printf '%s\n' "STUCK PRs: none."
+  else
+    printf '%s\n' "STUCK PRs (${n_stuck}) — oldest first"
+  fi
+}
+# END stuck_heading
 n_stuck="$(jq -r .totals.stuck_prs <<<"$brief")"
-if [[ "$n_stuck" -eq 0 ]]; then
-  echo "STUCK PRs: none."
-else
-  echo "STUCK PRs ($n_stuck) — oldest first"
+stuck_heading "$n_stuck"
+n_known_stuck="$(jq '.stuck_prs | length' <<<"$brief")"
+if [[ "$n_known_stuck" -gt 0 ]]; then
   jq -r '.stuck_prs[] | "  \(.repo) #\(.number)  \(.age_days)d  \(.reason)\n      \(.title[0:78])  \(.url)"' <<<"$brief"
 fi
 echo
 
 n_dec="$(jq -r .totals.decisions <<<"$brief")"
-if [[ "$n_dec" -eq 0 ]]; then
-  if [[ "$(jq 'length' <<<"$DECISION_LABELS_JSON")" -eq 0 ]]; then
-    echo "DECISIONS FOR YOU: not tracked (set brief.decisionLabels in progress.config.json)."
-  else
-    echo "DECISIONS FOR YOU: none open."
+n_labels="$(jq 'length' <<<"$DECISION_LABELS_JSON")"
+n_known_dec="$(jq '.decisions | length' <<<"$brief")"
+# BEGIN decisions_heading
+decisions_heading() {
+  local n_dec="$1" n_labels="$2" n_known="$3"
+  if [[ "$n_dec" != "null" && "$n_dec" -gt 0 ]]; then
+    printf '%s\n' "DECISIONS FOR YOU (${n_dec}) — oldest first; each one is work nobody else can unblock"
+    return
   fi
-else
-  echo "DECISIONS FOR YOU ($n_dec) — oldest first; each one is work nobody else can unblock"
+  if [[ "$n_dec" == "null" ]]; then
+    printf '%s\n' "DECISIONS FOR YOU: DATA INCOMPLETE."
+    return
+  fi
+  if [[ "$n_labels" -eq 0 ]]; then
+    printf '%s\n' "DECISIONS FOR YOU: not tracked (set brief.decisionLabels in progress.config.json)."
+    return
+  fi
+  printf '%s\n' "DECISIONS FOR YOU: none open."
+}
+# END decisions_heading
+decisions_heading "$n_dec" "$n_labels" "$n_known_dec"
+if [[ "$n_known_dec" -gt 0 ]]; then
   jq -r '.decisions[] | "  \(.repo_short) \(if .kind == "pr" then "PR " else "" end)#\(.number)  \(.age_days)d  [\(.labels|join(","))]  \(.title[0:70])\n      \(.url)"' <<<"$brief"
 fi
 echo
 
-jq -r '.repos[] | select(.merged_prs > 0) | "SHIPPED — \(.label):", (.merged_list[] | "  #\(.number)  \(.title[0:80])  (\(.author), \(.lead_hours*10|floor/10)h)")' <<<"$brief"
+# A positive merge count with no measured list is not an empty heading.
+# null (or any non-array) is unmeasured. An empty array prints nothing.
+# BEGIN shipped_lines
+shipped_lines() {
+  jq -r '
+    .repos[]
+    | select(.merged_prs > 0)
+    | if (.merged_list | type) != "array" then
+        "SHIPPED: DATA INCOMPLETE — \(.label)"
+      elif (.merged_list | length) == 0 then
+        empty
+      else
+        "SHIPPED — \(.label):",
+        (.merged_list[] | "  #\(.number)  \(.title[0:80])  (\(.author), \(.lead_hours*10|floor/10)h)")
+      end
+  '
+}
+# END shipped_lines
+shipped_lines <<<"$brief"
 
 [[ "$n_incomplete" -eq 0 ]] && exit 0 || exit 2

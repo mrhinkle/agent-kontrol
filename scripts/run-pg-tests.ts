@@ -8,7 +8,8 @@ import { randomUUID } from "node:crypto";
 import { Client } from "pg";
 import { sql } from "../src/lib/db";
 import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
-import { report, remember, recall, createTask, claimNextTask, listTasks } from "../src/lib/store";
+import { StaleWrite } from "../src/lib/revision";
+import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview, findAgent, deleteMemory } from "../src/lib/store";
 import { getWatchedRepos, replaceWatchedRepos } from "../src/lib/watched-repos";
 import type { RepoConfig } from "../src/lib/progress-config";
 import { getTrace, listTraces, pruneSpans, upsertSpans } from "../src/lib/trace-store";
@@ -28,6 +29,17 @@ import { finishSyncRun, markSkillRemoved, SyncLeaseLost, upsertSettings, upsertS
 import { runScheduleTick, type TickResult } from "../src/lib/skills/schedule";
 import { listLastScheduledTasks, listOpenScheduledTasks } from "../src/lib/skills/schedule-store";
 import type { SkillRecord } from "../src/lib/skills/types";
+import {
+  MEMORY_REST,
+  TASK_REST,
+  TRACE_LIST,
+  decodeCursor,
+  memoryKeyset,
+  parseToolList,
+  splitPage,
+  taskKeyset,
+  traceKeyset,
+} from "../src/lib/list-params";
 
 async function main() {
   if (!process.env.DATABASE_URL) {
@@ -50,6 +62,70 @@ async function main() {
   assert.equal(hits.length, 1, "case-insensitive search plus tag overlap");
   assert.ok(Array.isArray(hits[0].tags), "text[] comes back as an array");
 
+  // A microsecond timestamp stays in the row. The preview token is md5(row),
+  // computed in SQL, so the confirm matches that same value.
+  const memoryKey = `${tag}/k1`;
+  await sql()`update memory set updated_at = timestamptz '2026-10-28 12:00:00.123456+00' where key = ${memoryKey}`;
+  const micros = await sql()`select to_char(updated_at, 'US') as us from memory where key = ${memoryKey}`;
+  assert.equal(String(micros[0].us), "123456");
+  const memoryPreview = await readMemoryForPreview(memoryKey);
+  assert.ok(memoryPreview);
+  assert.match(memoryPreview.revision, /^[0-9a-f]{32}$/);
+  const confirmed = await remember({ content: `confirmed ${tag}`, key: memoryKey, expected_revision: memoryPreview.revision });
+  assert.equal(confirmed.content, `confirmed ${tag}`);
+  await assert.rejects(
+    () => remember({ content: `too late ${tag}`, key: memoryKey, expected_revision: memoryPreview.revision }),
+    (err: unknown) => err instanceof StaleWrite && err.currentRevision !== memoryPreview.revision,
+  );
+
+  const knownAgent = await findAgent(`${tag}-agent`);
+  assert.equal(knownAgent?.id, `${tag}-agent`);
+  assert.equal(await findAgent(`${tag}-missing`), null);
+  assert.equal(await findAgent("***"), null);
+  const deleteKey = `${tag}/delete-me`;
+  await assert.rejects(
+    () => deleteMemory({ key: deleteKey }),
+    (err: unknown) => err instanceof Error && err.message === "Memory not found",
+  );
+  await remember({ content: "one", key: deleteKey, agent_id: `${tag}-agent` });
+  const beforeDelete = await readMemoryForPreview(deleteKey);
+  assert.ok(beforeDelete);
+  await remember({ content: "two", key: deleteKey, agent_id: `${tag}-agent` });
+  await assert.rejects(
+    () => deleteMemory({ key: deleteKey, expected_revision: beforeDelete.revision }),
+    (err: unknown) => err instanceof StaleWrite && err.currentRevision !== beforeDelete.revision,
+  );
+  const kept = await readMemoryForPreview(deleteKey);
+  assert.ok(kept);
+  assert.equal(kept.item.content, "two");
+  const removed = await deleteMemory({ key: deleteKey, expected_revision: kept.revision });
+  assert.equal(removed.content, "two");
+  assert.equal(await readMemoryForPreview(deleteKey), null);
+  const actorTask = await createTask({ title: `${tag} actor requeue`, platform: "any" });
+  const stamped = await updateTask({
+    id: actorTask.id,
+    status: "failed",
+    actor: { actor_type: "agent", actor_id: `${tag}-actor` },
+  });
+  assert.equal(stamped.actor_type, "agent");
+  assert.equal(stamped.actor_id, `${tag}-actor`);
+  const untouched = await updateTask({ id: actorTask.id, result: "still mine" });
+  assert.equal(untouched.actor_id, `${tag}-actor`);
+  assert.equal(untouched.result, "still mine");
+
+  const absentKey = `${tag}/absent`;
+  const raced = await Promise.allSettled([
+    remember({ content: `race-a ${tag}`, key: absentKey, expected_revision: "absent" }),
+    remember({ content: `race-b ${tag}`, key: absentKey, expected_revision: "absent" }),
+  ]);
+  assert.equal(raced.filter((item) => item.status === "fulfilled").length, 1);
+  const lost = raced.find((item) => item.status === "rejected");
+  assert.ok(lost && lost.status === "rejected");
+  assert.equal(lost.reason instanceof StaleWrite, true);
+  const absentCount = await sql()`select count(*)::int as n from memory where key = ${absentKey}`;
+  assert.equal(Number(absentCount[0].n), 1);
+  await sql()`delete from memory where key = ${absentKey}`;
+
   const task = await createTask({ title: `smoke ${tag}`, platform: `pgtest-${tag}`, priority: 2 } as never);
   const claimed = await claimNextTask({ platform: `pgtest-${tag}`, machine: "m1", agent_id: `${tag}-agent` });
   const again = await claimNextTask({ platform: `pgtest-${tag}`, machine: "m1", agent_id: `${tag}-agent` });
@@ -57,6 +133,15 @@ async function main() {
   assert.equal(again, null, "a task is never handed out twice");
   const all = await listTasks({ status: "claimed" });
   assert.ok(all.some((t) => t.id === task.id));
+
+  await sql()`update tasks set updated_at = timestamptz '2026-10-28 12:00:00.123456+00' where id = ${task.id}`;
+  const taskMicros = await sql()`select to_char(updated_at, 'US') as us from tasks where id = ${task.id}`;
+  assert.equal(String(taskMicros[0].us), "123456");
+  const taskPreview = await readTaskForPreview(Number(task.id));
+  assert.ok(taskPreview);
+  assert.match(taskPreview.revision, /^[0-9a-f]{32}$/);
+  const cancelled = await updateTask({ id: Number(task.id), status: "cancelled", expected_revision: taskPreview.revision });
+  assert.equal(cancelled.status, "cancelled");
 
 
   // Watched repos: fallback, ordered replace, removal, restoring order.
@@ -251,6 +336,7 @@ async function main() {
   await testDecisions(tag);
   await testSkillLeaseFence(tag);
   await testSkillSchedule(tag);
+  await testListCursors(tag);
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
 }
@@ -704,7 +790,7 @@ function skillRecord(id: string, body: string): SkillRecord {
     commit_sha: "b".repeat(40),
     body,
     references: [],
-    runtimes: { claude: true, codex: false, grok: false, hermes: false, mini: false },
+    runtimes: { claude: true, codex: false, grok: false, hermes: false, mini: false, nemoclaw: false },
     category: null,
     tags: [],
     frontmatter: {},
@@ -761,6 +847,142 @@ async function holdExpiredLease<T>(holder: Client, runId: string, marker: string
     await holder.query("rollback").catch(() => undefined);
     if (pending) await pending.catch(() => undefined);
     throw err;
+  }
+}
+
+/**
+ * Keyset pages on Postgres. An insert ahead of the cursor must not repeat or
+ * skip a row, and two timestamps that differ only after the millisecond still
+ * page in id order.
+ */
+async function testListCursors(tag: string): Promise<void> {
+  const probe = `${tag}-cursor`;
+  const agent = `${tag}-cursor`;
+  await sql()`delete from tasks where status = 'cursorprobe' and title like ${probe + "%"}`;
+  await sql()`delete from memory where key like ${probe + "%"}`;
+  await sql()`delete from spans where agent_id = ${agent}`;
+  try {
+    const taskId = async (name: string, at: string) => {
+      const rows = await sql()`
+        insert into tasks (title, status, priority, platform, updated_at)
+        values (${`${probe}-${name}`}, 'cursorprobe', 2, 'any', ${at}::timestamptz)
+        returning id::text as id
+      `;
+      return String(rows[0].id);
+    };
+    const a = await taskId("a", "2026-10-28 12:00:00.200000+00");
+    const b = await taskId("b", "2026-10-28 12:00:00.123456+00");
+    const c = await taskId("c", "2026-10-28 12:00:00.123789+00");
+    const d = await taskId("d", "2026-10-28 12:00:00.100000+00");
+    const seen: string[] = [];
+    let cursor: ReturnType<typeof taskKeyset> | null = null;
+    let planted = false;
+    let tie: string | null = null;
+    for (let n = 0; n < 8; n++) {
+      const batch = await listTasks({ status: "cursorprobe", limit: 2, keyset: true, cursor });
+      for (const row of batch) assert.equal("list_sort_at" in row, false);
+      const page = splitPage(batch as never, parseToolList(TASK_REST, { limit: 1 }));
+      assert.equal(page.rows.length > 0, true, "a cursorprobe page must not be empty before the end");
+      seen.push(String(page.rows[0].id));
+      if (tie === null && n === 1) tie = page.next_cursor;
+      if (!page.next_cursor) break;
+      if (!planted) {
+        await taskId("e", "2026-10-28 12:00:00.900000+00");
+        planted = true;
+      } else if (tie && page.next_cursor) {
+        const firstTie = decodeCursor(TASK_REST, tie);
+        const nextTie = decodeCursor(TASK_REST, page.next_cursor);
+        if (String(firstTie.k[2]) === String(nextTie.k[2])) {
+          assert.equal(String(nextTie.k[2]).endsWith(".123Z"), true, "microseconds collapse to the same millisecond");
+        }
+      }
+      cursor = taskKeyset(decodeCursor(TASK_REST, page.next_cursor));
+    }
+    assert.deepEqual(seen, [a, b, c, d], "keyset returns each original task once after a newer insert");
+    const bCursor = decodeCursor(TASK_REST, tie as string);
+    assert.equal(String(bCursor.k[2]), "2026-10-28T12:00:00.123Z");
+
+    const noteId = async (name: string, at: string) => {
+      const rows = await sql()`
+        insert into memory (key, content, tags, updated_at)
+        values (${`${probe}-${name}`}, ${name}, ${[probe]}::text[], ${at}::timestamptz)
+        returning id::text as id
+      `;
+      return String(rows[0].id);
+    };
+    const newer = await noteId("newer", "2026-10-28 13:00:00.500000+00");
+    const low = await noteId("low", "2026-10-28 13:00:00.123111+00");
+    const high = await noteId("high", "2026-10-28 13:00:00.123999+00");
+    const notes: string[] = [];
+    let memoryCursor: ReturnType<typeof memoryKeyset> | null = null;
+    let memoryPlanted = false;
+    let memoryTie: string | null = null;
+    for (let n = 0; n < 8; n++) {
+      const batch = await recall({ tags: [probe], limit: 2, keyset: true, cursor: memoryCursor });
+      for (const row of batch) assert.equal("list_sort_at" in row, false);
+      const page = splitPage(batch as never, parseToolList(MEMORY_REST, { limit: 1 }));
+      if (page.rows.length === 0) break;
+      notes.push(String(page.rows[0].id));
+      if (n === 1) memoryTie = page.next_cursor;
+      if (!page.next_cursor) break;
+      if (!memoryPlanted) {
+        await noteId("front", "2026-10-28 13:00:01.000000+00");
+        memoryPlanted = true;
+      }
+      memoryCursor = memoryKeyset(decodeCursor(MEMORY_REST, page.next_cursor));
+    }
+    assert.deepEqual(notes, [newer, low, high], "keyset returns each original note once");
+    assert.equal(String(decodeCursor(MEMORY_REST, memoryTie as string).k[0]), "2026-10-28T13:00:00.123Z");
+
+    const hex = (ch: string) => ch.repeat(32);
+    const span = (trace: string, at: string): SpanInput => ({
+      trace_id: trace,
+      span_id: "0000000000000001",
+      parent_span_id: null,
+      agent_id: agent,
+      session_id: null,
+      name: "session",
+      kind: "session",
+      status: "ok",
+      status_message: null,
+      started_at: at,
+      ended_at: at,
+      attributes: {},
+      model: null,
+      input_tokens: null,
+      output_tokens: null,
+      cost_usd: null,
+    });
+    const traceC = hex("c");
+    const traceA = hex("a");
+    const traceB = hex("b");
+    await upsertSpans([span(traceC, "2026-10-28T16:00:00.000000Z")]);
+    await upsertSpans([span(traceA, "2026-10-28T15:00:00.123456Z")]);
+    await upsertSpans([span(traceB, "2026-10-28T15:00:00.123999Z")]);
+    const traces: string[] = [];
+    let traceCursor: ReturnType<typeof traceKeyset> | null = null;
+    let tracePlanted = false;
+    let traceTie: string | null = null;
+    for (let n = 0; n < 8; n++) {
+      const batch = await listTraces({ agent, limit: 2, keyset: true, cursor: traceCursor });
+      const page = splitPage(batch as never, parseToolList(TRACE_LIST, { limit: 1 }));
+      if (page.rows.length === 0) break;
+      traces.push(String(page.rows[0].trace_id));
+      assert.equal("list_sort_at" in page.rows[0], false);
+      if (n === 1) traceTie = page.next_cursor;
+      if (!page.next_cursor) break;
+      if (!tracePlanted) {
+        await upsertSpans([span(hex("d"), "2026-10-28T17:00:00.000000Z")]);
+        tracePlanted = true;
+      }
+      traceCursor = traceKeyset(decodeCursor(TRACE_LIST, page.next_cursor));
+    }
+    assert.deepEqual(traces, [traceC, traceA, traceB], "keyset returns each original trace once, trace_id ascending on a tie");
+    assert.equal(String(decodeCursor(TRACE_LIST, traceTie as string).k[0]), "2026-10-28T15:00:00.123Z");
+  } finally {
+    await sql()`delete from tasks where status = 'cursorprobe' and title like ${probe + "%"}`;
+    await sql()`delete from memory where key like ${probe + "%"}`;
+    await sql()`delete from spans where agent_id = ${agent}`;
   }
 }
 

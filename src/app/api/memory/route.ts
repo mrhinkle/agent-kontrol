@@ -2,10 +2,14 @@ import { NextResponse } from "next/server";
 import { enforceApi } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
-import { diffMemoryWrite, readDryRun } from "@/lib/dry-run";
+import { diffMemoryWrite, readDryRun, readExpectedRevision } from "@/lib/dry-run";
 import { previewMemoryWrite } from "@/lib/dry-run-actions";
-import { recall, remember } from "@/lib/store";
+import { remember } from "@/lib/store";
+import { demoFindMemoryByKey, demoRememberGuarded } from "@/lib/demo-store";
+import { absentRevision, memoryRevision } from "@/lib/revision";
 import { demoMemory } from "@/lib/demo-data";
+import { ListParamError, MEMORY_REST, listBody, listParamError, parseSearchList } from "@/lib/list-params";
+import { loadMemoryPage } from "@/lib/list-read";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -14,26 +18,37 @@ export const maxDuration = 30;
 export async function GET(req: Request) {
   const denied = await enforceApi(req);
   if (denied) return denied;
-  if (!isConfigured()) {
+  const url = new URL(req.url);
+  let parsed;
+  try {
+    parsed = parseSearchList(MEMORY_REST, url.searchParams);
+  } catch (e) {
+    if (e instanceof ListParamError) return listParamError(e);
+    throw e;
+  }
+  // No limit, cursor, or fields: the sample is the sample, filters included.
+  if (!isConfigured() && !parsed.active) {
     return NextResponse.json({ demo: true, items: demoMemory() });
   }
-  const url = new URL(req.url);
+  const tag = url.searchParams.get("tag");
   try {
-    const items = await recall({
+    const page = await loadMemoryPage(isConfigured() ? "database" : "demo-sample", {
       query: url.searchParams.get("query") ?? undefined,
-      tags: url.searchParams.get("tag") ? [url.searchParams.get("tag")!] : undefined,
-      limit: Number(url.searchParams.get("limit") ?? 50),
+      tags: tag ? [tag] : undefined,
+      parsed,
     });
-    return NextResponse.json({ demo: false, items });
+    return NextResponse.json(listBody("items", page.rows, page.paging, page.next_cursor, !isConfigured()));
   } catch (e) {
     return publicError("[memory]", e);
   }
 }
 
 /**
- * POST /api/memory { content, key?, tags?, agent_id?, dry_run? }
+ * POST /api/memory { content, key?, tags?, agent_id?, dry_run?, expected_revision? }
  * The REST twin of MCP `remember`. `dry_run: true` returns the insert or
  * overwrite and writes nothing. A non-boolean `dry_run` is 400 and writes nothing.
+ * `expected_revision` is optional. When present it must match the preview token
+ * or the route answers 409 stale_write and writes nothing.
  */
 export async function POST(req: Request) {
   const denied = await enforceApi(req);
@@ -44,6 +59,7 @@ export async function POST(req: Request) {
     tags?: unknown;
     agent_id?: unknown;
     dry_run?: unknown;
+    expected_revision?: unknown;
   } | null;
   try {
     body = await req.json();
@@ -94,17 +110,40 @@ export async function POST(req: Request) {
       fields: { dry_run: "Use true to preview, or false to save." },
     });
   }
+  const revision = readExpectedRevision(body.expected_revision);
+  if (!revision.ok) {
+    return apiError("validation_failed", {
+      message: "expected_revision must be a string of 1 to 200 characters.",
+      fields: { expected_revision: "Send the revision from the preview, or omit it." },
+    });
+  }
   const input = { content: body.content, key, tags, agent_id };
   if (!isConfigured()) {
     if (dry.dryRun) {
-      const preview = diffMemoryWrite(null, input);
+      const existing = key ? await demoFindMemoryByKey(key) : null;
+      const token = existing ? memoryRevision(existing) : absentRevision();
+      const preview = diffMemoryWrite(existing, input, token);
       return NextResponse.json({
         ...preview,
         would_write: false,
         note: "DATABASE_URL not set; note not stored.",
       });
     }
-    return NextResponse.json({ ok: true, demo: true, applied: false, note: "DATABASE_URL not set; note not stored." });
+    if (revision.revision === undefined) {
+      return NextResponse.json({ ok: true, demo: true, applied: false, note: "DATABASE_URL not set; note not stored." });
+    }
+    try {
+      const item = await demoRememberGuarded({
+        content: input.content,
+        key: input.key,
+        tags: input.tags,
+        agent_id: typeof input.agent_id === "string" ? input.agent_id : undefined,
+        expected_revision: revision.revision,
+      });
+      return NextResponse.json({ ok: true, demo: true, applied: true, item });
+    } catch (e) {
+      return publicError("[memory] write failed", e);
+    }
   }
   try {
     if (dry.dryRun) return NextResponse.json(await previewMemoryWrite(input));
@@ -113,6 +152,7 @@ export async function POST(req: Request) {
       key: input.key,
       tags: input.tags,
       agent_id: typeof input.agent_id === "string" ? input.agent_id : undefined,
+      expected_revision: revision.revision,
     });
     return NextResponse.json({ ok: true, applied: true, item });
   } catch (e) {

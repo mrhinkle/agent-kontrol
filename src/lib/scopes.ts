@@ -39,6 +39,7 @@ export const TOOL_SCOPES: Record<string, Scope> = {
   report_status: "status:write",
   get_fleet_status: "fleet:read",
   get_progress_digest: "progress:read",
+  get_morning_brief: "progress:read",
   remember: "memory:write",
   recall: "memory:read",
   check_inbox: "messages:read",
@@ -51,6 +52,9 @@ export const TOOL_SCOPES: Record<string, Scope> = {
   list_skills: "skills:read",
   get_skill: "skills:read",
   run_skill: "skills:write",
+  send_message: "messages:write",
+  requeue_task: "tasks:write",
+  delete_note: "memory:write",
 };
 
 /**
@@ -67,6 +71,7 @@ const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   { method: "POST", path: /^\/api\/messages\/reply$/, scope: "messages:write" },
   { method: "GET", path: /^\/api\/progress$/, scope: "progress:read" },
   { method: "GET", path: /^\/api\/progress\/digest$/, scope: "progress:read" },
+  { method: "GET", path: /^\/api\/brief$/, scope: "progress:read" },
   { method: "GET", path: /^\/api\/tasks$/, scope: "tasks:read" },
   { method: "POST", path: /^\/api\/tasks$/, scope: "tasks:write" },
   { method: "POST", path: /^\/api\/tasks\/claim$/, scope: "tasks:write" },
@@ -75,9 +80,11 @@ const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   // dashboard uses the session. An agent credential can change a decision
   // only when it holds decisions:write.
   { method: "PATCH", path: /^\/api\/decisions\/[^/]+$/, scope: "decisions:write" },
-  // GET only. PATCH, POST /api/skills/sync, and POST /api/skills/drift are
-  // operator routes: an agent must not be able to turn a skill on, sync, or
-  // file a drift report. The lookahead keeps those two paths off skills:read.
+  // GET only. PATCH, POST /api/skills/sync, POST /api/skills/drift, and
+  // GET /api/skill-bundles are operator routes: an agent must not be able to
+  // turn a skill on, sync, file a drift report, or download the skill tree.
+  // The lookahead keeps sync and drift off skills:read. A skill id of
+  // "export" stays on this route: the bundle download is /api/skill-bundles.
   { method: "GET", path: /^\/api\/skills$/, scope: "skills:read" },
   { method: "GET", path: /^\/api\/skills\/(?!sync$|drift$)[^/]+$/, scope: "skills:read" },
   // Read-only: renders the pointer block, and POST only transforms the text sent.

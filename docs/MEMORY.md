@@ -5,7 +5,7 @@ Agent Kontrol has a small shared notes store. This page says exactly what it doe
 ## What it is today
 
 - One Postgres table, `memory`: an optional unique `key`, `content`, a `tags` list, the writing `agent_id`, and timestamps. It lives in the same database as everything else.
-- Two MCP tools. `remember` writes a note; writing the same `key` again overwrites it, which suits living notes such as `project-x/status`. `recall` finds notes by exact key, by tag, or by a case-insensitive substring of the content, newest first, up to 100.
+- Two MCP tools. `remember` writes a note; writing the same `key` again overwrites it, which suits living notes such as `project-x/status`. `recall` finds notes by exact key, by tag, or by a case-insensitive substring of the content, newest first, up to 200. The default when `limit` is omitted stays 20.
 - A **Memory** page in the dashboard that lists the same notes.
 - No configuration. There are no settings and no environment variables for it.
 

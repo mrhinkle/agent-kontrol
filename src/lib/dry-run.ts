@@ -10,8 +10,10 @@ export type DryRunAction =
   | "replace_repos"
   | "cancel_task"
   | "update_task"
+  | "requeue_task"
   | "overwrite_memory"
-  | "insert_memory";
+  | "insert_memory"
+  | "delete_memory";
 
 export interface DryRunChange {
   op: "add" | "remove" | "update" | "reorder" | "overwrite" | "insert";
@@ -27,7 +29,35 @@ export interface DryRunResult {
   action: DryRunAction;
   changes: DryRunChange[];
   affected: Record<string, unknown>[];
+  /**
+   * Send this back as `expected_revision` to confirm. It is `md5` of the row,
+   * or the literal `absent` when a memory key has no row. Omitted on previews
+   * that have no row revision (a refused demo preview).
+   */
+  expected_revision?: string;
   note?: string;
+}
+
+/** Confirm tokens are short. A row hash or `absent` fits; a dump does not. */
+export const EXPECTED_REVISION_MAX = 200;
+
+/**
+ * `undefined` means the caller omitted the guard and the write stays unconditional.
+ * A present value must be a string of 1 to 200 characters with no control characters.
+ */
+export function readExpectedRevision(
+  value: unknown,
+): { ok: true; revision?: string } | { ok: false } {
+  if (value === undefined) return { ok: true };
+  if (typeof value !== "string") return { ok: false };
+  if (value.length < 1 || value.length > EXPECTED_REVISION_MAX) return { ok: false };
+  if (/[\u0000-\u001f\u007f]/.test(value)) return { ok: false };
+  return { ok: true, revision: value };
+}
+
+function withRevision(result: DryRunResult, expectedRevision?: string): DryRunResult {
+  if (!expectedRevision) return result;
+  return { ...result, expected_revision: expectedRevision };
 }
 
 export interface MemoryWriteInput {
@@ -158,7 +188,7 @@ export interface TaskPatch {
 const COMPLETES = new Set<TaskStatus>(["done", "failed", "cancelled"]);
 
 /** Field diff for the update `updateTask` would run. Does not invent a timestamp. */
-export function diffTaskUpdate(task: Task, patch: TaskPatch): DryRunResult {
+export function diffTaskUpdate(task: Task, patch: TaskPatch, expectedRevision?: string): DryRunResult {
   const before: Record<string, unknown> = { updated_at: task.updated_at };
   const after: Record<string, unknown> = { updated_at: "(set when the write runs)" };
   const bits: string[] = [];
@@ -215,18 +245,25 @@ export function diffTaskUpdate(task: Task, patch: TaskPatch): DryRunResult {
     });
   }
 
-  return {
-    dry_run: true,
-    applied: false,
-    would_write: true,
-    action: patch.status === "cancelled" ? "cancel_task" : "update_task",
-    changes,
-    affected: [{ ...task }],
-  };
+  return withRevision(
+    {
+      dry_run: true,
+      applied: false,
+      would_write: true,
+      action: patch.status === "cancelled" ? "cancel_task" : "update_task",
+      changes,
+      affected: [{ ...task }],
+    },
+    expectedRevision,
+  );
 }
 
 /** Insert when the key is new or omitted. Overwrite when a row already uses the key. */
-export function diffMemoryWrite(existing: StoredMemory | null, input: MemoryWriteInput): DryRunResult {
+export function diffMemoryWrite(
+  existing: StoredMemory | null,
+  input: MemoryWriteInput,
+  expectedRevision?: string,
+): DryRunResult {
   const key = input.key ?? null;
   const tags = input.tags ?? [];
   const agentId = input.agent_id ?? null;
@@ -243,14 +280,17 @@ export function diffMemoryWrite(existing: StoredMemory | null, input: MemoryWrit
     const summary = key
       ? `Insert a note at key "${key}". No row uses that key.`
       : "Insert a new note with no key.";
-    return {
-      dry_run: true,
-      applied: false,
-      would_write: true,
-      action: "insert_memory",
-      changes: [{ op: "insert", summary, before: null, after }],
-      affected: [],
-    };
+    return withRevision(
+      {
+        dry_run: true,
+        applied: false,
+        would_write: true,
+        action: "insert_memory",
+        changes: [{ op: "insert", summary, before: null, after }],
+        affected: [],
+      },
+      expectedRevision,
+    );
   }
 
   const before: Record<string, unknown> = {
@@ -272,21 +312,99 @@ export function diffMemoryWrite(existing: StoredMemory | null, input: MemoryWrit
     ? parts.join(", ")
     : "updated_at (content, tags, and agent_id already match)";
 
-  return {
-    dry_run: true,
-    applied: false,
-    would_write: true,
-    action: "overwrite_memory",
-    changes: [
-      {
-        op: "overwrite",
-        summary: `Overwrite memory #${existing.id} key "${existing.key}". Would replace ${fieldText}.`,
-        before,
-        after,
-      },
-    ],
-    affected: [before],
+  return withRevision(
+    {
+      dry_run: true,
+      applied: false,
+      would_write: true,
+      action: "overwrite_memory",
+      changes: [
+        {
+          op: "overwrite",
+          summary: `Overwrite memory #${existing.id} key "${existing.key}". Would replace ${fieldText}.`,
+          before,
+          after,
+        },
+      ],
+      affected: [before],
+    },
+    expectedRevision,
+  );
+}
+
+/**
+ * Preview of requeue_task. Status becomes queued. assigned_agent and
+ * completed_at stay. updated_at is filled in when the write runs.
+ * Actor columns change only when the confirm has an authenticated actor.
+ */
+export function diffTaskRequeue(
+  task: Task,
+  expectedRevision: string,
+  actor?: { actor_type: string; actor_id: string } | null,
+): DryRunResult {
+  const before: Record<string, unknown> = {
+    status: task.status,
+    assigned_agent: task.assigned_agent,
+    updated_at: task.updated_at,
   };
+  const after: Record<string, unknown> = {
+    status: "queued",
+    assigned_agent: task.assigned_agent,
+    updated_at: "(set when the write runs)",
+  };
+  if (actor) {
+    before.actor_type = task.actor_type;
+    before.actor_id = task.actor_id;
+    after.actor_type = actor.actor_type;
+    after.actor_id = actor.actor_id;
+  }
+  return withRevision(
+    {
+      dry_run: true,
+      applied: false,
+      would_write: true,
+      action: "requeue_task",
+      changes: [
+        {
+          op: "update",
+          summary: `Task #${task.id} "${task.title}": status ${task.status} → queued.`,
+          before,
+          after,
+        },
+      ],
+      affected: [{ ...task }],
+    },
+    expectedRevision,
+  );
+}
+
+/** Preview of delete_note. The row is removed. Nothing is written on preview. */
+export function diffMemoryDelete(item: MemoryItem, expectedRevision: string): DryRunResult {
+  const before: Record<string, unknown> = {
+    id: item.id,
+    key: item.key,
+    content: item.content,
+    tags: Array.isArray(item.tags) ? item.tags : [],
+    agent_id: item.agent_id,
+  };
+  return withRevision(
+    {
+      dry_run: true,
+      applied: false,
+      would_write: true,
+      action: "delete_memory",
+      changes: [
+        {
+          op: "remove",
+          summary: `Delete memory #${item.id} key "${item.key ?? ""}".`,
+          before,
+          after: null,
+        },
+      ],
+      affected: [before],
+    },
+    expectedRevision,
+  );
 }
 
 function formatDetail(value: unknown): string {

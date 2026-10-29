@@ -95,6 +95,7 @@ describe("scope table", { concurrency: false }, () => {
       "report_status",
       "get_fleet_status",
       "get_progress_digest",
+      "get_morning_brief",
       "remember",
       "recall",
       "check_inbox",
@@ -107,6 +108,9 @@ describe("scope table", { concurrency: false }, () => {
       "list_skills",
       "get_skill",
       "run_skill",
+      "send_message",
+      "requeue_task",
+      "delete_note",
     ]) {
       assert.ok(names.has(name), `route source is missing ${name}`);
       assert.ok(TOOL_SCOPES[name], `${name} is not in the scope table`);

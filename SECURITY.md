@@ -19,6 +19,14 @@ Credentials:
 - Agent credentials — one revocable `akc_…` token per agent, with scopes enforced on MCP tools and the agent REST routes. The token is shown once. The row stores a SHA-256 hash, not the token.
 - OAuth 2.1 with PKCE for MCP hosts. Consent is gated by the dashboard password. A verified access token keeps full access to mapped tools. Issuance is unchanged.
 
+Where each credential goes:
+
+- The MCP server (`/api/mcp`) runs inside the app. It reads its secrets from the deployment's environment. Callers authenticate to it; it never forwards `MC_TOKEN` or a caller's credential to another host.
+- `MC_TOKEN` leaves a machine in one case: the agent-side collectors and hooks under `agents/` and `scripts/` send it as a bearer token to your own `MC_URL`. Point `MC_URL` at your own deployment over https.
+- Those collectors read `MC_URL` and `MC_TOKEN` from the environment or from `~/.claude/mission-control.env` (`chmod 600`, written by `agents/claude-code/install.sh`). The path keeps the pre-rename name so existing installs work. They read nothing else from `~/.claude`. The usage collector and `scripts/collect-progress.sh` also honor `MC_ENV_FILE` to use another path; the Claude Code hook always reads the fixed path, and the dispatcher and `mc-agent` also check `~/.mission-control/env`.
+- `MC_COOKIE_SECRET`, `MC_DASHBOARD_PASSWORD`, `MC_OAUTH_SECRET` and the OpenRouter management keys are read only by the server, for the dashboard, OAuth and usage features. Agents never need them.
+- `MC_TRACE_CAPTURE_CONTENT` controls whether trace capture stores message content. Leave it unset unless you want that.
+
 ## Controls
 
 - A production build with a database refuses to serve (503) when `MC_DASHBOARD_PASSWORD` is unset.

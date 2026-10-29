@@ -42,10 +42,11 @@ depends on a file on an operator's laptop or on an agent remembering to report:
   own channel.
 - **Liveness is a work event, never a heartbeat.** A heartbeat proves the daemon that posts
   heartbeats is up. The brief calls a coordinator "working" only if a `session_end`,
-  `milestone` or `status` event arrived within `maxSilenceHours`. `turn_start` and `error`
+  `milestone` or `status` event arrived within `maxSilenceHours`. The read is that work event, not the newest 200 other events, so a burst of `turn_start` cannot hide it. `turn_start` and `error`
   do not count: a coordinator that starts turns and errors every hour is not working, it is
   failing, and the brief says *failing* for that case. Telemetry-only is reported as exactly
-  that.
+  that. Configuring `workKinds` as `heartbeat`, `telemetry`, `turn_start`, `status_update`, or `error`
+  does not make those events count. An error-only list falls back to the three work kinds.
 - **The watcher has a watcher.** The brief runs on a scheduler that can itself go silent (the
   coordinator's did). A dead-man's check on a second channel reports when no brief arrived by
   the expected time plus fifteen minutes. Without it the brief inherits the failure it was
@@ -129,10 +130,12 @@ open PR list with check rollups (one GraphQL call), the open issue list with lab
 `updatedAt` (one call), and the merged list with timestamps. It writes `detail` on the snapshot
 and upserts label-sourced `decisions`. Repo discovery runs once per tick per owner.
 
-Until the collector change lands, `scripts/morning-brief.sh` is the whole feature: it reads
-GitHub directly, reads the coordinator from `/api/fleet` when `MC_URL`/`MC_TOKEN` are set, and
-prints the brief. Install it on a scheduler (Hermes cron in `--no-agent` mode, launchd, cron)
-delivering to chat at the hour the owner starts work.
+`scripts/collect-progress.sh` writes those `detail` keys on each tick (stuck PRs, median lead
+time, stale issues, drafts, and merged PRs with timestamps covering 72h). A GitHub failure in
+that extra sweep logs and still posts the tick. `scripts/morning-brief.sh` remains the fallback
+when `GET /api/brief` is down: it reads GitHub directly, reads the coordinator from `/api/fleet`
+when `MC_URL`/`MC_TOKEN` are set, and prints the brief. The scheduler (Hermes cron in
+`--no-agent` mode) should `curl` the route and keep the script for the outage.
 
 ## Delivery
 
@@ -194,6 +197,7 @@ and a resolve path, so those come before any page.
 3. `decisions` table + `GET/POST/PATCH /api/decisions` **with GitHub write-back** + collector
    upsert from labels. Resolve ships with the table, as a CLI if the page is not ready.
 4. `/api/brief` + `get_morning_brief` reading the database; scheduler switches to the route.
+   Shipped 2026-10-27: `GET /api/brief` and MCP `get_morning_brief` read Postgres. The cron should `curl` the route. `scripts/morning-brief.sh` stays the fallback and still sweeps GitHub. The API does not. A 72h lead time uses `detail.merged` from the collector, not a live recompute. A positive 72h merge count with no `detail.merged` prints `SHIPPED: DATA INCOMPLETE` for that repo. A cumulative counter that went backwards is unmeasured (`DATA INCOMPLETE`), not 0. A decisions page that fills the 1000-row read is incomplete. With no database the route does not fill in the progress board's demo numbers.
 5. `/decisions` page; `request_decision` MCP tool.
 6. Owner-based repo discovery (`watched_owners`); Settings becomes the override layer.
 7. Remaining threshold alerts (zero-merge repo, review SLA, 14-day decision), enabled after
