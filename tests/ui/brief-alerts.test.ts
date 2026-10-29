@@ -436,7 +436,7 @@ const sqlFake: SqlTag = async (strings, ...values) => {
       }));
   }
   if (/from\s+brief_alerts\b/i.test(text)) {
-    if (world.fail.has("latches")) throw new Error("latches down");
+    if (world.fail.has("latches") || world.fail.has("latchRead")) throw new Error("latches down");
     const keys = values.find((value) => Array.isArray(value)) as string[] | undefined;
     const rows = [...world.alerts.entries()];
     return rows
@@ -1109,10 +1109,31 @@ describe("threshold alerts", { concurrency: false }, () => {
     assert.equal(evaluated.latches, "unknown");
     assert.equal(evaluated.sent_count, 0);
     assert.equal(world.messages.length, 0);
-    assert.deepEqual(evaluated.failures, [
-      { step: "claim", key: "coordinator-silent:carmack" },
-      { step: "latches" },
-    ]);
+    // Fail closed: the latch read comes first, so no claim is attempted.
+    assert.deepEqual(evaluated.failures, [{ step: "latches" }]);
+  });
+
+  it("evaluate neither sends nor clears when only the latch read fails", async () => {
+    useDb();
+    world.fail.add("latchRead");
+    silence(T, 4 * H);
+    const evaluated = await evaluateAlerts({ now: T, settings: settings({ enabled: true }) });
+    assert.equal(evaluated.latches, "unknown");
+    assert.equal(evaluated.sent_count, 0);
+    assert.equal(world.messages.length, 0);
+    assert.equal(world.alerts.size, 0, "no latch row may be claimed while latch state is unknown");
+    assert.deepEqual(evaluated.failures, [{ step: "latches" }]);
+    assert.equal(evaluated.alerts.every((alert) => alert.sent === null), true);
+  });
+
+  it("no database reports latches unknown, never sent false", async () => {
+    const read = await readAlerts({ now: T, settings: settings({ enabled: true }) });
+    assert.equal(read.latches, "unknown");
+    assert.equal(read.alerts.every((alert) => alert.sent === null), true);
+    const evaluated = await evaluateAlerts({ now: T, settings: settings({ enabled: true }) });
+    assert.equal(evaluated.latches, "unknown");
+    assert.equal(evaluated.alerts.every((alert) => alert.sent === null), true);
+    assert.equal(evaluated.sent_count, 0);
   });
 
   it("evaluate names the latch step that failed", async () => {

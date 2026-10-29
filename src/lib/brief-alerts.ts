@@ -147,7 +147,10 @@ function unmeasured(settings: BriefSettings, now: Date, delivery: AlertDelivery,
     delivery,
     generated_at: toSecondIso(now),
     sent_count: 0,
-    alerts: drafts.map((draft) => item(draft, false, null)),
+    // No latch row was read, so whether an alert was sent is unknown, never false.
+    latches: "unknown",
+    alerts: drafts.map((draft) => item(draft, null, null)),
+    failures: [{ step: "latches" }],
     note,
   };
 }
@@ -705,6 +708,11 @@ export async function evaluateAlerts(input: {
       undefined,
       "brief.alerts.enabled is false. Conditions were computed and nothing was sent.",
     );
+  }
+  // Fail closed: with latch state unreadable, nothing is claimed, sent or cleared.
+  const before = await readLatches(drafts.map((draft) => draft.key));
+  if (before == null) {
+    return pack(settings, now, "live", drafts, null, 0, undefined, "Latch state could not be read, so nothing was sent or cleared.");
   }
   const delivery = await deliver(drafts, settings, now, input.actor ?? null);
   const latches = await readLatches(drafts.map((draft) => draft.key));
