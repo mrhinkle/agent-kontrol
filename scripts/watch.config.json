@@ -1,0 +1,6 @@
+{
+  "sources": [
+    { "source": "mini", "max_age_s": 2700, "enabled": true },
+    { "source": "macbook", "max_age_s": 93600, "enabled": false }
+  ]
+}
