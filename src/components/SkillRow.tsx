@@ -8,16 +8,19 @@ import {
   dimSkillRow,
   formatVersion,
   isCronNonEmpty,
+  planScopeChange,
   readApiError,
   runtimePlatformId,
   showClaudeOnlyFlag,
   skillDetailPath,
   categoryLabel,
   reconcileSkill,
+  viewScope,
+  type ScopeAction,
 } from "./SkillHelpers";
 import { SkillScopeControl } from "./SkillScopeControl";
 import { SkillTriggerControl } from "./SkillTriggerControl";
-import type { SkillPatch, SkillScope, SkillSummary, Trigger } from "./skills-types";
+import type { SkillPatch, SkillSummary, Trigger } from "./skills-types";
 
 export function SkillRow({
   skill,
@@ -40,8 +43,13 @@ export function SkillRow({
   const [focusSchedule, setFocusSchedule] = useState(false);
   const [cronText, setCronText] = useState(skill.schedule ?? "");
   const [cronDirty, setCronDirty] = useState(false);
+  const [localSelected, setLocalSelected] = useState(false);
+  const [lastLaneNotice, setLastLaneNotice] = useState(false);
 
   const unsavedSchedule = visualScheduled && skill.trigger !== "scheduled";
+  // Selected lanes with no lane yet is not a valid saved scope, so it lives here until a lane is picked.
+  const unsavedScope = localSelected && skill.scope.mode === "all";
+  const shownScope = viewScope(skill.scope, localSelected);
   const displayTrigger: Trigger = visualScheduled ? "scheduled" : skill.trigger;
   const flagged = showClaudeOnlyFlag(skill.runtimes, runtime);
   const dimmed = dimSkillRow(skill.runtimes, runtime);
@@ -51,8 +59,12 @@ export function SkillRow({
   }, [skill.schedule, cronDirty]);
 
   useEffect(() => {
-    holdSkill(skill.id, pending || unsavedSchedule);
-  }, [holdSkill, pending, skill.id, unsavedSchedule]);
+    if (skill.scope.mode === "selected") setLocalSelected(false);
+  }, [skill.scope.mode]);
+
+  useEffect(() => {
+    holdSkill(skill.id, pending || unsavedSchedule || unsavedScope);
+  }, [holdSkill, pending, skill.id, unsavedSchedule, unsavedScope]);
 
   useEffect(() => {
     return () => holdSkill(skill.id, false);
@@ -90,6 +102,7 @@ export function SkillRow({
     clearError();
     const previous = skill;
     const touchesTrigger = patch.trigger !== undefined;
+    const touchesScope = patch.scope !== undefined;
     const optimistic = applyOptimisticSkillPatch([skill], skill.id, patch)[0];
     mutateSkill(skill.id, optimistic);
     try {
@@ -105,6 +118,7 @@ export function SkillRow({
           setCronDirty(false);
           setVisualScheduled(false);
         }
+        if (touchesScope) setLocalSelected(false);
         flashError(readApiError(body, `HTTP ${res.status}`));
         return;
       }
@@ -114,12 +128,14 @@ export function SkillRow({
         setCronDirty(false);
         setVisualScheduled(false);
       }
+      if (touchesScope) setLocalSelected(false);
     } catch (e) {
       mutateSkill(skill.id, previous);
       if (touchesTrigger) {
         setCronDirty(false);
         setVisualScheduled(false);
       }
+      if (touchesScope) setLocalSelected(false);
       flashError(e instanceof Error ? e.message : "network error");
     } finally {
       pendingRef.current = false;
@@ -155,10 +171,13 @@ export function SkillRow({
     void persist({ trigger: "scheduled", schedule });
   }
 
-  function onScope(scope: SkillScope) {
+  function onScope(action: ScopeAction) {
     if (pendingRef.current) return;
     clearError();
-    void persist({ scope });
+    const plan = planScopeChange(skill.scope, localSelected, action);
+    setLastLaneNotice(plan.kind === "last_lane");
+    if (plan.kind === "local") setLocalSelected(plan.selected);
+    else if (plan.kind === "patch") void persist({ scope: plan.scope });
   }
 
   return (
@@ -199,7 +218,15 @@ export function SkillRow({
         }}
         onSaveSchedule={onSaveSchedule}
       />
-      <SkillScopeControl skillId={skill.id} scope={skill.scope} lanes={lanes} pending={pending} onChange={onScope} />
+      <SkillScopeControl
+        skillId={skill.id}
+        scope={shownScope}
+        lanes={lanes}
+        pending={pending}
+        unsaved={unsavedScope}
+        lastLaneNotice={lastLaneNotice}
+        onAction={onScope}
+      />
 
       {rowError && (
         <p role="alert" className="mt-2 text-xs text-red-400">

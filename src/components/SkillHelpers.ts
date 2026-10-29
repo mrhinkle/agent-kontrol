@@ -201,6 +201,55 @@ export function isHttpUrl(value: string): boolean {
   }
 }
 
+export type ScopeAction =
+  | { type: "mode"; mode: SkillScope["mode"] }
+  | { type: "toggle"; lane: string }
+  | { type: "add"; lane: string };
+
+/**
+ * What a scope edit does. The API rejects `selected` with no lanes, so choosing Selected
+ * lanes from an all-lanes skill stays local until the first lane is picked, and unchecking
+ * the last lane is refused rather than sent or widened to all lanes.
+ * - `none`: nothing to do.
+ * - `local`: set or clear the unsaved Selected mode; nothing is sent.
+ * - `patch`: send this scope.
+ * - `last_lane`: refused; tell the operator to keep a lane or choose All lanes.
+ */
+export type ScopePlan =
+  | { kind: "none" }
+  | { kind: "local"; selected: boolean }
+  | { kind: "patch"; scope: SkillScope }
+  | { kind: "last_lane" };
+
+/** The scope the control shows: the saved scope, or an empty Selected draft while one is unsaved. */
+export function viewScope(saved: SkillScope, localSelected: boolean): SkillScope {
+  if (localSelected && saved.mode === "all") return { mode: "selected", lanes: [] };
+  return copyScope(saved);
+}
+
+export function planScopeChange(saved: SkillScope, localSelected: boolean, action: ScopeAction): ScopePlan {
+  const view = viewScope(saved, localSelected);
+  if (action.type === "mode") {
+    if (action.mode === view.mode) return { kind: "none" };
+    if (action.mode === "all") {
+      if (saved.mode === "all") return { kind: "local", selected: false };
+      return { kind: "patch", scope: { mode: "all", lanes: [] } };
+    }
+    if (view.lanes.length > 0) return { kind: "patch", scope: { mode: "selected", lanes: [...view.lanes] } };
+    return { kind: "local", selected: true };
+  }
+  const lane = action.lane.trim();
+  if (!lane) return { kind: "none" };
+  if (action.type === "add") {
+    if (view.lanes.includes(lane)) return { kind: "none" };
+    return { kind: "patch", scope: { mode: "selected", lanes: [...view.lanes, lane] } };
+  }
+  const has = view.lanes.includes(lane);
+  const next = has ? view.lanes.filter((item) => item !== lane) : [...view.lanes, lane];
+  if (next.length === 0) return { kind: "last_lane" };
+  return { kind: "patch", scope: { mode: "selected", lanes: next } };
+}
+
 function copyScope(scope: SkillScope): SkillScope {
   return { mode: scope.mode, lanes: [...scope.lanes] };
 }

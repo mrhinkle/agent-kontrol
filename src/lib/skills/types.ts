@@ -249,6 +249,8 @@ export interface SkillListItem {
   tags: string[];
   trigger: Trigger;
   scope: SkillScope;
+  /** The saved cron, as stored. Null when no schedule is saved. Same value the detail object carries. */
+  schedule: string | null;
   triggerCount7d: number;
   lastRun: { at: string; agent: string } | null;
   /** The newest slot the scheduler queued a task for. Null when the scheduler has not queued one. */

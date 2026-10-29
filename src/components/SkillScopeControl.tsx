@@ -1,45 +1,41 @@
 "use client";
 
 import { useState } from "react";
-import type { ScopeMode, SkillScope } from "./skills-types";
+import type { ScopeAction } from "./SkillHelpers";
+import type { SkillScope } from "./skills-types";
 
 const field =
   "min-w-0 flex-1 rounded-lg border border-white/10 bg-[#0a0f1c] px-3 py-2 text-sm text-gray-200 outline-none focus-visible:ring-2 focus-visible:ring-[#19d2ff]/70 disabled:opacity-40 sm:max-w-xs";
 
+/**
+ * `scope` is what to show, which may be an unsaved empty Selected draft. Every edit goes to
+ * `onAction`; the row decides whether it is sent, kept local, or refused.
+ */
 export function SkillScopeControl({
   skillId,
   scope,
   lanes,
   pending,
-  onChange,
+  unsaved,
+  lastLaneNotice,
+  onAction,
 }: {
   skillId: string;
   scope: SkillScope;
   lanes: readonly string[];
   pending: boolean;
-  onChange: (scope: SkillScope) => void;
+  unsaved: boolean;
+  lastLaneNotice: boolean;
+  onAction: (action: ScopeAction) => void;
 }) {
   const [draft, setDraft] = useState("");
   const groupName = `scope-${skillId}`;
   const options = uniqueLanes(lanes, scope.lanes);
 
-  function setMode(mode: ScopeMode) {
-    onChange({ mode, lanes: [...scope.lanes] });
-  }
-
-  function toggleLane(lane: string) {
-    const has = scope.lanes.includes(lane);
-    const next = has ? scope.lanes.filter((item) => item !== lane) : [...scope.lanes, lane];
-    onChange({ mode: "selected", lanes: next });
-  }
-
   function addLane() {
     const lane = draft.trim();
-    if (!lane || scope.lanes.includes(lane)) {
-      if (lane && scope.lanes.includes(lane)) setDraft("");
-      return;
-    }
-    onChange({ mode: "selected", lanes: [...scope.lanes, lane] });
+    if (!lane) return;
+    if (!scope.lanes.includes(lane)) onAction({ type: "add", lane });
     setDraft("");
   }
 
@@ -63,7 +59,7 @@ export function SkillScopeControl({
                 name={groupName}
                 value={value}
                 checked={scope.mode === value}
-                onChange={() => setMode(value)}
+                onChange={() => onAction({ type: "mode", mode: value })}
                 className="h-4 w-4 accent-[#2563eb] focus-visible:ring-2 focus-visible:ring-[#19d2ff]/70"
               />
               {label}
@@ -82,7 +78,7 @@ export function SkillScopeControl({
                 <input
                   type="checkbox"
                   checked={scope.lanes.includes(lane)}
-                  onChange={() => toggleLane(lane)}
+                  onChange={() => onAction({ type: "toggle", lane })}
                   className="h-4 w-4 accent-[#2563eb] focus-visible:ring-2 focus-visible:ring-[#19d2ff]/70"
                 />
                 <span className="mono">{lane}</span>
@@ -114,6 +110,14 @@ export function SkillScopeControl({
               Add
             </button>
           </div>
+          {unsaved && (
+            <p className="mt-2 text-xs text-gray-400">Not saved yet. Pick or add a lane to limit this skill to it.</p>
+          )}
+          {lastLaneNotice && (
+            <p role="status" className="mt-2 text-xs text-[#ffb020]">
+              Selected lanes needs at least one lane. Keep this lane, or choose All lanes to run this skill everywhere.
+            </p>
+          )}
         </div>
       )}
     </fieldset>

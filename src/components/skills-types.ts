@@ -27,7 +27,8 @@ export interface SkillSummary {
   scope: SkillScope;
   triggerCount7d: number;
   lastRun: SkillLastRun | null;
-  schedule?: string | null;
+  /** Saved cron from operator settings; null when none is saved. */
+  schedule: string | null;
 }
 
 export interface SkillUpstream {

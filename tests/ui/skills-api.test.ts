@@ -425,6 +425,68 @@ describe("skills routes", { concurrency: false }, () => {
       assert.equal(skillsMemory.settings[0]?.schedule, null);
     });
 
+    it("lists the saved schedule and scope the same way detail does", async () => {
+      const { PATCH, GET: GET_ID } = await import("../../src/app/api/skills/[id]/route");
+      const { GET } = await import("../../src/app/api/skills/route");
+      skillsMemory.skills.push(skill({ id: "nightly" }), skill({ id: "plain" }));
+      const auth = { authorization: "Bearer test-mc-token" };
+      const list = async () => {
+        const res = await GET(new Request("http://localhost/api/skills", { headers: auth }));
+        assert.equal(res.status, 200);
+        const body = await res.json() as { skills: { id: string; schedule: string | null; scope: unknown; trigger: string }[] };
+        return new Map(body.skills.map((row) => [row.id, row]));
+      };
+
+      const before = await list();
+      assert.equal(before.get("nightly")?.schedule, null);
+      assert.equal(before.get("plain")?.schedule, null);
+
+      const saved = await PATCH(new Request("http://localhost/api/skills/nightly", {
+        method: "PATCH",
+        headers: { ...auth, "content-type": "application/json" },
+        body: JSON.stringify({ trigger: "scheduled", schedule: "15 6 * * 1-5", scope: { mode: "selected", lanes: ["conference-os"] } }),
+      }), { params: Promise.resolve({ id: "nightly" }) });
+      assert.equal(saved.status, 200);
+
+      // A reload and a poll both read the list; each must carry the stored cron.
+      for (let poll = 0; poll < 2; poll++) {
+        const rows = await list();
+        assert.equal(rows.get("nightly")?.schedule, "15 6 * * 1-5");
+        assert.equal(rows.get("nightly")?.trigger, "scheduled");
+        assert.deepEqual(rows.get("nightly")?.scope, { mode: "selected", lanes: ["conference-os"] });
+        assert.equal(rows.get("plain")?.schedule, null);
+      }
+
+      const detailRes = await GET_ID(new Request("http://localhost/api/skills/nightly", { headers: auth }), {
+        params: Promise.resolve({ id: "nightly" }),
+      });
+      const detail = await detailRes.json() as { schedule: string | null; scope: unknown };
+      const listed = (await list()).get("nightly");
+      assert.equal(detail.schedule, listed?.schedule);
+      assert.deepEqual(detail.scope, listed?.scope);
+
+      // Leaving scheduled clears the stored cron; the list follows.
+      const off = await PATCH(new Request("http://localhost/api/skills/nightly", {
+        method: "PATCH",
+        headers: { ...auth, "content-type": "application/json" },
+        body: JSON.stringify({ trigger: "on_request" }),
+      }), { params: Promise.resolve({ id: "nightly" }) });
+      assert.equal(off.status, 200);
+      assert.equal((await list()).get("nightly")?.schedule, null);
+    });
+
+    it("rejects a selected scope with no lanes and keeps the stored scope", async () => {
+      const { PATCH } = await import("../../src/app/api/skills/[id]/route");
+      skillsMemory.skills.push(skill({ id: "scoped" }));
+      const res = await PATCH(new Request("http://localhost/api/skills/scoped", {
+        method: "PATCH",
+        headers: { authorization: "Bearer test-mc-token", "content-type": "application/json" },
+        body: JSON.stringify({ scope: { mode: "selected", lanes: [] } }),
+      }), { params: Promise.resolve({ id: "scoped" }) });
+      assert.equal(res.status, 400);
+      assert.equal(skillsMemory.settings.length, 0);
+    });
+
     it("stores a drift report and counts a repeated name once on the list", async () => {
       const { POST } = await import("../../src/app/api/skills/drift/route");
       const { GET } = await import("../../src/app/api/skills/route");

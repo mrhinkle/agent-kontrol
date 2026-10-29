@@ -34,6 +34,7 @@ export const skillsListFixture: SkillsListResponse = {
       scope: { mode: "selected", lanes: ["conference-os", "chatterbuilt"] },
       triggerCount7d: 0,
       lastRun: null,
+  schedule: null,
     },
     {
       id: "mark-hinkle-voice",
@@ -46,6 +47,7 @@ export const skillsListFixture: SkillsListResponse = {
       scope: { mode: "all", lanes: [] },
       triggerCount7d: 1,
       lastRun: { at: "2026-10-26T15:00:00.000Z", agent: "claude-lane-1" },
+  schedule: null,
     },
     {
       id: "morning-brief",
@@ -71,6 +73,7 @@ export const skillsListFixture: SkillsListResponse = {
       scope: { mode: "selected", lanes: ["agent-kontrol"] },
       triggerCount7d: 2,
       lastRun: { at: "2026-10-25T18:40:00.000Z", agent: "grok-lane-2" },
+  schedule: null,
     },
   ],
 };

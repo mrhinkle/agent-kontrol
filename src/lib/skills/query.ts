@@ -115,7 +115,6 @@ export async function getSkillDetail(id: string): Promise<SkillDetail | null> {
     body: row.body,
     references: row.references.map((ref) => ({ path: ref.path })),
     runtimes: row.runtimes,
-    schedule: setting?.schedule ?? null,
     triggers: triggers.map((run) => presentRun(run, now)),
   };
 }
@@ -165,6 +164,7 @@ function toListItem(
     tags: row.tags,
     trigger: setting?.trigger ?? DEFAULT_TRIGGER,
     scope: setting?.scope ?? DEFAULT_SCOPE,
+    schedule: setting?.schedule ?? null,
     triggerCount7d: stat?.triggers_7d ?? 0,
     lastRun: stat?.last_at && stat.last_agent ? { at: stat.last_at, agent: stat.last_agent } : null,
     ...scheduleView(setting, lastScheduled),
