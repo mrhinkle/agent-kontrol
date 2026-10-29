@@ -1014,6 +1014,7 @@ async function testBriefAlerts(tag: string): Promise<void> {
   assert.equal(nullable.get("first_sent_at"), "NO");
   assert.equal(nullable.get("last_sent_at"), "NO");
   assert.equal(nullable.get("cleared_at"), "YES");
+  assert.equal(nullable.get("claim_token"), "YES");
 
   await cleanup();
   try {

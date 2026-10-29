@@ -40,6 +40,7 @@ interface Latch {
   first: string;
   last: string;
   cleared: string | null;
+  claim_token?: string | null;
 }
 
 interface SentMessage {
@@ -74,6 +75,9 @@ interface World {
   claimWaiters: Array<() => void>;
   maxClaimWaiters: number;
   claimTexts: string[];
+  restoreTexts: string[];
+  /** Runs after a claim and before the message insert, so a second evaluate can clear. */
+  beforeMessageInsert: (() => void) | null;
 }
 
 let world: World;
@@ -96,6 +100,8 @@ function freshWorld(): World {
     claimWaiters: [],
     maxClaimWaiters: 0,
     claimTexts: [],
+    restoreTexts: [],
+    beforeMessageInsert: null,
   };
 }
 
@@ -184,6 +190,20 @@ function exclusive<T>(fn: () => T): Promise<T> {
   return run;
 }
 
+function uuidOf(values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function notDistinct(left: string | null | undefined, right: unknown): boolean {
+  if (left == null && right == null) return true;
+  return left === right;
+}
+
 function latchRow(key: string, latch: Latch): Row {
   return {
     key,
@@ -198,19 +218,26 @@ function applyClaim(text: string, values: unknown[]): Row[] {
   const now = isoValues(values)[0];
   if (!key || !now) throw new Error(`claim missing key or clock: ${text.slice(0, 120)}`);
   const hours = values.find((value) => typeof value === "number");
+  const token = uuidOf(values);
   const existing = world.alerts.get(key) ?? null;
   const prior = existing ? { ...existing } : null;
+  const claimedRow = (first: string): Latch => ({
+    first,
+    last: now,
+    cleared: null,
+    claim_token: token ?? existing?.claim_token ?? null,
+  });
   const marker = text.match(/brief-alert-claim:(repeat|episode|once)/);
   const atomic = Boolean(marker)
     && /on conflict\s*\(\s*key\s*\)/i.test(text)
     && /returning/i.test(text);
   let won = false;
   if (!existing || !atomic) {
-    world.alerts.set(key, { first: existing?.first ?? now, last: now, cleared: null });
+    world.alerts.set(key, claimedRow(existing?.first ?? now));
     won = true;
   } else if (marker![1] === "once") {
     won = !/do nothing/i.test(text);
-    if (won) world.alerts.set(key, { first: existing.first, last: now, cleared: null });
+    if (won) world.alerts.set(key, claimedRow(existing.first));
   } else {
     const whereCleared = /cleared_at\s+is\s+not\s+null/i.test(text);
     const whereRepeat = /last_sent_at\s*<=/i.test(text)
@@ -219,7 +246,7 @@ function applyClaim(text: string, values: unknown[]): Row[] {
     const due = whereRepeat && Date.parse(existing.last) <= Date.parse(now) - (hours as number) * H;
     const rearm = whereCleared && existing.cleared != null;
     if (rearm || due || (!whereCleared && !whereRepeat)) {
-      world.alerts.set(key, { first: existing.first, last: now, cleared: null });
+      world.alerts.set(key, claimedRow(existing.first));
       won = true;
     }
   }
@@ -272,7 +299,15 @@ function snapshotsFor(values: unknown[]): Row[] {
 const sqlFake: SqlTag = async (strings, ...values) => {
   await Promise.resolve();
   const text = textOf(strings);
+  if (/\bbrief_alerts\b/i.test(text) && world.fail.has("latches")) {
+    throw new Error("brief_alerts missing");
+  }
+  if (/insert\s+into\s+brief_alerts/i.test(text) && world.fail.has("claim")) {
+    throw new Error("claim failed");
+  }
   if (/insert\s+into\s+messages/i.test(text)) {
+    world.beforeMessageInsert?.();
+    world.beforeMessageInsert = null;
     if (world.failMessageInserts > 0) {
       world.failMessageInserts -= 1;
       throw new Error("message insert failed");
@@ -305,28 +340,48 @@ const sqlFake: SqlTag = async (strings, ...values) => {
   }
   if (/insert\s+into\s+brief_alerts/i.test(text)) return claim(text, values);
   if (/delete\s+from\s+brief_alerts/i.test(text)) {
+    world.restoreTexts.push(text);
     const key = alertKey(values);
-    const now = isoValues(values)[0];
-    if (!key || !now) return [];
+    if (!key) return [];
     const row = world.alerts.get(key);
-    if (row && row.last === now) world.alerts.delete(key);
+    if (!row) return [];
+    const guarded = /claim_token\s*=/i.test(text) && /cleared_at\s+is\s+not\s+distinct\s+from/i.test(text);
+    if (guarded) {
+      const token = uuidOf(values);
+      if (!token || row.claim_token !== token) return [];
+      if (!notDistinct(row.cleared, values[values.length - 1])) return [];
+    } else if (/last_sent_at\s*=/i.test(text)) {
+      const now = isoValues(values)[0];
+      if (!now || row.last !== now) return [];
+    }
+    world.alerts.delete(key);
     return [];
   }
   if (/update\s+brief_alerts/i.test(text) && /first_sent_at/i.test(text)) {
+    world.restoreTexts.push(text);
     const key = alertKey(values);
-    const isos = isoValues(values);
-    const now = isos[isos.length - 1];
-    if (!key || !now) return [];
+    if (!key) return [];
     const row = world.alerts.get(key);
-    if (!row || row.last !== now) return [];
+    if (!row) return [];
+    const guarded = /claim_token\s*=/i.test(text) && /cleared_at\s+is\s+not\s+distinct\s+from/i.test(text);
+    if (guarded) {
+      const token = uuidOf(values);
+      if (!token || row.claim_token !== token) return [];
+      if (!notDistinct(row.cleared, values[values.length - 1])) return [];
+    } else {
+      const now = isoValues(values).at(-1);
+      if (!now || row.last !== now) return [];
+    }
     world.alerts.set(key, {
       first: typeof values[0] === "string" ? values[0] : row.first,
       last: typeof values[1] === "string" ? values[1] : row.last,
       cleared: values[2] == null ? null : String(values[2]),
+      claim_token: row.claim_token,
     });
     return [];
   }
   if (/update\s+brief_alerts/i.test(text)) {
+    if (world.fail.has("clear")) throw new Error("clear failed");
     const key = alertKey(values);
     const now = isoValues(values)[0];
     if (!key || !now) return [];
@@ -691,6 +746,7 @@ describe("threshold alerts", { concurrency: false }, () => {
 
     world.watched = world.watched.filter((row) => row.repo === repos.exact);
     const later = new Date(T.getTime() + 12 * H);
+    snap(repos.exact, at(later, 0), []);
     const repeat = await evaluateAlerts({ now: later, settings: on });
     assert.equal(hit(repeat, `zero-merge:${repos.exact}`).condition, "firing");
     assert.equal(repeat.sent_count, 0);
@@ -926,7 +982,13 @@ describe("threshold alerts", { concurrency: false }, () => {
       assert.equal(schema.includes(name), true);
     }
     assert.match(schema, /alter table brief_alerts add column if not exists cleared_at timestamptz/i);
-    const spec = openApiDocument() as { paths: Record<string, { get?: unknown; post?: unknown }> };
+    assert.match(migration, /add column if not exists claim_token text/i);
+    assert.match(schema, /add column if not exists claim_token text/i);
+    const spec = openApiDocument() as {
+      paths: Record<string, { get?: unknown; post?: unknown }>;
+      components: { schemas: { BriefAlert: { required?: string[] } } };
+    };
+    assert.equal(spec.components.schemas.BriefAlert.required?.includes("last_sent_at"), true);
     assert.ok(spec.paths["/api/brief/alerts"].get);
     assert.ok(spec.paths["/api/brief/alerts/evaluate"].post);
     assert.equal(spec.paths["/api/brief/alerts"].post, undefined);
@@ -936,5 +998,151 @@ describe("threshold alerts", { concurrency: false }, () => {
     const api = fs.readFileSync("docs/API.md", "utf8");
     assert.match(api, /\/api\/brief\/alerts/);
     assert.match(api, /POST \| `\/api\/brief\/alerts\/evaluate`/);
+  });
+
+  it("stale zero-merge coverage is unknown until the quiet window is measured", async () => {
+    const alerts = settings().alerts;
+    const nowMs = T.getTime();
+    const hourStale = [{ repo: "r", collectedAt: nowMs - H, merged: [{ merged_at: at(T, -80 * H) }] }];
+    assert.equal(classifyZeroMerge(hourStale, nowMs, alerts), "unknown");
+    const pastCadence = [{ repo: "r", collectedAt: nowMs - 16 * M, merged: [{ merged_at: at(T, -80 * H) }] }];
+    assert.equal(classifyZeroMerge(pastCadence, nowMs, alerts), "unknown");
+    const withinCadence = [{ repo: "r", collectedAt: nowMs - 14 * M, merged: [{ merged_at: at(T, -80 * H) }] }];
+    assert.equal(classifyZeroMerge(withinCadence, nowMs, alerts), "firing");
+    const observed = [{ repo: "r", collectedAt: nowMs - H, merged: [{ merged_at: at(T, -H) }] }];
+    assert.equal(classifyZeroMerge(observed, nowMs, alerts), "clear");
+
+    useDb();
+    const on = settings({ enabled: true, agentId: null });
+    watch("example-org/stale");
+    snap("example-org/stale", at(T, -H), [{ merged_at: at(T, -80 * H) }]);
+    const report = await evaluateAlerts({ now: T, settings: on });
+    assert.equal(hit(report, "zero-merge:example-org/stale").condition, "unknown");
+    assert.equal(report.sent_count, 0);
+    assert.equal(messagesFor("zero-merge:example-org/stale").length, 0);
+    assert.equal(world.alerts.has("zero-merge:example-org/stale"), false);
+  });
+
+  it("a failed send does not restore over a concurrent clear", async () => {
+    useDb();
+    const on = settings({ enabled: true });
+    const key = "coordinator-silent:carmack";
+    silence(T, 4 * H);
+    watch("example-org/quiet");
+    snap("example-org/quiet", at(T, 0), [{ merged_at: at(T, -H) }]);
+
+    const first = await evaluateAlerts({ now: T, settings: on });
+    assert.equal(hit(first, key).condition, "firing");
+    assert.equal(hit(first, key).sent, true);
+    assert.equal(messagesFor(key).length, 1);
+    assert.equal(world.alerts.get(key)?.cleared ?? null, null);
+
+    const later = new Date(T.getTime() + 12 * H);
+    silence(later, 4 * H);
+    world.beforeMessageInsert = () => {
+      const row = world.alerts.get(key);
+      assert.ok(row, "the repeat claim lands before the message insert");
+      row.cleared = row.last;
+    };
+    world.failMessageInserts = 1;
+    const raced = await evaluateAlerts({ now: later, settings: on });
+    assert.equal(raced.sent_count, 0);
+    assert.equal(messagesFor(key).length, 1);
+    const row = world.alerts.get(key);
+    assert.ok(row, "the cleared latch still exists");
+    const laterIso = later.toISOString().replace(/\.\d{3}Z$/, "Z");
+    assert.equal(row.cleared, laterIso);
+    assert.equal(row.last, laterIso);
+    assert.equal(hit(raced, key).sent, false);
+    const restore = world.restoreTexts.join("\n");
+    assert.match(restore, /claim_token\s*=/);
+    assert.match(restore, /cleared_at\s+is\s+not\s+distinct\s+from/i);
+    assert.match(world.claimTexts.join("\n"), /claim_token/);
+    assert.equal(raced.failures?.some((failure) => failure.step === "message" && failure.key === key), true);
+  });
+
+  it("a failed first send does not delete a concurrently cleared latch", async () => {
+    useDb();
+    const on = settings({ enabled: true, agentId: null });
+    const repo = "example-org/race";
+    const key = `zero-merge:${repo}`;
+    watch(repo);
+    snap(repo, at(T, 0), [{ merged_at: at(T, -80 * H) }]);
+    world.beforeMessageInsert = () => {
+      const row = world.alerts.get(key);
+      assert.ok(row, "the claim lands before the message insert");
+      row.cleared = row.last;
+    };
+    world.failMessageInserts = 1;
+    const raced = await evaluateAlerts({ now: T, settings: on });
+    assert.equal(raced.sent_count, 0);
+    assert.equal(messagesFor(key).length, 0);
+    const row = world.alerts.get(key);
+    assert.ok(row, "a concurrent clear keeps the row");
+    assert.equal(row.cleared, T.toISOString().replace(/\.\d{3}Z$/, "Z"));
+    assert.match(world.restoreTexts.join("\n"), /claim_token\s*=/);
+    assert.match(world.restoreTexts.join("\n"), /cleared_at\s+is\s+not\s+distinct\s+from/i);
+  });
+
+  it("a missing brief_alerts table makes GET report latches unknown", async () => {
+    useDb();
+    world.fail.add("latches");
+    silence(T, 4 * H);
+    const read = await readAlerts({ now: T, settings: settings({ enabled: true }) });
+    assert.equal(read.latches, "unknown");
+    assert.equal(read.delivery, "read");
+    assert.equal(read.alerts.length > 0, true);
+    for (const alert of read.alerts) {
+      assert.equal(alert.sent, null);
+      assert.equal("last_sent_at" in alert, true);
+    }
+    assert.deepEqual(read.failures, [{ step: "latches" }]);
+
+    const got = await GET(new Request("http://localhost/api/brief/alerts"));
+    assert.equal(got.status, 200);
+    const body = await got.json() as AlertEvaluation;
+    assert.equal(body.latches, "unknown");
+    assert.equal(body.alerts.every((alert) => alert.sent === null), true);
+    assert.equal(body.alerts.some((alert) => alert.sent === false), false);
+
+    const evaluated = await evaluateAlerts({ now: T, settings: settings({ enabled: true }) });
+    assert.equal(evaluated.latches, "unknown");
+    assert.equal(evaluated.sent_count, 0);
+    assert.equal(world.messages.length, 0);
+    assert.deepEqual(evaluated.failures, [
+      { step: "claim", key: "coordinator-silent:carmack" },
+      { step: "latches" },
+    ]);
+  });
+
+  it("evaluate names the latch step that failed", async () => {
+    useDb();
+    const on = settings({ enabled: true });
+    const key = "coordinator-silent:carmack";
+
+    world.agents = [{ id: "carmack", last_seen_at: at(T, -M) }];
+    world.events = [{ agent_id: "carmack", kind: "milestone", created_at: at(T, -M) }];
+    world.fail.add("clear");
+    const cleared = await evaluateAlerts({ now: T, settings: on });
+    assert.equal(hit(cleared, key).condition, "clear");
+    assert.deepEqual(cleared.failures, [{ step: "clear", key }]);
+    assert.equal(cleared.sent_count, 0);
+
+    world.fail.delete("clear");
+    world.fail.add("claim");
+    silence(T, 4 * H);
+    const claimed = await evaluateAlerts({ now: T, settings: on });
+    assert.equal(hit(claimed, key).condition, "firing");
+    assert.equal(claimed.sent_count, 0);
+    assert.equal(messagesFor(key).length, 0);
+    assert.deepEqual(claimed.failures, [{ step: "claim", key }]);
+
+    world.fail.delete("claim");
+    world.failMessageInserts = 1;
+    const unsent = await evaluateAlerts({ now: T, settings: on });
+    assert.equal(unsent.sent_count, 0);
+    assert.equal(messagesFor(key).length, 0);
+    assert.deepEqual(unsent.failures, [{ step: "message", key }]);
+    assert.equal(world.alerts.has(key), false);
   });
 });

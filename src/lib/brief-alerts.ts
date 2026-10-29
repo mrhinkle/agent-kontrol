@@ -11,9 +11,13 @@
  * Unknown (a failed or incomplete read) never sends and never clears.
  *
  * The claim is one INSERT ... ON CONFLICT statement. Two ticks can both try;
- * only the statement that returns a row inserts an operator message.
+ * only the statement that returns a row inserts an operator message. The
+ * statement stores a random claim_token. A failed message insert puts the
+ * previous row back only while that token still matches and cleared_at is
+ * still the null the claim wrote, so a concurrent clear stays cleared.
  */
 
+import { randomUUID } from "node:crypto";
 import type { Actor } from "./actor";
 import { coordinatorFromDb, toSecondIso } from "./brief";
 import { isConfigured, sql } from "./db";
@@ -35,10 +39,20 @@ export interface AlertItem {
   key: string;
   kind: AlertKind;
   condition: AlertCondition;
-  /** True when a latch row exists and has not been cleared. */
-  sent: boolean;
+  /**
+   * True when a latch row exists and has not been cleared.
+   * False when the latch table was read and this key is not latched.
+   * Null when the latch table could not be read.
+   */
+  sent: boolean | null;
   last_sent_at: string | null;
   summary: string;
+}
+
+/** One latch read, claim, clear, message, or restore that threw. */
+export interface AlertFailure {
+  step: "latches" | "claim" | "clear" | "message" | "restore";
+  key?: string;
 }
 
 export interface AlertEvaluation {
@@ -48,6 +62,10 @@ export interface AlertEvaluation {
   /** Messages inserted by this call. A read, and a disabled evaluate, are 0. */
   sent_count: number;
   alerts: AlertItem[];
+  /** "unknown" when brief_alerts could not be read. "ok" after a successful read. */
+  latches?: "ok" | "unknown";
+  /** Present when a latch step threw. Omitted when every attempted step succeeded. */
+  failures?: AlertFailure[];
   note?: string;
 }
 
@@ -81,6 +99,14 @@ function hourMs(hours: number): number {
   return hours * 3_600_000;
 }
 
+/**
+ * Default progress-collector period (`MC_PROGRESS_INTERVAL`, 900s).
+ * A snapshot this fresh still covers through `now`. The collector does not
+ * run at the evaluate instant, so the quiet window is unmeasured only when
+ * the newest snapshot is older than one cadence.
+ */
+const COLLECTOR_CADENCE_MS = 15 * 60 * 1000;
+
 function stamp(value: unknown): number {
   if (value instanceof Date) return value.getTime();
   if (typeof value !== "string" || value.length === 0) return Number.NaN;
@@ -95,7 +121,7 @@ function asIso(value: unknown): string | null {
   return Number.isNaN(ms) ? null : new Date(ms).toISOString();
 }
 
-function item(draft: Draft, sent: boolean, lastSent: string | null): AlertItem {
+function item(draft: Draft, sent: boolean | null, lastSent: string | null): AlertItem {
   return {
     key: draft.key,
     kind: draft.kind,
@@ -194,6 +220,11 @@ function mergePoints(merged: unknown[]): number[] {
  * Lookback is closed at the far end: a merge at exactly N days ago still counts.
  * Coverage is the union of each measured snapshot's quiet-width window. A hole
  * in that union is unknown unless a timestamp already proves the condition.
+ * `firing` also requires that union to cover `[now - zeroMergeHours, now]`.
+ * The newest snapshot may lag `now` by one collector cadence; an older gap
+ * leaves the tail unmeasured. A merge timestamp inside the quiet window is
+ * `clear` without that coverage check, because the timestamp proves the repo
+ * is not quiet.
  */
 export function classifyZeroMerge(
   snapshots: MergeSnap[],
@@ -213,10 +244,22 @@ export function classifyZeroMerge(
   const points = measured.flatMap((snap) => mergePoints(snap.merged ?? []));
   const recent = points.some((at) => at > quietStart && at <= nowMs);
   if (recent) return "clear";
+  const intervals = coverageIntervals(measured, nowMs, quietMs);
   const inLookback = points.some((at) => at >= lookbackStart && at <= quietStart);
-  if (inLookback) return "firing";
-  const intervals = measured.map((snap) => [snap.collectedAt - quietMs, snap.collectedAt] as [number, number]);
+  if (inLookback) return covers(intervals, quietStart, nowMs) ? "firing" : "unknown";
   return covers(intervals, lookbackStart, nowMs) ? "clear" : "unknown";
+}
+
+function coverageIntervals(measured: MergeSnap[], nowMs: number, quietMs: number): Array<[number, number]> {
+  let newestAt = Number.NEGATIVE_INFINITY;
+  for (const snap of measured) {
+    if (snap.collectedAt > newestAt) newestAt = snap.collectedAt;
+  }
+  const fresh = newestAt <= nowMs && nowMs - newestAt <= COLLECTOR_CADENCE_MS;
+  return measured.map((snap) => {
+    const end = fresh && snap.collectedAt === newestAt ? nowMs : snap.collectedAt;
+    return [snap.collectedAt - quietMs, end];
+  });
 }
 
 function covers(intervals: Array<[number, number]>, start: number, end: number): boolean {
@@ -382,8 +425,9 @@ async function readLatches(keys: string[]): Promise<Map<string, Latch> | null> {
 }
 
 function decorate(drafts: Draft[], latches: Map<string, Latch> | null): AlertItem[] {
+  if (latches == null) return drafts.map((draft) => item(draft, null, null));
   return drafts.map((draft) => {
-    const latch = latches?.get(draft.key) ?? null;
+    const latch = latches.get(draft.key) ?? null;
     const sent = latch != null && latch.cleared == null;
     return item(draft, sent, latch?.last ?? null);
   });
@@ -404,9 +448,10 @@ async function claimSend(
   draft: Draft,
   nowIso: string,
   alerts: BriefAlertSettings,
-): Promise<{ ok: boolean; prev: ClaimPrev | null }> {
+): Promise<{ ok: boolean; prev: ClaimPrev | null; token: string }> {
   const mode = claimMode(draft);
   const hours = alerts.coordinatorRepeatHours;
+  const token = randomUUID();
   const rows = mode === "once"
     ? await sql()`
         -- brief-alert-claim:once
@@ -416,8 +461,8 @@ async function claimSend(
           where key = ${draft.key}
         ),
         claimed as (
-          insert into brief_alerts (key, first_sent_at, last_sent_at, cleared_at)
-          values (${draft.key}, ${nowIso}::timestamptz, ${nowIso}::timestamptz, null)
+          insert into brief_alerts (key, first_sent_at, last_sent_at, cleared_at, claim_token)
+          values (${draft.key}, ${nowIso}::timestamptz, ${nowIso}::timestamptz, null, ${token})
           on conflict (key) do nothing
           returning key
         )
@@ -437,11 +482,12 @@ async function claimSend(
             where key = ${draft.key}
           ),
           claimed as (
-            insert into brief_alerts (key, first_sent_at, last_sent_at, cleared_at)
-            values (${draft.key}, ${nowIso}::timestamptz, ${nowIso}::timestamptz, null)
+            insert into brief_alerts (key, first_sent_at, last_sent_at, cleared_at, claim_token)
+            values (${draft.key}, ${nowIso}::timestamptz, ${nowIso}::timestamptz, null, ${token})
             on conflict (key) do update
             set last_sent_at = excluded.last_sent_at,
-                cleared_at = null
+                cleared_at = null,
+                claim_token = excluded.claim_token
             where brief_alerts.cleared_at is not null
             returning key
           )
@@ -460,11 +506,12 @@ async function claimSend(
             where key = ${draft.key}
           ),
           claimed as (
-            insert into brief_alerts (key, first_sent_at, last_sent_at, cleared_at)
-            values (${draft.key}, ${nowIso}::timestamptz, ${nowIso}::timestamptz, null)
+            insert into brief_alerts (key, first_sent_at, last_sent_at, cleared_at, claim_token)
+            values (${draft.key}, ${nowIso}::timestamptz, ${nowIso}::timestamptz, null, ${token})
             on conflict (key) do update
             set last_sent_at = excluded.last_sent_at,
-                cleared_at = null
+                cleared_at = null,
+                claim_token = excluded.claim_token
             where brief_alerts.cleared_at is not null
                or brief_alerts.last_sent_at <= ${nowIso}::timestamptz - (${hours}::numeric * interval '1 hour')
             returning key
@@ -477,21 +524,33 @@ async function claimSend(
           left join prior on true
         `;
   const row = rows[0];
-  if (!row?.key) return { ok: false, prev: null };
+  if (!row?.key) return { ok: false, prev: null, token };
   const first = asIso(row.prev_first);
   const last = asIso(row.prev_last);
   return {
     ok: true,
+    token,
     prev: first && last ? { first, last, cleared: asIso(row.prev_cleared) } : null,
   };
 }
 
-async function restoreClaim(key: string, nowIso: string, prev: ClaimPrev | null): Promise<void> {
+/**
+ * Undo a claim whose message insert failed. The claim left `cleared_at`
+ * null. The predicate keeps a concurrent clear, and a later claim that
+ * replaced `claim_token`, from being overwritten.
+ */
+async function restoreClaim(
+  key: string,
+  token: string,
+  observedClearedAt: string | null,
+  prev: ClaimPrev | null,
+): Promise<void> {
   if (!prev) {
     await sql()`
       delete from brief_alerts
       where key = ${key}
-        and last_sent_at = ${nowIso}::timestamptz
+        and claim_token = ${token}
+        and cleared_at is not distinct from ${observedClearedAt}::timestamptz
     `;
     return;
   }
@@ -501,7 +560,8 @@ async function restoreClaim(key: string, nowIso: string, prev: ClaimPrev | null)
         last_sent_at = ${prev.last}::timestamptz,
         cleared_at = ${prev.cleared}::timestamptz
     where key = ${key}
-      and last_sent_at = ${nowIso}::timestamptz
+      and claim_token = ${token}
+      and cleared_at is not distinct from ${observedClearedAt}::timestamptz
   `;
 }
 
@@ -521,9 +581,10 @@ async function deliver(
   settings: BriefSettings,
   now: Date,
   actor: Actor | null,
-): Promise<number> {
+): Promise<{ sent: number; failures: AlertFailure[] }> {
   const nowIso = toSecondIso(now);
   const agentId = inboxAgent(settings);
+  const failures: AlertFailure[] = [];
   let sent = 0;
   for (const draft of drafts) {
     if (draft.condition === "unknown") continue;
@@ -532,14 +593,15 @@ async function deliver(
       try {
         await clearLatch(draft.key, nowIso);
       } catch {
-        // A failed clear leaves the latch. The next tick can try again.
+        failures.push({ step: "clear", key: draft.key });
       }
       continue;
     }
-    let claimed: { ok: boolean; prev: ClaimPrev | null };
+    let claimed: { ok: boolean; prev: ClaimPrev | null; token: string };
     try {
       claimed = await claimSend(draft, nowIso, settings.alerts);
     } catch {
+      failures.push({ step: "claim", key: draft.key });
       continue;
     }
     if (!claimed.ok) continue;
@@ -552,14 +614,16 @@ async function deliver(
       });
       sent += 1;
     } catch {
+      failures.push({ step: "message", key: draft.key });
       try {
-        await restoreClaim(draft.key, nowIso, claimed.prev);
+        // The claim wrote cleared_at null. A concurrent clear changes it.
+        await restoreClaim(draft.key, claimed.token, null, claimed.prev);
       } catch {
-        // The message did not land. Leaving the latch would hide the next retry.
+        failures.push({ step: "restore", key: draft.key });
       }
     }
   }
-  return sent;
+  return { sent, failures };
 }
 
 function pack(
@@ -569,14 +633,19 @@ function pack(
   drafts: Draft[],
   latches: Map<string, Latch> | null,
   sentCount: number,
+  failures?: AlertFailure[],
   note?: string,
 ): AlertEvaluation {
+  const reported = [...(failures ?? [])];
+  if (latches == null) reported.push({ step: "latches" });
   return {
     enabled: settings.alerts.enabled,
     delivery,
     generated_at: toSecondIso(now),
     sent_count: sentCount,
+    latches: latches == null ? "unknown" : "ok",
     alerts: decorate(drafts, latches),
+    ...(reported.length > 0 ? { failures: reported } : {}),
     ...(note ? { note } : {}),
   };
 }
@@ -597,7 +666,7 @@ export async function readAlerts(input: { now?: Date; settings?: BriefSettings }
   }
   const drafts = await compute(settings, now);
   const latches = await readLatches(drafts.map((draft) => draft.key));
-  return pack(settings, now, "read", drafts, latches, 0, "Read only. This route does not send.");
+  return pack(settings, now, "read", drafts, latches, 0, undefined, "Read only. This route does not send.");
 }
 
 export async function evaluateAlerts(input: {
@@ -633,10 +702,11 @@ export async function evaluateAlerts(input: {
       drafts,
       latches,
       0,
+      undefined,
       "brief.alerts.enabled is false. Conditions were computed and nothing was sent.",
     );
   }
-  const sentCount = await deliver(drafts, settings, now, input.actor ?? null);
+  const delivery = await deliver(drafts, settings, now, input.actor ?? null);
   const latches = await readLatches(drafts.map((draft) => draft.key));
-  return pack(settings, now, "live", drafts, latches, sentCount);
+  return pack(settings, now, "live", drafts, latches, delivery.sent, delivery.failures);
 }

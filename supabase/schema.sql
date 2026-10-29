@@ -407,13 +407,18 @@ create index if not exists decisions_repo_number_idx on decisions (repo, number)
 -- older than the repeat interval. A zero-merge row re-arms only after
 -- cleared_at is set. A decision row is inserted once and never replaced.
 -- cleared_at is nullable: null means the alert is still latched.
+-- claim_token is the attempt that owns a claim. A failed message insert
+-- restores the previous row only while this token still matches and
+-- cleared_at is still the null the claim wrote.
 create table if not exists brief_alerts (
   key text primary key,
   first_sent_at timestamptz not null,
   last_sent_at timestamptz not null,
-  cleared_at timestamptz
+  cleared_at timestamptz,
+  claim_token text
 );
 alter table brief_alerts add column if not exists cleared_at timestamptz;
+alter table brief_alerts add column if not exists claim_token text;
 
 -- Client idempotency keys for create_task, operator messages, and replies.
 -- scope is actor_type:actor_id:route, so two callers can reuse one key string.
