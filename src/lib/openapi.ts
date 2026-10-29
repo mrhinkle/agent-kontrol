@@ -383,6 +383,10 @@ export function openApiDocument(): Json {
             isFork: { type: "boolean", description: "True when the repo is a fork." },
             isArchived: { type: "boolean", description: "True when the repo is archived." },
             lastActivityAt: { type: ["string", "null"], format: "date-time", description: "Last push time from gh. The activity window uses this." },
+            fieldsOverridden: {
+              type: ["boolean", "null"],
+              description: "True after a hand-added save overrode label, short, color, or blocked label on an auto row. False after a later save cleared that override. Null means discovery owns those fields. Omitting the field is the same as null.",
+            },
           },
         },
         WatchedRepos: {
@@ -1373,7 +1377,7 @@ export function openApiDocument(): Json {
           tags: ["settings"],
           summary: "Replace the watched-repo list, or preview that replace.",
           description:
-            "dry_run true returns the diff against the list GET would show (adds, removes, updates, reorders) and writes nothing. A stale version is still 409. With no database, a dry run returns that diff with would_write false instead of 409. A non-boolean dry_run is 400 and writes nothing.",
+            "dry_run true returns the diff against the list GET would show (adds, removes, updates, reorders) and writes nothing. An omitted auto row is not a remove. When that row has fieldsOverridden true, the diff reports an update that resets label, short, color, and blocked label to the discovery defaults. A stale version is still 409. With no database, a dry run returns that diff with would_write false instead of 409. A non-boolean dry_run is 400 and writes nothing.",
           security: cookieOrBearer,
           requestBody: body(ref("RepoList")),
           responses: {
@@ -1394,7 +1398,7 @@ export function openApiDocument(): Json {
           tags: ["settings"],
           summary: "Pin or hide one watched repo.",
           description:
-            "Sets pinned and hidden on one stored row. Send at least one flag. Hide wins over pin: the repo stays collected and is left off the brief. A repo marked gone is not shown, including when it is pinned. Does not change origin. dry_run true writes nothing. No database is 409, or a preview with would_write false when dry_run is true. An unknown repo is 404.",
+            "Sets pinned and hidden on one stored row. Send at least one flag. Hide wins over pin: the repo stays collected and is left off the brief. A repo marked gone is not shown, including when it is pinned. Does not change origin. dry_run true returns before and after and writes nothing. With no database, the preview resolves the repo against the file fallback, returns before and after, and sets would_write false. An unknown repo is 404 in both modes.",
           security: cookieOrBearer,
           requestBody: body(ref("RepoOverride")),
           responses: {
@@ -1451,7 +1455,7 @@ export function openApiDocument(): Json {
           tags: ["settings"],
           summary: "Apply one collector tick of gh repo list results.",
           description:
-            "Auth matches PUT /api/settings/repos. A result with ok false, a rate-limit error, or zero repos records last_error and does not change tracked repos. A truncated list updates the repos it saw, does not mark the others gone, and stores a warning on last_error while still setting last_discovered_at. An unknown owner is an error on that result and does not fail the batch. A duplicate owner in one request is 400 and writes nothing. A missing swept_at is 400. A repo name that is not safe to store fails that owner's sweep and writes no repo changes. One owner's metadata update and repo changes commit together, under one global advisory lock shared by every owner, after reloading tracked repos. The lock is not held during gh repo list. swept_at orders overlapping ticks: a sweep that is not newer than last_discovered_at writes nothing. A short-name unique violation replans once and then is 409. Discovery does not change pin, hide, label, short, color, origin, or the actor who saved the owner. No database, or a missing watched_owners table, is 409 and includes results.",
+            "Auth matches PUT /api/settings/repos. A result with ok false, a rate-limit error, or zero repos records last_error and does not change tracked repos. A truncated list updates the repos it saw, does not mark the others gone, and stores a warning on last_error while still setting last_discovered_at. An unknown owner is an error on that result and does not fail the batch. A duplicate owner in one request is 400 and writes nothing. A missing swept_at is 400. A repo name that is not safe to store fails that owner's sweep and writes no repo changes. One owner's metadata update and repo changes commit together, under one global advisory lock shared by every owner, after reloading tracked repos. The lock is not held during gh repo list. swept_at orders overlapping ticks: a sweep that is not newer than last_discovered_at writes nothing. A short-name unique violation replans once and then is 409. Discovery does not change pin, hide, label, short, color, origin, fieldsOverridden, or the actor who saved the owner. No database, or a missing watched_owners table, is 409 and includes results plus added, updated, and marked_gone as empty arrays on the response and on each result.",
           security: cookieOrBearer,
           requestBody: body(ref("OwnerDiscovery")),
           responses: {

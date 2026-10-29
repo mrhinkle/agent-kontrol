@@ -14,6 +14,16 @@ export function newRow(index: number): Row {
   return { id: nextId(), repo: "", label: "", short: "", color: PALETTE[index % PALETTE.length], blockedLabel: null };
 }
 
+/** Hand-added rows, plus auto rows whose label, short, color, or blocked label was overridden. */
+export function splitWatchedRepos<T extends { origin?: "manual" | "auto"; fieldsOverridden?: boolean | null }>(
+  repos: T[],
+): { editable: T[]; discovered: T[] } {
+  return {
+    editable: repos.filter((repo) => repo.origin !== "auto" || repo.fieldsOverridden === true),
+    discovered: repos.filter((repo) => repo.origin === "auto" && repo.fieldsOverridden !== true),
+  };
+}
+
 export function fromRepos(repos: RepoInput[]): Row[] {
   return repos.map((r) => ({ ...r, id: nextId() }));
 }

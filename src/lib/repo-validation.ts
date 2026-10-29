@@ -145,12 +145,16 @@ export function validateRepoList(input: unknown): RepoValidation {
  */
 export function retainedAutoShortErrors(
   submitted: RepoInput[],
-  stored: { repo: string; short: string; origin?: "manual" | "auto" }[],
+  stored: { repo: string; short: string; origin?: "manual" | "auto"; fieldsOverridden?: boolean | null }[],
 ): RepoError[] {
   const submittedIds = new Set(submitted.map((row) => row.repo.toLowerCase()));
   const taken = new Set(
     stored
-      .filter((row) => row.origin === "auto" && !submittedIds.has(row.repo.toLowerCase()))
+      .filter((row) => (
+        row.origin === "auto"
+        && row.fieldsOverridden !== true
+        && !submittedIds.has(row.repo.toLowerCase())
+      ))
       .map((row) => row.short.toLowerCase()),
   );
   const errors: RepoError[] = [];

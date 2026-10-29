@@ -15,13 +15,13 @@ import {
   type TrackedRepo,
 } from "../../src/lib/owner-discovery";
 import { validateOwnerList, validateOwnerName } from "../../src/lib/owner-validation";
-import { MAX_REPOS, validateRepoList } from "../../src/lib/repo-validation";
+import { MAX_REPOS, retainedAutoShortErrors, validateRepoList } from "../../src/lib/repo-validation";
 import { authorizeRoute, scopeForRoute } from "../../src/lib/scopes";
 import { applyOwnerDiscovery, ownerListVersion } from "../../src/lib/watched-owners";
 import { getWatchedRepos, visibleOnBoard } from "../../src/lib/watched-repos";
 import { GET as getOwners, PUT as putOwners } from "../../src/app/api/settings/owners/route";
 import { POST as postDiscover } from "../../src/app/api/settings/owners/discover/route";
-import { PUT as putRepos } from "../../src/app/api/settings/repos/route";
+import { PATCH as patchRepos, PUT as putRepos } from "../../src/app/api/settings/repos/route";
 
 /**
  * Failure cases for watched_owners (#66). Each test tries to make discovery
@@ -1625,5 +1625,243 @@ describe("watched owners discovery", () => {
     const missing = await getWatchedRepos(fallback);
     assert.equal(missing.source, "file");
     assert.deepEqual(missing.repos, fallback);
+  });
+
+  it("omitting an overridden auto row resets its fields and the dry run reports that reset", () => {
+    // Discovery's colorFor: the same hash the reset must use.
+    const palette = ["#2563eb", "#f44800", "#19d2ff", "#2ee6a6", "#a855f7", "#f59e0b"];
+    const colorFor = (repo: string) => {
+      let hash = 0;
+      for (let i = 0; i < repo.length; i++) hash = (hash * 33 + repo.charCodeAt(i)) >>> 0;
+      return palette[hash % palette.length];
+    };
+    const overridden = {
+      repo: "acme/app",
+      label: "Custom",
+      short: "custom",
+      color: "#112233",
+      blockedLabel: "blocked",
+      origin: "auto" as const,
+      pinned: true,
+      hidden: true,
+      fieldsOverridden: true,
+    };
+    const held = {
+      repo: "acme/other",
+      label: "other",
+      short: "app",
+      color: "#abcdef",
+      blockedLabel: null,
+      origin: "auto" as const,
+      fieldsOverridden: false,
+    };
+    const diff = diffRepoList([overridden, held], []);
+    assert.equal(diff.changes.some((change) => change.op === "remove"), false);
+    const reset = diff.changes.find((change) => String(change.summary).includes("acme/app"));
+    assert.ok(reset, "the dry run must report the reset row");
+    assert.equal(reset.op, "update");
+    assert.equal(reset.after?.label, "app");
+    assert.equal(reset.after?.short, "app2");
+    assert.equal(reset.after?.color, colorFor("acme/app"));
+    assert.equal(reset.after?.blockedLabel, null);
+    assert.equal(reset.after?.pinned, true);
+    assert.equal(reset.after?.hidden, true);
+    assert.equal(diff.changes.some((change) => String(change.summary).includes("acme/other")), false);
+
+    const plain = { ...overridden, fieldsOverridden: null, label: "Custom", short: "custom" };
+    assert.equal(diffRepoList([plain], []).changes.length, 0, "a null flag is not an override to clear");
+    assert.deepEqual(
+      retainedAutoShortErrors(
+        [{ repo: "acme/manual", label: "Manual", short: "custom", color: "#111111", blockedLabel: null }],
+        [{ repo: "acme/app", short: "custom", origin: "auto", fieldsOverridden: true }],
+      ),
+      [],
+      "a reset releases the overridden short",
+    );
+  });
+
+  it("a hand-added save marks the auto row overridden, and omitting it clears those fields", async () => {
+    env.NODE_ENV = "test";
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+
+    const stored = {
+      repo: "acme/app",
+      label: "app",
+      short: "app",
+      color: "#2563eb",
+      blocked_label: null as string | null,
+      position: 4,
+      origin: "auto",
+      pinned: true,
+      hidden: true,
+      gone: true,
+      is_fork: true,
+      is_archived: false,
+      last_activity_at: "2026-10-01T00:00:00.000Z",
+      fields_overridden: null as boolean | null,
+    };
+    const writes: { text: string; values: unknown[] }[] = [];
+    const locks: unknown[] = [];
+    setSqlForTests(async (strings, ...values) => {
+      const text = strings.join(" ").replace(/\s+/g, " ").trim().toLowerCase();
+      if (text === "begin" || text === "commit" || text === "rollback") return [];
+      if (text.includes("pg_advisory_xact_lock")) {
+        locks.push(values[0]);
+        return [];
+      }
+      // The replace statement both writes and says "from watched_repos".
+      if (text.includes("watched_repos") && /insert|update|delete/.test(text)) {
+        writes.push({ text, values });
+        return [];
+      }
+      if (text.includes("from watched_repos")) return [{ ...stored }];
+      return [];
+    });
+
+    const edited = await putRepos(new Request("http://localhost/api/settings/repos", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repos: [{ repo: "acme/app", label: "Custom", short: "custom", color: "#112233", blockedLabel: "blocked" }],
+      }),
+    }));
+    assert.equal(edited.status, 200, JSON.stringify(await edited.clone().json()));
+    const marked = writes.find((write) => /fields_overridden/.test(write.text) && /true/.test(write.text));
+    assert.ok(marked, "a hand-added save must set fields_overridden");
+    assert.ok(writes.every((write) => !/\borigin\s*=/.test(write.text)), "origin stays auto");
+
+    writes.length = 0;
+    locks.length = 0;
+    stored.label = "Custom";
+    stored.short = "custom";
+    stored.color = "#112233";
+    stored.blocked_label = "blocked";
+    stored.fields_overridden = true;
+
+    const cleared = await putRepos(new Request("http://localhost/api/settings/repos", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repos: [] }),
+    }));
+    assert.equal(cleared.status, 200, JSON.stringify(await cleared.clone().json()));
+    const reset = writes.find((write) => /fields_overridden\s*=\s*false/.test(write.text));
+    assert.ok(reset, "omitting the row must clear fields_overridden");
+    assert.equal(String(locks[0]), "87216667");
+    const flat = JSON.stringify(reset.values);
+    assert.match(flat, /"app"/);
+    assert.match(flat, /acme\/app/);
+    const setClause = reset.text.slice(reset.text.indexOf(" set "), reset.text.indexOf(" from resets"));
+    assert.doesNotMatch(setClause, /\bpinned\s*=/);
+    assert.doesNotMatch(setClause, /\bhidden\s*=/);
+    assert.doesNotMatch(setClause, /\bgone\s*=/);
+    assert.doesNotMatch(setClause, /\borigin\s*=/);
+    assert.doesNotMatch(setClause, /is_fork\s*=/);
+    assert.doesNotMatch(setClause, /is_archived\s*=/);
+    assert.doesNotMatch(setClause, /last_activity_at\s*=/);
+    assert.match(reset.text, /w\.origin = 'auto'/);
+    const body = await cleared.json() as { repos?: { repo: string; origin?: string; pinned?: boolean; hidden?: boolean; gone?: boolean }[] };
+    const row = body.repos?.find((item) => item.repo === "acme/app");
+    assert.equal(row?.origin, "auto");
+    assert.equal(row?.pinned, true);
+    assert.equal(row?.hidden, true);
+    assert.equal(row?.gone, true);
+  });
+
+  it("demo-mode PATCH dry_run resolves the file list and returns before and after", async () => {
+    env.NODE_ENV = "test";
+    delete env.DATABASE_URL;
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+
+    const known = await patchRepos(new Request("http://localhost/api/settings/repos", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "example-org/app-server", pinned: true, dry_run: true }),
+    }));
+    assert.equal(known.status, 200, JSON.stringify(await known.clone().json()));
+    const preview = await known.json() as {
+      dry_run?: boolean;
+      applied?: boolean;
+      would_write?: boolean;
+      repo?: string;
+      before?: { pinned: boolean; hidden: boolean };
+      after?: { pinned: boolean; hidden: boolean };
+    };
+    assert.equal(preview.dry_run, true);
+    assert.equal(preview.applied, false);
+    assert.equal(preview.would_write, false);
+    assert.equal(preview.repo, "example-org/app-server");
+    assert.deepEqual(preview.before, { pinned: false, hidden: false });
+    assert.deepEqual(preview.after, { pinned: true, hidden: false });
+
+    const unknown = await patchRepos(new Request("http://localhost/api/settings/repos", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "nope/missing", hidden: true, dry_run: true }),
+    }));
+    assert.equal(unknown.status, 404, JSON.stringify(await unknown.clone().json()));
+    const missing = await unknown.json() as { code?: string; error?: string; fix?: string };
+    assert.equal(missing.code, "not_found");
+    assert.equal(missing.error, "That repo is not in the watched list.");
+    assert.match(missing.fix ?? "", /Discover or add the repo/);
+  });
+
+  it("discovery conflict responses include empty added, updated, and marked_gone arrays", async () => {
+    env.NODE_ENV = "test";
+    delete env.DATABASE_URL;
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+    const request = () => postDiscover(new Request("http://localhost/api/settings/owners/discover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        results: [{ owner: "acme", ok: false, swept_at: atAge(0), error: "rate limit" }],
+      }),
+    }));
+
+    const offline = await request();
+    assert.equal(offline.status, 409, JSON.stringify(await offline.clone().json()));
+    const offlineBody = await offline.json() as {
+      results?: { owner?: string; added?: unknown; updated?: unknown; marked_gone?: unknown }[];
+      added?: unknown;
+      updated?: unknown;
+      marked_gone?: unknown;
+    };
+    assert.equal(offlineBody.results?.[0]?.owner, "acme");
+    assert.deepEqual(offlineBody.added, []);
+    assert.deepEqual(offlineBody.updated, []);
+    assert.deepEqual(offlineBody.marked_gone, []);
+    assert.deepEqual(offlineBody.results?.[0]?.added, []);
+    assert.deepEqual(offlineBody.results?.[0]?.updated, []);
+    assert.deepEqual(offlineBody.results?.[0]?.marked_gone, []);
+
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    setSqlForTests(async (strings) => {
+      const text = strings.join(" ");
+      if (/watched_owners/i.test(text)) {
+        const err = new Error('relation "watched_owners" does not exist');
+        (err as { code?: string }).code = "42P01";
+        throw err;
+      }
+      return [];
+    });
+    const unwritable = await request();
+    assert.equal(unwritable.status, 409, JSON.stringify(await unwritable.clone().json()));
+    const missingBody = await unwritable.json() as {
+      results?: { added?: unknown; updated?: unknown; marked_gone?: unknown }[];
+      added?: unknown;
+      updated?: unknown;
+      marked_gone?: unknown;
+    };
+    assert.deepEqual(missingBody.added, []);
+    assert.deepEqual(missingBody.updated, []);
+    assert.deepEqual(missingBody.marked_gone, []);
+    assert.deepEqual(missingBody.results?.[0]?.added, []);
+    assert.deepEqual(missingBody.results?.[0]?.updated, []);
+    assert.deepEqual(missingBody.results?.[0]?.marked_gone, []);
   });
 });

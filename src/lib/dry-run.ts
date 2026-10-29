@@ -3,6 +3,7 @@
  * cancelling or updating a task, and overwriting a memory key.
  * Pure. Safe to import from a client component. Nothing here touches the database.
  */
+import { planOverrideResets } from "./owner-discovery";
 import type { OwnerInput } from "./owner-validation";
 import type { RepoInput } from "./repo-validation";
 import type { MemoryItem, Task, TaskStatus } from "./types";
@@ -108,21 +109,47 @@ function repoRecord(repo: RepoInput, position: number): Record<string, unknown> 
   };
 }
 
+type ListedRepo = RepoInput & { fieldsOverridden?: boolean | null };
+
 /**
  * Diff two watched-repo lists the way `replaceWatchedRepos` matches rows:
  * the repo string is the primary key, so a case change is a remove plus an add.
+ * An omitted auto row stays. When that row's fields were overridden, the diff
+ * reports the reset back to the discovery defaults.
  */
-export function diffRepoList(current: RepoInput[], next: RepoInput[], wouldWrite = true): DryRunResult {
+export function diffRepoList(current: ListedRepo[], next: RepoInput[], wouldWrite = true): DryRunResult {
   const currentAt = new Map(current.map((repo, index) => [repo.repo, index]));
   const nextAt = new Map(next.map((repo, index) => [repo.repo, index]));
+  const resets = new Map(planOverrideResets(current, next).map((row) => [row.repo, row]));
   const changes: DryRunChange[] = [];
   const affected: Record<string, unknown>[] = [];
 
   current.forEach((repo, index) => {
     if (nextAt.has(repo.repo)) return;
     // Auto-discovered rows stay when a manual save omits them. The save
-    // does not hide them and does not delete them.
-    if (repo.origin === "auto") return;
+    // does not hide them and does not delete them. An override is cleared.
+    const reset = resets.get(repo.repo);
+    if (repo.origin === "auto") {
+      if (!reset) return;
+      const before = repoRecord(repo, index);
+      const after = repoRecord(
+        { ...repo, label: reset.label, short: reset.short, color: reset.color, blockedLabel: null },
+        index,
+      );
+      const fields = (["label", "short", "color", "blockedLabel"] as const).filter(
+        (field) => (before[field] ?? null) !== (after[field] ?? null),
+      );
+      changes.push({
+        op: "update",
+        summary: fields.length > 0
+          ? `Reset ${repo.repo}: ${fields.join(", ")}.`
+          : `Reset ${repo.repo}: label, short, color, blockedLabel.`,
+        before,
+        after,
+      });
+      affected.push(before);
+      return;
+    }
     const before = repoRecord(repo, index);
     changes.push({
       op: "remove",

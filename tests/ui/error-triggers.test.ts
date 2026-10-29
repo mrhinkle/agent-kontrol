@@ -62,8 +62,21 @@ globalThis.Request = class extends NativeRequest {
   }
 } as typeof Request;
 
-(globalThis as unknown as { __mcPgPool?: { query: (text: string) => Promise<{ rows: Record<string, unknown>[] }>; on: () => void } }).__mcPgPool = {
+(globalThis as unknown as {
+  __mcPgPool?: {
+    query: (text: string) => Promise<{ rows: Record<string, unknown>[] }>;
+    connect: () => Promise<{ query: (text: string) => Promise<{ rows: Record<string, unknown>[] }>; release: () => void }>;
+    on: () => void;
+  };
+}).__mcPgPool = {
   on() {},
+  async connect() {
+    const pool = (globalThis as unknown as { __mcPgPool: { query: (text: string) => Promise<{ rows: Record<string, unknown>[] }> } }).__mcPgPool;
+    return {
+      query: (text: string) => pool.query(text),
+      release() {},
+    };
+  },
   async query(text: string) {
     if (mode === "throw") throw new Error("db down SECRET-DETAIL");
     if (mode === "missing-relation") {

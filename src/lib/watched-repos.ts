@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
-import { isConfigured, sql, type SqlTag } from "./db";
-import { briefShown, repoOwner, type OwnerRule, type TrackedRepo } from "./owner-discovery";
+import { isConfigured, sql, withTransaction, type SqlTag } from "./db";
+import {
+  briefShown,
+  DISCOVERY_WRITE_LOCK,
+  planOverrideResets,
+  repoOwner,
+  type OwnerRule,
+  type TrackedRepo,
+} from "./owner-discovery";
 import type { RepoConfig } from "./progress-config";
 import type { RepoInput } from "./repo-validation";
 import { missingOwnersRelation, ownerFromRow, ruleOf, type StoredOwner } from "./watched-owners";
@@ -15,6 +22,12 @@ export interface WatchedRepo extends RepoConfig {
   isFork?: boolean;
   isArchived?: boolean;
   lastActivityAt?: string | null;
+  /**
+   * True after a hand-added save wrote label, short, color, or blocked label
+   * onto an auto row. False after a later save cleared that override. Null
+   * when discovery still owns those fields.
+   */
+  fieldsOverridden?: boolean | null;
   /** False drops the repo off the brief and the board. Omitted means show. */
   shown?: boolean;
 }
@@ -52,6 +65,7 @@ export function trackedFromRow(r: Record<string, unknown>, position: number): Tr
     isFork: r.is_fork === true,
     isArchived: r.is_archived === true,
     lastActivityAt: iso(r.last_activity_at),
+    fieldsOverridden: r.fields_overridden === true ? true : r.fields_overridden === false ? false : null,
     position: Number.isFinite(Number(r.position)) ? Number(r.position) : position,
   };
 }
@@ -71,6 +85,7 @@ export function toWatchedRepo(row: TrackedRepo, owners: OwnerRule[], now: Date):
     isFork: row.isFork,
     isArchived: row.isArchived,
     lastActivityAt: row.lastActivityAt,
+    fieldsOverridden: row.fieldsOverridden ?? null,
     shown: briefShown(row, owner, now),
   };
 }
@@ -97,7 +112,23 @@ function missingReposRelation(e: unknown): boolean {
 }
 
 /** Reads tracked repos through `q`, so a discovery transaction can reload under its lock. */
+function mapRepoRows(rows: Record<string, unknown>[]): TrackedRepo[] {
+  return rows.map((r, i) => trackedFromRow(r, i));
+}
+
 export async function readTrackedRepos(q: SqlTag): Promise<TrackedRepo[]> {
+  try {
+    const rows = await q`
+      select repo, label, short, color, blocked_label, position, origin, pinned, hidden, gone,
+             is_fork, is_archived, last_activity_at, fields_overridden
+      from watched_repos
+      order by position asc, repo asc
+    `;
+    return mapRepoRows(rows);
+  } catch (e) {
+    const err = e as { code?: string };
+    if (err.code !== "42703") throw e;
+  }
   try {
     const rows = await q`
       select repo, label, short, color, blocked_label, position, origin, pinned, hidden, gone,
@@ -105,17 +136,17 @@ export async function readTrackedRepos(q: SqlTag): Promise<TrackedRepo[]> {
       from watched_repos
       order by position asc, repo asc
     `;
-    return rows.map((r, i) => trackedFromRow(r, i));
+    return mapRepoRows(rows);
   } catch (e) {
     const err = e as { code?: string };
     if (err.code !== "42703") throw e;
-    const rows = await q`
-      select repo, label, short, color, blocked_label, position
-      from watched_repos
-      order by position asc, repo asc
-    `;
-    return rows.map((r, i) => trackedFromRow(r, i));
   }
+  const rows = await q`
+    select repo, label, short, color, blocked_label, position
+    from watched_repos
+    order by position asc, repo asc
+  `;
+  return mapRepoRows(rows);
 }
 
 export async function loadTrackedRepos(): Promise<TrackedRepo[]> {
@@ -139,24 +170,133 @@ export async function getWatchedRepos(fallback: RepoConfig[]): Promise<{ source:
 /** A short fingerprint of a list, so a client can tell whether it changed since it loaded it. */
 export function listVersion(repos: WatchedRepo[]): string {
   const canonical = JSON.stringify(
-    repos.map((r) => [r.repo, r.label, r.short, r.color, r.blockedLabel, r.pinned === true, r.hidden === true, r.origin === "auto"]),
+    repos.map((r) => [
+      r.repo,
+      r.label,
+      r.short,
+      r.color,
+      r.blockedLabel,
+      r.pinned === true,
+      r.hidden === true,
+      r.origin === "auto",
+      r.fieldsOverridden === true ? true : r.fieldsOverridden === false ? false : null,
+    ]),
   );
   return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
 }
 
 /**
- * Replaces the list in ONE statement, so a failure part-way or a concurrent
- * read never sees a half-old, half-new list: the upserts and the delete of rows
- * no longer listed all run against the same snapshot. Snapshots of a removed
- * repo stay in `repo_snapshots`; adding it back restores its history.
+ * Replaces the hand-added list in one statement, so a failure part-way or a
+ * concurrent read never sees a half-old, half-new list. Auto rows the body
+ * omits stay. When `fields_overridden` is true, that omit resets label, short,
+ * color, and blocked label to the discovery defaults and sets the flag false.
+ * Origin, pin, hide, gone, and discovery metadata stay. The short is allocated
+ * under the same lock discovery uses. Snapshots of a removed repo stay in
+ * `repo_snapshots`; adding it back restores its history.
  */
 export async function replaceWatchedRepos(repos: RepoInput[]): Promise<void> {
-  if (repos.length === 0) {
-    await sql()`delete from watched_repos w where w.origin is distinct from 'auto'`;
+  await withTransaction(async (q) => {
+    await q`select pg_advisory_xact_lock(${DISCOVERY_WRITE_LOCK}::bigint)`;
+    const stored = await readTrackedRepos(q);
+    const resets = planOverrideResets(stored, repos);
+    await writeReplacedRepos(q, repos, resets);
+  });
+}
+
+async function writeReplacedRepos(q: SqlTag, repos: RepoInput[], resets: TrackedRepo[]): Promise<void> {
+  if (repos.length === 0 && resets.length === 0) {
+    await q`delete from watched_repos w where w.origin is distinct from 'auto'`;
     return;
   }
-  await sql()`
-    with incoming as (
+  if (resets.length === 0) {
+    await q`
+      with incoming as (
+        select * from unnest(
+          ${repos.map((r) => r.repo)}::text[],
+          ${repos.map((r) => r.label)}::text[],
+          ${repos.map((r) => r.short)}::text[],
+          ${repos.map((r) => r.color)}::text[],
+          ${repos.map((r) => r.blockedLabel)}::text[],
+          ${repos.map((_, i) => i)}::int[],
+          ${repos.map((r) => (typeof r.pinned === "boolean" ? r.pinned : false))}::boolean[],
+          ${repos.map((r) => (typeof r.hidden === "boolean" ? r.hidden : false))}::boolean[]
+        ) as t(repo, label, short, color, blocked_label, position, pinned, hidden)
+      ),
+      upserted as (
+        insert into watched_repos (repo, label, short, color, blocked_label, position, pinned, hidden, fields_overridden, updated_at)
+        select repo, label, short, color, blocked_label, position, pinned, hidden, true, now() from incoming
+        on conflict (repo) do update set
+          label = excluded.label,
+          short = excluded.short,
+          color = excluded.color,
+          blocked_label = excluded.blocked_label,
+          position = excluded.position,
+          pinned = excluded.pinned,
+          hidden = excluded.hidden,
+          fields_overridden = true,
+          updated_at = now()
+        returning repo
+      )
+      delete from watched_repos w
+      where w.origin is distinct from 'auto'
+        and not exists (select 1 from incoming i where i.repo = w.repo)
+    `;
+    return;
+  }
+  if (repos.length === 0) {
+    await q`
+      with resets as (
+        select * from unnest(
+          ${resets.map((r) => r.repo)}::text[],
+          ${resets.map((r) => r.label)}::text[],
+          ${resets.map((r) => r.short)}::text[],
+          ${resets.map((r) => r.color)}::text[],
+          ${resets.map((r) => r.blockedLabel)}::text[]
+        ) as t(repo, label, short, color, blocked_label)
+      ),
+      cleared as (
+        update watched_repos w set
+          label = r.label,
+          short = r.short,
+          color = r.color,
+          blocked_label = r.blocked_label,
+          fields_overridden = false,
+          updated_at = now()
+        from resets r
+        where w.repo = r.repo
+          and w.origin = 'auto'
+        returning w.repo
+      )
+      delete from watched_repos w
+      where w.origin is distinct from 'auto'
+        and (select count(*) from cleared) >= 0
+    `;
+    return;
+  }
+  await q`
+    with resets as (
+      select * from unnest(
+        ${resets.map((r) => r.repo)}::text[],
+        ${resets.map((r) => r.label)}::text[],
+        ${resets.map((r) => r.short)}::text[],
+        ${resets.map((r) => r.color)}::text[],
+        ${resets.map((r) => r.blockedLabel)}::text[]
+      ) as t(repo, label, short, color, blocked_label)
+    ),
+    cleared as (
+      update watched_repos w set
+        label = r.label,
+        short = r.short,
+        color = r.color,
+        blocked_label = r.blocked_label,
+        fields_overridden = false,
+        updated_at = now()
+      from resets r
+      where w.repo = r.repo
+        and w.origin = 'auto'
+      returning w.repo
+    ),
+    incoming as (
       select * from unnest(
         ${repos.map((r) => r.repo)}::text[],
         ${repos.map((r) => r.label)}::text[],
@@ -169,8 +309,8 @@ export async function replaceWatchedRepos(repos: RepoInput[]): Promise<void> {
       ) as t(repo, label, short, color, blocked_label, position, pinned, hidden)
     ),
     upserted as (
-      insert into watched_repos (repo, label, short, color, blocked_label, position, pinned, hidden, updated_at)
-      select repo, label, short, color, blocked_label, position, pinned, hidden, now() from incoming
+      insert into watched_repos (repo, label, short, color, blocked_label, position, pinned, hidden, fields_overridden, updated_at)
+      select repo, label, short, color, blocked_label, position, pinned, hidden, true, now() from incoming
       on conflict (repo) do update set
         label = excluded.label,
         short = excluded.short,
@@ -179,7 +319,9 @@ export async function replaceWatchedRepos(repos: RepoInput[]): Promise<void> {
         position = excluded.position,
         pinned = excluded.pinned,
         hidden = excluded.hidden,
+        fields_overridden = true,
         updated_at = now()
+      where (select count(*) from cleared) >= 0
       returning repo
     )
     delete from watched_repos w

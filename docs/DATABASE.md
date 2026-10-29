@@ -39,7 +39,7 @@ psql "$DATABASE_URL" -f supabase/schema.sql
 
 The schema file is idempotent: it is safe to re-run, including to upgrade an existing database to the current schema.
 
-`watched_owners` (`supabase/migrations/20261028_watched_owners.sql`, also in `supabase/schema.sql`) stores the GitHub logins the collector discovers. `watched_repos` gains nullable-or-defaulted columns (`origin`, `pinned`, `hidden`, `gone`, `is_fork`, `is_archived`, `last_activity_at`) and a deferrable unique constraint on `short` (`watched_repos_short_key`). Existing rows stay, and nothing in that migration drops `watched_repos`. Hide wins over pin. A repo marked gone is not shown, including when it is pinned. A failed or empty discovery does not delete or hide rows; it records `last_error` on the owner.
+`watched_owners` (`supabase/migrations/20261028_watched_owners.sql`, also in `supabase/schema.sql`) stores the GitHub logins the collector discovers. `watched_repos` gains nullable-or-defaulted columns (`origin`, `pinned`, `hidden`, `gone`, `is_fork`, `is_archived`, `last_activity_at`, `fields_overridden`) and a deferrable unique constraint on `short` (`watched_repos_short_key`). `fields_overridden` is a nullable boolean with no default: null means discovery owns label, short, color, and blocked label; true means a hand-added save overrode them; false means a later save cleared that override back to the discovery defaults. Existing rows stay, and nothing in that migration drops `watched_repos`. Hide wins over pin. A repo marked gone is not shown, including when it is pinned. A failed or empty discovery does not delete or hide rows; it records `last_error` on the owner.
 
 ## Connection limits on serverless hosts
 

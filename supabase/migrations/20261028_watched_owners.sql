@@ -22,6 +22,10 @@ alter table watched_repos add column if not exists gone boolean not null default
 alter table watched_repos add column if not exists is_fork boolean not null default false;
 alter table watched_repos add column if not exists is_archived boolean not null default false;
 alter table watched_repos add column if not exists last_activity_at timestamptz;
+-- null: discovery owns label, short, color, and blocked_label.
+-- true: a hand-added save overrode those fields. false: a later save cleared them.
+-- Nullable, no default.
+alter table watched_repos add column if not exists fields_overridden boolean;
 
 -- Deferrable so replaceWatchedRepos can swap two short names in one statement.
 -- Checked at the end of that statement (initially immediate). Discovery retries

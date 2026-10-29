@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { PALETTE, fromRepos, groupErrors, isDirty, moveRow, newRow, toPayload } from "../../src/lib/repo-settings-helpers";
+import { PALETTE, fromRepos, groupErrors, isDirty, moveRow, newRow, splitWatchedRepos, toPayload } from "../../src/lib/repo-settings-helpers";
 import type { RepoInput } from "../../src/lib/repo-validation";
 
 const repo = (n: number): RepoInput => ({ repo: `acme/r${n}`, label: `R${n}`, short: `r${n}`, color: "#2563eb", blockedLabel: null });
@@ -33,6 +33,17 @@ describe("repo settings helpers", () => {
     assert.deepEqual(moveRow(rows, 1, 1).map((r) => r.repo), before);
     assert.deepEqual(rows.map((r) => r.repo), before);
     assert.notEqual(moveRow(rows, 1, 1), rows);
+  });
+
+  it("keeps an overridden auto row editable so the operator can clear it", () => {
+    const discovered = { repo: "acme/app", label: "app", short: "app", color: "#2563eb", blockedLabel: null, origin: "auto" as const, fieldsOverridden: null };
+    const overridden = { ...discovered, repo: "acme/custom", label: "Custom", short: "custom", fieldsOverridden: true as const };
+    const manual = { repo: "acme/hand", label: "Hand", short: "hand", color: "#112233", blockedLabel: null, origin: "manual" as const, fieldsOverridden: null };
+    const split = splitWatchedRepos([discovered, overridden, manual]);
+    assert.deepEqual(split.editable.map((row) => row.repo), ["acme/custom", "acme/hand"]);
+    assert.equal(split.editable[0]?.fieldsOverridden, true);
+    assert.deepEqual(split.discovered.map((row) => row.repo), ["acme/app"]);
+    assert.deepEqual(splitWatchedRepos([discovered]).discovered.map((row) => row.repo), ["acme/app"]);
   });
 
   it("isDirty notices edits, reorders, additions and removals only", () => {

@@ -6,6 +6,7 @@
  * age is greater than `activity_days` (the boundary day is still shown).
  * Hide wins over pin. A repo marked gone is not shown, including when it is pinned.
  * Forks and archived repos are not added unless that owner's flag says so.
+ * A pin still shows a fork or archive that is already stored.
  * Identity is `owner/name`, never the short name.
  */
 
@@ -13,6 +14,13 @@ import { PALETTE } from "./repo-settings-helpers";
 
 export const MS_PER_DAY = 86_400_000;
 export const DISCOVERY_LIST_CAP = 1000;
+
+/**
+ * One lock for owner-list replacement, discovery apply, and clearing a
+ * hand-added field override. Short-name allocation stays serialized because
+ * every one of those writes takes this same lock, and never around `gh`.
+ */
+export const DISCOVERY_WRITE_LOCK = 87216667;
 
 export interface GhListedRepo {
   name: string;
@@ -35,6 +43,11 @@ export interface TrackedRepo {
   isArchived: boolean;
   lastActivityAt: string | null;
   position: number;
+  /**
+   * True after a hand-added save wrote label, short, color, or blocked label.
+   * False after that override was cleared. Null when discovery owns the fields.
+   */
+  fieldsOverridden?: boolean | null;
 }
 
 export interface OwnerRule {
@@ -157,6 +170,61 @@ function takeShort(name: string, used: Set<string>): string {
 function labelFor(name: string): string {
   const label = name.trim().slice(0, 40);
   return label.length > 0 ? label : "repo";
+}
+
+/** Label, short, color, and blocked label that a new discovery row would get. */
+export function discoveryDefaults(repo: string, usedShorts: Set<string>): {
+  label: string;
+  short: string;
+  color: string;
+  blockedLabel: null;
+} {
+  const name = repoName(repo);
+  return {
+    label: labelFor(name),
+    short: takeShort(name, usedShorts),
+    color: colorFor(repo),
+    blockedLabel: null,
+  };
+}
+
+/**
+ * Auto rows a hand-added save omits after a previous save set
+ * `fieldsOverridden`. Each one returns to the discovery defaults.
+ * Submitted shorts and shorts of auto rows that stay overridden-or-not are
+ * already taken, so the allocator will not steal them.
+ */
+export function planOverrideResets<T extends {
+  repo: string;
+  short: string;
+  origin?: "manual" | "auto";
+  fieldsOverridden?: boolean | null;
+}>(stored: T[], submitted: { repo: string; short: string }[]): Array<T & {
+  label: string;
+  short: string;
+  color: string;
+  blockedLabel: null;
+  fieldsOverridden: false;
+}> {
+  const submittedIds = new Set(submitted.map((row) => row.repo));
+  const resetting = stored.filter(
+    (row) => row.origin === "auto" && row.fieldsOverridden === true && !submittedIds.has(row.repo),
+  );
+  const resettingIds = new Set(resetting.map((row) => row.repo));
+  const used = new Set<string>();
+  for (const row of submitted) used.add(row.short.toLowerCase());
+  for (const row of stored) {
+    if (resettingIds.has(row.repo) || submittedIds.has(row.repo)) continue;
+    if (row.origin !== "auto") continue;
+    used.add(row.short.toLowerCase());
+  }
+  return [...resetting]
+    .sort((a, b) => a.repo.localeCompare(b.repo))
+    .map((row) => ({
+      ...row,
+      ...discoveryDefaults(row.repo, used),
+      fieldsOverridden: false as const,
+    }));
 }
 
 function untouched(existing: TrackedRepo[], failure: string): DiscoveryOutcome {

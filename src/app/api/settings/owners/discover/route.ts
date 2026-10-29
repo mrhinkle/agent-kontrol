@@ -64,6 +64,23 @@ function parseSweptAt(raw: unknown): { ok: true; sweptAt: string } | { ok: false
   return { ok: true, sweptAt: new Date(raw).toISOString() };
 }
 
+function discoveryConflict(parsed: DiscoveryRequest[], error: string) {
+  const empty: string[] = [];
+  return {
+    results: parsed.map((item) => ({
+      owner: item.owner,
+      ok: false as const,
+      error,
+      added: [...empty],
+      updated: [...empty],
+      marked_gone: [...empty],
+    })),
+    added: [...empty],
+    updated: [...empty],
+    marked_gone: [...empty],
+  };
+}
+
 function parseResult(raw: unknown): { ok: true; request: DiscoveryRequest } | { ok: false; error: string } {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return { ok: false, error: "Each result must be an object." };
@@ -134,9 +151,7 @@ export async function POST(req: Request) {
     return apiError("conflict", {
       message: "Owner discovery can only be saved when a database is connected.",
       fix: "Connect a database (DATABASE_URL) and retry the tick.",
-      extra: {
-        results: parsed.map((item) => ({ owner: item.owner, ok: false, error: "no database" })),
-      },
+      extra: discoveryConflict(parsed, "no database"),
     });
   }
   try {
@@ -145,16 +160,7 @@ export async function POST(req: Request) {
       return apiError("conflict", {
         message: "Owner discovery can only be saved after the owner store exists.",
         fix: "Apply supabase/migrations/20261028_watched_owners.sql, then retry the tick.",
-        extra: {
-          results: parsed.map((item) => ({
-            owner: item.owner,
-            ok: false,
-            error: "owner store is not writable",
-            added: 0,
-            updated: 0,
-            marked_gone: 0,
-          })),
-        },
+        extra: discoveryConflict(parsed, "owner store is not writable"),
       });
     }
     const owners = listed.owners;

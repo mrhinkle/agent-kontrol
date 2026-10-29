@@ -3,12 +3,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { DryRunResult } from "@/lib/dry-run";
 import { MAX_REPOS, validateRepoList, type RepoError, type RepoInput } from "@/lib/repo-validation";
-import { fromRepos, groupErrors, isDirty, moveRow, newRow, toPayload, type Row } from "@/lib/repo-settings-helpers";
+import { fromRepos, groupErrors, isDirty, moveRow, newRow, splitWatchedRepos, toPayload, type Row } from "@/lib/repo-settings-helpers";
 import { PreviewDialog } from "@/components/PreviewDialog";
 
 interface ListedRepo extends RepoInput {
   gone?: boolean;
   shown?: boolean;
+  fieldsOverridden?: boolean | null;
 }
 
 interface Loaded {
@@ -41,11 +42,11 @@ export function RepoSettings() {
   const [preview, setPreview] = useState<DryRunResult | null>(null);
 
   const apply = useCallback((data: Loaded) => {
-    const manual = data.repos.filter((repo) => repo.origin !== "auto");
+    const split = splitWatchedRepos(data.repos);
     setLoaded(data);
-    setAutoRepos(data.repos.filter((repo) => repo.origin === "auto"));
-    setInitial(manual);
-    setRows(fromRepos(manual));
+    setAutoRepos(split.discovered);
+    setInitial(split.editable);
+    setRows(fromRepos(split.editable));
     setAttempted(false);
     setServerErrors([]);
     setStale(false);
@@ -95,10 +96,11 @@ export function RepoSettings() {
     return () => document.removeEventListener("click", guard, true);
   }, [dirty]);
 
+  const hasAuto = loaded?.repos.some((repo) => repo.origin === "auto") ?? false;
   const clientCheck = useMemo(() => {
-    if (rows.length === 0 && autoRepos.length > 0) return { ok: true as const, errors: [] as RepoError[] };
+    if (rows.length === 0 && hasAuto) return { ok: true as const, errors: [] as RepoError[] };
     return validateRepoList(toPayload(rows));
-  }, [rows, autoRepos.length]);
+  }, [rows, hasAuto]);
   const errors = attempted ? (clientCheck.ok ? serverErrors : clientCheck.errors) : serverErrors;
   const grouped = useMemo(() => groupErrors(errors), [errors]);
   const writable = loaded?.writable ?? false;
@@ -147,7 +149,7 @@ export function RepoSettings() {
     setAttempted(true);
     setMessage(null);
     const payload = toPayload(rows);
-    const allowEmpty = rows.length === 0 && autoRepos.length > 0;
+    const allowEmpty = rows.length === 0 && hasAuto;
     if (!allowEmpty && !validateRepoList(payload).ok) {
       requestAnimationFrame(() => document.querySelector<HTMLElement>("[data-repo-settings] [aria-invalid='true']")?.focus());
       return;
@@ -304,6 +306,11 @@ export function RepoSettings() {
                 <label className="mb-2 block md:mb-0">
                   <span className="mb-1 block text-xs text-gray-400 md:sr-only">Repo (owner/name)</span>
                   <input className={input} value={r.repo} disabled={disabled} placeholder="acme/app" onChange={(ev) => edit(r.id, { repo: ev.target.value })} aria-label={`Repo for row ${i + 1}`} aria-invalid={!!e.repo} aria-describedby={e.repo ? `${r.id}-repo-err` : undefined} />
+                  {r.origin === "auto" && (
+                    <span className="mt-1 block text-xs text-gray-500">
+                      Discovered. Removing this row clears the label, short, color, and blocked-label override. Pin and hide remain.
+                    </span>
+                  )}
                   {e.repo && <span id={`${r.id}-repo-err`} className="mt-1 block text-xs text-red-400">{e.repo}</span>}
                 </label>
                 <label className="mb-2 block md:mb-0">
@@ -346,6 +353,30 @@ export function RepoSettings() {
                   {e.blockedLabel && <span id={`${r.id}-blocked-err`} className="mt-1 block text-xs text-red-400">{e.blockedLabel}</span>}
                 </label>
                 <div>
+                  {r.origin === "auto" && (
+                    <span className="mb-2 flex flex-wrap gap-2 text-xs text-gray-300 md:mb-1">
+                      <label className="flex items-center gap-1">
+                        <input
+                          type="checkbox"
+                          checked={r.pinned === true}
+                          disabled={disabled}
+                          aria-label={`Pin ${r.repo}`}
+                          onChange={(ev) => void setOverride(r.repo, { pinned: ev.target.checked })}
+                        />
+                        Pin
+                      </label>
+                      <label className="flex items-center gap-1">
+                        <input
+                          type="checkbox"
+                          checked={r.hidden === true}
+                          disabled={disabled}
+                          aria-label={`Hide ${r.repo}`}
+                          onChange={(ev) => void setOverride(r.repo, { hidden: ev.target.checked })}
+                        />
+                        Hide
+                      </label>
+                    </span>
+                  )}
                   <button
                     className={iconBtn}
                     disabled={disabled}
@@ -365,7 +396,7 @@ export function RepoSettings() {
 
         {rows.length === 0 && (
           <p className="text-sm text-gray-400">
-            {autoRepos.length > 0 ? "No hand-added repos. Discovered repos stay tracked." : "No repos yet. Add one to start."}
+            {hasAuto ? "No hand-added repos. Discovered repos stay tracked." : "No repos yet. Add one to start."}
           </p>
         )}
 

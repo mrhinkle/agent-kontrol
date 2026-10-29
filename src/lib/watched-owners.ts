@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { Actor } from "./actor";
 import { isConfigured, sql, withTransaction, type Row } from "./db";
 import {
+  DISCOVERY_WRITE_LOCK,
   planDiscovery,
   repoIdentity,
   repoOwner,
@@ -74,15 +75,6 @@ export interface WatchedOwnerRead {
   writable: boolean;
   owners: StoredOwner[];
 }
-
-/**
- * One lock for owner-list replacement and every discovery write.
- * Both paths take it so a save cannot remove or retune an owner while
- * discovery is committing repos for the rule it just read. Discovery holds
- * it only around read-plan-write, never around `gh`. Short-name allocation
- * stays serialized because every discovery write takes this same lock.
- */
-const DISCOVERY_WRITE_LOCK = 87216667;
 
 export type DiscoverySkip = "owner_removed" | "rule_changed";
 

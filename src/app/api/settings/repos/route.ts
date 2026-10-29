@@ -21,7 +21,9 @@ export const dynamic = "force-dynamic";
  *      changed since, answers 409 { code: "stale" } instead of overwriting someone
  *      else's change. `dry_run: true` returns that diff and writes nothing.
  *      Any other `dry_run` value is 400 and also writes nothing.
- *      Rows with origin "auto" are kept when the body omits them.
+ *      Rows with origin "auto" are kept when the body omits them. Omitting one
+ *      whose fields were overridden resets label, short, color, and blocked
+ *      label to the discovery defaults and clears fields_overridden.
  * PATCH /api/settings/repos  { repo, pinned?, hidden?, dry_run? }
  *      Sets the override flags on one stored repo. Hide wins over pin when
  *      both are true: the repo stays collected and is left off the brief.
@@ -170,6 +172,13 @@ export async function PUT(req: Request) {
 
 const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
 
+function repoNotFound(): Response {
+  return apiError("not_found", {
+    message: "That repo is not in the watched list.",
+    fix: "Discover or add the repo, then set pin or hide.",
+  });
+}
+
 export async function PATCH(req: Request) {
   const denied = await enforceApi(req);
   if (denied) return denied;
@@ -212,11 +221,20 @@ export async function PATCH(req: Request) {
   };
   if (!isConfigured()) {
     if (dry.dryRun) {
+      const found = REPOS.find((item) => item.repo === repo);
+      if (!found) return repoNotFound();
+      const before = { pinned: false, hidden: false };
+      const after = {
+        pinned: patch.pinned ?? before.pinned,
+        hidden: patch.hidden ?? before.hidden,
+      };
       return NextResponse.json({
         dry_run: true,
         applied: false,
         would_write: false,
         repo,
+        before,
+        after,
         note: "No database is connected, so a save would be refused and nothing would be written.",
       });
     }
@@ -228,12 +246,7 @@ export async function PATCH(req: Request) {
   try {
     const tracked = await loadTrackedRepos();
     const found = tracked.find((item) => item.repo === repo);
-    if (!found) {
-      return apiError("not_found", {
-        message: "That repo is not in the watched list.",
-        fix: "Discover or add the repo, then set pin or hide.",
-      });
-    }
+    if (!found) return repoNotFound();
     const after = {
       pinned: patch.pinned ?? found.pinned,
       hidden: patch.hidden ?? found.hidden,
