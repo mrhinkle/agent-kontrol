@@ -42,6 +42,17 @@ export function writebackLockUnexpired(lock: unknown, lockAt: unknown, nowMs = D
   if (Number.isNaN(at)) return true;
   return nowMs - at < WRITEBACK_LOCK_LEASE_SECONDS * 1000;
 }
+
+/**
+ * A decided row that never received a write-back stamp. Strictly older than
+ * the claim lease, so a writer still inside that lease is not in the retry
+ * population. Equal to the lease is still inside.
+ */
+export function nullWritebackPastLease(updatedAt: unknown, nowMs = Date.now()): boolean {
+  const at = updatedAt instanceof Date ? updatedAt.getTime() : Date.parse(String(updatedAt ?? ""));
+  if (!Number.isFinite(at)) return false;
+  return nowMs - at > WRITEBACK_LOCK_LEASE_SECONDS * 1000;
+}
 export type DecisionStatus = (typeof DECISION_STATUSES)[number];
 
 export const LIST_STATUSES = [...DECISION_STATUSES, "all"] as const;
@@ -186,7 +197,8 @@ export interface DecisionStore {
   /**
    * Stamp writeback only when the row is still `decided` at `revision`.
    * A token requires that claim as well and clears the lock.
-   * A null token is the give-up stamp: same revision and status, lock left for its owner.
+   * A null token is the give-up stamp when no live claim holds the row.
+   * A lock still inside the lease refuses the stamp so the writer is not fenced.
    */
   setWriteback(id: number, writeback: "written" | "not_written", revision: number, token: string | null): Promise<Record<string, unknown> | null>;
   /**
@@ -208,6 +220,11 @@ export function setDecisionStoreForTests(store: DecisionStore | null): void {
 /** True when a database or a test store will keep the row. */
 export function decisionPersistenceOn(): boolean {
   return isConfigured() || testStore !== null;
+}
+
+/** True when route tests substituted the queue. Callers must not hit SQL then. */
+export function usingDecisionTestStore(): boolean {
+  return testStore !== null;
 }
 
 export interface ReconcileInput {
@@ -842,6 +859,10 @@ export async function setDecisionWriteback(
         where id = ${id}
           and status = 'decided'
           and revision = ${revision}
+          and (
+            writeback_lock is null
+            or writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+          )
         returning *
       `;
   return rows[0] ? presentDecision(rows[0], now) : null;
@@ -890,6 +911,12 @@ export async function listDecisions(query: {
       ${brief} is true
       or ${query.writeback ?? null}::text is null
       or writeback = ${query.writeback ?? null}
+      or (
+        ${query.writeback ?? null}::text = 'not_written'
+        and status = 'decided'
+        and writeback is null
+        and updated_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+      )
     )
     order by first_seen_at asc, id asc
     limit ${query.limit}

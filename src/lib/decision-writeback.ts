@@ -9,6 +9,7 @@
 import {
   claimDecisionWriteback,
   decisionWritebackClaimHeld,
+  decisionWritebackLocked,
   getDecision,
   isDecisionLabel,
   releaseDecisionWriteback,
@@ -34,10 +35,19 @@ export const GITHUB_FETCH_TIMEOUT_MS = 15_000;
 /** How long to wait for another writer to finish before stamping not_written. */
 const WRITEBACK_LOCK_WAIT_MS = 20_000;
 let writebackLockWaitMs = WRITEBACK_LOCK_WAIT_MS;
+let processLockEnabled = true;
 
 /** Tests shorten the busy wait. Production stays at 20 seconds. */
 export function setWritebackLockWaitForTests(ms: number | null): void {
   writebackLockWaitMs = ms == null ? WRITEBACK_LOCK_WAIT_MS : ms;
+}
+
+/**
+ * The in-process queue serializes one key. A second process has no such
+ * queue. Tests turn this off to overlap a retry with a live claim.
+ */
+export function setWritebackProcessLockForTests(enabled: boolean | null): void {
+  processLockEnabled = enabled == null ? true : enabled;
 }
 
 export class GitHubWriteError extends Error {
@@ -209,8 +219,12 @@ function delay(ms: number): Promise<void> {
  * Claim one decided revision. Wait only while that same revision is still
  * decided and another writer holds the lock. A reopen, or any other revision
  * change, returns superseded so the caller does not contact GitHub.
- * Giving up stamps `not_written` on that revision so the row stays in the
- * retry queue instead of sitting at writeback null.
+ * A live claim is not stamped `not_written`: that stamp would bump revision
+ * and fence the writer who still holds the lease. The row stays at
+ * writeback null until that writer stamps, or until the lease expires and
+ * the retry population includes it.
+ * Giving up only when no live claim remains stamps `not_written` on that
+ * revision so the row stays in the retry queue.
  */
 async function claimRevision(
   id: number,
@@ -224,9 +238,13 @@ async function claimRevision(
     if (!current || current.status !== "decided" || current.revision !== revision) {
       return { ok: false, outcome: { status: "superseded" } };
     }
+    if (await decisionWritebackLocked(id)) {
+      return { ok: false, outcome: { status: "superseded" } };
+    }
     await delay(25);
   }
-  await setDecisionWriteback(id, "not_written", revision, null);
+  const stamped = await setDecisionWriteback(id, "not_written", revision, null);
+  if (!stamped) return { ok: false, outcome: { status: "superseded" } };
   return { ok: false, outcome: { status: "not_written", reason: "write-back busy" } };
 }
 
@@ -292,7 +310,7 @@ export async function writeDecisionBack(
   if (!target) return { status: "no_target" };
   const client = activeClient();
   const revision = row.revision;
-  if (!client) return publish(row.id, revision, null, target, row);
+  if (!client || !processLockEnabled) return publish(row.id, revision, client, target, row);
   return withLocalLock(row.key, () => publish(row.id, revision, client, target, row));
 }
 

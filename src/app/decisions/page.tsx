@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { DecisionList } from "@/components/DecisionQueue";
-import { decisionQueueVisible, decisionsForPage, loadDecisionPage } from "@/lib/decision-page";
+import { decisionAwaitingWriteback, decisionQueueVisible, decisionsForPage, loadDecisionPage } from "@/lib/decision-page";
 import type { Decision } from "@/lib/decisions";
 
 export default function DecisionsPage() {
@@ -15,11 +15,11 @@ export default function DecisionsPage() {
     if (!loaded.ok) {
       setError(loaded.error);
       setLoadFailed(true);
-      setRows(keep?.writeback === "not_written" ? decisionsForPage([], [keep]) : []);
+      setRows(decisionAwaitingWriteback(keep) ? decisionsForPage([], [keep]) : []);
       return;
     }
     setLoadFailed(false);
-    setRows(keep?.writeback === "not_written" ? decisionsForPage(loaded.decisions, [keep]) : loaded.decisions);
+    setRows(decisionAwaitingWriteback(keep) ? decisionsForPage(loaded.decisions, [keep]) : loaded.decisions);
   }, []);
 
   useEffect(() => {
@@ -62,7 +62,7 @@ export default function DecisionsPage() {
     if (!res.ok) {
       if (body.code === "stale") setError("This decision changed. Reload to see the latest.");
       else setError(body.error ?? "Could not write the decision back.");
-      await load(decision.writeback === "not_written" ? decision : null);
+      await load(decisionAwaitingWriteback(decision) ? decision : null);
       return;
     }
     await load(body.decision ?? null);

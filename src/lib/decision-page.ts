@@ -16,11 +16,19 @@ export function decisionQueueVisible(rows: Decision[] | null, loadFailed: boolea
   return true;
 }
 
+/**
+ * A decided row the page can still retry. `written` is done. Age filtering
+ * stays in the list query, which is what puts a null writeback here.
+ */
+export function decisionAwaitingWriteback(row: Decision | null | undefined): row is Decision {
+  return row != null && row.status === "decided" && row.writeback !== "written";
+}
+
 export function decisionsForPage(openRows: Decision[], decidedRows: Decision[]): Decision[] {
   const byId = new Map<number, Decision>();
   for (const row of openRows) byId.set(row.id, row);
   for (const row of decidedRows) {
-    if (row.status === "decided" && row.writeback === "not_written") byId.set(row.id, row);
+    if (decisionAwaitingWriteback(row)) byId.set(row.id, row);
   }
   return [...byId.values()].sort((a, b) => a.first_seen_at.localeCompare(b.first_seen_at) || a.id - b.id);
 }
