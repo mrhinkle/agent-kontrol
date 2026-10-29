@@ -24,12 +24,16 @@ import { pruneAutomaticNotes, upsertAutomaticNote } from "../src/lib/session-mem
 import type { SpanInput } from "../src/lib/traces";
 import {
   ageDays,
+  claimDecisionWriteback,
+  getDecision,
   listDecisions,
   patchDecision,
   reconcileDecisions,
   partitionBrief,
+  setDecisionWriteback,
   toBriefDecisions,
   upsertDecision,
+  WRITEBACK_LOCK_LEASE_SECONDS,
   type UpsertInput,
 } from "../src/lib/decisions";
 import { finishSyncRun, markSkillRemoved, SyncLeaseLost, upsertSettings, upsertSkill } from "../src/lib/skills/store";
@@ -355,6 +359,7 @@ async function main() {
   await testWatchBeats(tag);
   await testListCursors(tag);
   await testBriefAlerts(tag);
+  await testDecisionWritebackHardening(tag);
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
 }
@@ -1781,6 +1786,262 @@ async function testBriefAlerts(tag: string): Promise<void> {
     setBeforeClaimForTests(null);
     setBriefSettingsForTests(null);
     await cleanup();
+  }
+}
+
+/**
+ * Claim, stamp, and reopen predicates, plus the crash-window retry population.
+ * Tagged by repo so the delete cannot touch another test's rows.
+ */
+async function testDecisionWritebackHardening(tag: string) {
+  const repo = `pgtest/h${tag.replace(/\W/g, "")}`;
+  const key = (n: number) => `github:${repo}#${n}`;
+  const drop = () => sql()`delete from decisions where repo = ${repo}`;
+  const body = (n: number): UpsertInput => ({
+    key: key(n),
+    source: "github-label",
+    repo,
+    repo_short: "app",
+    number: n,
+    url: null,
+    title: `harden ${n}`,
+    why: null,
+    options: null,
+    recommended: null,
+    requested_by: "owner",
+    kind: "issue",
+    labels: ["needs-owner"],
+    opened_at: "2026-07-21T12:00:00.000Z",
+    first_seen_at: "2026-07-21T12:00:00.000Z",
+    github_present: true,
+    force: false,
+  });
+  const decide = async (id: number, revision: number) => {
+    const row = await patchDecision(id, {
+      status: "decided",
+      decision: "ship",
+      setDecision: true,
+      decided_by: "mark",
+      setDecidedBy: true,
+      defer_until: null,
+      setDefer: false,
+      guardTerminal: true,
+      expectedRevision: revision,
+    });
+    assert.ok(row);
+    assert.equal(row.status, "decided");
+    return row;
+  };
+
+  await drop();
+  try {
+    const seeded = await upsertDecision(body(1));
+    const decided = await decide(seeded.decision.id, seeded.decision.revision);
+    const claim = await claimDecisionWriteback(decided.id, decided.revision);
+    assert.ok(claim);
+    assert.equal(claim.revision, decided.revision + 1);
+    const locked = await sql()`
+      select writeback_lock, writeback, revision, status from decisions where id = ${decided.id}
+    `;
+    assert.equal(locked[0].writeback_lock, claim.token);
+    assert.equal(locked[0].writeback, null);
+    assert.equal(Number(locked[0].revision), claim.revision);
+
+    assert.equal(await claimDecisionWriteback(decided.id, decided.revision), null);
+    assert.equal(await claimDecisionWriteback(decided.id, claim.revision), null);
+    assert.equal(await setDecisionWriteback(decided.id, "written", claim.revision, "wrong-token"), null);
+    assert.equal(await setDecisionWriteback(decided.id, "not_written", claim.revision, null), null);
+    const fenced = await sql()`
+      select writeback_lock, writeback, revision from decisions where id = ${decided.id}
+    `;
+    assert.equal(fenced[0].writeback_lock, claim.token);
+    assert.equal(fenced[0].writeback, null);
+    assert.equal(Number(fenced[0].revision), claim.revision);
+
+    const reopened = await patchDecision(decided.id, {
+      status: "open",
+      setDecision: false,
+      setDecidedBy: false,
+      defer_until: null,
+      setDefer: false,
+      guardTerminal: true,
+      expectedRevision: claim.revision,
+    });
+    assert.equal(reopened, null);
+    assert.equal((await getDecision(decided.id))?.status, "decided");
+
+    const stamped = await setDecisionWriteback(decided.id, "written", claim.revision, claim.token);
+    assert.equal(stamped?.writeback, "written");
+    assert.equal(stamped?.revision, claim.revision + 1);
+    const cleared = await sql()`select writeback_lock from decisions where id = ${decided.id}`;
+    assert.equal(cleared[0].writeback_lock, null);
+
+    const takeoverSeed = await upsertDecision(body(2));
+    const takeoverDecided = await decide(takeoverSeed.decision.id, takeoverSeed.decision.revision);
+    const firstClaim = await claimDecisionWriteback(takeoverDecided.id, takeoverDecided.revision);
+    assert.ok(firstClaim);
+    await sql()`
+      update decisions
+      set writeback_lock_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 1})
+      where id = ${takeoverDecided.id}
+    `;
+    const took = await claimDecisionWriteback(takeoverDecided.id, firstClaim.revision);
+    assert.ok(took);
+    assert.notEqual(took.token, firstClaim.token);
+    assert.equal(took.revision, firstClaim.revision + 1);
+
+    const reopenSeed = await upsertDecision(body(3));
+    const reopenDecided = await decide(reopenSeed.decision.id, reopenSeed.decision.revision);
+    const reopenClaim = await claimDecisionWriteback(reopenDecided.id, reopenDecided.revision);
+    assert.ok(reopenClaim);
+    await sql()`
+      update decisions
+      set writeback_lock_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 1})
+      where id = ${reopenDecided.id}
+    `;
+    const opened = await patchDecision(reopenDecided.id, {
+      status: "open",
+      setDecision: false,
+      setDecidedBy: false,
+      defer_until: null,
+      setDefer: false,
+      guardTerminal: true,
+      expectedRevision: reopenClaim.revision,
+    });
+    assert.equal(opened?.status, "open");
+    const openedLock = await sql()`select writeback_lock, status from decisions where id = ${reopenDecided.id}`;
+    assert.equal(openedLock[0].writeback_lock, null);
+    assert.equal(openedLock[0].status, "open");
+
+    const insideSeed = await upsertDecision(body(4));
+    const outsideSeed = await upsertDecision(body(5));
+    const stampedSeed = await upsertDecision(body(6));
+    const writtenSeed = await upsertDecision(body(7));
+    const inside = await decide(insideSeed.decision.id, insideSeed.decision.revision);
+    const outside = await decide(outsideSeed.decision.id, outsideSeed.decision.revision);
+    const freshStamp = await decide(stampedSeed.decision.id, stampedSeed.decision.revision);
+    const written = await decide(writtenSeed.decision.id, writtenSeed.decision.revision);
+    await sql()`
+      update decisions
+      set writeback = null,
+          writeback_lock = null,
+          writeback_lock_at = null,
+          decided_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS - 30}),
+          updated_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS - 30})
+      where id = ${inside.id}
+    `;
+    await sql()`
+      update decisions
+      set writeback = null,
+          writeback_lock = null,
+          writeback_lock_at = null,
+          decided_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30}),
+          updated_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30})
+      where id = ${outside.id}
+    `;
+    await sql()`
+      update decisions set writeback = 'not_written', updated_at = now() where id = ${freshStamp.id}
+    `;
+    await sql()`
+      update decisions
+      set writeback = 'written',
+          updated_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30})
+      where id = ${written.id}
+    `;
+
+    // A claimed row whose process died before the stamp. The collector
+    // upserts the still-labeled row and refreshes updated_at. The lock
+    // timestamp and decided_at stay, so an expired claim is still due.
+    const expiredSeed = await upsertDecision(body(8));
+    const expiredDecided = await decide(expiredSeed.decision.id, expiredSeed.decision.revision);
+    const expiredClaim = await claimDecisionWriteback(expiredDecided.id, expiredDecided.revision);
+    assert.ok(expiredClaim);
+    await sql()`
+      update decisions
+      set writeback_lock_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30}),
+          decided_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30})
+      where id = ${expiredDecided.id}
+    `;
+    const expiredAgain = await upsertDecision(body(8));
+    assert.equal(expiredAgain.decision.id, expiredDecided.id);
+    assert.equal(expiredAgain.status_held, true);
+    assert.equal(expiredAgain.decision.writeback, null);
+    const expiredRow = await sql()`
+      select writeback_lock, writeback,
+        writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as lock_old,
+        decided_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as decided_old,
+        updated_at >= now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as updated_fresh
+      from decisions where id = ${expiredDecided.id}
+    `;
+    assert.equal(expiredRow[0].writeback_lock, expiredClaim.token);
+    assert.equal(expiredRow[0].writeback, null);
+    assert.equal(expiredRow[0].lock_old === true || expiredRow[0].lock_old === "t", true);
+    assert.equal(expiredRow[0].decided_old === true || expiredRow[0].decided_old === "t", true);
+    assert.equal(expiredRow[0].updated_fresh === true || expiredRow[0].updated_fresh === "t", true);
+
+    // Same crash, but the claim is still inside its lease. The collector
+    // refresh must not put that row in the retry population.
+    const liveSeed = await upsertDecision(body(9));
+    const liveDecided = await decide(liveSeed.decision.id, liveSeed.decision.revision);
+    const liveClaim = await claimDecisionWriteback(liveDecided.id, liveDecided.revision);
+    assert.ok(liveClaim);
+    await sql()`
+      update decisions
+      set writeback_lock_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS - 30}),
+          decided_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30})
+      where id = ${liveDecided.id}
+    `;
+    const liveAgain = await upsertDecision(body(9));
+    assert.equal(liveAgain.decision.id, liveDecided.id);
+    assert.equal(liveAgain.decision.writeback, null);
+    const liveRow = await sql()`
+      select writeback_lock,
+        writeback_lock_at >= now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as lock_live,
+        updated_at >= now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as updated_fresh
+      from decisions where id = ${liveDecided.id}
+    `;
+    assert.equal(liveRow[0].writeback_lock, liveClaim.token);
+    assert.equal(liveRow[0].lock_live === true || liveRow[0].lock_live === "t", true);
+    assert.equal(liveRow[0].updated_fresh === true || liveRow[0].updated_fresh === "t", true);
+
+    const flags = await sql()`
+      select id,
+        (
+          writeback = 'not_written'
+          or (
+            status = 'decided'
+            and writeback is null
+            and (
+              writeback_lock is null
+              or writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+            )
+            and coalesce(writeback_lock_at, decided_at, updated_at) < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+          )
+        ) as due
+      from decisions
+      where repo = ${repo} and status = 'decided'
+    `;
+    const due = new Map(flags.map((row) => [Number(row.id), row.due === true || row.due === "t"]));
+    assert.equal(due.get(inside.id), false, "a null writeback inside the lease is not due");
+    assert.equal(due.get(outside.id), true, "a null writeback older than the lease is due");
+    assert.equal(due.get(freshStamp.id), true, "not_written stays due at any age");
+    assert.equal(due.get(written.id), false, "written is not a retry");
+    assert.equal(due.get(expiredDecided.id), true, "an expired claim stays due after a collector upsert refreshes updated_at");
+    assert.equal(due.get(liveDecided.id), false, "a live claim stays out of the retry population after a collector upsert");
+    const listed = await listDecisions({
+      status: "decided",
+      repo,
+      source: null,
+      limit: 100,
+      shape: "row",
+      writeback: "not_written",
+    });
+    assert.deepEqual(
+      listed.map((row) => row.id).sort((a, b) => a - b),
+      [...due.entries()].filter(([, isDue]) => isDue).map(([id]) => id).sort((a, b) => a - b),
+    );
+  } finally {
+    await drop();
   }
 }
 

@@ -1,6 +1,7 @@
 "use client";
 
 import React, { type FormEvent } from "react";
+import { decisionAwaitingWriteback } from "@/lib/decision-page";
 import { decisionSourceHref, readOptions } from "@/lib/decision-format";
 import type { Decision } from "@/lib/decisions";
 
@@ -66,7 +67,7 @@ export function DecisionCard({
         </ul>
       ) : null}
       {decision.decision ? <p className="text-sm mt-3">{decision.decision}</p> : null}
-      {decision.writeback === "not_written" ? (
+      {decision.writeback === "not_written" || decisionAwaitingWriteback(decision) ? (
         <p className="text-sm text-[#f44800] mt-3">
           not written back{" "}
           <button

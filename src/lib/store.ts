@@ -1,5 +1,5 @@
 import { currentActor, type Actor } from "./actor";
-import { activityRow, attachReceipt, receiptFromParts, type ActivityRow, type Receipt } from "./activity";
+import { activityDetail, activityRow, attachReceipt, receiptFromParts, type ActivityRow, type Receipt } from "./activity";
 import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } from "./idempotency";
 import { StaleWrite, absentRevision } from "./revision";
 import { writeSessionNote } from "./session-memory";
@@ -1675,6 +1675,29 @@ export async function readMemoryForPreview(key: string): Promise<{ item: MemoryI
   } catch (e) {
     if (e instanceof Error && e.message === "memory preview returned no revision") throw e;
     throw new Error(errMsg(e));
+  }
+}
+
+/**
+ * One events row for a write that already committed in its own statement.
+ * Decision tools use this after the row is stored. The kind is the tool name.
+ */
+export async function recordToolReceipt(input: {
+  kind: string;
+  title: string;
+  extra?: Record<string, unknown>;
+}): Promise<Receipt | null> {
+  const detail = JSON.stringify(activityDetail(input.kind, currentActor(), input.extra ?? {}));
+  try {
+    const rows = await sql()`
+      insert into events (agent_id, session_id, kind, title, detail)
+      values (null, null, ${input.kind}, ${input.title}, ${detail}::jsonb)
+      returning id, kind, created_at
+    `;
+    const row = rows[0] as Record<string, unknown> | undefined;
+    return row ? receiptFromParts(row.id, row.kind, row.created_at) : null;
+  } catch (e) {
+    throw new Error(`recordToolReceipt: ${errMsg(e)}`);
   }
 }
 
