@@ -1,6 +1,7 @@
 import { createMcpHandler, withMcpAuth } from "mcp-handler";
 import { z } from "zod";
 import { actorFromPrincipal, currentActor, runWithActor } from "@/lib/actor";
+import { activityDetail, readReceipt, withReceipt } from "@/lib/activity";
 import { apiError, memoryKeyError, toolResultFromCaught, type McpToolResult } from "@/lib/api-error";
 import { secretsMatch, verifyAccessToken } from "@/lib/authcrypto";
 import { resolveAgentCredential } from "@/lib/credentials";
@@ -13,7 +14,7 @@ import {
   demoReportStatusTool,
   demoTaskQueueTool,
 } from "@/lib/demo-store";
-import { recallResult, taskQueueResult } from "@/lib/list-read";
+import { listActivityResult, recallResult, taskQueueResult } from "@/lib/list-read";
 import { evaluateMcpMessages, insufficientScopeBody, principalFromMcpAuth } from "@/lib/scopes";
 import { rememberForTool, updateTaskForTool } from "@/lib/dry-run-actions";
 import { claimNextTask, createTask, fetchMessages, fleet, replyFromAgent, report } from "@/lib/store";
@@ -80,7 +81,8 @@ const handler = createMcpHandler(
       },
       async (args) => guardTool("report_status", async () => {
         if (!isConfigured()) return demoReportStatusTool(args);
-        await report({
+        const actor = currentActor();
+        const receipt = await report({
           agent_id: args.agent_id,
           platform: args.platform,
           machine: args.machine,
@@ -91,8 +93,9 @@ const handler = createMcpHandler(
           title: args.title,
           project: args.project,
           summary: args.summary ?? args.title,
+          detail: activityDetail("report_status", actor, {}),
         });
-        return { content: [{ type: "text", text: "Status reported to Agent Kontrol." }] };
+        return withReceipt("Status reported to Agent Kontrol.", receipt);
       }),
     );
 
@@ -312,15 +315,9 @@ const handler = createMcpHandler(
             actor: currentActor(),
             idempotency_key: args.idempotency_key,
           });
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Reply #${msg.id} delivered to Agent Kontrol` +
-                  (msg.thread_id ? ` (thread ${msg.thread_id}).` : "."),
-              },
-            ],
-          };
+          const text = `Reply #${msg.id} delivered to Agent Kontrol` +
+            (msg.thread_id ? ` (thread ${msg.thread_id}).` : ".");
+          return withReceipt(text, readReceipt(msg));
         }),
       );
     }
@@ -362,11 +359,8 @@ const handler = createMcpHandler(
           idempotency_key: args.idempotency_key,
           actor: currentActor(),
         });
-        return {
-          content: [
-            { type: "text", text: `Task #${task.id} queued for ${task.platform} (priority ${task.priority}).` },
-          ],
-        };
+        const text = `Task #${task.id} queued for ${task.platform} (priority ${task.priority}).`;
+        return withReceipt(text, readReceipt(task));
       }),
     );
 
@@ -413,19 +407,13 @@ const handler = createMcpHandler(
         if (!task) {
           return { content: [{ type: "text", text: "No queued tasks for your platform." }] };
         }
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `Claimed task #${task.id}: ${task.title}\n` +
-                (task.project ? `Project: ${task.project}\n` : "") +
-                (task.reviewer_platform ? `Review by: ${task.reviewer_platform} when done\n` : "") +
-                `Instructions:\n${task.description ?? task.title}\n\n` +
-                `When finished, call update_task (id: ${task.id}) with status 'done' or 'failed' and a result summary.`,
-            },
-          ],
-        };
+        const text =
+          `Claimed task #${task.id}: ${task.title}\n` +
+          (task.project ? `Project: ${task.project}\n` : "") +
+          (task.reviewer_platform ? `Review by: ${task.reviewer_platform} when done\n` : "") +
+          `Instructions:\n${task.description ?? task.title}\n\n` +
+          `When finished, call update_task (id: ${task.id}) with status 'done' or 'failed' and a result summary.`;
+        return withReceipt(text, readReceipt(task));
       }),
     );
 
@@ -566,6 +554,26 @@ const handler = createMcpHandler(
         },
       },
       async (args) => guardTool("delete_note", () => deleteNoteTool(args)),
+    );
+
+    server.registerTool(
+      "list_activity",
+      {
+        title: "List activity",
+        annotations: READ_ONLY,
+        description:
+          "List write receipts and other events, newest first. Filter by actor (the authenticated actor id), kind, since, and until. since and until are inclusive ISO timestamps. limit, cursor, and fields match the other lists: limit is 1 to 200, cursor is the opaque next_cursor, and fields is a comma-separated allowlist. Operator only, the same boundary as traces. An agent credential is denied, including one with fleet:read. MC_TOKEN and an OAuth access token can call it. With no database, this reads the in-memory demo log.",
+        inputSchema: {
+          actor: z.string().optional().describe("Exact actor_id. Omit to include every actor."),
+          kind: z.string().optional().describe("Exact event kind, such as task_updated or status."),
+          since: z.string().optional().describe("Inclusive ISO timestamp. Rows at or after this instant."),
+          until: z.string().optional().describe("Inclusive ISO timestamp. Rows in this millisecond and earlier."),
+          limit: z.number().optional().describe("Maximum rows, from 1 to 200. Defaults to 50. Passing limit or cursor adds a next_cursor line."),
+          cursor: z.string().optional().describe("Opaque cursor from a previous next_cursor line."),
+          fields: z.string().optional().describe("Comma-separated allowlisted fields. id is always included. One JSON object per line."),
+        },
+      },
+      async (args) => guardTool("list_activity", () => listActivityResult(args, isConfigured())),
     );
   },
   {},

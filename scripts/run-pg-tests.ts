@@ -9,7 +9,9 @@ import { Client } from "pg";
 import { sql } from "../src/lib/db";
 import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
 import { StaleWrite } from "../src/lib/revision";
-import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview, findAgent, deleteMemory } from "../src/lib/store";
+import { readReceipt } from "../src/lib/activity";
+import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview, findAgent, deleteMemory, slugify } from "../src/lib/store";
+import { updateTaskForTool } from "../src/lib/dry-run-actions";
 import { getWatchedRepos, replaceWatchedRepos } from "../src/lib/watched-repos";
 import type { RepoConfig } from "../src/lib/progress-config";
 import { getTrace, listTraces, pruneSpans, upsertSpans } from "../src/lib/trace-store";
@@ -327,18 +329,324 @@ async function main() {
       idempotency_key: idemKey,
     });
     assert.notEqual(String(afterExpiry.id), String(first.id), "an expired key can create a new task");
+    await sql()`
+      delete from events
+      where kind = 'create_task'
+        and detail->>'task_id' in (select id::text from tasks where platform = ${idemPlatform})
+    `;
     await sql()`delete from tasks where platform = ${idemPlatform}`;
     await sql()`delete from idempotency_keys where idempotency_key = ${idemKey}`;
   } finally {
     setIdempotencyClockForTests(null);
   }
 
+  await testActivityReceiptAtomic(tag);
+  await testReportStatusAtomic(tag);
   await testDecisions(tag);
   await testSkillLeaseFence(tag);
   await testSkillSchedule(tag);
   await testListCursors(tag);
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
+}
+
+/**
+ * One idempotent create_task is one task, one event, and one receipt.
+ * A forced events-insert failure rolls the write back with it.
+ */
+async function testActivityReceiptAtomic(tag: string) {
+  const platform = `pgtest-act-${tag}`;
+  const key = `act-${tag}`;
+  const failPlatform = `pgtest-act-fail-${tag}`;
+  const memoryKey = `${tag}/act-keep`;
+  const freshKey = `${tag}/act-fresh`;
+  const deleteKey = `${tag}/act-del`;
+  const failIdem = `act-fail-${tag}`;
+  try {
+    const settled = await Promise.allSettled([
+      createTask({ title: `race ${tag}`, platform, priority: 1, idempotency_key: key }),
+      createTask({ title: `race ${tag}`, platform, priority: 1, idempotency_key: key }),
+    ]);
+    for (const item of settled) {
+      if (item.status === "rejected" && !(item.reason instanceof IdempotencyConflict)) throw item.reason;
+    }
+    const won = settled.filter((item) => item.status === "fulfilled");
+    assert.ok(won.length >= 1, "at least one concurrent create_task completed");
+    const taskIds = new Set(won.map((item) => String(item.value.id)));
+    assert.equal(taskIds.size, 1, "concurrent same-key creates share one task");
+    const receiptIds = new Set(won.map((item) => readReceipt(item.value)?.id).filter((id): id is string => Boolean(id)));
+    assert.equal(receiptIds.size, 1, "concurrent same-key creates share one receipt");
+    const taskId = [...taskIds][0];
+    const receiptId = [...receiptIds][0];
+    const tasks = await sql()`select count(*)::int as n from tasks where platform = ${platform}`;
+    assert.equal(Number(tasks[0].n), 1, "two concurrent calls insert one task");
+    const events = await sql()`
+      select id::text as id
+      from events
+      where kind = 'create_task' and detail->>'task_id' = ${taskId}
+    `;
+    assert.equal(events.length, 1, "two concurrent calls insert one activity event");
+    assert.equal(String(events[0].id), receiptId);
+
+    const replay = await createTask({ title: `race ${tag}`, platform, priority: 1, idempotency_key: key });
+    assert.equal(String(replay.id), taskId);
+    assert.equal(readReceipt(replay)?.id, receiptId, "a replay returns the stored receipt");
+    const afterReplay = await sql()`
+      select count(*)::int as n from events
+      where kind = 'create_task' and detail->>'task_id' = ${taskId}
+    `;
+    assert.equal(Number(afterReplay[0].n), 1, "a replay does not insert a second event");
+
+    await remember({ content: "before", key: memoryKey, agent_id: `${tag}-agent` });
+    await remember({ content: "stay", key: deleteKey, agent_id: `${tag}-agent` });
+
+    await sql()`
+      create or replace function ak_test_fail_event()
+      returns trigger
+      language plpgsql
+      as $fn$
+      begin
+        if new.kind in ('create_task', 'remember', 'delete_note', 'send_message', 'reply_to_operator') then
+          raise exception 'simulated events insert failure';
+        end if;
+        return new;
+      end;
+      $fn$
+    `;
+    await sql()`drop trigger if exists ak_test_fail_event on events`;
+    await sql()`
+      create trigger ak_test_fail_event
+      before insert on events
+      for each row
+      execute procedure ak_test_fail_event()
+    `;
+
+    const orphansBefore = await sql()`
+      select count(*)::int as n
+      from events e
+      where e.kind = 'create_task'
+        and not exists (
+          select 1 from tasks t where t.id::text = e.detail->>'task_id'
+        )
+    `;
+    await assert.rejects(
+      () => createTask({ title: `fail ${tag}`, platform: failPlatform }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const failedTasks = await sql()`select count(*)::int as n from tasks where platform = ${failPlatform}`;
+    assert.equal(Number(failedTasks[0].n), 0, "a failed event insert leaves no task");
+    const orphans = await sql()`
+      select count(*)::int as n
+      from events e
+      where e.kind = 'create_task'
+        and not exists (
+          select 1 from tasks t where t.id::text = e.detail->>'task_id'
+        )
+    `;
+    assert.equal(
+      Number(orphans[0].n),
+      Number(orphansBefore[0].n),
+      "a failed event insert leaves no receipt row",
+    );
+
+    await assert.rejects(
+      () => remember({ content: "after", key: memoryKey, agent_id: `${tag}-agent` }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const kept = await sql()`select content from memory where key = ${memoryKey}`;
+    assert.equal(String(kept[0]?.content), "before", "a failed event insert leaves the previous note");
+
+    await assert.rejects(
+      () => remember({ content: "nope", key: freshKey, agent_id: `${tag}-agent` }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const fresh = await sql()`select count(*)::int as n from memory where key = ${freshKey}`;
+    assert.equal(Number(fresh[0].n), 0, "a failed event insert leaves no new note");
+
+    await assert.rejects(
+      () => deleteMemory({ key: deleteKey }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const stillThere = await sql()`select content from memory where key = ${deleteKey}`;
+    assert.equal(String(stillThere[0]?.content), "stay", "a failed event insert does not delete the note");
+
+    await assert.rejects(
+      () => createTask({ title: `fail idem ${tag}`, platform: failPlatform, idempotency_key: failIdem }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    await sql()`drop trigger if exists ak_test_fail_event on events`;
+    const recovered = await createTask({
+      title: `fail idem ${tag}`,
+      platform: failPlatform,
+      idempotency_key: failIdem,
+    });
+    assert.equal(readReceipt(recovered)?.kind, "create_task");
+    const recoveredTasks = await sql()`select count(*)::int as n from tasks where platform = ${failPlatform}`;
+    assert.equal(Number(recoveredTasks[0].n), 1, "a failed claim is released so the same key can write once");
+    const recoveredEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'create_task' and detail->>'task_id' = ${String(recovered.id)}
+    `;
+    assert.equal(Number(recoveredEvents[0].n), 1);
+  } finally {
+    await sql()`drop trigger if exists ak_test_fail_event on events`;
+    await sql()`drop function if exists ak_test_fail_event()`;
+    await sql()`
+      delete from events e
+      where e.kind in ('create_task', 'remember', 'delete_note')
+        and (
+          e.detail->>'memory_key' like ${`%${tag}%`}
+          or e.detail->>'task_id' in (
+            select id::text from tasks where platform like ${`pgtest-act-%${tag}`}
+          )
+        )
+    `;
+    await sql()`delete from tasks where platform like ${`pgtest-act-%${tag}`}`;
+    await sql()`delete from memory where key like ${`%${tag}%`}`;
+    await sql()`delete from idempotency_keys where idempotency_key like ${`%${tag}%`}`;
+  }
+}
+
+/**
+ * report() writes the agent, the session, and the event in one statement.
+ * A rejecting events insert leaves both rows as they were. updateTaskForTool
+ * still returns the task receipt when the later status report fails.
+ */
+async function testReportStatusAtomic(tag: string) {
+  const agentId = slugify(`${tag}-rpt`);
+  // main() already stores a writeback session at `${tag}-sess`. A colliding id
+  // would make the rollback count look like a leftover insert.
+  const sessionId = `${tag}-rpt-sess`;
+  const laneId = slugify(`${tag}-lane`);
+  const platform = `pgtest-rpt-${tag}`;
+  const install = async () => {
+    await sql()`
+      create or replace function ak_test_fail_status_event()
+      returns trigger
+      language plpgsql
+      as $fn$
+      begin
+        if new.kind = 'status' then
+          raise exception 'simulated events insert failure';
+        end if;
+        return new;
+      end;
+      $fn$
+    `;
+    await sql()`drop trigger if exists ak_test_fail_status_event on events`;
+    await sql()`
+      create trigger ak_test_fail_status_event
+      before insert on events
+      for each row
+      execute procedure ak_test_fail_status_event()
+    `;
+  };
+  const drop = async () => {
+    await sql()`drop trigger if exists ak_test_fail_status_event on events`;
+    await sql()`drop function if exists ak_test_fail_status_event()`;
+  };
+  try {
+    await install();
+    await assert.rejects(
+      () => report({
+        agent_id: agentId,
+        platform: "codex",
+        machine: "m1",
+        display_name: "Should Not Stick",
+        session_id: sessionId,
+        kind: "status",
+        title: "ghost",
+        project: "p",
+        summary: "ghost summary",
+      }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const newAgents = await sql()`select count(*)::int as n from agents where id = ${agentId}`;
+    const newSessions = await sql()`select count(*)::int as n from sessions where id = ${sessionId}`;
+    const ghosts = await sql()`select count(*)::int as n from events where kind = 'status' and title = 'ghost'`;
+    assert.equal(Number(newAgents[0].n), 0, "a failed event insert leaves no new agent");
+    assert.equal(Number(newSessions[0].n), 0, "a failed event insert leaves no new session");
+    assert.equal(Number(ghosts[0].n), 0, "a failed event insert leaves no status event");
+
+    await drop();
+    const seeded = await report({
+      agent_id: agentId,
+      platform: "codex",
+      display_name: "Kept",
+      session_id: sessionId,
+      kind: "session_start",
+      title: "hello",
+      project: "p",
+      summary: "kept",
+    });
+    assert.equal(seeded?.kind, "session_start");
+    const beforeAgent = await sql()`select platform, display_name, last_seen_at from agents where id = ${agentId}`;
+    const beforeSession = await sql()`select status, summary, project, ended_at from sessions where id = ${sessionId}`;
+    assert.equal(beforeAgent.length, 1);
+    assert.equal(beforeSession.length, 1);
+    await install();
+    await assert.rejects(
+      () => report({
+        agent_id: agentId,
+        platform: "hermes",
+        display_name: "Changed",
+        session_id: sessionId,
+        kind: "status",
+        status: "failed",
+        title: "ghost-update",
+        summary: "changed",
+      }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const afterAgent = await sql()`select platform, display_name, last_seen_at from agents where id = ${agentId}`;
+    const afterSession = await sql()`select status, summary, project, ended_at from sessions where id = ${sessionId}`;
+    assert.equal(String(afterAgent[0].platform), String(beforeAgent[0].platform));
+    assert.equal(String(afterAgent[0].display_name), String(beforeAgent[0].display_name));
+    assert.equal(new Date(afterAgent[0].last_seen_at as string | Date).toISOString(), new Date(beforeAgent[0].last_seen_at as string | Date).toISOString());
+    assert.equal(String(afterSession[0].status), String(beforeSession[0].status));
+    assert.equal(String(afterSession[0].summary), String(beforeSession[0].summary));
+    assert.equal(String(afterSession[0].project), String(beforeSession[0].project));
+    const endedBefore = beforeSession[0].ended_at == null ? null : new Date(beforeSession[0].ended_at as string | Date).toISOString();
+    const endedAfter = afterSession[0].ended_at == null ? null : new Date(afterSession[0].ended_at as string | Date).toISOString();
+    assert.equal(endedAfter, endedBefore);
+    const updates = await sql()`select count(*)::int as n from events where kind = 'status' and title = 'ghost-update'`;
+    assert.equal(Number(updates[0].n), 0, "a failed event insert leaves no status event on an existing session");
+
+    const task = await createTask({ title: `secondary ${tag}`, platform });
+    const result = await updateTaskForTool({ id: task.id, status: "done", agent_id: `${tag}-lane` });
+    assert.equal(result.isError, undefined);
+    const text = result.content[0]?.text ?? "";
+    assert.match(text, new RegExp(`^Task #${task.id} updated \\(done\\)\\.`));
+    assert.match(text, /note: the status event was not recorded/);
+    const receiptLine = text.split("\n").at(-1) ?? "";
+    assert.match(receiptLine, /^receipt: \{/);
+    const receipt = JSON.parse(receiptLine.slice("receipt: ".length)) as { id: string; kind: string };
+    assert.equal(receipt.kind, "task_updated");
+    const structured = result.structuredContent as { receipt?: { id: string; kind: string } } | undefined;
+    assert.equal(structured?.receipt?.id, receipt.id);
+    assert.equal(structured?.receipt?.kind, "task_updated");
+    const stored = await sql()`select status from tasks where id = ${task.id}`;
+    assert.equal(String(stored[0].status), "done");
+    const lane = await sql()`select count(*)::int as n from agents where id = ${laneId}`;
+    assert.equal(Number(lane[0].n), 0, "a failed secondary report writes no agent");
+    const statusEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'status' and detail->>'task_id' = ${String(task.id)}
+    `;
+    assert.equal(Number(statusEvents[0].n), 0, "a failed secondary report writes no status event");
+    const taskEvents = await sql()`
+      select id::text as id from events
+      where kind = 'task_updated' and detail->>'task_id' = ${String(task.id)}
+    `;
+    assert.equal(taskEvents.length, 1);
+    assert.equal(String(taskEvents[0].id), receipt.id);
+  } finally {
+    await drop();
+    await sql()`delete from tasks where platform = ${platform}`;
+    await sql()`delete from events where agent_id in (${agentId}, ${laneId}) or session_id = ${sessionId}`;
+    await sql()`delete from sessions where id = ${sessionId}`;
+    await sql()`delete from agents where id in (${agentId}, ${laneId})`;
+  }
 }
 
 async function testDecisions(tag: string) {

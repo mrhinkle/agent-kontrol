@@ -83,6 +83,18 @@ function installFake() {
       return creds.filter((row) => row.token_hash === values[0]);
     }
     if (lower.includes("update agent_credentials")) return [];
+    // claimNextTask is one statement: update tasks, then insert the event.
+    // The task id is the fourth bind. Later binds are the event's actor.
+    if (lower.includes("update tasks") && lower.includes("insert into events")) {
+      const id = values[3];
+      const found = inserts.find((item) => item.table === "tasks" && item.row.id === id);
+      if (!found || found.row.status !== "queued") return [];
+      found.row.status = "claimed";
+      found.row.assigned_agent = values[0];
+      found.row.claimed_at = values[1];
+      found.row.updated_at = values[2];
+      return [{ ...found.row }];
+    }
     if (lower.includes("insert into ")) {
       const rootMessage = lower.includes("insert into messages") && lower.includes("overriding system value");
       const row: Row = rootMessage
