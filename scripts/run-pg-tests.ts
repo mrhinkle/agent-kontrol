@@ -1498,6 +1498,48 @@ async function testWatchBeatRoute(tag: string): Promise<void> {
       assert.deepEqual(await stored("mini"), before);
     }
 
+    const bound = process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON;
+    for (const raw of ["{}", JSON.stringify({ mini: [] }), JSON.stringify({ mini: [], macbook: [] })]) {
+      process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON = raw;
+      const res = await post(mini.token, {
+        source: "mini",
+        status: "failing",
+        detail: "empty binding must not land",
+        beat_at: futureBeat,
+      });
+      assert.equal(res.status, 503, raw);
+      assert.deepEqual(await stored("mini"), before);
+    }
+    for (const contentType of [
+      "application/json, text/plain",
+      "application/json+x",
+      "application/jsonx",
+      "text/json",
+      "",
+    ]) {
+      const res = await post(mini.token, {
+        source: "mini",
+        status: "failing",
+        detail: "bad content type must not land",
+        beat_at: futureBeat,
+      }, { "content-type": contentType });
+      assert.equal(res.status, 415, JSON.stringify(contentType));
+      assert.deepEqual(await stored("mini"), before);
+    }
+    const missingType = await POST(new Request("http://localhost/api/watch/beat", {
+      method: "POST",
+      headers: { authorization: `Bearer ${mini.token}` },
+      body: JSON.stringify({
+        source: "mini",
+        status: "failing",
+        detail: "missing content type must not land",
+        beat_at: futureBeat,
+      }),
+    }));
+    assert.equal(missingType.status, 415);
+    assert.deepEqual(await stored("mini"), before);
+    process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON = bound;
+
     const ahead = await post(mini.token, {
       source: "mini",
       status: "held",

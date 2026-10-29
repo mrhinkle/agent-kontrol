@@ -70,10 +70,18 @@ export async function readCappedBody(
   return { ok: true, bytes };
 }
 
+/**
+ * One media type. `application/json` only, compared case-insensitively,
+ * optionally followed by `;` parameters such as `charset=utf-8`.
+ * A comma is a second type. A suffix (`application/json+x`), a different
+ * type, an empty value, and a missing header are all rejected.
+ */
 export function isJsonContentType(header: string | null): boolean {
-  if (!header) return false;
-  const first = header.split(",")[0] ?? "";
-  const media = first.split(";")[0]?.trim().toLowerCase() ?? "";
+  if (typeof header !== "string") return false;
+  const value = header.trim();
+  if (value.length === 0 || value.includes(",")) return false;
+  const splitAt = value.indexOf(";");
+  const media = (splitAt === -1 ? value : value.slice(0, splitAt)).trim().toLowerCase();
   return media === "application/json";
 }
 

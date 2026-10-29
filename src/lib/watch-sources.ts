@@ -4,8 +4,10 @@
  * `WATCH_SOURCE_CREDENTIAL_IDS_JSON` maps `mini`, `macbook`, and `watcher`
  * to arrays of credential row UUIDs (`principal.id`, not an agent id and
  * not a label). Several UUIDs per source are rotation. One UUID under two
- * sources is invalid configuration. A missing or invalid document fails
- * closed. GET does not use this map.
+ * sources is invalid configuration. The object must name at least one known
+ * source, and every named source must map to a non-empty array of UUIDs.
+ * A missing document, `{}`, an empty list, or any other invalid document
+ * fails closed. GET does not use this map.
  *
  * The beat instant rules match `beatAtForSql` in src/lib/watch.ts so a
  * string the store would reject is rejected here, before a query.
@@ -83,6 +85,10 @@ export function loadWatchSourceBindings(
     }
     bindings[name] = ids;
   }
+  // `{}` names nothing. An empty list already failed above. Either one
+  // leaves every source unbound, which is missing configuration, not a
+  // credential that is merely on the wrong host.
+  if (seen.size === 0) return { ok: false, reason: "empty" };
   return { ok: true, bindings };
 }
 

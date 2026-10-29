@@ -10,8 +10,10 @@ import {
 import { setSqlForTests, type Row } from "../../src/lib/db";
 import { openApiDocument } from "../../src/lib/openapi";
 import { SCOPES, scopeForRoute } from "../../src/lib/scopes";
+import { isJsonContentType } from "../../src/app/api/watch/access";
 import { POST } from "../../src/app/api/watch/beat/route";
 import { GET } from "../../src/app/api/watch/beats/route";
+import { loadWatchSourceBindings } from "../../src/lib/watch-sources";
 
 /**
  * Failure cases for mrhinkle/agent-kontrol#82. A rejected call must not insert.
@@ -254,7 +256,9 @@ describe("watch routes", () => {
       "[]",
       `"${id}"`,
       JSON.stringify({ laptop: [id] }),
+      "{}",
       JSON.stringify({ mini: [] }),
+      JSON.stringify({ mini: [], macbook: [] }),
       JSON.stringify({ mini: "not-an-array" }),
       JSON.stringify({ mini: ["not-a-uuid"] }),
       JSON.stringify({ mini: [id, id] }),
@@ -265,6 +269,9 @@ describe("watch routes", () => {
     ];
     for (const raw of cases) {
       queries = [];
+      if (typeof raw === "string") {
+        assert.equal(loadWatchSourceBindings(raw).ok, false, JSON.stringify(raw));
+      }
       if (raw === undefined) delete env.WATCH_SOURCE_CREDENTIAL_IDS_JSON;
       else env.WATCH_SOURCE_CREDENTIAL_IDS_JSON = raw;
       const res = await post(mini.token, BEAT);
@@ -282,15 +289,41 @@ describe("watch routes", () => {
     const mini = await issue(["watch:write"]);
     bind({ mini: [mini.credential.id] });
 
+    assert.equal(isJsonContentType(null), false);
+    assert.equal(isJsonContentType(""), false);
+    assert.equal(isJsonContentType("   "), false);
+    assert.equal(isJsonContentType("application/json, text/plain"), false);
+    assert.equal(isJsonContentType("application/json+x"), false);
+    assert.equal(isJsonContentType("application/jsonx"), false);
+    assert.equal(isJsonContentType("text/json"), false);
+    assert.equal(isJsonContentType("application/json"), true);
+    assert.equal(isJsonContentType("Application/JSON; charset=UTF-8"), true);
+    assert.equal(isJsonContentType(" application/json ; charset=utf-8 "), true);
+
     const wrongType = await post(mini.token, BEAT, { "content-type": "text/plain" });
     assert.equal(wrongType.status, 415);
+    assertNothingWritten();
+    queries = [];
     const missingType = await POST(new Request("http://localhost/api/watch/beat", {
       method: "POST",
       headers: { authorization: `Bearer ${mini.token}` },
       body: JSON.stringify(BEAT),
     }));
     assert.equal(missingType.status, 415);
-    assert.equal((await post(mini.token, BEAT, { "content-type": "text/json" })).status, 415);
+    assertNothingWritten();
+    for (const contentType of [
+      "application/json, text/plain",
+      "application/json+x",
+      "application/jsonx",
+      "text/json",
+      "",
+      "   ",
+    ]) {
+      queries = [];
+      const rejected = await post(mini.token, BEAT, { "content-type": contentType });
+      assert.equal(rejected.status, 415, JSON.stringify(contentType));
+      assertNothingWritten();
+    }
 
     const nineKib = Buffer.alloc(9 * 1024, 0x78);
     assert.equal((await post(mini.token, null, {}, nineKib)).status, 413);
@@ -355,6 +388,8 @@ describe("watch routes", () => {
 
     const typed = await post(mini.token, BEAT, { "content-type": "application/json; charset=utf-8" });
     assert.equal(typed.status, 200);
+    const mixedCase = await post(mini.token, BEAT, { "content-type": "Application/JSON; charset=UTF-8" });
+    assert.equal(mixedCase.status, 200);
     const wide = await post(mini.token, { ...BEAT, detail: "😀".repeat(500) });
     assert.equal(wide.status, 200);
   });
