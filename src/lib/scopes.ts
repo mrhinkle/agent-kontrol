@@ -55,6 +55,7 @@ export const TOOL_SCOPES: Record<string, Scope> = {
   send_message: "messages:write",
   requeue_task: "tasks:write",
   delete_note: "memory:write",
+  list_activity: "fleet:read",
 };
 
 /**
@@ -64,6 +65,7 @@ export const TOOL_SCOPES: Record<string, Scope> = {
  */
 const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   { method: "GET", path: /^\/api\/fleet$/, scope: "fleet:read" },
+  { method: "GET", path: /^\/api\/activity$/, scope: "fleet:read" },
   { method: "POST", path: /^\/api\/ingest$/, scope: "status:write" },
   { method: "GET", path: /^\/api\/memory$/, scope: "memory:read" },
   { method: "POST", path: /^\/api\/memory$/, scope: "memory:write" },

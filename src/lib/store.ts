@@ -1,4 +1,5 @@
-import type { Actor } from "./actor";
+import { currentActor, type Actor } from "./actor";
+import { activityDetail, activityRow, attachReceipt, receiptFromParts, type ActivityRow, type Receipt } from "./activity";
 import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } from "./idempotency";
 import { StaleWrite, absentRevision } from "./revision";
 import { writeSessionNote } from "./session-memory";
@@ -68,7 +69,7 @@ function rethrowStore(e: unknown): never {
   throw new Error(errMsg(e));
 }
 
-export async function report(input: ReportInput): Promise<void> {
+export async function report(input: ReportInput): Promise<Receipt | null> {
   const db = sql();
   const now = new Date().toISOString();
   const agentId = slugify(input.agent_id);
@@ -168,8 +169,9 @@ export async function report(input: ReportInput): Promise<void> {
     }
   }
 
+  let receipt: Receipt | null = null;
   try {
-    await db`
+    const rows = await db`
       insert into events (agent_id, session_id, kind, title, detail)
       values (
         ${agentId},
@@ -178,7 +180,10 @@ export async function report(input: ReportInput): Promise<void> {
         ${input.title ?? null},
         ${JSON.stringify(input.detail ?? null)}::jsonb
       )
+      returning id, kind, created_at
     `;
+    const row = rows[0] as Record<string, unknown> | undefined;
+    receipt = row ? receiptFromParts(row.id, row.kind, row.created_at) : null;
   } catch (e) {
     throw new Error(`events insert: ${errMsg(e)}`);
   }
@@ -192,6 +197,7 @@ export async function report(input: ReportInput): Promise<void> {
     await Promise.race([work, new Promise<void>((resolve) => (timer = setTimeout(resolve, 2500)))]);
     clearTimeout(timer);
   }
+  return receipt;
 }
 
 const OFFLINE_AFTER_MS = 15 * 60 * 1000;
@@ -480,11 +486,18 @@ function actorFields(actor: Actor | null | undefined): { actor_type: string | nu
 }
 
 function asTask(row: Record<string, unknown>): Task {
-  return {
+  const receipt = receiptFromParts(row.receipt_id, row.receipt_kind, row.receipt_at);
+  const task: Task = {
     ...(row as unknown as Task),
     actor_type: row.actor_type === "human" || row.actor_type === "agent" ? row.actor_type : null,
     actor_id: row.actor_id == null || row.actor_id === "" ? null : String(row.actor_id),
   };
+  const extra = task as unknown as Record<string, unknown>;
+  delete extra.receipt_id;
+  delete extra.receipt_kind;
+  delete extra.receipt_at;
+  if (receipt) attachReceipt(task, receipt);
+  return task;
 }
 
 /** The atomic statement returns the jsonb it stored, not the driver row. */
@@ -1126,18 +1139,51 @@ export async function claimNextTask(input: {
   }
 
   const now = new Date().toISOString();
+  const actor = currentActor();
+  const activityActorType = actor?.actor_type ?? null;
+  const activityActorId = actor?.actor_id ?? null;
   for (const t of candidates) {
     if (t.machine && input.machine && t.machine !== input.machine) continue;
     if (t.machine && !input.machine) continue;
     try {
+      // One statement. The event insert reads only the updated row, so a lost
+      // race (zero rows) writes no event. Actor parameters follow `where id`
+      // so the claim's existing binds stay $1..$4.
       const claimed = await db`
-        update tasks set
-          status = 'claimed',
-          assigned_agent = ${input.agent_id},
-          claimed_at = ${now},
-          updated_at = ${now}
-        where id = ${t.id} and status = 'queued'
-        returning *
+        with changed as (
+          update tasks set
+            status = 'claimed',
+            assigned_agent = ${input.agent_id},
+            claimed_at = ${now},
+            updated_at = ${now}
+          where id = ${t.id} and status = 'queued'
+          returning *
+        ),
+        logged as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            'task_claimed',
+            'Claimed task #' || changed.id::text || ': ' || coalesce(changed.title, ''),
+            jsonb_build_object(
+              'task_id', changed.id,
+              'tool', 'claim_task',
+              'status', changed.status,
+              'assigned_agent', changed.assigned_agent,
+              'actor_type', ${activityActorType}::text,
+              'actor_id', ${activityActorId}::text
+            )
+          from changed
+          returning id, kind, created_at
+        )
+        select
+          changed.*,
+          logged.id as receipt_id,
+          logged.kind as receipt_kind,
+          logged.created_at as receipt_at
+        from changed
+        left join logged on true
       `;
       if (claimed.length > 0) return asTask(claimed[0] as Record<string, unknown>);
     } catch (e) {
@@ -1166,6 +1212,10 @@ export async function updateTask(input: {
    * creator. requeue_task passes it. created_by never does.
    */
   actor?: Actor | null;
+  /** Audit kind recorded in the same statement. Default task_updated. */
+  eventKind?: string;
+  /** Tool name stored on the event. Default update_task. */
+  activityTool?: string;
 }): Promise<Task> {
   const db = sql();
   const now = new Date().toISOString();
@@ -1181,39 +1231,98 @@ export async function updateTask(input: {
   const hasSession = input.session_id !== undefined;
   const hasAgent = input.assigned_agent !== undefined;
   const expected = input.expected_revision;
+  const activity = currentActor();
+  const eventKind = input.eventKind ?? "task_updated";
+  const activityTool = input.activityTool ?? "update_task";
+  const activityActorType = activity?.actor_type ?? null;
+  const activityActorId = activity?.actor_id ?? null;
 
   let rows: Record<string, unknown>[] = [];
   try {
+    // Activity binds are after the task predicate. A zero-row update inserts
+    // no event, because the insert selects from the updated rows only.
     if (expected === undefined) {
       rows = await db`
-        update tasks set
-          updated_at = ${now},
-          status = case when ${hasStatus} then ${status} else status end,
-          completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
-          result = case when ${hasResult} then ${input.result ?? null} else result end,
-          cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
-          session_id = case when ${hasSession} then ${input.session_id ?? null} else session_id end,
-          assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end,
-          actor_type = case when ${hasActor} then ${actorType} else actor_type end,
-          actor_id = case when ${hasActor} then ${actorId} else actor_id end
-        where id = ${input.id}
-        returning *
+        with changed as (
+          update tasks set
+            updated_at = ${now},
+            status = case when ${hasStatus} then ${status} else status end,
+            completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
+            result = case when ${hasResult} then ${input.result ?? null} else result end,
+            cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
+            session_id = case when ${hasSession} then ${input.session_id ?? null} else session_id end,
+            assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end,
+            actor_type = case when ${hasActor} then ${actorType} else actor_type end,
+            actor_id = case when ${hasActor} then ${actorId} else actor_id end
+          where id = ${input.id}
+          returning *
+        ),
+        logged as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            ${eventKind},
+            'Task #' || changed.id::text || ' → ' || changed.status || ': ' || coalesce(changed.title, ''),
+            jsonb_build_object(
+              'task_id', changed.id,
+              'tool', ${activityTool},
+              'status', changed.status,
+              'actor_type', ${activityActorType}::text,
+              'actor_id', ${activityActorId}::text
+            )
+          from changed
+          returning id, kind, created_at
+        )
+        select
+          changed.*,
+          logged.id as receipt_id,
+          logged.kind as receipt_kind,
+          logged.created_at as receipt_at
+        from changed
+        left join logged on true
       `;
     } else {
       rows = await db`
-        update tasks t set
-          updated_at = ${now},
-          status = case when ${hasStatus} then ${status} else status end,
-          completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
-          result = case when ${hasResult} then ${input.result ?? null} else result end,
-          cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
-          session_id = case when ${hasSession} then ${input.session_id ?? null} else session_id end,
-          assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end,
-          actor_type = case when ${hasActor} then ${actorType} else actor_type end,
-          actor_id = case when ${hasActor} then ${actorId} else actor_id end
-        where t.id = ${input.id}
-          and md5(t::text) = ${expected}
-        returning *
+        with changed as (
+          update tasks t set
+            updated_at = ${now},
+            status = case when ${hasStatus} then ${status} else status end,
+            completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
+            result = case when ${hasResult} then ${input.result ?? null} else result end,
+            cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
+            session_id = case when ${hasSession} then ${input.session_id ?? null} else session_id end,
+            assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end,
+            actor_type = case when ${hasActor} then ${actorType} else actor_type end,
+            actor_id = case when ${hasActor} then ${actorId} else actor_id end
+          where t.id = ${input.id}
+            and md5(t::text) = ${expected}
+          returning *
+        ),
+        logged as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            ${eventKind},
+            'Task #' || changed.id::text || ' → ' || changed.status || ': ' || coalesce(changed.title, ''),
+            jsonb_build_object(
+              'task_id', changed.id,
+              'tool', ${activityTool},
+              'status', changed.status,
+              'actor_type', ${activityActorType}::text,
+              'actor_id', ${activityActorId}::text
+            )
+          from changed
+          returning id, kind, created_at
+        )
+        select
+          changed.*,
+          logged.id as receipt_id,
+          logged.kind as receipt_kind,
+          logged.created_at as receipt_at
+        from changed
+        left join logged on true
       `;
     }
   } catch (e) {
@@ -1354,4 +1463,113 @@ export async function deleteMemory(input: { key: string; expected_revision?: str
   const current = await memoryRevisionOf(input.key);
   if (!current) throw new Error("Memory not found");
   throw new StaleWrite(current);
+}
+
+const SUBJECT_KEYS = new Set(["task_id", "message_id", "memory_id", "memory_key"]);
+
+/**
+ * An event for a write that is not itself the task-status statement.
+ * Idempotent routes pass reuse so a replay returns the original receipt
+ * and does not insert a second row. An empty RETURNING yields null: a test
+ * double that does not model events must not turn the write into an error.
+ */
+export async function recordSubjectReceipt(input: {
+  kind: string;
+  title: string;
+  tool: string;
+  matchKey: "task_id" | "message_id" | "memory_id" | "memory_key";
+  matchValue: string;
+  reuse: boolean;
+  extra?: Record<string, unknown>;
+}): Promise<Receipt | null> {
+  if (!SUBJECT_KEYS.has(input.matchKey)) throw new Error("activity subject key is not allowlisted");
+  const db = sql();
+  const actor = currentActor();
+  try {
+    if (input.reuse) {
+      const found = await db`
+        select id, kind, created_at
+        from events
+        where kind = ${input.kind}
+          and detail->>${input.matchKey} = ${input.matchValue}
+        order by id asc
+        limit 1
+      `;
+      const existing = found[0] as Record<string, unknown> | undefined;
+      const prior = existing ? receiptFromParts(existing.id, existing.kind, existing.created_at) : null;
+      if (prior) return prior;
+    }
+    const detail = activityDetail(input.tool, actor, {
+      [input.matchKey]: input.matchValue,
+      ...(input.extra ?? {}),
+    });
+    const rows = await db`
+      insert into events (agent_id, session_id, kind, title, detail)
+      values (
+        ${null},
+        ${null},
+        ${input.kind},
+        ${input.title},
+        ${JSON.stringify(detail)}::jsonb
+      )
+      returning id, kind, created_at
+    `;
+    const row = rows[0] as Record<string, unknown> | undefined;
+    return row ? receiptFromParts(row.id, row.kind, row.created_at) : null;
+  } catch (e) {
+    rethrowStore(e);
+  }
+}
+
+export interface ActivityListQuery {
+  actor: string | null;
+  kind: string | null;
+  since: string | null;
+  until: string | null;
+  limit: number;
+  cursorCreatedAt: string | null;
+  cursorId: string | null;
+}
+
+/**
+ * Newest first, id ascending on a tie. since is inclusive. until includes
+ * the whole named millisecond. The cursor is the last row already returned.
+ */
+export async function listActivity(query: ActivityListQuery): Promise<ActivityRow[]> {
+  const db = sql();
+  try {
+    const rows = await db`
+      select
+        id,
+        agent_id,
+        session_id,
+        kind,
+        title,
+        detail,
+        to_char(date_trunc('milliseconds', created_at) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as created_at,
+        detail->>'actor_type' as actor_type,
+        detail->>'actor_id' as actor_id
+      from events
+      where (${query.actor}::text is null or detail->>'actor_id' = ${query.actor})
+        and (${query.kind}::text is null or kind = ${query.kind})
+        and (${query.since}::timestamptz is null or created_at >= ${query.since}::timestamptz)
+        and (
+          ${query.until}::timestamptz is null
+          or created_at < (${query.until}::timestamptz + interval '1 millisecond')
+        )
+        and (
+          ${query.cursorCreatedAt}::timestamptz is null
+          or date_trunc('milliseconds', created_at) < ${query.cursorCreatedAt}::timestamptz
+          or (
+            date_trunc('milliseconds', created_at) = ${query.cursorCreatedAt}::timestamptz
+            and id > ${query.cursorId}::bigint
+          )
+        )
+      order by date_trunc('milliseconds', created_at) desc, id asc
+      limit ${query.limit}
+    `;
+    return (rows as Record<string, unknown>[]).map((row) => activityRow(row));
+  } catch (e) {
+    throw new Error(errMsg(e));
+  }
 }

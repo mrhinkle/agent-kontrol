@@ -32,7 +32,7 @@ const MAX_BIGINT = 9223372036854775807n;
 const PRIORITY_MIN = -1_000_000;
 const PRIORITY_MAX = 1_000_000;
 
-export type ListResource = "task" | "memory" | "trace";
+export type ListResource = "task" | "memory" | "trace" | "activity";
 
 export class ListParamError extends Error {
   readonly field: "limit" | "cursor" | "fields";
@@ -118,6 +118,11 @@ export interface TraceKeyset {
   id: string;
 }
 
+export interface ActivityKeyset {
+  createdAt: string;
+  id: string;
+}
+
 const TASK_ALLOW = [
   "id",
   "title",
@@ -167,6 +172,18 @@ const TRACE_ALLOW = [
   "cost_usd",
 ] as const;
 
+const ACTIVITY_ALLOW = [
+  "id",
+  "agent_id",
+  "session_id",
+  "kind",
+  "title",
+  "detail",
+  "created_at",
+  "actor_type",
+  "actor_id",
+] as const;
+
 function makeSpec(
   resource: ListResource,
   idField: "id" | "trace_id",
@@ -186,6 +203,7 @@ const TASK_KEYS: readonly SortKey[] = [
 
 const MEMORY_KEYS: readonly SortKey[] = [{ name: "updated_at", dir: "desc", type: "time" }];
 const TRACE_KEYS: readonly SortKey[] = [{ name: "started_at", dir: "desc", type: "time" }];
+const ACTIVITY_KEYS: readonly SortKey[] = [{ name: "created_at", dir: "desc", type: "time" }];
 
 /** REST tasks. Default 100, matching listTasks. */
 export const TASK_REST: ListSpec = makeSpec("task", "id", "int", TASK_KEYS, TASK_ALLOW, 100);
@@ -197,6 +215,8 @@ export const MEMORY_REST: ListSpec = makeSpec("memory", "id", "int", MEMORY_KEYS
 export const RECALL_SPEC: ListSpec = { ...MEMORY_REST, defaultLimit: 20 };
 /** REST traces. Default 50. */
 export const TRACE_LIST: ListSpec = makeSpec("trace", "trace_id", "trace", TRACE_KEYS, TRACE_ALLOW, 50);
+/** REST activity and MCP list_activity. Newest first, then id ascending. Default 50. */
+export const ACTIVITY_LIST: ListSpec = makeSpec("activity", "id", "int", ACTIVITY_KEYS, ACTIVITY_ALLOW, 50);
 
 export function stampSortAt(row: object, iso: string): void {
   Object.defineProperty(row, LIST_SORT_AT, { value: iso, enumerable: false });
@@ -453,4 +473,8 @@ export function memoryKeyset(cursor: DecodedCursor): MemoryKeyset {
 
 export function traceKeyset(cursor: DecodedCursor): TraceKeyset {
   return { startedAt: String(cursor.k[0]), id: cursor.id };
+}
+
+export function activityKeyset(cursor: DecodedCursor): ActivityKeyset {
+  return { createdAt: String(cursor.k[0]), id: cursor.id };
 }

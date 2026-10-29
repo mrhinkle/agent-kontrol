@@ -194,6 +194,7 @@ export function openApiDocument(): Json {
       { name: "settings" },
       { name: "usage" },
       { name: "traces" },
+      { name: "activity" },
       { name: "skills" },
       { name: "auth" },
       { name: "mcp" },
@@ -1355,6 +1356,36 @@ export function openApiDocument(): Json {
             "200": jsonResponse("Facts written, or dropped in demo mode.", { type: "object" }),
             ...flatErrors,
             "503": jsonResponse("The usage tables are not set up.", ref("Error")),
+          },
+        }),
+      },
+      "/api/activity": {
+        get: operation({
+          operationId: "listActivity",
+          tags: ["activity"],
+          summary: "Write receipts and other events, newest first.",
+          description:
+            "Agent credentials need fleet:read. actor is an exact actor_id. kind is an exact event kind. since and until are inclusive ISO timestamps; a since later than until is 400 validation_failed. With no database the body is the in-memory demo event log (demo true), not a static sample, and the filters still apply. next_cursor is absent unless limit or cursor was passed.",
+          security: cookieOrBearer,
+          parameters: [
+            query("actor", { type: "string" }, "Exact actor_id. Empty means no filter. Longer than 200 characters is 400."),
+            query("kind", { type: "string" }, "Exact event kind. Empty means no filter. Anything other than 1 to 64 letters, digits, or _ . : - is 400."),
+            query("since", { type: "string", format: "date-time" }, "Inclusive start. A value that is not an ISO timestamp is 400."),
+            query("until", { type: "string", format: "date-time" }, "Inclusive end, through that millisecond. A value that is not an ISO timestamp, or a value before since, is 400."),
+            listLimitParam(50),
+            listCursor,
+            listFields,
+          ],
+          responses: {
+            "200": jsonResponse("demo and activity. next_cursor is absent unless limit or cursor was passed.", {
+              type: "object",
+              properties: {
+                demo: { type: "boolean" },
+                activity: { type: "array", items: { type: "object" } },
+                next_cursor: nextCursor,
+              },
+            }),
+            ...flatErrors,
           },
         }),
       },

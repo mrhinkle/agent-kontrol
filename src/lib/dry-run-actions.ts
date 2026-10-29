@@ -2,6 +2,7 @@
  * Server side of a dry run. The preview helpers only read. The tool helpers
  * write only when dry_run is not true, and they are what the MCP handlers call.
  */
+import { readReceipt, withReceipt } from "./activity";
 import { memoryKeyError, mcpToolError, type McpToolResult } from "./api-error";
 import { isConfigured } from "./db";
 import {
@@ -14,7 +15,8 @@ import {
 } from "./dry-run";
 import { demoRememberTool, demoUpdateTaskTool } from "./demo-store";
 import { absentRevision } from "./revision";
-import { readMemoryForPreview, readTaskForPreview, remember, report, updateTask } from "./store";
+import { currentActor } from "./actor";
+import { readMemoryForPreview, readTaskForPreview, recordSubjectReceipt, remember, report, updateTask } from "./store";
 import type { TaskStatus } from "./types";
 
 export async function previewTaskChange(id: number, patch: TaskPatch): Promise<DryRunResult | null> {
@@ -46,9 +48,17 @@ export async function rememberForTool(args: {
     return { content: [{ type: "text", text: JSON.stringify(preview) }] };
   }
   const item = await remember(args);
-  return {
-    content: [{ type: "text", text: `Stored memory #${item.id}${item.key ? ` (key: ${item.key})` : ""}.` }],
-  };
+  const text = `Stored memory #${item.id}${item.key ? ` (key: ${item.key})` : ""}.`;
+  const receipt = await recordSubjectReceipt({
+    kind: "remember",
+    title: text.replace(/\.$/, ""),
+    tool: "remember",
+    matchKey: "memory_id",
+    matchValue: String(item.id),
+    reuse: false,
+    extra: { memory_key: item.key },
+  });
+  return withReceipt(text, receipt);
 }
 
 export async function updateTaskForTool(args: {
@@ -72,12 +82,18 @@ export async function updateTaskForTool(args: {
     cost_usd: args.cost_usd,
   });
   if (args.status && args.agent_id) {
+    const actor = currentActor();
     await report({
       agent_id: args.agent_id,
       kind: args.status === "failed" ? "error" : "status",
       title: `Task #${task.id} → ${args.status}: ${task.title}`,
-      detail: { task_id: task.id },
+      detail: {
+        task_id: task.id,
+        tool: "update_task",
+        actor_type: actor?.actor_type ?? null,
+        actor_id: actor?.actor_id ?? null,
+      },
     });
   }
-  return { content: [{ type: "text", text: `Task #${task.id} updated (${task.status}).` }] };
+  return withReceipt(`Task #${task.id} updated (${task.status}).`, readReceipt(task));
 }

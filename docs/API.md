@@ -45,6 +45,7 @@ Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI
 | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- |
 | GET | `/api/fleet` | Cookie or bearer | Everything the dashboard needs in one call |
+| GET | `/api/activity` | Cookie, bearer, or `fleet:read` | Write receipts and other events, newest first. Filters: `actor`, `kind`, `since`, `until`. Same `limit`, `cursor`, and `fields` rules as the other lists. Default limit 50. |
 | POST | `/api/ingest` | Bearer | Deterministic telemetry from hooks, watchers, and daemons |
 | GET | `/api/memory` | Cookie or bearer | Memory browser feed |
 | POST | `/api/memory` | Cookie or bearer | Store a note, or preview an overwrite with `dry_run` |
@@ -313,7 +314,7 @@ OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this sha
 | `forbidden` | 403 | no | `POST /api/messages/reply` when `in_reply_to` names a message that belongs to a different agent. |
 | `identity_mismatch` | 403 | no | MCP `run_skill` when an agent credential or an OAuth client passes an `agent_id` other than the authenticated id. The call writes no run. Omit `agent_id`, or pass that id. |
 | `not_found` | 404 | no | Unknown trace id on `GET /api/traces/:traceId` when a database is connected (demo mode returns 200 and an empty `spans` list), `POST /api/messages/reply` when `in_reply_to` names a message that does not exist, `PATCH /api/decisions/:id` when a database is connected and that id does not exist (`error` stays `Decision not found`), or `POST /api/memory` when `expected_revision` is present and that key does not exist (`error` is `not found`). A missing key with no `expected_revision` still inserts. Demo mode does not look the decision id up. |
-| `validation_failed` | 400 | no | A field is present but not usable: a bad `before` on `GET /api/traces`, a bad `limit`, `cursor`, or `fields` on `GET /api/tasks`, `GET /api/memory`, or `GET /api/traces` (and on MCP `recall` and `get_task_queue`), a bad `since` and `until` pair on `GET /api/usage` (a `since` without `until` is ignored), a bad `collected_at` on usage or progress ingest, a bad task, trace, or decision id, a decision body or `status` the parser rejected, a privacy refusal, an OTLP body the parser rejected, or an idempotency key longer than 200 characters or containing a control character. |
+| `validation_failed` | 400 | no | A field is present but not usable: a bad `before` on `GET /api/traces`, a bad `limit`, `cursor`, or `fields` on `GET /api/tasks`, `GET /api/memory`, `GET /api/traces`, or `GET /api/activity` (and on MCP `recall`, `get_task_queue`, and `list_activity`), a bad `since`, `until`, `actor`, or `kind` on `GET /api/activity` (a `since` later than `until` is rejected; a bad timestamp is rejected), a bad `since` and `until` pair on `GET /api/usage` (a `since` without `until` is ignored), a bad `collected_at` on usage or progress ingest, a bad task, trace, or decision id, a decision body or `status` the parser rejected, a privacy refusal, an OTLP body the parser rejected, or an idempotency key longer than 200 characters or containing a control character. |
 | `invalid_json` | 400 | no | The body is not JSON. On `POST /api/login` the `error` string stays `invalid request`. On `POST /api/mcp` an empty or non-JSON body uses this code and `error` `invalid JSON`. A missing bearer on that route is still `401` with `WWW-Authenticate`. |
 | `missing_field` | 400 | no | A required field is absent. `fields` names it. |
 | `rate_limited` | 429 | yes | More than 5 `POST /api/login` attempts in 10 minutes from one client IP. `Retry-After` is seconds. The OAuth consent form shares this limiter and answers with HTML, not this JSON. |
@@ -334,18 +335,20 @@ OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this sha
 
 ## List pages
 
-`GET /api/tasks`, `GET /api/memory`, and `GET /api/traces` take three optional parameters. Omitting all three leaves the JSON body as it was: no `next_cursor` field. `fields` by itself narrows each row and still omits `next_cursor`.
+`GET /api/tasks`, `GET /api/memory`, `GET /api/traces`, and `GET /api/activity` take three optional parameters. Omitting all three leaves the JSON body as it was: no `next_cursor` field. `fields` by itself narrows each row and still omits `next_cursor`.
 
-- `limit` — integer from 1 to 200. The default stays the route default (tasks 100, memory 50, traces 50) when it is omitted. `0`, a negative, a non-integer (`1.5`, `1e2`, `01`, `+10`), or a value above 200 is `400` `validation_failed`. The error text does not echo the value.
+- `limit` — integer from 1 to 200. The default stays the route default (tasks 100, memory 50, traces 50, activity 50) when it is omitted. `0`, a negative, a non-integer (`1.5`, `1e2`, `01`, `+10`), or a value above 200 is `400` `validation_failed`. The error text does not echo the value.
 - `cursor` — opaque token. It is the base64url of the sort key and id of the last row on the previous page. The next page is the rows strictly after that point, so a row inserted ahead of the cursor does not shift the rest of the walk and does not repeat a row. Rows that share a timestamp are ordered by id ascending (`trace_id` ascending for traces). A garbage token, a token for a different list, or a token whose id is not the id shape for that list is `400`, not the first page and not `500`. A well-formed cursor past the last row is `200` with an empty list and `next_cursor: null`.
 - `fields` — comma-separated names from that route's allowlist. `id` (or `trace_id`) is always included and is first. An unknown name, an empty entry, or any text that is not an allowlisted name rejects the whole request with `400`. Columns outside the allowlist, including credential hashes, are not returned. Names are copied in the server after the query. They are not placed into SQL.
 - `next_cursor` — string or null. Present only when the request passed `limit` or `cursor`.
 
 `before` on traces still means "started before this instant". It does not by itself add `next_cursor`.
 
-With no database, those three GET routes keep returning the static sample, and they keep ignoring `status`, `query`, `tag`, `agent`, `errors`, and `before` (including a `before` that is not a timestamp), until the request passes `limit`, `cursor`, or `fields`. After that, the sample is filtered, ordered, and paged with the same rules as the database. That sample is not the in-memory store MCP writes use.
+With no database, tasks, memory, and traces keep returning the static sample, and they keep ignoring `status`, `query`, `tag`, `agent`, `errors`, and `before` (including a `before` that is not a timestamp), until the request passes `limit`, `cursor`, or `fields`. After that, the sample is filtered, ordered, and paged with the same rules as the database. That sample is not the in-memory store MCP writes use.
 
-MCP `recall` and `get_task_queue` take the same three parameters. Omitting them keeps the previous text, including the demo banner and the defaults (recall 20, task queue 40). Passing `limit` or `cursor` adds a final `next_cursor:` line. Passing `fields` returns one JSON object per line. The maximum is 200. The tool names are unchanged.
+`GET /api/activity` is the exception. With no database it reads the in-memory demo event log, not a static sample, and it applies `actor`, `kind`, `since`, and `until` even when `limit`, `cursor`, and `fields` are omitted. An empty log is `{ "demo": true, "activity": [] }`. Rows are newest `created_at` first, and rows that share a millisecond are ordered by `id` ascending. `since` is inclusive. `until` includes that whole millisecond. The actor filter matches `detail.actor_id`. The kind filter is an exact `events.kind`.
+
+MCP `recall`, `get_task_queue`, and `list_activity` take the same three paging parameters. Omitting them keeps the previous text for recall and the task queue, including the demo banner and the defaults (recall 20, task queue 40, activity 50). Passing `limit` or `cursor` adds a final `next_cursor:` line. Passing `fields` returns one JSON object per line. The maximum is 200. The tool names are unchanged. `list_activity` reads the in-memory demo log when no database is set, and its text starts with the demo banner.
 
 ## Demo mode
 
@@ -354,7 +357,7 @@ With no `DATABASE_URL` set (demo mode):
 - The auth gate is open.
 - GET routes return demo data, usually with `demo: true` in the response. `GET /api/decisions` returns `{ "demo": true, "decisions": [] }`. `GET /api/brief` does not. The brief is database-only: with no `DATABASE_URL` every configured repo is incomplete and the text says `DATA INCOMPLETE`. In the JSON, a fleet total that is unmeasured is `null`, and the top-level `stuck_prs` / `decisions` lists are `null` (not `[]`) when that total is unmeasured and no row is known; known rows are still listed when some were measured. See [Brief](#brief).
 - Ingest routes answer `{"ok": true, "demo": true}` and drop the data. `POST /api/decisions` does the same and adds `note`. `PATCH /api/decisions/:id` answers `{ "ok": true, "demo": true }` and does not look the id up.
-- MCP `report_status`, `remember`, `create_task`, `claim_task`, and `update_task` store in memory for this process. `get_fleet_status`, `recall`, and `get_task_queue` read that store. Successful text starts with `[demo — in-memory, cleared when this process restarts]`. The store is cleared when the process restarts. Those rows are not mixed into the sample data on GET routes.
+- MCP `report_status`, `remember`, `create_task`, `claim_task`, and `update_task` store in memory for this process. `get_fleet_status`, `recall`, `get_task_queue`, and `list_activity` read that store. `GET /api/activity` reads the same in-memory event log. Successful text starts with `[demo — in-memory, cleared when this process restarts]`. The store is cleared when the process restarts. Those rows are not mixed into the sample data on the other GET routes.
 - REST `POST` and `PATCH` in demo mode still answer `{ "ok": true, "demo": true }` (memory adds `note`) and do not write the in-memory store.
 
 ## Versioning

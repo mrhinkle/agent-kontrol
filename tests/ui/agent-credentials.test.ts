@@ -111,6 +111,7 @@ describe("scope table", { concurrency: false }, () => {
       "send_message",
       "requeue_task",
       "delete_note",
+      "list_activity",
     ]) {
       assert.ok(names.has(name), `route source is missing ${name}`);
       assert.ok(TOOL_SCOPES[name], `${name} is not in the scope table`);

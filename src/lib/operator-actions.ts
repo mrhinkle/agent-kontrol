@@ -4,18 +4,21 @@
  * The route file only registers them. Demo mode and Postgres share this entry.
  */
 import { currentActor, type Actor } from "./actor";
+import { readReceipt, withReceipt } from "./activity";
 import { memoryKeyError, mcpToolError, type McpToolResult } from "./api-error";
 import { isConfigured } from "./db";
 import { DEMO_BANNER, demoDeleteMemory, demoRequeueTask, demoSendMessage } from "./demo-store";
 import { diffMemoryDelete, diffTaskRequeue, readDryRun, readExpectedRevision } from "./dry-run";
 import { messageBodyProblem } from "./message-body";
 import { requeueBlock, requeueCallerId } from "./requeue";
+import { StaleWrite } from "./revision";
 import {
   deleteMemory,
   enqueueMessage,
   findAgent,
   readMemoryForPreview,
   readTaskForPreview,
+  recordSubjectReceipt,
   updateTask,
 } from "./store";
 
@@ -79,7 +82,7 @@ export async function sendMessageTool(args: {
     });
     if (sent.kind === "missing") return agentNotFound();
     const text = `Message #${sent.message.id} sent to ${sent.message.agent_id}.`;
-    return { content: [{ type: "text", text: labeled(text, true) }] };
+    return withReceipt(labeled(text, true), readReceipt(sent.message));
   }
   const agent = await findAgent(args.agent_id);
   if (!agent) return agentNotFound();
@@ -90,7 +93,16 @@ export async function sendMessageTool(args: {
     actor,
     idempotency_key: args.idempotency_key,
   });
-  return { content: [{ type: "text", text: `Message #${message.id} sent to ${message.agent_id}.` }] };
+  const text = `Message #${message.id} sent to ${message.agent_id}.`;
+  const receipt = await recordSubjectReceipt({
+    kind: "send_message",
+    title: text.replace(/\.$/, ""),
+    tool: "send_message",
+    matchKey: "message_id",
+    matchValue: String(message.id),
+    reuse: true,
+  });
+  return withReceipt(text, receipt);
 }
 
 export async function requeueTaskTool(args: {
@@ -119,7 +131,7 @@ export async function requeueTaskTool(args: {
       const preview = diffTaskRequeue(result.task, result.revision, actor);
       return { content: [{ type: "text", text: JSON.stringify(preview) }] };
     }
-    return { content: [{ type: "text", text: labeled(requeuedText(result.task.id, actor), true) }] };
+    return withReceipt(labeled(requeuedText(result.task.id, actor), true), readReceipt(result.task));
   }
   const loaded = await readTaskForPreview(args.id);
   if (!loaded) return mcpToolError("task_not_found");
@@ -137,8 +149,10 @@ export async function requeueTaskTool(args: {
     status: "queued",
     expected_revision: revision.revision ?? loaded.revision,
     actor,
+    eventKind: "task_requeued",
+    activityTool: "requeue_task",
   });
-  return { content: [{ type: "text", text: requeuedText(task.id, actor) }] };
+  return withReceipt(requeuedText(task.id, actor), readReceipt(task));
 }
 
 export async function deleteNoteTool(args: {
@@ -154,18 +168,24 @@ export async function deleteNoteTool(args: {
   if (!revision.ok) return revisionRejected();
   const actor = currentActor();
   if (!isConfigured()) {
-    const result = await demoDeleteMemory({
-      key: args.key,
-      dryRun: dry.dryRun,
-      expectedRevision: revision.revision,
-    });
-    if (result.kind === "missing") return memoryNotFound();
-    if (result.kind === "preview") {
-      return {
-        content: [{ type: "text", text: JSON.stringify(diffMemoryDelete(result.item, result.revision)) }],
-      };
+    try {
+      const result = await demoDeleteMemory({
+        key: args.key,
+        dryRun: dry.dryRun,
+        expectedRevision: revision.revision,
+      });
+      if (result.kind === "missing") return memoryNotFound();
+      if (result.kind === "preview") {
+        return {
+          content: [{ type: "text", text: JSON.stringify(diffMemoryDelete(result.item, result.revision)) }],
+        };
+      }
+      return withReceipt(labeled(deletedText(args.key, actor), true), readReceipt(result.item));
+    } catch (err) {
+      const mapped = mapDeleteError(err);
+      if (mapped) return mapped;
+      throw err;
     }
-    return { content: [{ type: "text", text: labeled(deletedText(args.key, actor), true) }] };
   }
   if (dry.dryRun) {
     const loaded = await readMemoryForPreview(args.key);
@@ -176,9 +196,29 @@ export async function deleteNoteTool(args: {
   }
   try {
     const removed = await deleteMemory({ key: args.key, expected_revision: revision.revision });
-    return { content: [{ type: "text", text: deletedText(removed.key ?? args.key, actor) }] };
+    const text = deletedText(removed.key ?? args.key, actor);
+    const receipt = await recordSubjectReceipt({
+      kind: "delete_note",
+      title: text.replace(/\.$/, ""),
+      tool: "delete_note",
+      matchKey: "memory_key",
+      matchValue: removed.key ?? args.key,
+      reuse: false,
+      extra: { memory_id: String(removed.id) },
+    });
+    return withReceipt(text, receipt);
   } catch (err) {
-    if (err instanceof Error && err.message === "Memory not found") return memoryNotFound();
+    const mapped = mapDeleteError(err);
+    if (mapped) return mapped;
     throw err;
   }
+}
+
+/** A stale confirm is an isError result, same as the route's guard. Nothing was deleted. */
+function mapDeleteError(err: unknown): McpToolResult | null {
+  if (err instanceof StaleWrite) {
+    return mcpToolError("stale_write", { extra: { current_revision: err.currentRevision } });
+  }
+  if (err instanceof Error && err.message === "Memory not found") return memoryNotFound();
+  return null;
 }
