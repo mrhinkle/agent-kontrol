@@ -8,6 +8,7 @@ export const NAV_LINKS: { href: string; label: string; accent?: boolean }[] = [
   { href: "/history", label: "History" },
   { href: "/traces", label: "Traces" },
   { href: "/memory", label: "Memory" },
+  { href: "/skills", label: "Skills" },
   { href: "/gibson", label: "Gibson", accent: true },
   { href: "/settings", label: "Settings" },
   { href: "/help", label: "Help" },

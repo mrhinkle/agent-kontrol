@@ -143,6 +143,7 @@ export function demoList(filter: { runtime?: string | null; q?: string | null; c
       tags: skill.tags,
       trigger: skill.trigger,
       scope: skill.scope,
+      schedule: skill.schedule,
       triggerCount7d: skill.id === "verify-gibson" ? 2 : 0,
       lastRun: skill.id === "verify-gibson" ? { at: "2026-10-27T09:14:00.000Z", agent: "grok-lane-3" } : null,
     }));
