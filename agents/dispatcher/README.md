@@ -109,10 +109,17 @@ worktree, you merge or delete it.
    committed and then removed again in a later commit is not caught.
 5. Review (optional): if the task has `reviewer_platform`, the reviewer runs
    **read-only** with a skeptical-reviewer prompt and must end with
-   `VERDICT: APPROVE` or `VERDICT: REQUEST_CHANGES`. The verdict is appended
-   to the result; REQUEST_CHANGES marks the task failed so you triage it.
-   Review runs only after a clean step 4. Known limit, unchanged here: a
-   reviewer that exits non-zero does not fail the task (it fails open).
+   `VERDICT: APPROVE` or `VERDICT: REQUEST_CHANGES`, optionally followed by
+   ` — <reason>`. The verdict is appended to the result. A configured reviewer
+   is required, and the review fails closed: the task is done only if the
+   reviewer is a known platform whose CLI is on `PATH`, exits 0, and its last
+   non-blank line is exactly `VERDICT: APPROVE` (no earlier line holding a
+   conflicting verdict). REQUEST_CHANGES, an unknown platform, a missing CLI,
+   a non-zero exit or timeout, or a missing or malformed final verdict marks
+   the task failed with the reason. With no `reviewer_platform` the worker's
+   own result decides. Review runs only after a successful worker and a clean
+   step 4. Not addressed here: a reviewer of the same vendor as the worker is
+   still accepted.
 6. Report: `PATCH /api/tasks/<id>` with status, result summary, and cost.
 
 ## launchd (run at login on macOS)

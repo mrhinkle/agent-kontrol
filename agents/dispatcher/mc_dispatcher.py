@@ -186,6 +186,43 @@ def build_review_prompt(task: dict, worker_output: str) -> str:
     )
 
 
+# The whole final line: VERDICT: APPROVE or VERDICT: REQUEST_CHANGES, optionally " — <reason>".
+VERDICT_RE = re.compile(r"VERDICT: (APPROVE|REQUEST_CHANGES)(?:\s+[—–-]\s+\S.*)?")
+
+
+def parse_verdict(output: str) -> tuple[str | None, str]:
+    """(decision, line) from the reviewer's final non-blank line; decision None if it is not a valid verdict.
+
+    Earlier lines are not scanned for a verdict. An earlier valid verdict that
+    disagrees with the final one makes the decision None (contradictory review).
+    """
+    lines = [l.strip() for l in output.splitlines() if l.strip()]
+    if not lines:
+        return None, "no output"
+    final = lines[-1]
+    m = VERDICT_RE.fullmatch(final)
+    if not m:
+        return None, final
+    for earlier in lines[:-1]:
+        e = VERDICT_RE.fullmatch(earlier)
+        if e and e.group(1) != m.group(1):
+            return None, final
+    return m.group(1), final
+
+
+def review_outcome(r_ok: bool, r_out: str) -> tuple[bool, str]:
+    """(approved, note) for a configured reviewer's run. Anything short of a clean APPROVE fails."""
+    decision, line = parse_verdict(r_out)
+    line = line[:200]
+    if not r_ok:
+        return False, f"reviewer failed, task not approved: {line}"
+    if decision == "APPROVE":
+        return True, line
+    if decision == "REQUEST_CHANGES":
+        return False, line
+    return False, f"no valid final verdict line, task not approved (last line: {line})"
+
+
 class ContainmentError(Exception):
     """A dispatched CLI's process group could not be stopped."""
 
@@ -505,18 +542,23 @@ def run_task(task: dict, platform: str, sem: threading.Semaphore) -> None:
                 )
 
         reviewer = task.get("reviewer_platform")
-        if ok and reviewer and shutil.which(CLI_FOR_PLATFORM.get(reviewer, "")):
-            api(f"/api/tasks/{tid}", {"status": "review", "agent_id": agent_id}, "PATCH")
-            ingest("status", f"Task #{tid} in review by {reviewer}", agent_id, platform, {"task_id": tid})
-            r_ok, r_out, r_cost = run_cli(reviewer, build_review_prompt(task, output), cwd, review=True)
-            if r_cost:
-                cost = (cost or 0) + r_cost
-            verdict_line = next(
-                (l for l in reversed(r_out.splitlines()) if "VERDICT:" in l), "VERDICT: (no verdict)"
-            )
-            approved = "APPROVE" in verdict_line and "REQUEST_CHANGES" not in verdict_line
-            result = f"{result}\n\n[{reviewer} review] {verdict_line.strip()}"
-            ok = ok and (approved or not r_ok)  # a broken reviewer doesn't fail good work
+        # A configured reviewer is required: unknown, missing, failed, or verdict-less fails the task.
+        if ok and reviewer:
+            cli = CLI_FOR_PLATFORM.get(reviewer) if isinstance(reviewer, str) else None
+            if cli is None:
+                ok = False
+                result = f"{result}\n\n[review] unknown reviewer platform {reviewer!r}, task not approved"
+            elif not shutil.which(cli):
+                ok = False
+                result = f"{result}\n\n[{reviewer} review] {cli} not found on PATH, task not approved"
+            else:
+                api(f"/api/tasks/{tid}", {"status": "review", "agent_id": agent_id}, "PATCH")
+                ingest("status", f"Task #{tid} in review by {reviewer}", agent_id, platform, {"task_id": tid})
+                r_ok, r_out, r_cost = run_cli(reviewer, build_review_prompt(task, output), cwd, review=True)
+                if r_cost:
+                    cost = (cost or 0) + r_cost
+                ok, note = review_outcome(r_ok, r_out)
+                result = f"{result}\n\n[{reviewer} review] {note}"
 
         body = {
             "status": "done" if ok else "failed",
