@@ -113,8 +113,9 @@ worktree, you merge or delete it.
    ` — <reason>`. The verdict is appended to the result. A configured reviewer
    is required, and the review fails closed: the task is done only if the
    reviewer is a known platform whose CLI is on `PATH`, exits 0, and its last
-   non-blank line is exactly `VERDICT: APPROVE` (no earlier line holding a
-   conflicting verdict). REQUEST_CHANGES, an unknown platform, a missing CLI,
+   non-blank line is exactly `VERDICT: APPROVE`, starting at column 0 and not
+   inside an unclosed ```` ``` ```` or `~~~` code fence (no earlier line
+   holding a conflicting verdict). REQUEST_CHANGES, an unknown platform, a missing CLI,
    a non-zero exit or timeout, or a missing or malformed final verdict marks
    the task failed with the reason. With no `reviewer_platform` the worker's
    own result decides. Review runs only after a successful worker and a clean

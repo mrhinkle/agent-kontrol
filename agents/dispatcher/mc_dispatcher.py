@@ -188,23 +188,38 @@ def build_review_prompt(task: dict, worker_output: str) -> str:
 
 # The whole final line: VERDICT: APPROVE or VERDICT: REQUEST_CHANGES, optionally " — <reason>".
 VERDICT_RE = re.compile(r"VERDICT: (APPROVE|REQUEST_CHANGES)(?:\s+[—–-]\s+\S.*)?")
+# A Markdown code fence: up to 3 spaces of indent, then 3+ backticks or tildes.
+FENCE_RE = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
 
 
 def parse_verdict(output: str) -> tuple[str | None, str]:
     """(decision, line) from the reviewer's final non-blank line; decision None if it is not a valid verdict.
 
-    Earlier lines are not scanned for a verdict. An earlier valid verdict that
-    disagrees with the final one makes the decision None (contradictory review).
+    The final line must be the verdict at column 0: indented, quoted, or inside
+    a still-open ``` / ~~~ fence is not a verdict. Earlier lines are not scanned
+    for a verdict. An earlier verdict-shaped line (at any indent) that disagrees
+    with the final one makes the decision None (contradictory review).
     """
-    lines = [l.strip() for l in output.splitlines() if l.strip()]
+    lines = [l.rstrip() for l in output.splitlines() if l.strip()]
     if not lines:
         return None, "no output"
     final = lines[-1]
+    fence = None  # (char, length) of the open fence, if any
+    for line in lines[:-1]:
+        f = FENCE_RE.fullmatch(line)
+        if not f:
+            continue
+        run, rest = f.group(1), f.group(2)
+        if fence is None:
+            if not (run[0] == "`" and "`" in rest):
+                fence = (run[0], len(run))
+        elif run[0] == fence[0] and len(run) >= fence[1] and not rest.strip():
+            fence = None
     m = VERDICT_RE.fullmatch(final)
-    if not m:
-        return None, final
+    if not m or fence is not None:
+        return None, final.strip()
     for earlier in lines[:-1]:
-        e = VERDICT_RE.fullmatch(earlier)
+        e = VERDICT_RE.fullmatch(earlier.strip())
         if e and e.group(1) != m.group(1):
             return None, final
     return m.group(1), final
