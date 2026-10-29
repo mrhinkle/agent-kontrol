@@ -179,7 +179,7 @@ export interface FleetTotals {
 export interface SkillsDigest {
   window: TimeWindow;
   triggers_by_skill: { id: string; count: number }[];
-  triggers_by_runtime: { claude: number; codex: number; grok: number; hermes: number; mini: number };
+  triggers_by_runtime: { claude: number; codex: number; grok: number; hermes: number; mini: number; nemoclaw: number };
   /** Open runs past the stall window, including ones that started before `window`. */
   stalled: { run_id: string; skill_id: string; agent: string; at: string }[];
   /** Enabled skills with no run inside the window. */

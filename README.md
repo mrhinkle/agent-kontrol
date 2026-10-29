@@ -65,7 +65,7 @@ Agent Kontrol is in **1.0 beta** ([release notes](https://github.com/mrhinkle/ag
 | --- | --- |
 | [Deploy](docs/DEPLOY.md) | One-line install, targets, environment variables, operations |
 | [Agents](docs/AGENTS.md) | Adapters and what each can do |
-| [MCP](docs/MCP.md) | The 15 tools and how to connect |
+| [MCP](docs/MCP.md) | The 19 tools and how to connect |
 | [API](docs/API.md) | REST routes and authentication |
 | [Database](docs/DATABASE.md) | Neon or any Postgres, driver selection |
 | [Architecture](docs/ARCHITECTURE.md) | Data flow, tables, code map |

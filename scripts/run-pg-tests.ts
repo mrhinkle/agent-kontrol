@@ -12,7 +12,9 @@ import { Client } from "pg";
 import { sql } from "../src/lib/db";
 import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
 import { StaleWrite } from "../src/lib/revision";
-import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview } from "../src/lib/store";
+import { readReceipt } from "../src/lib/activity";
+import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview, findAgent, deleteMemory, slugify } from "../src/lib/store";
+import { updateTaskForTool } from "../src/lib/dry-run-actions";
 import { getWatchedRepos, replaceWatchedRepos } from "../src/lib/watched-repos";
 import type { RepoConfig } from "../src/lib/progress-config";
 import { getTrace, listTraces, pruneSpans, upsertSpans } from "../src/lib/trace-store";
@@ -33,6 +35,17 @@ import { runScheduleTick, type TickResult } from "../src/lib/skills/schedule";
 import { listLastScheduledTasks, listOpenScheduledTasks } from "../src/lib/skills/schedule-store";
 import type { SkillRecord } from "../src/lib/skills/types";
 import { readBeats, upsertBeat, WATCH_STATUSES, type WatchBeat } from "../src/lib/watch";
+import {
+  MEMORY_REST,
+  TASK_REST,
+  TRACE_LIST,
+  decodeCursor,
+  memoryKeyset,
+  parseToolList,
+  splitPage,
+  taskKeyset,
+  traceKeyset,
+} from "../src/lib/list-params";
 
 async function main() {
   if (!process.env.DATABASE_URL) {
@@ -70,6 +83,41 @@ async function main() {
     () => remember({ content: `too late ${tag}`, key: memoryKey, expected_revision: memoryPreview.revision }),
     (err: unknown) => err instanceof StaleWrite && err.currentRevision !== memoryPreview.revision,
   );
+
+  const knownAgent = await findAgent(`${tag}-agent`);
+  assert.equal(knownAgent?.id, `${tag}-agent`);
+  assert.equal(await findAgent(`${tag}-missing`), null);
+  assert.equal(await findAgent("***"), null);
+  const deleteKey = `${tag}/delete-me`;
+  await assert.rejects(
+    () => deleteMemory({ key: deleteKey }),
+    (err: unknown) => err instanceof Error && err.message === "Memory not found",
+  );
+  await remember({ content: "one", key: deleteKey, agent_id: `${tag}-agent` });
+  const beforeDelete = await readMemoryForPreview(deleteKey);
+  assert.ok(beforeDelete);
+  await remember({ content: "two", key: deleteKey, agent_id: `${tag}-agent` });
+  await assert.rejects(
+    () => deleteMemory({ key: deleteKey, expected_revision: beforeDelete.revision }),
+    (err: unknown) => err instanceof StaleWrite && err.currentRevision !== beforeDelete.revision,
+  );
+  const kept = await readMemoryForPreview(deleteKey);
+  assert.ok(kept);
+  assert.equal(kept.item.content, "two");
+  const removed = await deleteMemory({ key: deleteKey, expected_revision: kept.revision });
+  assert.equal(removed.content, "two");
+  assert.equal(await readMemoryForPreview(deleteKey), null);
+  const actorTask = await createTask({ title: `${tag} actor requeue`, platform: "any" });
+  const stamped = await updateTask({
+    id: actorTask.id,
+    status: "failed",
+    actor: { actor_type: "agent", actor_id: `${tag}-actor` },
+  });
+  assert.equal(stamped.actor_type, "agent");
+  assert.equal(stamped.actor_id, `${tag}-actor`);
+  const untouched = await updateTask({ id: actorTask.id, result: "still mine" });
+  assert.equal(untouched.actor_id, `${tag}-actor`);
+  assert.equal(untouched.result, "still mine");
 
   const absentKey = `${tag}/absent`;
   const raced = await Promise.allSettled([
@@ -285,18 +333,325 @@ async function main() {
       idempotency_key: idemKey,
     });
     assert.notEqual(String(afterExpiry.id), String(first.id), "an expired key can create a new task");
+    await sql()`
+      delete from events
+      where kind = 'create_task'
+        and detail->>'task_id' in (select id::text from tasks where platform = ${idemPlatform})
+    `;
     await sql()`delete from tasks where platform = ${idemPlatform}`;
     await sql()`delete from idempotency_keys where idempotency_key = ${idemKey}`;
   } finally {
     setIdempotencyClockForTests(null);
   }
 
+  await testActivityReceiptAtomic(tag);
+  await testReportStatusAtomic(tag);
   await testDecisions(tag);
   await testSkillLeaseFence(tag);
   await testSkillSchedule(tag);
   await testWatchBeats(tag);
+  await testListCursors(tag);
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
+}
+
+/**
+ * One idempotent create_task is one task, one event, and one receipt.
+ * A forced events-insert failure rolls the write back with it.
+ */
+async function testActivityReceiptAtomic(tag: string) {
+  const platform = `pgtest-act-${tag}`;
+  const key = `act-${tag}`;
+  const failPlatform = `pgtest-act-fail-${tag}`;
+  const memoryKey = `${tag}/act-keep`;
+  const freshKey = `${tag}/act-fresh`;
+  const deleteKey = `${tag}/act-del`;
+  const failIdem = `act-fail-${tag}`;
+  try {
+    const settled = await Promise.allSettled([
+      createTask({ title: `race ${tag}`, platform, priority: 1, idempotency_key: key }),
+      createTask({ title: `race ${tag}`, platform, priority: 1, idempotency_key: key }),
+    ]);
+    for (const item of settled) {
+      if (item.status === "rejected" && !(item.reason instanceof IdempotencyConflict)) throw item.reason;
+    }
+    const won = settled.filter((item) => item.status === "fulfilled");
+    assert.ok(won.length >= 1, "at least one concurrent create_task completed");
+    const taskIds = new Set(won.map((item) => String(item.value.id)));
+    assert.equal(taskIds.size, 1, "concurrent same-key creates share one task");
+    const receiptIds = new Set(won.map((item) => readReceipt(item.value)?.id).filter((id): id is string => Boolean(id)));
+    assert.equal(receiptIds.size, 1, "concurrent same-key creates share one receipt");
+    const taskId = [...taskIds][0];
+    const receiptId = [...receiptIds][0];
+    const tasks = await sql()`select count(*)::int as n from tasks where platform = ${platform}`;
+    assert.equal(Number(tasks[0].n), 1, "two concurrent calls insert one task");
+    const events = await sql()`
+      select id::text as id
+      from events
+      where kind = 'create_task' and detail->>'task_id' = ${taskId}
+    `;
+    assert.equal(events.length, 1, "two concurrent calls insert one activity event");
+    assert.equal(String(events[0].id), receiptId);
+
+    const replay = await createTask({ title: `race ${tag}`, platform, priority: 1, idempotency_key: key });
+    assert.equal(String(replay.id), taskId);
+    assert.equal(readReceipt(replay)?.id, receiptId, "a replay returns the stored receipt");
+    const afterReplay = await sql()`
+      select count(*)::int as n from events
+      where kind = 'create_task' and detail->>'task_id' = ${taskId}
+    `;
+    assert.equal(Number(afterReplay[0].n), 1, "a replay does not insert a second event");
+
+    await remember({ content: "before", key: memoryKey, agent_id: `${tag}-agent` });
+    await remember({ content: "stay", key: deleteKey, agent_id: `${tag}-agent` });
+
+    await sql()`
+      create or replace function ak_test_fail_event()
+      returns trigger
+      language plpgsql
+      as $fn$
+      begin
+        if new.kind in ('create_task', 'remember', 'delete_note', 'send_message', 'reply_to_operator') then
+          raise exception 'simulated events insert failure';
+        end if;
+        return new;
+      end;
+      $fn$
+    `;
+    await sql()`drop trigger if exists ak_test_fail_event on events`;
+    await sql()`
+      create trigger ak_test_fail_event
+      before insert on events
+      for each row
+      execute procedure ak_test_fail_event()
+    `;
+
+    const orphansBefore = await sql()`
+      select count(*)::int as n
+      from events e
+      where e.kind = 'create_task'
+        and not exists (
+          select 1 from tasks t where t.id::text = e.detail->>'task_id'
+        )
+    `;
+    await assert.rejects(
+      () => createTask({ title: `fail ${tag}`, platform: failPlatform }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const failedTasks = await sql()`select count(*)::int as n from tasks where platform = ${failPlatform}`;
+    assert.equal(Number(failedTasks[0].n), 0, "a failed event insert leaves no task");
+    const orphans = await sql()`
+      select count(*)::int as n
+      from events e
+      where e.kind = 'create_task'
+        and not exists (
+          select 1 from tasks t where t.id::text = e.detail->>'task_id'
+        )
+    `;
+    assert.equal(
+      Number(orphans[0].n),
+      Number(orphansBefore[0].n),
+      "a failed event insert leaves no receipt row",
+    );
+
+    await assert.rejects(
+      () => remember({ content: "after", key: memoryKey, agent_id: `${tag}-agent` }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const kept = await sql()`select content from memory where key = ${memoryKey}`;
+    assert.equal(String(kept[0]?.content), "before", "a failed event insert leaves the previous note");
+
+    await assert.rejects(
+      () => remember({ content: "nope", key: freshKey, agent_id: `${tag}-agent` }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const fresh = await sql()`select count(*)::int as n from memory where key = ${freshKey}`;
+    assert.equal(Number(fresh[0].n), 0, "a failed event insert leaves no new note");
+
+    await assert.rejects(
+      () => deleteMemory({ key: deleteKey }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const stillThere = await sql()`select content from memory where key = ${deleteKey}`;
+    assert.equal(String(stillThere[0]?.content), "stay", "a failed event insert does not delete the note");
+
+    await assert.rejects(
+      () => createTask({ title: `fail idem ${tag}`, platform: failPlatform, idempotency_key: failIdem }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    await sql()`drop trigger if exists ak_test_fail_event on events`;
+    const recovered = await createTask({
+      title: `fail idem ${tag}`,
+      platform: failPlatform,
+      idempotency_key: failIdem,
+    });
+    assert.equal(readReceipt(recovered)?.kind, "create_task");
+    const recoveredTasks = await sql()`select count(*)::int as n from tasks where platform = ${failPlatform}`;
+    assert.equal(Number(recoveredTasks[0].n), 1, "a failed claim is released so the same key can write once");
+    const recoveredEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'create_task' and detail->>'task_id' = ${String(recovered.id)}
+    `;
+    assert.equal(Number(recoveredEvents[0].n), 1);
+  } finally {
+    await sql()`drop trigger if exists ak_test_fail_event on events`;
+    await sql()`drop function if exists ak_test_fail_event()`;
+    await sql()`
+      delete from events e
+      where e.kind in ('create_task', 'remember', 'delete_note')
+        and (
+          e.detail->>'memory_key' like ${`%${tag}%`}
+          or e.detail->>'task_id' in (
+            select id::text from tasks where platform like ${`pgtest-act-%${tag}`}
+          )
+        )
+    `;
+    await sql()`delete from tasks where platform like ${`pgtest-act-%${tag}`}`;
+    await sql()`delete from memory where key like ${`%${tag}%`}`;
+    await sql()`delete from idempotency_keys where idempotency_key like ${`%${tag}%`}`;
+  }
+}
+
+/**
+ * report() writes the agent, the session, and the event in one statement.
+ * A rejecting events insert leaves both rows as they were. updateTaskForTool
+ * still returns the task receipt when the later status report fails.
+ */
+async function testReportStatusAtomic(tag: string) {
+  const agentId = slugify(`${tag}-rpt`);
+  // main() already stores a writeback session at `${tag}-sess`. A colliding id
+  // would make the rollback count look like a leftover insert.
+  const sessionId = `${tag}-rpt-sess`;
+  const laneId = slugify(`${tag}-lane`);
+  const platform = `pgtest-rpt-${tag}`;
+  const install = async () => {
+    await sql()`
+      create or replace function ak_test_fail_status_event()
+      returns trigger
+      language plpgsql
+      as $fn$
+      begin
+        if new.kind = 'status' then
+          raise exception 'simulated events insert failure';
+        end if;
+        return new;
+      end;
+      $fn$
+    `;
+    await sql()`drop trigger if exists ak_test_fail_status_event on events`;
+    await sql()`
+      create trigger ak_test_fail_status_event
+      before insert on events
+      for each row
+      execute procedure ak_test_fail_status_event()
+    `;
+  };
+  const drop = async () => {
+    await sql()`drop trigger if exists ak_test_fail_status_event on events`;
+    await sql()`drop function if exists ak_test_fail_status_event()`;
+  };
+  try {
+    await install();
+    await assert.rejects(
+      () => report({
+        agent_id: agentId,
+        platform: "codex",
+        machine: "m1",
+        display_name: "Should Not Stick",
+        session_id: sessionId,
+        kind: "status",
+        title: "ghost",
+        project: "p",
+        summary: "ghost summary",
+      }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const newAgents = await sql()`select count(*)::int as n from agents where id = ${agentId}`;
+    const newSessions = await sql()`select count(*)::int as n from sessions where id = ${sessionId}`;
+    const ghosts = await sql()`select count(*)::int as n from events where kind = 'status' and title = 'ghost'`;
+    assert.equal(Number(newAgents[0].n), 0, "a failed event insert leaves no new agent");
+    assert.equal(Number(newSessions[0].n), 0, "a failed event insert leaves no new session");
+    assert.equal(Number(ghosts[0].n), 0, "a failed event insert leaves no status event");
+
+    await drop();
+    const seeded = await report({
+      agent_id: agentId,
+      platform: "codex",
+      display_name: "Kept",
+      session_id: sessionId,
+      kind: "session_start",
+      title: "hello",
+      project: "p",
+      summary: "kept",
+    });
+    assert.equal(seeded?.kind, "session_start");
+    const beforeAgent = await sql()`select platform, display_name, last_seen_at from agents where id = ${agentId}`;
+    const beforeSession = await sql()`select status, summary, project, ended_at from sessions where id = ${sessionId}`;
+    assert.equal(beforeAgent.length, 1);
+    assert.equal(beforeSession.length, 1);
+    await install();
+    await assert.rejects(
+      () => report({
+        agent_id: agentId,
+        platform: "hermes",
+        display_name: "Changed",
+        session_id: sessionId,
+        kind: "status",
+        status: "failed",
+        title: "ghost-update",
+        summary: "changed",
+      }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const afterAgent = await sql()`select platform, display_name, last_seen_at from agents where id = ${agentId}`;
+    const afterSession = await sql()`select status, summary, project, ended_at from sessions where id = ${sessionId}`;
+    assert.equal(String(afterAgent[0].platform), String(beforeAgent[0].platform));
+    assert.equal(String(afterAgent[0].display_name), String(beforeAgent[0].display_name));
+    assert.equal(new Date(afterAgent[0].last_seen_at as string | Date).toISOString(), new Date(beforeAgent[0].last_seen_at as string | Date).toISOString());
+    assert.equal(String(afterSession[0].status), String(beforeSession[0].status));
+    assert.equal(String(afterSession[0].summary), String(beforeSession[0].summary));
+    assert.equal(String(afterSession[0].project), String(beforeSession[0].project));
+    const endedBefore = beforeSession[0].ended_at == null ? null : new Date(beforeSession[0].ended_at as string | Date).toISOString();
+    const endedAfter = afterSession[0].ended_at == null ? null : new Date(afterSession[0].ended_at as string | Date).toISOString();
+    assert.equal(endedAfter, endedBefore);
+    const updates = await sql()`select count(*)::int as n from events where kind = 'status' and title = 'ghost-update'`;
+    assert.equal(Number(updates[0].n), 0, "a failed event insert leaves no status event on an existing session");
+
+    const task = await createTask({ title: `secondary ${tag}`, platform });
+    const result = await updateTaskForTool({ id: task.id, status: "done", agent_id: `${tag}-lane` });
+    assert.equal(result.isError, undefined);
+    const text = result.content[0]?.text ?? "";
+    assert.match(text, new RegExp(`^Task #${task.id} updated \\(done\\)\\.`));
+    assert.match(text, /note: the status event was not recorded/);
+    const receiptLine = text.split("\n").at(-1) ?? "";
+    assert.match(receiptLine, /^receipt: \{/);
+    const receipt = JSON.parse(receiptLine.slice("receipt: ".length)) as { id: string; kind: string };
+    assert.equal(receipt.kind, "task_updated");
+    const structured = result.structuredContent as { receipt?: { id: string; kind: string } } | undefined;
+    assert.equal(structured?.receipt?.id, receipt.id);
+    assert.equal(structured?.receipt?.kind, "task_updated");
+    const stored = await sql()`select status from tasks where id = ${task.id}`;
+    assert.equal(String(stored[0].status), "done");
+    const lane = await sql()`select count(*)::int as n from agents where id = ${laneId}`;
+    assert.equal(Number(lane[0].n), 0, "a failed secondary report writes no agent");
+    const statusEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'status' and detail->>'task_id' = ${String(task.id)}
+    `;
+    assert.equal(Number(statusEvents[0].n), 0, "a failed secondary report writes no status event");
+    const taskEvents = await sql()`
+      select id::text as id from events
+      where kind = 'task_updated' and detail->>'task_id' = ${String(task.id)}
+    `;
+    assert.equal(taskEvents.length, 1);
+    assert.equal(String(taskEvents[0].id), receipt.id);
+  } finally {
+    await drop();
+    await sql()`delete from tasks where platform = ${platform}`;
+    await sql()`delete from events where agent_id in (${agentId}, ${laneId}) or session_id = ${sessionId}`;
+    await sql()`delete from sessions where id = ${sessionId}`;
+    await sql()`delete from agents where id in (${agentId}, ${laneId})`;
+  }
 }
 
 async function testDecisions(tag: string) {
@@ -748,7 +1103,7 @@ function skillRecord(id: string, body: string): SkillRecord {
     commit_sha: "b".repeat(40),
     body,
     references: [],
-    runtimes: { claude: true, codex: false, grok: false, hermes: false, mini: false },
+    runtimes: { claude: true, codex: false, grok: false, hermes: false, mini: false, nemoclaw: false },
     category: null,
     tags: [],
     frontmatter: {},
@@ -1053,6 +1408,142 @@ async function testWatchBeats(tag: string): Promise<void> {
     if (process.env.DATABASE_URL !== previousUrl) process.env.DATABASE_URL = previousUrl;
     await restoreWatchBeatsName();
     await sql()`delete from watch_beats`;
+  }
+}
+
+/**
+ * Keyset pages on Postgres. An insert ahead of the cursor must not repeat or
+ * skip a row, and two timestamps that differ only after the millisecond still
+ * page in id order.
+ */
+async function testListCursors(tag: string): Promise<void> {
+  const probe = `${tag}-cursor`;
+  const agent = `${tag}-cursor`;
+  await sql()`delete from tasks where status = 'cursorprobe' and title like ${probe + "%"}`;
+  await sql()`delete from memory where key like ${probe + "%"}`;
+  await sql()`delete from spans where agent_id = ${agent}`;
+  try {
+    const taskId = async (name: string, at: string) => {
+      const rows = await sql()`
+        insert into tasks (title, status, priority, platform, updated_at)
+        values (${`${probe}-${name}`}, 'cursorprobe', 2, 'any', ${at}::timestamptz)
+        returning id::text as id
+      `;
+      return String(rows[0].id);
+    };
+    const a = await taskId("a", "2026-10-28 12:00:00.200000+00");
+    const b = await taskId("b", "2026-10-28 12:00:00.123456+00");
+    const c = await taskId("c", "2026-10-28 12:00:00.123789+00");
+    const d = await taskId("d", "2026-10-28 12:00:00.100000+00");
+    const seen: string[] = [];
+    let cursor: ReturnType<typeof taskKeyset> | null = null;
+    let planted = false;
+    let tie: string | null = null;
+    for (let n = 0; n < 8; n++) {
+      const batch = await listTasks({ status: "cursorprobe", limit: 2, keyset: true, cursor });
+      for (const row of batch) assert.equal("list_sort_at" in row, false);
+      const page = splitPage(batch as never, parseToolList(TASK_REST, { limit: 1 }));
+      assert.equal(page.rows.length > 0, true, "a cursorprobe page must not be empty before the end");
+      seen.push(String(page.rows[0].id));
+      if (tie === null && n === 1) tie = page.next_cursor;
+      if (!page.next_cursor) break;
+      if (!planted) {
+        await taskId("e", "2026-10-28 12:00:00.900000+00");
+        planted = true;
+      } else if (tie && page.next_cursor) {
+        const firstTie = decodeCursor(TASK_REST, tie);
+        const nextTie = decodeCursor(TASK_REST, page.next_cursor);
+        if (String(firstTie.k[2]) === String(nextTie.k[2])) {
+          assert.equal(String(nextTie.k[2]).endsWith(".123Z"), true, "microseconds collapse to the same millisecond");
+        }
+      }
+      cursor = taskKeyset(decodeCursor(TASK_REST, page.next_cursor));
+    }
+    assert.deepEqual(seen, [a, b, c, d], "keyset returns each original task once after a newer insert");
+    const bCursor = decodeCursor(TASK_REST, tie as string);
+    assert.equal(String(bCursor.k[2]), "2026-10-28T12:00:00.123Z");
+
+    const noteId = async (name: string, at: string) => {
+      const rows = await sql()`
+        insert into memory (key, content, tags, updated_at)
+        values (${`${probe}-${name}`}, ${name}, ${[probe]}::text[], ${at}::timestamptz)
+        returning id::text as id
+      `;
+      return String(rows[0].id);
+    };
+    const newer = await noteId("newer", "2026-10-28 13:00:00.500000+00");
+    const low = await noteId("low", "2026-10-28 13:00:00.123111+00");
+    const high = await noteId("high", "2026-10-28 13:00:00.123999+00");
+    const notes: string[] = [];
+    let memoryCursor: ReturnType<typeof memoryKeyset> | null = null;
+    let memoryPlanted = false;
+    let memoryTie: string | null = null;
+    for (let n = 0; n < 8; n++) {
+      const batch = await recall({ tags: [probe], limit: 2, keyset: true, cursor: memoryCursor });
+      for (const row of batch) assert.equal("list_sort_at" in row, false);
+      const page = splitPage(batch as never, parseToolList(MEMORY_REST, { limit: 1 }));
+      if (page.rows.length === 0) break;
+      notes.push(String(page.rows[0].id));
+      if (n === 1) memoryTie = page.next_cursor;
+      if (!page.next_cursor) break;
+      if (!memoryPlanted) {
+        await noteId("front", "2026-10-28 13:00:01.000000+00");
+        memoryPlanted = true;
+      }
+      memoryCursor = memoryKeyset(decodeCursor(MEMORY_REST, page.next_cursor));
+    }
+    assert.deepEqual(notes, [newer, low, high], "keyset returns each original note once");
+    assert.equal(String(decodeCursor(MEMORY_REST, memoryTie as string).k[0]), "2026-10-28T13:00:00.123Z");
+
+    const hex = (ch: string) => ch.repeat(32);
+    const span = (trace: string, at: string): SpanInput => ({
+      trace_id: trace,
+      span_id: "0000000000000001",
+      parent_span_id: null,
+      agent_id: agent,
+      session_id: null,
+      name: "session",
+      kind: "session",
+      status: "ok",
+      status_message: null,
+      started_at: at,
+      ended_at: at,
+      attributes: {},
+      model: null,
+      input_tokens: null,
+      output_tokens: null,
+      cost_usd: null,
+    });
+    const traceC = hex("c");
+    const traceA = hex("a");
+    const traceB = hex("b");
+    await upsertSpans([span(traceC, "2026-10-28T16:00:00.000000Z")]);
+    await upsertSpans([span(traceA, "2026-10-28T15:00:00.123456Z")]);
+    await upsertSpans([span(traceB, "2026-10-28T15:00:00.123999Z")]);
+    const traces: string[] = [];
+    let traceCursor: ReturnType<typeof traceKeyset> | null = null;
+    let tracePlanted = false;
+    let traceTie: string | null = null;
+    for (let n = 0; n < 8; n++) {
+      const batch = await listTraces({ agent, limit: 2, keyset: true, cursor: traceCursor });
+      const page = splitPage(batch as never, parseToolList(TRACE_LIST, { limit: 1 }));
+      if (page.rows.length === 0) break;
+      traces.push(String(page.rows[0].trace_id));
+      assert.equal("list_sort_at" in page.rows[0], false);
+      if (n === 1) traceTie = page.next_cursor;
+      if (!page.next_cursor) break;
+      if (!tracePlanted) {
+        await upsertSpans([span(hex("d"), "2026-10-28T17:00:00.000000Z")]);
+        tracePlanted = true;
+      }
+      traceCursor = traceKeyset(decodeCursor(TRACE_LIST, page.next_cursor));
+    }
+    assert.deepEqual(traces, [traceC, traceA, traceB], "keyset returns each original trace once, trace_id ascending on a tie");
+    assert.equal(String(decodeCursor(TRACE_LIST, traceTie as string).k[0]), "2026-10-28T15:00:00.123Z");
+  } finally {
+    await sql()`delete from tasks where status = 'cursorprobe' and title like ${probe + "%"}`;
+    await sql()`delete from memory where key like ${probe + "%"}`;
+    await sql()`delete from spans where agent_id = ${agent}`;
   }
 }
 

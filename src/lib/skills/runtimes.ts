@@ -10,7 +10,7 @@ import {
 /**
  * Which runtimes may see a skill.
  * An explicit `runtimes` list wins. A list we cannot read is claude-only.
- * With no list, Claude-only machinery is claude-only. Anything else is all five.
+ * With no list, Claude-only machinery is claude-only. Anything else is every runtime in RUNTIMES.
  * Unknown names are ignored. Ignoring them does not add the other runtimes.
  */
 

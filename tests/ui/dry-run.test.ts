@@ -129,10 +129,10 @@ function hasField(line: string | undefined, field: string): boolean {
 function assertRendersRecord(change: DryRunChange, field: string, before: string | null, after: string | null) {
   const beforeLine = detailSide(change, "Before");
   const afterLine = detailSide(change, "After");
-  if (before === null) assert.equal(hasField(beforeLine, field), false, beforeLine);
-  else assert.ok(hasSegment(beforeLine, field, before), beforeLine);
-  if (after === null) assert.equal(hasField(afterLine, field), false, afterLine);
-  else assert.ok(hasSegment(afterLine, field, after), afterLine);
+  if (before === null) assert.equal(hasField(beforeLine, field), false, beforeLine ?? "");
+  else assert.ok(hasSegment(beforeLine, field, before), beforeLine ?? "");
+  if (after === null) assert.equal(hasField(afterLine, field), false, afterLine ?? "");
+  else assert.ok(hasSegment(afterLine, field, after), afterLine ?? "");
 
   for (const [label, record] of [
     ["Before", change.before],
@@ -146,7 +146,9 @@ function assertRendersRecord(change: DryRunChange, field: string, before: string
     assert.ok(line, label);
     for (const key of Object.keys(record)) {
       if (record[key] === undefined) continue;
-      const value = record[key];
+      // @types/node 26 assert signatures make an unannotated index read circular
+      // when the formatted value is passed to assert.ok.
+      const value: unknown = record[key];
       const shown =
         value === null ? "null" : Array.isArray(value) ? value.map((item) => String(item)).join(", ") : String(value);
       assert.ok(hasSegment(line, key, shown), `${label} missing ${key}: ${shown} in ${line}`);
@@ -840,7 +842,10 @@ describe("stale preview confirmations", () => {
     assert.equal(storedMemory()?.content, "newer note");
     assert.equal(fixtureSnapshot(), before);
     assert.equal(appliedWrites(), 0);
-    assert.equal(queries[0]?.includes("select"), false);
+    // The receipt is selected from the updated row inside this statement. A leading select would read before the write.
+    assert.doesNotMatch(queries[0] ?? "", /^\s*(with\s+\w+\s+as\s*\(\s*)?select/i);
+    assert.match(queries[0] ?? "", /update\s+memory/i);
+    assert.match(queries[0] ?? "", /insert\s+into\s+events/i);
     assert.match(queries.find((sql) => /update\s+memory/i.test(sql)) ?? "", /md5\(\s*m::text\s*\)/);
     assert.equal(writes.some((sql) => /insert\s+into\s+memory/i.test(sql)), false);
   });
@@ -1282,7 +1287,10 @@ describe("stale preview confirmations", () => {
     assert.equal(storedMemory()?.content, "concurrent note");
     assert.equal(body.current_revision, stableRowRevision(storedMemoryRow()));
     assert.notEqual(body.current_revision, seen);
-    assert.equal(queries[0]?.includes("select"), false);
+    // The receipt is selected from the updated row inside this statement. A leading select would read before the write.
+    assert.doesNotMatch(queries[0] ?? "", /^\s*(with\s+\w+\s+as\s*\(\s*)?select/i);
+    assert.match(queries[0] ?? "", /update\s+memory/i);
+    assert.match(queries[0] ?? "", /insert\s+into\s+events/i);
   });
 
   it("two racing absent-key confirms return one 200 and one 409", async () => {

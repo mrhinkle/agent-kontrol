@@ -3,12 +3,14 @@ import { currentActor, DASHBOARD_ACTOR_ID, LEGACY_ACTOR_ID, type Actor } from ".
 import { upsertSpans } from "../trace-store";
 import type { SpanInput } from "../traces";
 import { skillNow } from "./clock";
+import { presentSkillDocument } from "./present";
 import { scopeAdmits } from "./settings";
 import { completeRun, deleteRun, getRun, getSkillRow, insertRun, listSettings } from "./store";
 import {
   NOTE_MAX,
   isRuntime,
   runtimeList,
+  runtimeMustBeMessage,
   type RunRecord,
   type Runtime,
   type SkillRecord,
@@ -26,6 +28,7 @@ const PREAMBLE: Record<Runtime, string> = {
   grok: "You are Grok. Follow this skill in your own session. Agent Kontrol does not execute it.",
   hermes: "You are Hermes. Follow this skill in your own session. Agent Kontrol does not execute it.",
   mini: "You are the Mini worker. Follow this skill in your own session. Agent Kontrol does not execute it.",
+  nemoclaw: "You are NemoClaw. Follow this skill in your own session. Agent Kontrol does not execute it.",
 };
 
 export async function loadVisibleSkill(id: string): Promise<SkillRecord | null> {
@@ -66,7 +69,7 @@ export function renderSkillText(skill: SkillRecord, runtime: Runtime | null): st
     "",
     runtime ? PREAMBLE[runtime] : "Follow this skill in your own session. Agent Kontrol does not execute it.",
     "",
-    skill.body.trimEnd(),
+    presentSkillDocument(skill, runtime),
     "",
     "References (fetch with get_skill):",
   ];
@@ -117,7 +120,7 @@ function sharedSecretActor(actor: Actor): boolean {
 
 export async function startSkillRun(input: StartInput): Promise<{ ok: true; text: string; runId: string } | RunFail> {
   if (!isRuntime(input.runtime)) {
-    return { ok: false, code: "validation_failed", message: "runtime must be claude, codex, grok, hermes, or mini." };
+    return { ok: false, code: "validation_failed", message: runtimeMustBeMessage() };
   }
   const gated = await gateSkill({ id: input.id, runtime: input.runtime, lane: input.lane });
   if (!gated.ok) return gated;

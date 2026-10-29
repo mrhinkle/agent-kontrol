@@ -4,8 +4,10 @@ import { deny, resolveApiAccess } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { readIdempotencyHeader } from "@/lib/idempotency";
-import { createTask, listTasks } from "@/lib/store";
 import { demoTasks } from "@/lib/demo-data";
+import { ListParamError, TASK_REST, listBody, listParamError, parseSearchList } from "@/lib/list-params";
+import { loadTaskPage } from "@/lib/list-read";
+import { createTask } from "@/lib/store";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -15,7 +17,7 @@ export const maxDuration = 30;
  * Auth: dashboard session, legacy MC_TOKEN, or an agent credential with the
  * route's scope (tasks:read on GET, tasks:write on POST).
  *
- * GET  /api/tasks?status=open|all|<status>&limit=N
+ * GET  /api/tasks?status=open|all|<status>&limit=N&cursor=&fields=
  * POST /api/tasks { title, description?, project?, platform?, machine?,
  *                   priority?, reviewer_platform?, created_by? }
  * Optional header Idempotency-Key. Same key, actor, and route return the
@@ -25,16 +27,24 @@ export const maxDuration = 30;
 export async function GET(req: Request) {
   const access = await resolveApiAccess(req);
   if (!access.ok) return deny(access);
-  if (!isConfigured()) {
+  const url = new URL(req.url);
+  let parsed;
+  try {
+    parsed = parseSearchList(TASK_REST, url.searchParams);
+  } catch (e) {
+    if (e instanceof ListParamError) return listParamError(e);
+    throw e;
+  }
+  // No limit, cursor, or fields: the sample is the sample, filters included.
+  if (!isConfigured() && !parsed.active) {
     return NextResponse.json({ demo: true, tasks: demoTasks() });
   }
-  const url = new URL(req.url);
   try {
-    const tasks = await listTasks({
+    const page = await loadTaskPage(isConfigured() ? "database" : "demo-sample", {
       status: url.searchParams.get("status") ?? "all",
-      limit: url.searchParams.get("limit") ? Number(url.searchParams.get("limit")) : undefined,
+      parsed,
     });
-    return NextResponse.json({ demo: false, tasks });
+    return NextResponse.json(listBody("tasks", page.rows, page.paging, page.next_cursor, !isConfigured()));
   } catch (e) {
     return publicError("[tasks] list failed", e);
   }
