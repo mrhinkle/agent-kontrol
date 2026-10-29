@@ -768,6 +768,24 @@ export function openApiDocument(): Json {
             note: { type: "string" },
           },
         },
+        // Only PUT /api/settings/repos adds source. The other dry-run routes return DryRunResult.
+        RepoDryRunResult: {
+          description: "PUT /api/settings/repos with dry_run true. DryRunResult plus where the watched list came from.",
+          allOf: [
+            ref("DryRunResult"),
+            {
+              type: "object",
+              properties: {
+                source: {
+                  type: "string",
+                  enum: ["database", "file"],
+                  description:
+                    "When a database is connected and source is file, that baseline is the empty stored list, not the file fallback.",
+                },
+              },
+            },
+          ],
+        },
         Decision: {
           type: "object",
           required: [
@@ -1629,7 +1647,7 @@ export function openApiDocument(): Json {
           requestBody: body(ref("RepoList")),
           responses: {
             "200": jsonResponse("The stored list, or a preview that writes nothing.", {
-              oneOf: [ref("WatchedRepos"), ref("DryRunResult")],
+              oneOf: [ref("WatchedRepos"), ref("RepoDryRunResult")],
             }),
             "400": jsonResponse("The list failed validation. errors is unchanged.", {
               allOf: [ref("Error"), { type: "object", properties: { errors: { type: "array" } } }],
