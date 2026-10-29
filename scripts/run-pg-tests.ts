@@ -5,6 +5,9 @@
  */
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import { sql } from "../src/lib/db";
 import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
@@ -31,6 +34,7 @@ import { finishSyncRun, markSkillRemoved, SyncLeaseLost, upsertSettings, upsertS
 import { runScheduleTick, type TickResult } from "../src/lib/skills/schedule";
 import { listLastScheduledTasks, listOpenScheduledTasks } from "../src/lib/skills/schedule-store";
 import type { SkillRecord } from "../src/lib/skills/types";
+import { readBeats, upsertBeat, WATCH_STATUSES, type WatchBeat } from "../src/lib/watch";
 import {
   MEMORY_REST,
   TASK_REST,
@@ -345,6 +349,7 @@ async function main() {
   await testDecisions(tag);
   await testSkillLeaseFence(tag);
   await testSkillSchedule(tag);
+  await testWatchBeats(tag);
   await testListCursors(tag);
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
@@ -1155,6 +1160,254 @@ async function holdExpiredLease<T>(holder: Client, runId: string, marker: string
     await holder.query("rollback").catch(() => undefined);
     if (pending) await pending.catch(() => undefined);
     throw err;
+  }
+}
+
+function pgCode(err: unknown): string | undefined {
+  if (!err || typeof err !== "object" || !("code" in err)) return undefined;
+  const code = (err as { code: unknown }).code;
+  return typeof code === "string" ? code : undefined;
+}
+
+async function applyCanonicalSchema(): Promise<void> {
+  const schemaPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "supabase", "schema.sql");
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    await client.query(fs.readFileSync(schemaPath, "utf8"));
+  } finally {
+    await client.end();
+  }
+}
+
+async function restoreWatchBeatsName(): Promise<void> {
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    await client.query(`
+      do $$ begin
+        if to_regclass('public.watch_beats_hidden') is not null
+           and to_regclass('public.watch_beats') is null then
+          alter table watch_beats_hidden rename to watch_beats;
+        end if;
+      end $$
+    `);
+  } finally {
+    await client.end();
+  }
+}
+
+function beatFor(rows: WatchBeat[], source: string): WatchBeat {
+  const found = rows.find((row) => row.source === source);
+  assert.ok(found, `missing beat ${source}`);
+  return found;
+}
+
+/**
+ * Failure cases for watch_beats: constraint rejects, clock skew, a second
+ * write refreshing received_at, concurrent same-source upserts, a failed
+ * read, a missing DATABASE_URL, and a second schema apply that must not
+ * rewrite a stored beat.
+ */
+async function testWatchBeats(tag: string): Promise<void> {
+  await sql()`delete from watch_beats`;
+  const previousUrl = process.env.DATABASE_URL;
+  try {
+    const encoding = await sql()`show server_encoding`;
+    assert.equal(String(encoding[0].server_encoding).toUpperCase(), "UTF8");
+
+    const cols = await sql()`
+      select column_name, data_type, is_nullable
+      from information_schema.columns
+      where table_schema = 'public' and table_name = 'watch_beats'
+      order by ordinal_position
+    `;
+    assert.deepEqual(
+      cols.map((col) => [col.column_name, col.data_type, col.is_nullable]),
+      [
+        ["source", "text", "NO"],
+        ["status", "text", "NO"],
+        ["detail", "text", "NO"],
+        ["beat_at", "timestamp with time zone", "NO"],
+        ["received_at", "timestamp with time zone", "NO"],
+      ],
+    );
+
+    assert.deepEqual(await readBeats(), [], "an empty table is not a fabricated healthy beat");
+
+    const behind = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+    const ahead = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString();
+    const skew = `${tag}-skew`;
+    await upsertBeat(skew, "ok", "sender behind", behind);
+    let row = beatFor(await readBeats(), skew);
+    assert.equal(row.beat_at, behind);
+    assert.match(row.beat_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    assert.match(row.received_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    assert.equal(Number.isInteger(row.age_s), true);
+    assert.ok(row.age_s >= 0 && row.age_s < 30, `age follows received_at, got ${row.age_s}`);
+    assert.deepEqual(Object.keys(row), ["source", "status", "detail", "beat_at", "received_at", "age_s"]);
+
+    await upsertBeat(skew, "failing", "sender ahead", ahead);
+    row = beatFor(await readBeats(), skew);
+    assert.equal(row.status, "failing", "a future beat_at is still accepted");
+    assert.equal(row.detail, "sender ahead");
+    assert.equal(row.beat_at, ahead);
+    assert.ok(row.age_s < 30, `a future beat_at must not zero the age by itself, got ${row.age_s}`);
+
+    // An older sender instant still overwrites. beat_at is not a version.
+    await upsertBeat(skew, "paused", "older sender wins", behind);
+    row = beatFor(await readBeats(), skew);
+    assert.equal(row.status, "paused");
+    assert.equal(row.detail, "older sender wins");
+    assert.equal(row.beat_at, behind);
+
+    await sql()`update watch_beats set received_at = clock_timestamp() - interval '2 days' where source = ${skew}`;
+    const rewound = beatFor(await readBeats(), skew);
+    assert.ok(rewound.age_s >= 2 * 86400 - 5, `rewound age should be about two days, got ${rewound.age_s}`);
+    await upsertBeat(skew, "held", "refreshed", behind);
+    row = beatFor(await readBeats(), skew);
+    assert.equal(row.status, "held");
+    assert.equal(row.detail, "refreshed");
+    assert.ok(row.age_s < 30, `the conflict update must stamp received_at again, got ${row.age_s}`);
+
+    await sql()`update watch_beats set received_at = clock_timestamp() + interval '2 days' where source = ${skew}`;
+    assert.equal(beatFor(await readBeats(), skew).age_s, 0, "age_s floors at zero when received_at is ahead of the database clock");
+
+    const micros = `${tag}-micros`;
+    await upsertBeat(micros, "unknown", "", "2026-10-26T12:00:00.123456Z");
+    const storedUs = await sql()`
+      select to_char(beat_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as beat
+      from watch_beats where source = ${micros}
+    `;
+    assert.equal(String(storedUs[0].beat), "2026-10-26T12:00:00.123456Z");
+    const offset = `${tag}-offset`;
+    await upsertBeat(offset, "ok", "", "2026-10-26T12:00:00-05:00");
+    assert.equal(beatFor(await readBeats(), offset).beat_at, "2026-10-26T17:00:00.000Z");
+
+    const emoji = "😀".repeat(500);
+    const wide = `${tag}-wide`;
+    await upsertBeat(wide, "stale", emoji, "2026-10-28T00:00:00Z");
+    assert.equal(beatFor(await readBeats(), wide).detail, emoji);
+    await upsertBeat(`${tag}-empty-detail`, "ok", "", "2026-10-28T00:00:00Z");
+
+    const hostile = `${tag}-'); drop table watch_beats; --`;
+    await upsertBeat(hostile, "ok", "still here", "2026-10-28T00:00:00Z");
+    assert.equal(beatFor(await readBeats(), hostile).detail, "still here");
+    const stillThere = await sql()`select to_regclass('public.watch_beats') as rel`;
+    assert.equal(stillThere[0].rel, "watch_beats");
+
+    const sources = [`${tag}-c`, `${tag}-a`, `${tag}-b`];
+    for (const source of sources) await upsertBeat(source, "ok", source, "2026-10-28T00:00:00Z");
+    const ordered = (await readBeats()).map((item) => item.source).filter((source) => sources.includes(source));
+    assert.deepEqual(ordered, [...sources].sort(), "readBeats orders by source");
+    const distinct = await sql()`select count(*)::int as n from watch_beats where source like ${`${tag}-%`}`;
+    assert.ok(Number(distinct[0].n) >= sources.length);
+
+    const race = `${tag}-race`;
+    await Promise.all(Array.from({ length: 12 }, (_, i) => upsertBeat(
+      race,
+      WATCH_STATUSES[i % WATCH_STATUSES.length],
+      `n${i}`,
+      new Date(Date.now() - i * 1000).toISOString(),
+    )));
+    const raceCount = await sql()`select count(*)::int as n from watch_beats where source = ${race}`;
+    assert.equal(Number(raceCount[0].n), 1, "concurrent same-source writes leave one row");
+
+    const same = `${tag}-same`;
+    await upsertBeat(same, "ok", "one", "2026-10-28T00:00:00Z");
+    await upsertBeat(same, "unknown", "two", "2026-10-28T00:00:01Z");
+    const sameCount = await sql()`select count(*)::int as n, max(detail) as detail from watch_beats where source = ${same}`;
+    assert.equal(Number(sameCount[0].n), 1);
+    assert.equal(String(sameCount[0].detail), "two");
+    await upsertBeat(`${tag}-other`, "held", "separate", "2026-10-28T00:00:00Z");
+    const pair = await sql()`select count(*)::int as n from watch_beats where source in (${same}, ${`${tag}-other`})`;
+    assert.equal(Number(pair[0].n), 2, "different sources stay separate");
+
+    const kept = `${tag}-kept`;
+    await upsertBeat(kept, "ok", "do not touch", "2026-10-27T01:02:03Z");
+    const before = await sql()`
+      select status, detail,
+             extract(epoch from beat_at) as beat_epoch,
+             extract(epoch from received_at) as received_epoch
+      from watch_beats where source = ${kept}
+    `;
+    await applyCanonicalSchema();
+    await applyCanonicalSchema();
+    const after = await sql()`
+      select status, detail,
+             extract(epoch from beat_at) as beat_epoch,
+             extract(epoch from received_at) as received_epoch
+      from watch_beats where source = ${kept}
+    `;
+    assert.deepEqual(after, before, "applying the canonical schema twice leaves the beat unchanged");
+
+    const badSource = `${tag}-bad`;
+    await assert.rejects(
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values ('', 'ok', '', now(), now())`,
+      (err: unknown) => pgCode(err) === "23514",
+      "empty source",
+    );
+    await assert.rejects(
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'nope', '', now(), now())`,
+      (err: unknown) => pgCode(err) === "23514",
+      "invalid status",
+    );
+    await assert.rejects(
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'OK', '', now(), now())`,
+      (err: unknown) => pgCode(err) === "23514",
+      "status is case-sensitive",
+    );
+    await assert.rejects(
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'ok', ${"a".repeat(501)}, now(), now())`,
+      (err: unknown) => pgCode(err) === "23514",
+      "501 code points",
+    );
+    await assert.rejects(
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'ok', ${"😀".repeat(501)}, now(), now())`,
+      (err: unknown) => pgCode(err) === "23514",
+      "501 emoji code points",
+    );
+    const nullWrites = [
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (null, 'ok', '', now(), now())`,
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, null, '', now(), now())`,
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'ok', null, now(), now())`,
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'ok', '', null, now())`,
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'ok', '', now(), null)`,
+    ];
+    for (const write of nullWrites) {
+      await assert.rejects(write, (err: unknown) => pgCode(err) === "23502");
+    }
+    const badLeft = await sql()`select count(*)::int as n from watch_beats where source = ${badSource} or source = ''`;
+    assert.equal(Number(badLeft[0].n), 0, "rejected rows are not stored");
+
+    const admin = new Client({ connectionString: process.env.DATABASE_URL });
+    await admin.connect();
+    try {
+      await admin.query("alter table watch_beats rename to watch_beats_hidden");
+      await assert.rejects(readBeats, (err: unknown) => pgCode(err) === "42P01");
+      await assert.rejects(
+        () => upsertBeat("missing-table", "ok", "", "2026-10-28T00:00:00Z"),
+        (err: unknown) => pgCode(err) === "42P01",
+      );
+    } finally {
+      await admin.query("alter table if exists watch_beats_hidden rename to watch_beats");
+      await admin.end();
+    }
+
+    delete process.env.DATABASE_URL;
+    try {
+      await assert.rejects(readBeats, /DATABASE_URL is not set/);
+      await assert.rejects(
+        () => upsertBeat("unconfigured", "ok", "", new Date()),
+        /DATABASE_URL is not set/,
+      );
+    } finally {
+      process.env.DATABASE_URL = previousUrl;
+    }
+  } finally {
+    if (process.env.DATABASE_URL !== previousUrl) process.env.DATABASE_URL = previousUrl;
+    await restoreWatchBeatsName();
+    await sql()`delete from watch_beats`;
   }
 }
 
