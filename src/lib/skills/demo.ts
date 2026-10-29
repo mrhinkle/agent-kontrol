@@ -159,6 +159,7 @@ export function demoDetail(id: string): SkillDetail | null {
     body: skill.body,
     references: skill.references.map((ref) => ({ path: ref.path })),
     runtimes: skill.runtimes,
+    schedule: skill.schedule,
     triggers: skill.id === "verify-gibson"
       ? [
           {

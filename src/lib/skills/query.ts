@@ -115,6 +115,7 @@ export async function getSkillDetail(id: string): Promise<SkillDetail | null> {
     body: row.body,
     references: row.references.map((ref) => ({ path: ref.path })),
     runtimes: row.runtimes,
+    schedule: setting?.schedule ?? null,
     triggers: triggers.map((run) => presentRun(run, now)),
   };
 }
