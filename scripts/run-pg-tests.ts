@@ -12,7 +12,7 @@ import type { BriefSettings } from "../src/lib/progress-config";
 import { sql } from "../src/lib/db";
 import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
 import { StaleWrite } from "../src/lib/revision";
-import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview } from "../src/lib/store";
+import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview, findAgent, deleteMemory } from "../src/lib/store";
 import { getWatchedRepos, replaceWatchedRepos } from "../src/lib/watched-repos";
 import type { RepoConfig } from "../src/lib/progress-config";
 import { getTrace, listTraces, pruneSpans, upsertSpans } from "../src/lib/trace-store";
@@ -80,6 +80,41 @@ async function main() {
     () => remember({ content: `too late ${tag}`, key: memoryKey, expected_revision: memoryPreview.revision }),
     (err: unknown) => err instanceof StaleWrite && err.currentRevision !== memoryPreview.revision,
   );
+
+  const knownAgent = await findAgent(`${tag}-agent`);
+  assert.equal(knownAgent?.id, `${tag}-agent`);
+  assert.equal(await findAgent(`${tag}-missing`), null);
+  assert.equal(await findAgent("***"), null);
+  const deleteKey = `${tag}/delete-me`;
+  await assert.rejects(
+    () => deleteMemory({ key: deleteKey }),
+    (err: unknown) => err instanceof Error && err.message === "Memory not found",
+  );
+  await remember({ content: "one", key: deleteKey, agent_id: `${tag}-agent` });
+  const beforeDelete = await readMemoryForPreview(deleteKey);
+  assert.ok(beforeDelete);
+  await remember({ content: "two", key: deleteKey, agent_id: `${tag}-agent` });
+  await assert.rejects(
+    () => deleteMemory({ key: deleteKey, expected_revision: beforeDelete.revision }),
+    (err: unknown) => err instanceof StaleWrite && err.currentRevision !== beforeDelete.revision,
+  );
+  const kept = await readMemoryForPreview(deleteKey);
+  assert.ok(kept);
+  assert.equal(kept.item.content, "two");
+  const removed = await deleteMemory({ key: deleteKey, expected_revision: kept.revision });
+  assert.equal(removed.content, "two");
+  assert.equal(await readMemoryForPreview(deleteKey), null);
+  const actorTask = await createTask({ title: `${tag} actor requeue`, platform: "any" });
+  const stamped = await updateTask({
+    id: actorTask.id,
+    status: "failed",
+    actor: { actor_type: "agent", actor_id: `${tag}-actor` },
+  });
+  assert.equal(stamped.actor_type, "agent");
+  assert.equal(stamped.actor_id, `${tag}-actor`);
+  const untouched = await updateTask({ id: actorTask.id, result: "still mine" });
+  assert.equal(untouched.actor_id, `${tag}-actor`);
+  assert.equal(untouched.result, "still mine");
 
   const absentKey = `${tag}/absent`;
   const raced = await Promise.allSettled([
