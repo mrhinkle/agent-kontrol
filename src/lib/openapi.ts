@@ -13,6 +13,8 @@ import { USAGE_SOURCES } from "@/lib/usage-types";
 import { USAGE_WINDOWS } from "@/lib/usage-window";
 import { ACTIVITY_LIST, LIST_MAX } from "./list-params";
 import { RUNTIMES } from "./skills/types";
+import { WATCH_STATUSES } from "./watch";
+import { WATCH_SOURCES } from "./watch-sources";
 
 /**
  * OpenAPI 3.1 for the documented REST routes.
@@ -220,6 +222,7 @@ export function openApiDocument(): Json {
       { name: "skills" },
       { name: "auth" },
       { name: "mcp" },
+      { name: "watch" },
     ],
     components: {
       securitySchemes: {
@@ -234,6 +237,13 @@ export function openApiDocument(): Json {
           scheme: "bearer",
           bearerFormat: "MC_TOKEN",
           description: "Operator MC_TOKEN. An agent credential and an OAuth access token are not accepted on operations that use this scheme.",
+        },
+        agentCredential: {
+          type: "http",
+          scheme: "bearer",
+          bearerFormat: "akc_",
+          description:
+            "Per-agent akc_ credential. MC_TOKEN, the dashboard session, an OAuth access token, and a dev-open caller are not accepted on operations that use this scheme.",
         },
       },
       schemas: {
@@ -941,6 +951,41 @@ export function openApiDocument(): Json {
               items: { type: "string", enum: [...SCOPES] },
             },
             expires_at: { type: ["string", "null"], format: "date-time" },
+          },
+        },
+        WatchBeatWrite: {
+          type: "object",
+          additionalProperties: false,
+          required: ["source", "status", "detail", "beat_at"],
+          properties: {
+            source: { type: "string", enum: [...WATCH_SOURCES] },
+            status: { type: "string", enum: [...WATCH_STATUSES] },
+            detail: {
+              type: "string",
+              description: "At most 500 Unicode code points. Empty is allowed.",
+            },
+            beat_at: {
+              type: "string",
+              format: "date-time",
+              description:
+                "Finite RFC 3339 instant with an explicit Z or ±HH:MM offset. The sender clock does not decide freshness.",
+            },
+          },
+        },
+        WatchBeat: {
+          type: "object",
+          required: ["source", "status", "detail", "beat_at", "received_at", "age_s"],
+          properties: {
+            source: { type: "string", enum: [...WATCH_SOURCES] },
+            status: { type: "string", enum: [...WATCH_STATUSES] },
+            detail: { type: "string" },
+            beat_at: { type: "string", format: "date-time" },
+            received_at: { type: "string", format: "date-time" },
+            age_s: {
+              type: "integer",
+              minimum: 0,
+              description: "Whole seconds from the database clock to received_at, never below 0. Not derived from beat_at.",
+            },
           },
         },
       },
@@ -2040,6 +2085,50 @@ export function openApiDocument(): Json {
             "200": jsonResponse("The updated skill, or a demo no-op.", { type: "object" }),
             ...flatErrors,
             "404": jsonResponse("Unknown or removed skill when a database is connected.", ref("Error")),
+          },
+        }),
+      },
+      "/api/watch/beat": {
+        post: operation({
+          operationId: "postWatchBeat",
+          tags: ["watch"],
+          summary: "Store one host liveness beat.",
+          description:
+            "Verified akc_ credential with watch:write only. MC_TOKEN, the dashboard session, an OAuth access token, and a dev-open caller are 401. A valid credential without watch:write is 403 insufficient_scope. The credential store being unreachable is 503 credential_store_unavailable. WATCH_SOURCE_CREDENTIAL_IDS_JSON must map the body's source to this credential's row id; a missing, empty, or otherwise invalid map is 503, and a credential bound to a different source is 403 with no write. Content-Type must be the single media type application/json, optionally with parameters (415 for a missing value, a comma, or any other type). The body is measured before parsing and rejected at 413 above 8 KiB; Content-Length is not trusted. received_at and age_s are rejected. beat_at is the sender's instant and may be old or in the future. received_at and age_s come from the database on read. No database is 503, never a demo ack.",
+          security: [{ agentCredential: [] }],
+          requestBody: body(ref("WatchBeatWrite")),
+          responses: {
+            "200": jsonResponse("The beat replaced the row for that source.", {
+              type: "object",
+              required: ["ok"],
+              properties: { ok: { type: "boolean", const: true } },
+            }),
+            ...flatErrors,
+            "413": jsonResponse("The body is larger than 8 KiB.", ref("Error")),
+            "415": jsonResponse("Content-Type is not application/json.", ref("Error")),
+            "503": jsonResponse(
+              "The credential store is unreachable, source binding is not configured, or the beat table is unavailable.",
+              ref("Error"),
+            ),
+          },
+        }),
+      },
+      "/api/watch/beats": {
+        get: operation({
+          operationId: "listWatchBeats",
+          tags: ["watch"],
+          summary: "List host liveness beats.",
+          description:
+            "Verified akc_ credential with watch:read only. MC_TOKEN, the dashboard session, an OAuth access token, and a dev-open caller are 401. A valid credential without watch:read is 403 insufficient_scope. No source binding. age_s is the database clock minus received_at. Cache-Control is no-store. With no database, or when the query fails, the response is 503. It is not an empty list and not demo data. An empty beats array means the table was read and has no rows.",
+          security: [{ agentCredential: [] }],
+          responses: {
+            "200": jsonResponse("Rows ordered by source. Cache-Control: no-store.", {
+              type: "object",
+              required: ["beats"],
+              properties: { beats: { type: "array", items: ref("WatchBeat") } },
+            }),
+            ...flatErrors,
+            "503": jsonResponse("The credential store or the beat table is unavailable.", ref("Error")),
           },
         }),
       },

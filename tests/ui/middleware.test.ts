@@ -51,6 +51,10 @@ describe("middleware with no dashboard password", () => {
     env.DATABASE_URL = "postgres://x";
     assert.notEqual((await middleware(req("/api/ingest"))).status, 503);
     assert.notEqual((await middleware(req("/api/mcp"))).status, 503);
+    assert.notEqual((await middleware(req("/api/watch/beat"))).status, 503);
+    assert.notEqual((await middleware(req("/api/watch/beats"))).status, 503);
+    assert.equal((await middleware(req("/api/watch/beat/extra"))).status, 503);
+    assert.equal((await middleware(req("/api/watch/beating"))).status, 503);
   });
 
   it("serves the public agent docs while data routes stay refused", async () => {
@@ -130,5 +134,17 @@ describe("middleware with a dashboard password", () => {
     }
     const escaped = await middleware(req("/docs/../package.json"));
     assert.equal(escaped.status, 307);
+  });
+
+  it("forwards the watch routes with no session and does not open a prefix", async () => {
+    env.MC_DASHBOARD_PASSWORD = "pw";
+    env.NODE_ENV = "production";
+    delete env.MC_TOKEN;
+    assert.equal((await middleware(req("/api/watch/beat"))).status, 200);
+    assert.equal((await middleware(req("/api/watch/beats"))).status, 200);
+    assert.equal((await middleware(req("/api/watch/beat", { authorization: "Bearer akc_example-not-a-secret" }))).status, 200);
+    assert.equal((await middleware(req("/api/watch/beat/extra"))).status, 401);
+    assert.equal((await middleware(req("/api/watch/beating"))).status, 401);
+    assert.equal((await middleware(req("/api/fleet"))).status, 401);
   });
 });
