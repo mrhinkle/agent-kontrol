@@ -842,7 +842,7 @@ export function openApiDocument(): Json {
           tags: ["messages"],
           summary: "Operator enqueues an inbound message.",
           description:
-            "The server sets actor_type and actor_id from the authenticated credential. created_by is a label and does not set those fields. When MC_DASHBOARD_PASSWORD is unset and the request presents no credential, both actor fields are null. Optional header Idempotency-Key.",
+            "The server sets actor_type and actor_id from the authenticated credential. created_by is a label and does not set those fields. When MC_DASHBOARD_PASSWORD is unset and the request presents no credential, both actor fields are null. body is at most 8000 characters. A longer body is 400 validation_failed and stores nothing. Optional header Idempotency-Key.",
           security: cookieOrBearer,
           parameters: [idempotencyHeader],
           requestBody: body({
@@ -850,7 +850,7 @@ export function openApiDocument(): Json {
             required: ["agent_id", "body"],
             properties: {
               agent_id: { type: "string" },
-              body: { type: "string" },
+              body: { type: "string", maxLength: 8000 },
               created_by: { type: "string" },
             },
           }),

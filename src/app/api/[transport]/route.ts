@@ -23,18 +23,19 @@ import { morningBriefText } from "@/lib/brief";
 import { OPERATOR } from "@/lib/operator";
 import { demoProgress } from "@/lib/demo-progress";
 import { getSkillTool, listSkillsTool, runSkillTool } from "@/lib/skills/mcp";
+import { deleteNoteTool, requeueTaskTool, sendMessageTool } from "@/lib/operator-actions";
 
 export const maxDuration = 60;
 
 /**
  * MCP tool annotations. Every tool declares all four hints explicitly so hosts can
  * warn before invoking. Agent Kontrol is a closed system (its own database), so
- * openWorldHint is false everywhere, and nothing here deletes data.
+ * openWorldHint is false everywhere. delete_note is the tool that removes a row.
  */
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
 const WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false } as const;
 const WRITE_IDEMPOTENT = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
-/** Overwrites existing state (a keyed note, a task's status and result) and appends an event, so not idempotent. */
+/** Overwrites existing state, or deletes a note, so not idempotent. */
 const WRITE_DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false } as const;
 
 /** Caught tool failures become an isError result. The text is the JSON error body, never the exception. */
@@ -503,6 +504,68 @@ const handler = createMcpHandler(
         },
       },
       async (args) => guardTool("run_skill", () => runSkillTool(args)),
+    );
+
+    server.registerTool(
+      "send_message",
+      {
+        title: "Send message",
+        annotations: WRITE,
+        description:
+          "Send an inbound message to an agent that has already reported. Requires messages:write. The recipient is slugified and must match an existing agent. body is at most 8000 characters and is stored as given. created_by is a label and does not set actor_type or actor_id. The server records the authenticated credential. idempotency_key matches create_task: the same key, actor, and arguments return the original message for 24 hours.",
+        inputSchema: {
+          agent_id: z.string().describe("Agent to receive the message. Slugified. Must already exist."),
+          body: z.string().describe("Message text, 1 to 8000 characters. Not trimmed."),
+          created_by: z.string().optional().describe("Free-text label. It does not set actor_type or actor_id."),
+          idempotency_key: z
+            .string()
+            .optional()
+            .describe("Optional. Scoped by actor and the enqueue_message route. The same key and the same arguments return the original message for 24 hours."),
+        },
+      },
+      async (args) => guardTool("send_message", () => sendMessageTool(args)),
+    );
+
+    server.registerTool(
+      "requeue_task",
+      {
+        title: "Requeue task",
+        annotations: WRITE,
+        description:
+          "Put a done, failed, or cancelled task back to queued. Requires tasks:write. A running, claimed, or review task is refused. A running task held by another agent is forbidden. assigned_agent and completed_at are left as they are. dry_run true returns the diff and expected_revision and writes nothing. Send that expected_revision to make the confirm conditional. A mismatch is stale_write and writes nothing. The server records the authenticated actor on the task.",
+        inputSchema: {
+          id: z.number().int().describe("Task id."),
+          agent_id: z
+            .string()
+            .optional()
+            .describe("Caller compared with assigned_agent. Omit to use the authenticated actor id. This does not clear or set assigned_agent."),
+          dry_run: z.boolean().optional().describe("True returns the preview and writes nothing."),
+          expected_revision: z
+            .string()
+            .optional()
+            .describe("Revision from the preview. Omit for an unconditional confirm. Ignored when dry_run is true, except that a bad token is still rejected."),
+        },
+      },
+      async (args) => guardTool("requeue_task", () => requeueTaskTool(args)),
+    );
+
+    server.registerTool(
+      "delete_note",
+      {
+        title: "Delete note",
+        annotations: WRITE_DESTRUCTIVE,
+        description:
+          "Delete one shared memory note by key. Requires memory:write. A missing key is not_found and deletes nothing. dry_run true returns the diff and expected_revision and writes nothing. Send that expected_revision to make the confirm conditional. A mismatch is stale_write and writes nothing. The authenticated actor is named in the result. The memory table has no actor columns.",
+        inputSchema: {
+          key: z.string().describe("Memory key, 1 to 200 characters, no control characters."),
+          dry_run: z.boolean().optional().describe("True returns the preview and writes nothing."),
+          expected_revision: z
+            .string()
+            .optional()
+            .describe("Revision from the preview. Omit for an unconditional confirm. Ignored when dry_run is true, except that a bad token is still rejected."),
+        },
+      },
+      async (args) => guardTool("delete_note", () => deleteNoteTool(args)),
     );
   },
   {},

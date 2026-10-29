@@ -1,6 +1,6 @@
 # Agent Kontrol MCP Server
 
-Agent Kontrol exposes fleet coordination to AI coding agents over the Model Context Protocol. This document covers how to connect, the 15 tools, how shared memory works, and a block of standing instructions you can paste into an agent.
+Agent Kontrol exposes fleet coordination to AI coding agents over the Model Context Protocol. This document covers how to connect, the 18 tools, how shared memory works, and a block of standing instructions you can paste into an agent.
 
 An agent that only has the deployment URL can start at [/llms.txt](/llms.txt).
 
@@ -30,17 +30,19 @@ A tool that is not in the table below is denied for every caller, including `MC_
 | `status:write` | `report_status` | `POST /api/ingest` |
 | `fleet:read` | `get_fleet_status` | `GET /api/fleet` |
 | `tasks:read` | `get_task_queue` | `GET /api/tasks` |
-| `tasks:write` | `create_task`, `claim_task`, `update_task` | `POST /api/tasks`, `POST /api/tasks/claim`, `PATCH /api/tasks/:id` |
+| `tasks:write` | `create_task`, `claim_task`, `update_task`, `requeue_task` | `POST /api/tasks`, `POST /api/tasks/claim`, `PATCH /api/tasks/:id` |
 | `memory:read` | `recall` | `GET /api/memory` |
-| `memory:write` | `remember` | `POST /api/memory` |
+| `memory:write` | `remember`, `delete_note` | `POST /api/memory` |
 | `messages:read` | `check_inbox` | `GET /api/messages` |
-| `messages:write` | `reply_to_operator`, `reply_to_mark` | `POST /api/messages/reply` |
+| `messages:write` | `reply_to_operator`, `reply_to_mark`, `send_message` | `POST /api/messages/reply` |
 | `progress:read` | `get_progress_digest`, `get_morning_brief` | `GET /api/progress`, `GET /api/progress/digest`, `GET /api/brief` |
 | `decisions:write` | — (no MCP tool yet) | `PATCH /api/decisions/:id` |
 | `skills:read` | `list_skills`, `get_skill` | `GET /api/skills`, `GET /api/skills/:id` |
 | `skills:write` | `run_skill` | — (no REST route; the agent calls `run_skill`) |
 
 `reply_to_mark` is the deprecated alias of `reply_to_operator` and requires the same scope.
+
+`send_message` is the MCP form of operator `POST /api/messages`. That REST route stays off this table, so an agent credential still cannot call it. The tool requires `messages:write`. `delete_note` uses `memory:write`. There is no memory DELETE route. `requeue_task` uses `tasks:write`, the same scope as `PATCH /api/tasks/:id`.
 
 Collector and operator routes are not in this table. An agent credential cannot call them. `MC_TOKEN` and the dashboard session still can. That set is `POST /api/progress/ingest`, `POST /api/usage/ingest`, `GET /api/usage`, `POST /api/v1/traces`, `GET /api/traces`, `GET /api/traces/:traceId`, `POST /api/messages`, `PATCH /api/messages`, `GET /api/decisions`, `POST /api/decisions`, `PATCH /api/skills/:id`, `POST /api/skills/sync`, `POST /api/skills/drift`, and `GET`/`PUT /api/settings/repos`. `GET`/`POST`/`DELETE /api/settings/credentials` accepts only the dashboard session. `PATCH /api/decisions/:id` is the `decisions:write` row above. There is no MCP tool for decisions yet.
 
@@ -88,13 +90,13 @@ A `401` on this request means the token does not match `MC_TOKEN` on the deploym
 
 ## Tools
 
-The server exposes 15 tools: `report_status`, `get_fleet_status`, `get_progress_digest`, `get_morning_brief`, `remember`, `recall`, `check_inbox`, `reply_to_operator`, `create_task`, `get_task_queue`, `claim_task`, `update_task`, `list_skills`, `get_skill`, `run_skill`.
+The server exposes 18 tools: `report_status`, `get_fleet_status`, `get_progress_digest`, `get_morning_brief`, `remember`, `recall`, `check_inbox`, `reply_to_operator`, `create_task`, `get_task_queue`, `claim_task`, `update_task`, `list_skills`, `get_skill`, `run_skill`, `send_message`, `requeue_task`, `delete_note`.
 
 Tool names are part of the public API and will not change within 1.x.
 
 ### Demo mode
 
-With no `DATABASE_URL`, `report_status`, `remember`, `create_task`, `claim_task`, and `update_task` store in memory for the life of the process. `get_fleet_status`, `recall`, and `get_task_queue` return what those tools wrote. A successful result starts with `[demo — in-memory, cleared when this process restarts]`. A `dry_run: true` preview is JSON with `applied: false` and does not start with that banner. The store is cleared when the process restarts. It is not the sample data the dashboard shows. REST writes are still dropped. `check_inbox` and `reply_to_operator` are not stored. `get_progress_digest` stays on sample data. `run_skill` still returns `DATABASE_URL not set; skill run not stored.`
+With no `DATABASE_URL`, `report_status`, `remember`, `create_task`, `claim_task`, `update_task`, `send_message`, `requeue_task`, and `delete_note` store in memory for the life of the process. `get_fleet_status`, `recall`, and `get_task_queue` return what those tools wrote. A successful result starts with `[demo — in-memory, cleared when this process restarts]`. A `dry_run: true` preview is JSON with `applied: false` and does not start with that banner. The store is cleared when the process restarts. It is not the sample data the dashboard shows. REST writes are still dropped, including `POST /api/messages`. `check_inbox` and `reply_to_operator` are not stored. `get_progress_digest` stays on sample data. `run_skill` still returns `DATABASE_URL not set; skill run not stored.`
 
 `remember` with a `key` upserts that key. Memory is shared across agents, the same as the database. `dry_run: true` previews and writes nothing. A non-boolean `dry_run` is `validation_failed`. `create_task` idempotency matches the database: the same key, actor, and arguments replay the original task; different arguments are `idempotency_conflict`. `claim_task` on a task that is already claimed or done is the same empty result as a database with nothing queued (`No queued tasks for your platform.`). Two claims in one process yield one winner. `update_task` on a missing id is `task_not_found`. The store caps tasks, notes, agents, events, sessions, and idempotency keys. Sessions are capped per agent, and the oldest session for that agent is dropped past the cap. Past the other caps, the oldest row is dropped. Dropping a task at the cap does not drop its idempotency key. That key still returns the original result for 24 hours and does not queue a second task. Actor fields come from the credential, the same way they do with a database.
 
@@ -312,6 +314,44 @@ Omit `agent_id` and the start uses that authenticated id. Passing the same id is
 
 Demo mode, with no database, still applies the trigger, runtime, and lane gates on a start. A start that passes them returns exactly `DATABASE_URL not set; skill run not stored.` and does not invent a run id. A completion in demo mode is `not_found`, because no run row exists.
 
+### send_message
+
+Send an inbound message to an agent that has already reported. Requires `messages:write`. This is the MCP form of operator `POST /api/messages`. That REST route stays off the agent scope table.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `agent_id` | string | yes | Recipient. Slugified the same way a report stores the agent id. An unknown agent, or a value that slugifies to nothing, is `not_found` with `error` `Agent not found`. Nothing is stored. |
+| `body` | string | yes | 1 to 8000 characters. Not trimmed. Empty is `validation_failed`. Longer than 8000 is `validation_failed`. Nothing is stored. |
+| `created_by` | string | no | Free-text label. It does not set `actor_type` or `actor_id`. |
+| `idempotency_key` | string | no | Same rule as `create_task`, on the `enqueue_message` route. The same key, the same actor, and the same arguments return the original message for 24 hours and do not insert a second row. Different arguments are `idempotency_conflict`. A bad key is `validation_failed` and stores nothing. |
+
+The server records the authenticated actor on the message row. A successful result is `Message #<id> sent to <agent>.` In demo mode that text starts with the demo banner. `POST /api/messages` with no database still drops the message and does not store it.
+
+### requeue_task
+
+Put a finished task back on the queue. Requires `tasks:write`. Only `done`, `failed`, and `cancelled` can be requeued. There is no separate stuck status. `queued`, `claimed`, `running`, and `review` are refused with `conflict` and `error` `Task cannot be requeued from status <status>.` A `claimed`, `running`, or `review` task whose `assigned_agent` is set and is not the caller is `forbidden` with `error` `Task is running under another agent.` The caller is `agent_id` when that argument is passed, otherwise the authenticated actor id. The comparison is the raw string and the slug. Nothing is written on a refusal.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `id` | integer | yes | Task id. A missing id is `task_not_found` and `error` stays `Task not found`, including when `expected_revision` is sent. |
+| `agent_id` | string | no | Who is asking, for the other-agent check only. It does not change `assigned_agent`. |
+| `dry_run` | boolean | no | `true` returns the diff and the current `expected_revision` and writes nothing. The preview does not start with the demo banner. A non-boolean is `validation_failed` and writes nothing. A stale token on a preview is not an error. The preview returns the current revision. |
+| `expected_revision` | string | no | The token from the preview. When it is present on a confirm, the update matches `md5` of the task row and a mismatch is `stale_write` with `current_revision`. Nothing is written. Omit it and the confirm is unconditional. An empty string, a non-string, or a value longer than 200 characters is `validation_failed` and writes nothing. |
+
+The write sets `status` to `queued` and records the authenticated actor on `actor_type` and `actor_id`. `assigned_agent` and `completed_at` stay as they were. A successful result is `Task #<id> requeued.`
+
+### delete_note
+
+Delete one shared memory note by key. Requires `memory:write`. There is no REST delete. The memory table has no actor columns. The result text names the authenticated actor.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `key` | string | yes | 1 to 200 characters, no control characters. A bad key is `memory_key_invalid` and deletes nothing. A valid key with no row is `not_found` with `error` `Memory not found`, including when `expected_revision` is a hash or `absent`. |
+| `dry_run` | boolean | no | `true` returns the diff and the current `expected_revision` and writes nothing. The preview does not start with the demo banner. A non-boolean is `validation_failed`. |
+| `expected_revision` | string | no | The token from the preview. When it is present on a confirm, the delete matches `md5` of the memory row and a mismatch is `stale_write` with `current_revision`. Nothing is written. Omit it and the delete is unconditional. A bad token is `validation_failed` and writes nothing. |
+
+A successful result is `Deleted memory key "<key>".`
+
 ## Errors
 
 A tool failure returns `isError: true`. The text of the result is JSON with the same keys as a REST error:
@@ -333,18 +373,18 @@ The HTTP `401` for a missing or invalid bearer is unchanged: `WWW-Authenticate` 
 | Code | Retryable | When a tool returns it |
 | --- | --- | --- |
 | `unauthorized` | no | Not returned inside a tool result. The HTTP `401` above covers a bad bearer. |
-| `forbidden` | no | `reply_to_operator` when `in_reply_to` belongs to a different agent. `get_skill` or `run_skill` when the runtime is incompatible or the lane is outside the skill's scope. `run_skill` when a different actor finishes a run, or when the caller has no actor. |
+| `forbidden` | no | `reply_to_operator` when `in_reply_to` belongs to a different agent. `get_skill` or `run_skill` when the runtime is incompatible or the lane is outside the skill's scope. `run_skill` when a different actor finishes a run, or when the caller has no actor. `requeue_task` when a claimed, running, or review task is held by another agent. `error` is `Task is running under another agent.` |
 | `identity_mismatch` | no | `run_skill` when an agent credential or an OAuth client passes an `agent_id` other than the authenticated id. The message names that id. Omit `agent_id`, or pass the same id. The call writes no run and no span. `MC_TOKEN` and a dashboard session do not return this code: a supplied `agent_id` there is the span attribute `reported_agent_id` only. |
-| `not_found` | no | `reply_to_operator` when `in_reply_to` does not exist. `get_skill` or `run_skill` when the skill is missing, removed, or trigger `off`. `run_skill` when `run_id` does not exist or is not a canonical UUID. |
-| `validation_failed` | no | `create_task` or `reply_to_operator` when `idempotency_key` is longer than 200 characters or contains a control character. `run_skill` when a start omits `id` or `runtime`, when `complete` is true without `run_id`, when `run_id` is set without `complete: true`, when `id` on completion does not match the skill on the run, or when `note` is longer than 500 characters. A privacy refusal on `POST /api/usage/ingest` is this code. Schema failures are the SDK message, not this JSON. |
+| `not_found` | no | `reply_to_operator` when `in_reply_to` does not exist. `get_skill` or `run_skill` when the skill is missing, removed, or trigger `off`. `run_skill` when `run_id` does not exist or is not a canonical UUID. `send_message` when the agent does not exist (`error` is `Agent not found`). `delete_note` when the key does not exist (`error` is `Memory not found`). |
+| `validation_failed` | no | `create_task`, `reply_to_operator`, or `send_message` when `idempotency_key` is longer than 200 characters or contains a control character. `send_message` when `body` is empty or longer than 8000 characters. `requeue_task` or `delete_note` when `dry_run` is not a boolean or `expected_revision` is empty, non-string, or longer than 200 characters. `run_skill` when a start omits `id` or `runtime`, when `complete` is true without `run_id`, when `run_id` is set without `complete: true`, when `id` on completion does not match the skill on the run, or when `note` is longer than 500 characters. A privacy refusal on `POST /api/usage/ingest` is this code. Schema failures are the SDK message, not this JSON. |
 | `invalid_json` | no | Not a tool result. Authenticated `POST /api/mcp` returns HTTP 400 when the body is empty or not JSON. A missing bearer stays HTTP 401 with `WWW-Authenticate`. |
 | `missing_field` | no | Not returned by a tool. The input schema rejects a missing argument first. |
 | `rate_limited` | yes | Not returned by a tool. `POST /api/login` only. The OAuth consent form shares that limiter and answers with HTML, not this JSON. |
-| `conflict` | no | Not returned by a tool. REST settings save with no database. |
-| `idempotency_conflict` | no | `create_task` or `reply_to_operator` reused `idempotency_key` with different arguments, or the first request with that key is still inside its 30 second lease. `reply_to_mark` is the same tool schema and the same key as `reply_to_operator`. The same key, the same actor, the same route, and the same arguments return the original result for 24 hours. Different arguments stay non-retryable. While the first request is inside its 30 second lease, the same arguments are `retryable: true` and the tool JSON includes `retry_after` seconds. The REST form of that wait is the `Retry-After` header. After that lease, the same key and the same arguments take over a claim that never stored a result and run the write once. A claim insert whose result is lost is re-read, and the write runs once when this attempt owns the claim. The resource insert and the stored response commit in one statement, and that insert runs only while this attempt's claim token still matches. A committed write therefore has a stored response. A retry returns that response and does not insert another row while the claim is inside its 24 hour window. A caller that dies before reading the response gets the same row on retry. After that window the same key starts a new write. The key is scoped by actor and route. |
+| `conflict` | no | `requeue_task` when the status is not `done`, `failed`, or `cancelled`, and the other-agent refusal does not apply. `error` is `Task cannot be requeued from status <status>.` REST settings save with no database also uses this code. |
+| `idempotency_conflict` | no | `create_task`, `send_message`, or `reply_to_operator` reused `idempotency_key` with different arguments, or the first request with that key is still inside its 30 second lease. `reply_to_mark` is the same tool schema and the same key as `reply_to_operator`. `send_message` uses the `enqueue_message` route, the same route as `POST /api/messages`. The same key, the same actor, the same route, and the same arguments return the original result for 24 hours. Different arguments stay non-retryable. While the first request is inside its 30 second lease, the same arguments are `retryable: true` and the tool JSON includes `retry_after` seconds. The REST form of that wait is the `Retry-After` header. After that lease, the same key and the same arguments take over a claim that never stored a result and run the write once. A claim insert whose result is lost is re-read, and the write runs once when this attempt owns the claim. The resource insert and the stored response commit in one statement, and that insert runs only while this attempt's claim token still matches. A committed write therefore has a stored response. A retry returns that response and does not insert another row while the claim is inside its 24 hour window. A caller that dies before reading the response gets the same row on retry. After that window the same key starts a new write. The key is scoped by actor and route. |
 | `stale` | no | Not returned by a tool. REST settings save with a stale `version`. |
-| `stale_write` | no | Not returned by a tool. REST `POST /api/memory` and `PATCH /api/tasks/:id` when `expected_revision` does not match the current row. |
-| `task_not_found` | no | `update_task` when the id does not exist in the database, or in the in-memory store when `DATABASE_URL` is unset. `error` stays `Task not found`. |
+| `stale_write` | no | `requeue_task` or `delete_note` when `expected_revision` does not match the current row. The result includes `current_revision`. Nothing is written. REST `POST /api/memory` and `PATCH /api/tasks/:id` return the same code. |
+| `task_not_found` | no | `update_task` or `requeue_task` when the id does not exist in the database, or in the in-memory store when `DATABASE_URL` is unset. `error` stays `Task not found`. |
 | `task_not_claimable` | no | Defined, not returned. See above. |
 | `memory_key_invalid` | no | `remember` or `recall` with a bad `key`. |
 | `repo_list_invalid` | no | Not returned by a tool. REST settings only. |
