@@ -443,13 +443,13 @@ class TestPointerResponse(Harness):
                 self.assert_failed_untouched("skill pointers unavailable")
 
     def test_concurrent_edit_refused(self):
-        real_mkstemp = ak_pointers.tempfile.mkstemp
+        real_create = ak_pointers._create_temp
 
-        def racing_mkstemp(*a, **k):
+        def racing_create(*a, **k):
             self.agents.write_bytes(b"# someone else\n")
-            return real_mkstemp(*a, **k)
+            return real_create(*a, **k)
 
-        with mock.patch.object(ak_pointers.tempfile, "mkstemp", side_effect=racing_mkstemp):
+        with mock.patch.object(ak_pointers, "_create_temp", side_effect=racing_create):
             body = self.dispatch()
         self.assertEqual(body["status"], "failed")
         self.assertIn("changed during dispatch", body["result"])
@@ -500,6 +500,22 @@ class TestLifecycle(Harness):
         self.assertEqual(body["status"], "done")
         self.assertFalse(self.agents.exists())
         self.assertNotIn("ak-skills", self.cli_calls[0][2])
+
+    def test_new_file_mode_follows_umask_without_changing_it(self):
+        seen = []
+
+        def worker(cwd):
+            seen.append(stat.S_IMODE(os.stat(cwd / "AGENTS.md").st_mode))
+            return True, "RESULT: ok", None
+
+        self.worker = worker
+        old = os.umask(0o027)
+        try:
+            with mock.patch.object(os, "umask", side_effect=AssertionError("umask touched")):
+                self.assertEqual(self.dispatch()["status"], "done")
+        finally:
+            os.umask(old)
+        self.assertEqual(seen, [0o640])
 
     def test_missing_file_block_created_then_removed(self):
         seen = []

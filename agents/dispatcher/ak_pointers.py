@@ -15,8 +15,8 @@ that changed under them.
 from __future__ import annotations
 
 import os
+import secrets
 import stat
-import tempfile
 from pathlib import Path
 
 POINTERS_BEGIN = "<!-- ak-skills:begin -->"
@@ -198,6 +198,19 @@ def _unchanged(path: Path, expected: Snapshot) -> bool:
     return now.raw == expected.raw and now.ident == expected.ident
 
 
+def _create_temp(directory: Path, perm: int) -> tuple[int, str]:
+    """Exclusive-create a temp file. A new file gets perm minus the umask, applied by the
+    kernel, so the process umask is never read or changed (other threads share it)."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    for _ in range(100):
+        name = str(directory / f".AGENTS.md.ak-{secrets.token_hex(8)}")
+        try:
+            return os.open(name, flags, perm), name
+        except FileExistsError:
+            continue
+    raise PointerFileError("could not create a temp file next to AGENTS.md")
+
+
 def write_replacing(path: Path, expected: Snapshot, new_text: str | None, mode: int | None) -> None:
     """Swap the file from expected to new_text (None deletes it), or raise and change nothing.
 
@@ -215,17 +228,13 @@ def write_replacing(path: Path, expected: Snapshot, new_text: str | None, mode: 
         os.unlink(path)
         return
     data = new_text.encode("utf-8")
-    fd, tmp = tempfile.mkstemp(prefix=".AGENTS.md.ak-", dir=str(directory))
+    fd, tmp = _create_temp(directory, 0o600 if mode is not None else 0o666)
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
             fh.flush()
             if mode is not None:
                 os.fchmod(fh.fileno(), mode)
-            else:
-                umask = os.umask(0)
-                os.umask(umask)
-                os.fchmod(fh.fileno(), 0o666 & ~umask)
             os.fsync(fh.fileno())
         if expected.raw is None:
             if os.path.lexists(path):
