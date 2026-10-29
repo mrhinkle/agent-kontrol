@@ -9,8 +9,7 @@ import { isConfigured } from "./db";
 import { diffRepoList, readDryRun, type DryRunChange, type DryRunResult } from "./dry-run";
 import { repoErrorFields, retainedAutoShortErrorsForSave, validateReposForSave } from "./repo-save";
 import type { RepoError } from "./repo-validation";
-import { readOwnerSettings, readRepoSettings } from "./settings-read";
-import { recordToolReceipt } from "./store";
+import { readOwnerSettings, readRepoSettings, reposForReplaceDiff } from "./settings-read";
 import { replaceWatchedRepos } from "./watched-repos";
 
 function repoInvalid(errors: RepoError[]): McpToolResult {
@@ -61,18 +60,19 @@ function repoName(change: DryRunChange): string {
 }
 
 /** REST diff plus the current list version and the three repo groups. */
-export function repoDiffPreview(diff: DryRunResult, version: string) {
+export function repoDiffPreview(diff: DryRunResult, version: string, source?: "database" | "file") {
   return {
     ...diff,
     version,
+    ...(source ? { source } : {}),
     added: diff.changes.filter((change) => change.op === "add").map(repoName),
     removed: diff.changes.filter((change) => change.op === "remove").map(repoName),
     changed: diff.changes.filter((change) => change.op === "update" || change.op === "reorder").map(repoName),
   };
 }
 
-function preview(diff: DryRunResult, version: string): McpToolResult {
-  return { content: [{ type: "text", text: JSON.stringify(repoDiffPreview(diff, version)) }] };
+function preview(diff: DryRunResult, version: string, source?: "database" | "file"): McpToolResult {
+  return { content: [{ type: "text", text: JSON.stringify(repoDiffPreview(diff, version, source)) }] };
 }
 
 export async function getSettingsTool(): Promise<McpToolResult> {
@@ -85,7 +85,8 @@ export async function getSettingsTool(): Promise<McpToolResult> {
  * Same validation and replace as PUT /api/settings/repos.
  * A real write requires expected_version. dry_run does not.
  * A mismatch is the REST stale error and writes nothing.
- * Only a successful replace records a receipt.
+ * A successful replace records its receipt in that same transaction.
+ * The receipt version is the rows just written. A stale result inserts nothing.
  */
 export async function setWatchedReposTool(args: {
   repos?: unknown;
@@ -102,30 +103,30 @@ export async function setWatchedReposTool(args: {
   if (!isConfigured()) {
     if (dry.dryRun) {
       const cur = await readRepoSettings();
-      return preview(diffRepoList(cur.repos, checked.repos, false), cur.version);
+      return preview(diffRepoList(reposForReplaceDiff(cur), checked.repos, false), cur.version);
     }
     return noDatabase();
   }
   const cur = await readRepoSettings();
   const sent = typeof args.expected_version === "string" ? args.expected_version : undefined;
   if (sent !== undefined && sent !== cur.version) return mcpToolError("stale");
-  if (dry.dryRun) return preview(diffRepoList(cur.repos, checked.repos, true), cur.version);
+  if (dry.dryRun) {
+    return preview(diffRepoList(reposForReplaceDiff(cur), checked.repos, true), cur.version, cur.source);
+  }
   try {
-    const saved = await replaceWatchedRepos(checked.repos, sent);
+    const saved = await replaceWatchedRepos(checked.repos, sent, {
+      kind: "set_watched_repos",
+      title: "Watched repos replaced",
+    });
     if (!saved.ok) return mcpToolError("stale");
+    const body = await readRepoSettings();
+    const actor = currentActor();
+    const text = actor
+      ? `Watched repos saved. actor_type=${actor.actor_type} actor_id=${actor.actor_id}.\n${JSON.stringify(body)}`
+      : `Watched repos saved.\n${JSON.stringify(body)}`;
+    return withReceipt(text, saved.receipt);
   } catch (e) {
     if (isUniqueViolation(e)) return uniqueConflict();
     throw e;
   }
-  const body = await readRepoSettings();
-  const actor = currentActor();
-  const text = actor
-    ? `Watched repos saved. actor_type=${actor.actor_type} actor_id=${actor.actor_id}.\n${JSON.stringify(body)}`
-    : `Watched repos saved.\n${JSON.stringify(body)}`;
-  const receipt = await recordToolReceipt({
-    kind: "set_watched_repos",
-    title: "Watched repos replaced",
-    extra: { version: body.version },
-  });
-  return withReceipt(text, receipt);
 }

@@ -7,7 +7,7 @@ import { repoIdentity } from "@/lib/owner-discovery";
 import { REPOS } from "@/lib/progress-config";
 import { repoErrorFields, retainedAutoShortErrorsForSave, validateReposForSave } from "@/lib/repo-save";
 import type { RepoInput } from "@/lib/repo-validation";
-import { readRepoSettings } from "@/lib/settings-read";
+import { readRepoSettings, reposForReplaceDiff } from "@/lib/settings-read";
 import { loadTrackedRepos, replaceWatchedRepos, setRepoOverride } from "@/lib/watched-repos";
 
 export const dynamic = "force-dynamic";
@@ -23,7 +23,9 @@ export const dynamic = "force-dynamic";
  *      If `version` (from the GET the caller started from) is sent and the list has
  *      changed since, answers 409 { code: "stale" } instead of overwriting someone
  *      else's change. A real save checks that version again under the discovery
- *      write lock, in the same transaction as the replace. `dry_run: true` returns that diff and writes nothing.
+ *      write lock, in the same transaction as the replace. `dry_run: true` diffs
+ *      the stored rows (empty when `source` is `file`), includes `source`, and
+ *      writes nothing. With no database the diff stays against the file list.
  *      Any other `dry_run` value is 400 and also writes nothing.
  *      Rows with origin "auto" are kept when the body omits them. Omitting one
  *      whose fields were overridden resets label, short, color, and blocked
@@ -109,7 +111,7 @@ export async function PUT(req: Request) {
     if (dry.dryRun) {
       try {
         const cur = await current();
-        return NextResponse.json(diffRepoList(cur.repos, checked.repos, false));
+        return NextResponse.json(diffRepoList(reposForReplaceDiff(cur), checked.repos, false));
       } catch (e) {
         return failure(e, "load settings");
       }
@@ -126,7 +128,10 @@ export async function PUT(req: Request) {
       return apiError("stale");
     }
     if (dry.dryRun) {
-      return NextResponse.json(diffRepoList(cur.repos, checked.repos, true));
+      return NextResponse.json({
+        ...diffRepoList(reposForReplaceDiff(cur), checked.repos, true),
+        source: cur.source,
+      });
     }
     // A mismatch above is enough for a dry run. A real save checks again
     // under the discovery write lock, after a pin or hide may have landed.

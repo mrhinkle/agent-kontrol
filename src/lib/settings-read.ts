@@ -36,9 +36,25 @@ export interface OwnerSettingsBody {
   owners: OwnerSettingsRow[];
 }
 
+/**
+ * Rows a replace would overwrite. The file list is what GET shows when nothing
+ * is stored. It is not the list the write diffs or versions, except in demo
+ * mode, where there is no stored list.
+ */
+export function reposForReplaceDiff<T>(body: { source: RepoSettingsBody["source"]; repos: T[] }): T[] {
+  if (!isConfigured() || body.source === "database") return body.repos;
+  return [];
+}
+
 export async function readRepoSettings(): Promise<RepoSettingsBody> {
-  const { source, repos } = await getWatchedRepos(REPOS);
-  return { source, writable: isConfigured(), max: MAX_REPOS, version: listVersion(repos), repos };
+  const loaded = await getWatchedRepos(REPOS);
+  return {
+    source: loaded.source,
+    writable: isConfigured(),
+    max: MAX_REPOS,
+    version: loaded.storedVersion ?? listVersion(loaded.repos),
+    repos: loaded.repos,
+  };
 }
 
 export async function readOwnerSettings(): Promise<OwnerSettingsBody> {

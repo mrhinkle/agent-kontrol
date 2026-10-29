@@ -663,7 +663,7 @@ const handler = createMcpHandler(
         title: "Get settings",
         annotations: READ_ONLY,
         description:
-          "Read the watched repo list and the watched owners. The repos object matches GET /api/settings/repos, including source and version. The owners object matches GET /api/settings/owners. Operator only, the same boundary as list_activity. An agent credential is denied. MC_TOKEN and an OAuth access token can call it. With no database, this matches those GETs: file repos and an empty owner list.",
+          "Read the watched repo list and the watched owners. The repos object matches GET /api/settings/repos, including source and version. When a database is connected, version is the stored rows, including the empty-list version when source is file. The owners object matches GET /api/settings/owners. Operator only, the same boundary as list_activity. An agent credential is denied. MC_TOKEN and an OAuth access token can call it. With no database, this matches those GETs: file repos and an empty owner list.",
         inputSchema: {},
       },
       async () => guardTool("get_settings", () => getSettingsTool()),
@@ -675,7 +675,7 @@ const handler = createMcpHandler(
         title: "Set watched repos",
         annotations: WRITE_DESTRUCTIVE,
         description:
-          "Replace the hand-added watched repo list. Same validation and replace as PUT /api/settings/repos, including case-insensitive owner/name. Operator only, the same boundary as list_activity. An agent credential is denied. MC_TOKEN and an OAuth access token can call it. expected_version is required unless dry_run is true. Send the version from get_settings. A mismatch is stale and writes nothing. dry_run true returns the diff (added, removed, and changed repos) and the current version and writes nothing. A successful write records one activity receipt for the authenticated actor. Auto rows the body omits stay.",
+          "Replace the hand-added watched repo list. Same validation and replace as PUT /api/settings/repos, including case-insensitive owner/name. Operator only, the same boundary as list_activity. An agent credential is denied. MC_TOKEN and an OAuth access token can call it. expected_version is required unless dry_run is true. Send the version from get_settings. A mismatch is stale and writes nothing. dry_run true returns the diff against the stored rows (added, removed, and changed repos) and the current version, plus source when a database is connected, and writes nothing. A successful write records one activity receipt in that same transaction. If the receipt insert fails, the replace rolls back. Auto rows the body omits stay.",
         inputSchema: {
           repos: z
             .array(

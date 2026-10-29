@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import type { Receipt } from "./activity";
 import { isConfigured, sql, withTransaction, type SqlTag } from "./db";
+import { insertToolReceipt } from "./tool-receipt";
 import {
   alignRepoCasing,
   briefShown,
@@ -154,16 +156,26 @@ export async function loadTrackedRepos(): Promise<TrackedRepo[]> {
   return readTrackedRepos(sql());
 }
 
-export async function getWatchedRepos(fallback: RepoConfig[]): Promise<{ source: RepoSource; repos: WatchedRepo[] }> {
-  if (!isConfigured()) return { source: "file", repos: fallback };
+export async function getWatchedRepos(fallback: RepoConfig[]): Promise<{
+  source: RepoSource;
+  repos: WatchedRepo[];
+  /**
+   * Fingerprint of the rows a replace compares. Null when no database is
+   * configured, so the caller fingerprints the file list instead. When the
+   * file list is only a fallback, this is the empty stored list.
+   */
+  storedVersion: string | null;
+}> {
+  if (!isConfigured()) return { source: "file", repos: fallback, storedVersion: null };
   try {
     const rows = await loadTrackedRepos();
     const owners = (await loadOwners()).map(ruleOf);
-    if (rows.length === 0 && owners.length === 0) return { source: "file", repos: fallback };
+    const storedVersion = versionOf(rows);
+    if (rows.length === 0 && owners.length === 0) return { source: "file", repos: fallback, storedVersion };
     const now = new Date();
-    return { source: "database", repos: rows.map((row) => toWatchedRepo(row, owners, now)) };
+    return { source: "database", repos: rows.map((row) => toWatchedRepo(row, owners, now)), storedVersion };
   } catch (e) {
-    if (missingReposRelation(e)) return { source: "file", repos: fallback };
+    if (missingReposRelation(e)) return { source: "file", repos: fallback, storedVersion: versionOf([]) };
     throw e;
   }
 }
@@ -186,8 +198,14 @@ export function listVersion(repos: WatchedRepo[]): string {
   return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
 }
 
+export interface RepoWriteReceipt {
+  kind: string;
+  title: string;
+  extra?: Record<string, unknown>;
+}
+
 export type RepoWriteResult =
-  | { ok: true }
+  | { ok: true; receipt?: Receipt | null }
   | { ok: false; reason: "stale" };
 
 /** Same fingerprint GET returns. Owners and `shown` are not part of it. */
@@ -206,8 +224,17 @@ function versionOf(rows: TrackedRepo[]): string {
  *
  * `expectedVersion`, when passed, is checked again after that lock so a pin
  * or hide that committed since the caller's read cannot be overwritten.
+ * A mismatch writes nothing, including no receipt.
+ *
+ * `receipt`, when passed, is inserted in this same transaction after the
+ * rows are written. `extra.version` is the fingerprint of those rows.
+ * A failed insert rolls the replace back.
  */
-export async function replaceWatchedRepos(repos: RepoInput[], expectedVersion?: string): Promise<RepoWriteResult> {
+export async function replaceWatchedRepos(
+  repos: RepoInput[],
+  expectedVersion?: string,
+  receipt?: RepoWriteReceipt,
+): Promise<RepoWriteResult> {
   return withTransaction(async (q) => {
     await q`select pg_advisory_xact_lock(${DISCOVERY_WRITE_LOCK}::bigint)`;
     const stored = await readTrackedRepos(q);
@@ -217,7 +244,14 @@ export async function replaceWatchedRepos(repos: RepoInput[], expectedVersion?: 
     const aligned = alignRepoCasing(stored, repos);
     const resets = planOverrideResets(stored, aligned);
     await writeReplacedRepos(q, aligned, resets);
-    return { ok: true };
+    if (!receipt) return { ok: true };
+    const written = await readTrackedRepos(q);
+    const inserted = await insertToolReceipt(q, {
+      kind: receipt.kind,
+      title: receipt.title,
+      extra: { ...receipt.extra, version: versionOf(written) },
+    });
+    return { ok: true, receipt: inserted };
   });
 }
 

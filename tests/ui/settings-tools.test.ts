@@ -15,6 +15,7 @@ import { REPOS } from "../../src/lib/progress-config";
 import { authorizeTool, evaluateMcpMessages, SCOPES } from "../../src/lib/scopes";
 import { readRepoSettings } from "../../src/lib/settings-read";
 import { getSettingsTool, setWatchedReposTool } from "../../src/lib/settings-tools";
+import { listVersion, replaceWatchedRepos } from "../../src/lib/watched-repos";
 
 const env = process.env as Record<string, string | undefined>;
 const saved = {
@@ -122,11 +123,36 @@ function installRepoStore(initial: MemRepo[]) {
   const repos = initial.map((row) => ({ ...row }));
   const events: { id: number; kind: string; title: string; detail: string }[] = [];
   let writes = 0;
+  const control = { failReceipt: false };
+  let snap: { repos: MemRepo[]; events: typeof events; writes: number } | null = null;
   setSqlForTests(async (strings, ...values) => {
     const text = strings.join(" ").replace(/\s+/g, " ").trim().toLowerCase();
-    if (text === "begin" || text === "commit" || text === "rollback") return [];
+    if (text === "begin") {
+      snap = {
+        repos: repos.map((row) => ({ ...row })),
+        events: events.map((row) => ({ ...row })),
+        writes,
+      };
+      return [];
+    }
+    if (text === "commit") {
+      snap = null;
+      return [];
+    }
+    if (text === "rollback") {
+      if (snap) {
+        repos.length = 0;
+        repos.push(...snap.repos);
+        events.length = 0;
+        events.push(...snap.events);
+        writes = snap.writes;
+      }
+      snap = null;
+      return [];
+    }
     if (text.includes("pg_advisory_xact_lock")) return [];
     if (text.includes("insert into events")) {
+      if (control.failReceipt) throw new Error("simulated events insert failure");
       const id = events.length + 1;
       const row = {
         id,
@@ -177,6 +203,7 @@ function installRepoStore(initial: MemRepo[]) {
   return {
     repos,
     events,
+    control,
     writes: () => writes,
   };
 }
@@ -358,11 +385,17 @@ describe("settings MCP tools", { concurrency: false }, () => {
     assert.equal(store.writes(), 1);
     assert.equal(store.events.length, 1);
     assert.equal(store.events[0]?.kind, "set_watched_repos");
-    const detail = JSON.parse(store.events[0]?.detail ?? "{}") as { actor_type?: string; actor_id?: string; tool?: string };
+    const detail = JSON.parse(store.events[0]?.detail ?? "{}") as {
+      actor_type?: string;
+      actor_id?: string;
+      tool?: string;
+      version?: string;
+    };
     assert.equal(detail.actor_type, "agent");
     assert.equal(detail.actor_id, "mc-token");
     assert.equal(detail.tool, "set_watched_repos");
     const after = await readRepoSettings();
+    assert.equal(detail.version, after.version);
     assert.notEqual(after.version, before.version);
     assert.deepEqual(after.repos.map((row) => row.repo), ["acme/new"]);
     assert.equal(store.repos[0]?.repo, "acme/new");
@@ -413,5 +446,152 @@ describe("settings MCP tools", { concurrency: false }, () => {
     const calls = src.match(/server\.registerTool\(/g)?.length ?? 0;
     const annotated = src.match(/^\s+annotations: (READ_ONLY|WRITE|WRITE_IDEMPOTENT|WRITE_DESTRUCTIVE),$/gm)?.length ?? 0;
     assert.equal(annotated, calls);
+  });
+
+  it("F9 a failed receipt insert rolls the repo replace back", async () => {
+    const store = installRepoStore([memRepo("acme/old", "old")]);
+    store.control.failReceipt = true;
+    const before = await readRepoSettings();
+    await assert.rejects(
+      () => runWithActor(actor, () => setWatchedReposTool({
+        repos: [repo("acme/new", "new", "New")],
+        expected_version: before.version,
+      })),
+      /simulated events insert failure/,
+    );
+    assert.equal(store.writes(), 0);
+    assert.equal(store.events.length, 0);
+    assert.equal(store.repos[0]?.repo, "acme/old");
+    const still = await readRepoSettings();
+    assert.equal(still.version, before.version);
+    assert.deepEqual(still.repos.map((row) => row.repo), ["acme/old"]);
+  });
+
+  it("F10 a stale replace that was asked for a receipt inserts nothing", async () => {
+    const store = installRepoStore([memRepo("acme/old", "old")]);
+    const saved = await replaceWatchedRepos(
+      [repo("acme/new", "new", "New")],
+      "not-the-version",
+      { kind: "set_watched_repos", title: "Watched repos replaced" },
+    );
+    assert.equal(saved.ok, false);
+    if (!saved.ok) assert.equal(saved.reason, "stale");
+    assert.equal(store.events.length, 0);
+    assert.equal(store.writes(), 0);
+    assert.equal(store.repos[0]?.repo, "acme/old");
+  });
+
+  it("F11 an empty configured database versions the stored rows and a dry run diffs against empty", async () => {
+    const store = installRepoStore([]);
+    const body = await readRepoSettings();
+    assert.equal(body.source, "file");
+    assert.equal(body.writable, true);
+    assert.equal(body.version, "4f53cda18c2baa0c");
+    assert.equal(body.version, listVersion([]));
+    assert.notEqual(body.version, listVersion(body.repos));
+    assert.ok(body.repos.length > 0);
+    assert.deepEqual(body.repos.map((row) => row.repo), REPOS.map((row) => row.repo));
+
+    const tool = JSON.parse((await getSettingsTool()).content[0].text) as {
+      repos: { version: string; source: string };
+    };
+    assert.equal(tool.repos.version, body.version);
+    assert.equal(tool.repos.source, "file");
+
+    const next = [repo("acme/from-empty", "empty", "Empty")];
+    const preview = await setWatchedReposTool({ repos: next, dry_run: true });
+    assert.equal(preview.isError, undefined, preview.content[0]?.text);
+    const diff = JSON.parse(preview.content[0].text) as {
+      source?: string;
+      version: string;
+      added: string[];
+      removed: string[];
+      would_write: boolean;
+    };
+    assert.equal(diff.source, "file");
+    assert.equal(diff.version, body.version);
+    assert.deepEqual(diff.added, ["acme/from-empty"]);
+    assert.deepEqual(diff.removed, []);
+    assert.equal(diff.would_write, true);
+    assert.equal(store.writes(), 0);
+    assert.equal(store.events.length, 0);
+
+    const restPreview = await putRepos(new Request("http://localhost/api/settings/repos", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repos: next, version: body.version, dry_run: true }),
+    }));
+    assert.equal(restPreview.status, 200);
+    const restDiff = await restPreview.json() as {
+      source?: string;
+      would_write: boolean;
+      changes: { op: string }[];
+    };
+    assert.equal(restDiff.source, "file");
+    assert.equal(restDiff.would_write, true);
+    assert.equal(restDiff.changes.some((change) => change.op === "remove"), false);
+    assert.equal(restDiff.changes.some((change) => change.op === "add"), true);
+    assert.equal(store.writes(), 0);
+
+    const saved = await runWithActor(actor, () => setWatchedReposTool({
+      repos: next,
+      expected_version: body.version,
+    }));
+    assert.equal(saved.isError, undefined, saved.content[0]?.text);
+    assert.equal(store.writes(), 1);
+    assert.equal(store.events.length, 1);
+    const after = await readRepoSettings();
+    assert.equal(after.source, "database");
+    assert.deepEqual(after.repos.map((row) => row.repo), ["acme/from-empty"]);
+    const detail = JSON.parse(store.events[0]?.detail ?? "{}") as { version?: string };
+    assert.equal(detail.version, after.version);
+    assert.notEqual(after.version, body.version);
+  });
+
+  it("F12 REST GET then PUT uses the empty stored version and saves", async () => {
+    const store = installRepoStore([]);
+    const got = await getRepos(new Request("http://localhost/api/settings/repos"));
+    assert.equal(got.status, 200);
+    const body = await got.json() as { source: string; version: string; repos: { repo: string }[] };
+    assert.equal(body.source, "file");
+    assert.equal(body.version, "4f53cda18c2baa0c");
+    assert.ok(body.repos.length > 0);
+    const put = await putRepos(new Request("http://localhost/api/settings/repos", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repos: [repo("acme/rest", "rest", "Rest")],
+        version: body.version,
+      }),
+    }));
+    const raw = await put.text();
+    assert.equal(put.status, 200, raw);
+    const saved = JSON.parse(raw) as { source: string; version: string; repos: { repo: string }[] };
+    assert.equal(saved.source, "database");
+    assert.deepEqual(saved.repos.map((row) => row.repo), ["acme/rest"]);
+    assert.notEqual(saved.version, body.version);
+    assert.equal(store.events.length, 0);
+    assert.equal(store.writes(), 1);
+  });
+
+  it("F13 a populated database keeps the pre-change list version", async () => {
+    const row = memRepo("acme/kept", "kept");
+    row.label = "Kept";
+    row.color = "#abcdef";
+    row.blocked_label = "wait";
+    row.pinned = true;
+    row.hidden = false;
+    row.origin = "auto";
+    row.fields_overridden = true;
+    installRepoStore([row]);
+    const body = await readRepoSettings();
+    assert.equal(body.source, "database");
+    assert.equal(body.version, "fc16e23e1910c991");
+    assert.equal(body.version, listVersion(body.repos));
+    const tool = JSON.parse((await getSettingsTool()).content[0].text) as { repos: { version: string } };
+    assert.equal(tool.repos.version, "fc16e23e1910c991");
+    const rest = await getRepos(new Request("http://localhost/api/settings/repos"));
+    assert.equal(rest.status, 200);
+    assert.equal((await rest.json() as { version: string }).version, "fc16e23e1910c991");
   });
 });
