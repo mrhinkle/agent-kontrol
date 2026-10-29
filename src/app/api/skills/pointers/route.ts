@@ -4,7 +4,7 @@ import { enforceApi } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import { applyPointerBlock, MalformedBlockError } from "@/lib/skills/agents-md";
 import { renderLaneSkillPointers } from "@/lib/skills/inject";
-import { isRuntime } from "@/lib/skills/types";
+import { isRuntime, runtimeMustBeMessage } from "@/lib/skills/types";
 
 export const dynamic = "force-dynamic";
 
@@ -91,7 +91,7 @@ function checkTarget(
 ): { ok: true; lane: string; runtime: string } | { ok: false; response: NextResponse } {
   const fields: Record<string, string> = {};
   if (typeof lane !== "string" || !LANE_RE.test(lane)) fields.lane = "lane is required: 1-100 characters of letters, digits, and . _ : / -.";
-  if (typeof runtime !== "string" || !isRuntime(runtime)) fields.runtime = "runtime must be claude, codex, grok, hermes, or mini.";
+  if (typeof runtime !== "string" || !isRuntime(runtime)) fields.runtime = runtimeMustBeMessage();
   if (Object.keys(fields).length > 0) {
     return { ok: false, response: apiError("validation_failed", { message: "invalid lane or runtime", fields }) };
   }

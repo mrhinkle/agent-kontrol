@@ -484,6 +484,24 @@ if [[ "$n_known_dec" -gt 0 ]]; then
 fi
 echo
 
-jq -r '.repos[] | select(.merged_prs > 0) | "SHIPPED — \(.label):", (.merged_list[] | "  #\(.number)  \(.title[0:80])  (\(.author), \(.lead_hours*10|floor/10)h)")' <<<"$brief"
+# A positive merge count with no measured list is not an empty heading.
+# null (or any non-array) is unmeasured. An empty array prints nothing.
+# BEGIN shipped_lines
+shipped_lines() {
+  jq -r '
+    .repos[]
+    | select(.merged_prs > 0)
+    | if (.merged_list | type) != "array" then
+        "SHIPPED: DATA INCOMPLETE — \(.label)"
+      elif (.merged_list | length) == 0 then
+        empty
+      else
+        "SHIPPED — \(.label):",
+        (.merged_list[] | "  #\(.number)  \(.title[0:80])  (\(.author), \(.lead_hours*10|floor/10)h)")
+      end
+  '
+}
+# END shipped_lines
+shipped_lines <<<"$brief"
 
 [[ "$n_incomplete" -eq 0 ]] && exit 0 || exit 2

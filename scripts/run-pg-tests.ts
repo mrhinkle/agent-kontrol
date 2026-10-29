@@ -6,13 +6,17 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import { evaluateAlerts, setBeforeClaimForTests, setBriefSettingsForTests } from "../src/lib/brief-alerts";
 import type { BriefSettings } from "../src/lib/progress-config";
 import { sql } from "../src/lib/db";
 import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
 import { StaleWrite } from "../src/lib/revision";
-import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview, findAgent, deleteMemory } from "../src/lib/store";
+import { readReceipt } from "../src/lib/activity";
+import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview, findAgent, deleteMemory, slugify } from "../src/lib/store";
+import { updateTaskForTool } from "../src/lib/dry-run-actions";
 import { getWatchedRepos, replaceWatchedRepos } from "../src/lib/watched-repos";
 import type { RepoConfig } from "../src/lib/progress-config";
 import { getTrace, listTraces, pruneSpans, upsertSpans } from "../src/lib/trace-store";
@@ -32,6 +36,7 @@ import { finishSyncRun, markSkillRemoved, SyncLeaseLost, upsertSettings, upsertS
 import { runScheduleTick, type TickResult } from "../src/lib/skills/schedule";
 import { listLastScheduledTasks, listOpenScheduledTasks } from "../src/lib/skills/schedule-store";
 import type { SkillRecord } from "../src/lib/skills/types";
+import { readBeats, upsertBeat, WATCH_STATUSES, type WatchBeat } from "../src/lib/watch";
 import {
   MEMORY_REST,
   TASK_REST,
@@ -330,19 +335,326 @@ async function main() {
       idempotency_key: idemKey,
     });
     assert.notEqual(String(afterExpiry.id), String(first.id), "an expired key can create a new task");
+    await sql()`
+      delete from events
+      where kind = 'create_task'
+        and detail->>'task_id' in (select id::text from tasks where platform = ${idemPlatform})
+    `;
     await sql()`delete from tasks where platform = ${idemPlatform}`;
     await sql()`delete from idempotency_keys where idempotency_key = ${idemKey}`;
   } finally {
     setIdempotencyClockForTests(null);
   }
 
+  await testActivityReceiptAtomic(tag);
+  await testReportStatusAtomic(tag);
   await testDecisions(tag);
   await testSkillLeaseFence(tag);
   await testSkillSchedule(tag);
+  await testWatchBeats(tag);
   await testListCursors(tag);
   await testBriefAlerts(tag);
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
+}
+
+/**
+ * One idempotent create_task is one task, one event, and one receipt.
+ * A forced events-insert failure rolls the write back with it.
+ */
+async function testActivityReceiptAtomic(tag: string) {
+  const platform = `pgtest-act-${tag}`;
+  const key = `act-${tag}`;
+  const failPlatform = `pgtest-act-fail-${tag}`;
+  const memoryKey = `${tag}/act-keep`;
+  const freshKey = `${tag}/act-fresh`;
+  const deleteKey = `${tag}/act-del`;
+  const failIdem = `act-fail-${tag}`;
+  try {
+    const settled = await Promise.allSettled([
+      createTask({ title: `race ${tag}`, platform, priority: 1, idempotency_key: key }),
+      createTask({ title: `race ${tag}`, platform, priority: 1, idempotency_key: key }),
+    ]);
+    for (const item of settled) {
+      if (item.status === "rejected" && !(item.reason instanceof IdempotencyConflict)) throw item.reason;
+    }
+    const won = settled.filter((item) => item.status === "fulfilled");
+    assert.ok(won.length >= 1, "at least one concurrent create_task completed");
+    const taskIds = new Set(won.map((item) => String(item.value.id)));
+    assert.equal(taskIds.size, 1, "concurrent same-key creates share one task");
+    const receiptIds = new Set(won.map((item) => readReceipt(item.value)?.id).filter((id): id is string => Boolean(id)));
+    assert.equal(receiptIds.size, 1, "concurrent same-key creates share one receipt");
+    const taskId = [...taskIds][0];
+    const receiptId = [...receiptIds][0];
+    const tasks = await sql()`select count(*)::int as n from tasks where platform = ${platform}`;
+    assert.equal(Number(tasks[0].n), 1, "two concurrent calls insert one task");
+    const events = await sql()`
+      select id::text as id
+      from events
+      where kind = 'create_task' and detail->>'task_id' = ${taskId}
+    `;
+    assert.equal(events.length, 1, "two concurrent calls insert one activity event");
+    assert.equal(String(events[0].id), receiptId);
+
+    const replay = await createTask({ title: `race ${tag}`, platform, priority: 1, idempotency_key: key });
+    assert.equal(String(replay.id), taskId);
+    assert.equal(readReceipt(replay)?.id, receiptId, "a replay returns the stored receipt");
+    const afterReplay = await sql()`
+      select count(*)::int as n from events
+      where kind = 'create_task' and detail->>'task_id' = ${taskId}
+    `;
+    assert.equal(Number(afterReplay[0].n), 1, "a replay does not insert a second event");
+
+    await remember({ content: "before", key: memoryKey, agent_id: `${tag}-agent` });
+    await remember({ content: "stay", key: deleteKey, agent_id: `${tag}-agent` });
+
+    await sql()`
+      create or replace function ak_test_fail_event()
+      returns trigger
+      language plpgsql
+      as $fn$
+      begin
+        if new.kind in ('create_task', 'remember', 'delete_note', 'send_message', 'reply_to_operator') then
+          raise exception 'simulated events insert failure';
+        end if;
+        return new;
+      end;
+      $fn$
+    `;
+    await sql()`drop trigger if exists ak_test_fail_event on events`;
+    await sql()`
+      create trigger ak_test_fail_event
+      before insert on events
+      for each row
+      execute procedure ak_test_fail_event()
+    `;
+
+    const orphansBefore = await sql()`
+      select count(*)::int as n
+      from events e
+      where e.kind = 'create_task'
+        and not exists (
+          select 1 from tasks t where t.id::text = e.detail->>'task_id'
+        )
+    `;
+    await assert.rejects(
+      () => createTask({ title: `fail ${tag}`, platform: failPlatform }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const failedTasks = await sql()`select count(*)::int as n from tasks where platform = ${failPlatform}`;
+    assert.equal(Number(failedTasks[0].n), 0, "a failed event insert leaves no task");
+    const orphans = await sql()`
+      select count(*)::int as n
+      from events e
+      where e.kind = 'create_task'
+        and not exists (
+          select 1 from tasks t where t.id::text = e.detail->>'task_id'
+        )
+    `;
+    assert.equal(
+      Number(orphans[0].n),
+      Number(orphansBefore[0].n),
+      "a failed event insert leaves no receipt row",
+    );
+
+    await assert.rejects(
+      () => remember({ content: "after", key: memoryKey, agent_id: `${tag}-agent` }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const kept = await sql()`select content from memory where key = ${memoryKey}`;
+    assert.equal(String(kept[0]?.content), "before", "a failed event insert leaves the previous note");
+
+    await assert.rejects(
+      () => remember({ content: "nope", key: freshKey, agent_id: `${tag}-agent` }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const fresh = await sql()`select count(*)::int as n from memory where key = ${freshKey}`;
+    assert.equal(Number(fresh[0].n), 0, "a failed event insert leaves no new note");
+
+    await assert.rejects(
+      () => deleteMemory({ key: deleteKey }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const stillThere = await sql()`select content from memory where key = ${deleteKey}`;
+    assert.equal(String(stillThere[0]?.content), "stay", "a failed event insert does not delete the note");
+
+    await assert.rejects(
+      () => createTask({ title: `fail idem ${tag}`, platform: failPlatform, idempotency_key: failIdem }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    await sql()`drop trigger if exists ak_test_fail_event on events`;
+    const recovered = await createTask({
+      title: `fail idem ${tag}`,
+      platform: failPlatform,
+      idempotency_key: failIdem,
+    });
+    assert.equal(readReceipt(recovered)?.kind, "create_task");
+    const recoveredTasks = await sql()`select count(*)::int as n from tasks where platform = ${failPlatform}`;
+    assert.equal(Number(recoveredTasks[0].n), 1, "a failed claim is released so the same key can write once");
+    const recoveredEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'create_task' and detail->>'task_id' = ${String(recovered.id)}
+    `;
+    assert.equal(Number(recoveredEvents[0].n), 1);
+  } finally {
+    await sql()`drop trigger if exists ak_test_fail_event on events`;
+    await sql()`drop function if exists ak_test_fail_event()`;
+    await sql()`
+      delete from events e
+      where e.kind in ('create_task', 'remember', 'delete_note')
+        and (
+          e.detail->>'memory_key' like ${`%${tag}%`}
+          or e.detail->>'task_id' in (
+            select id::text from tasks where platform like ${`pgtest-act-%${tag}`}
+          )
+        )
+    `;
+    await sql()`delete from tasks where platform like ${`pgtest-act-%${tag}`}`;
+    await sql()`delete from memory where key like ${`%${tag}%`}`;
+    await sql()`delete from idempotency_keys where idempotency_key like ${`%${tag}%`}`;
+  }
+}
+
+/**
+ * report() writes the agent, the session, and the event in one statement.
+ * A rejecting events insert leaves both rows as they were. updateTaskForTool
+ * still returns the task receipt when the later status report fails.
+ */
+async function testReportStatusAtomic(tag: string) {
+  const agentId = slugify(`${tag}-rpt`);
+  // main() already stores a writeback session at `${tag}-sess`. A colliding id
+  // would make the rollback count look like a leftover insert.
+  const sessionId = `${tag}-rpt-sess`;
+  const laneId = slugify(`${tag}-lane`);
+  const platform = `pgtest-rpt-${tag}`;
+  const install = async () => {
+    await sql()`
+      create or replace function ak_test_fail_status_event()
+      returns trigger
+      language plpgsql
+      as $fn$
+      begin
+        if new.kind = 'status' then
+          raise exception 'simulated events insert failure';
+        end if;
+        return new;
+      end;
+      $fn$
+    `;
+    await sql()`drop trigger if exists ak_test_fail_status_event on events`;
+    await sql()`
+      create trigger ak_test_fail_status_event
+      before insert on events
+      for each row
+      execute procedure ak_test_fail_status_event()
+    `;
+  };
+  const drop = async () => {
+    await sql()`drop trigger if exists ak_test_fail_status_event on events`;
+    await sql()`drop function if exists ak_test_fail_status_event()`;
+  };
+  try {
+    await install();
+    await assert.rejects(
+      () => report({
+        agent_id: agentId,
+        platform: "codex",
+        machine: "m1",
+        display_name: "Should Not Stick",
+        session_id: sessionId,
+        kind: "status",
+        title: "ghost",
+        project: "p",
+        summary: "ghost summary",
+      }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const newAgents = await sql()`select count(*)::int as n from agents where id = ${agentId}`;
+    const newSessions = await sql()`select count(*)::int as n from sessions where id = ${sessionId}`;
+    const ghosts = await sql()`select count(*)::int as n from events where kind = 'status' and title = 'ghost'`;
+    assert.equal(Number(newAgents[0].n), 0, "a failed event insert leaves no new agent");
+    assert.equal(Number(newSessions[0].n), 0, "a failed event insert leaves no new session");
+    assert.equal(Number(ghosts[0].n), 0, "a failed event insert leaves no status event");
+
+    await drop();
+    const seeded = await report({
+      agent_id: agentId,
+      platform: "codex",
+      display_name: "Kept",
+      session_id: sessionId,
+      kind: "session_start",
+      title: "hello",
+      project: "p",
+      summary: "kept",
+    });
+    assert.equal(seeded?.kind, "session_start");
+    const beforeAgent = await sql()`select platform, display_name, last_seen_at from agents where id = ${agentId}`;
+    const beforeSession = await sql()`select status, summary, project, ended_at from sessions where id = ${sessionId}`;
+    assert.equal(beforeAgent.length, 1);
+    assert.equal(beforeSession.length, 1);
+    await install();
+    await assert.rejects(
+      () => report({
+        agent_id: agentId,
+        platform: "hermes",
+        display_name: "Changed",
+        session_id: sessionId,
+        kind: "status",
+        status: "failed",
+        title: "ghost-update",
+        summary: "changed",
+      }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const afterAgent = await sql()`select platform, display_name, last_seen_at from agents where id = ${agentId}`;
+    const afterSession = await sql()`select status, summary, project, ended_at from sessions where id = ${sessionId}`;
+    assert.equal(String(afterAgent[0].platform), String(beforeAgent[0].platform));
+    assert.equal(String(afterAgent[0].display_name), String(beforeAgent[0].display_name));
+    assert.equal(new Date(afterAgent[0].last_seen_at as string | Date).toISOString(), new Date(beforeAgent[0].last_seen_at as string | Date).toISOString());
+    assert.equal(String(afterSession[0].status), String(beforeSession[0].status));
+    assert.equal(String(afterSession[0].summary), String(beforeSession[0].summary));
+    assert.equal(String(afterSession[0].project), String(beforeSession[0].project));
+    const endedBefore = beforeSession[0].ended_at == null ? null : new Date(beforeSession[0].ended_at as string | Date).toISOString();
+    const endedAfter = afterSession[0].ended_at == null ? null : new Date(afterSession[0].ended_at as string | Date).toISOString();
+    assert.equal(endedAfter, endedBefore);
+    const updates = await sql()`select count(*)::int as n from events where kind = 'status' and title = 'ghost-update'`;
+    assert.equal(Number(updates[0].n), 0, "a failed event insert leaves no status event on an existing session");
+
+    const task = await createTask({ title: `secondary ${tag}`, platform });
+    const result = await updateTaskForTool({ id: task.id, status: "done", agent_id: `${tag}-lane` });
+    assert.equal(result.isError, undefined);
+    const text = result.content[0]?.text ?? "";
+    assert.match(text, new RegExp(`^Task #${task.id} updated \\(done\\)\\.`));
+    assert.match(text, /note: the status event was not recorded/);
+    const receiptLine = text.split("\n").at(-1) ?? "";
+    assert.match(receiptLine, /^receipt: \{/);
+    const receipt = JSON.parse(receiptLine.slice("receipt: ".length)) as { id: string; kind: string };
+    assert.equal(receipt.kind, "task_updated");
+    const structured = result.structuredContent as { receipt?: { id: string; kind: string } } | undefined;
+    assert.equal(structured?.receipt?.id, receipt.id);
+    assert.equal(structured?.receipt?.kind, "task_updated");
+    const stored = await sql()`select status from tasks where id = ${task.id}`;
+    assert.equal(String(stored[0].status), "done");
+    const lane = await sql()`select count(*)::int as n from agents where id = ${laneId}`;
+    assert.equal(Number(lane[0].n), 0, "a failed secondary report writes no agent");
+    const statusEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'status' and detail->>'task_id' = ${String(task.id)}
+    `;
+    assert.equal(Number(statusEvents[0].n), 0, "a failed secondary report writes no status event");
+    const taskEvents = await sql()`
+      select id::text as id from events
+      where kind = 'task_updated' and detail->>'task_id' = ${String(task.id)}
+    `;
+    assert.equal(taskEvents.length, 1);
+    assert.equal(String(taskEvents[0].id), receipt.id);
+  } finally {
+    await drop();
+    await sql()`delete from tasks where platform = ${platform}`;
+    await sql()`delete from events where agent_id in (${agentId}, ${laneId}) or session_id = ${sessionId}`;
+    await sql()`delete from sessions where id = ${sessionId}`;
+    await sql()`delete from agents where id in (${agentId}, ${laneId})`;
+  }
 }
 
 async function testDecisions(tag: string) {
@@ -794,7 +1106,7 @@ function skillRecord(id: string, body: string): SkillRecord {
     commit_sha: "b".repeat(40),
     body,
     references: [],
-    runtimes: { claude: true, codex: false, grok: false, hermes: false, mini: false },
+    runtimes: { claude: true, codex: false, grok: false, hermes: false, mini: false, nemoclaw: false },
     category: null,
     tags: [],
     frontmatter: {},
@@ -851,6 +1163,254 @@ async function holdExpiredLease<T>(holder: Client, runId: string, marker: string
     await holder.query("rollback").catch(() => undefined);
     if (pending) await pending.catch(() => undefined);
     throw err;
+  }
+}
+
+function pgCode(err: unknown): string | undefined {
+  if (!err || typeof err !== "object" || !("code" in err)) return undefined;
+  const code = (err as { code: unknown }).code;
+  return typeof code === "string" ? code : undefined;
+}
+
+async function applyCanonicalSchema(): Promise<void> {
+  const schemaPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "supabase", "schema.sql");
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    await client.query(fs.readFileSync(schemaPath, "utf8"));
+  } finally {
+    await client.end();
+  }
+}
+
+async function restoreWatchBeatsName(): Promise<void> {
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    await client.query(`
+      do $$ begin
+        if to_regclass('public.watch_beats_hidden') is not null
+           and to_regclass('public.watch_beats') is null then
+          alter table watch_beats_hidden rename to watch_beats;
+        end if;
+      end $$
+    `);
+  } finally {
+    await client.end();
+  }
+}
+
+function beatFor(rows: WatchBeat[], source: string): WatchBeat {
+  const found = rows.find((row) => row.source === source);
+  assert.ok(found, `missing beat ${source}`);
+  return found;
+}
+
+/**
+ * Failure cases for watch_beats: constraint rejects, clock skew, a second
+ * write refreshing received_at, concurrent same-source upserts, a failed
+ * read, a missing DATABASE_URL, and a second schema apply that must not
+ * rewrite a stored beat.
+ */
+async function testWatchBeats(tag: string): Promise<void> {
+  await sql()`delete from watch_beats`;
+  const previousUrl = process.env.DATABASE_URL;
+  try {
+    const encoding = await sql()`show server_encoding`;
+    assert.equal(String(encoding[0].server_encoding).toUpperCase(), "UTF8");
+
+    const cols = await sql()`
+      select column_name, data_type, is_nullable
+      from information_schema.columns
+      where table_schema = 'public' and table_name = 'watch_beats'
+      order by ordinal_position
+    `;
+    assert.deepEqual(
+      cols.map((col) => [col.column_name, col.data_type, col.is_nullable]),
+      [
+        ["source", "text", "NO"],
+        ["status", "text", "NO"],
+        ["detail", "text", "NO"],
+        ["beat_at", "timestamp with time zone", "NO"],
+        ["received_at", "timestamp with time zone", "NO"],
+      ],
+    );
+
+    assert.deepEqual(await readBeats(), [], "an empty table is not a fabricated healthy beat");
+
+    const behind = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+    const ahead = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString();
+    const skew = `${tag}-skew`;
+    await upsertBeat(skew, "ok", "sender behind", behind);
+    let row = beatFor(await readBeats(), skew);
+    assert.equal(row.beat_at, behind);
+    assert.match(row.beat_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    assert.match(row.received_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    assert.equal(Number.isInteger(row.age_s), true);
+    assert.ok(row.age_s >= 0 && row.age_s < 30, `age follows received_at, got ${row.age_s}`);
+    assert.deepEqual(Object.keys(row), ["source", "status", "detail", "beat_at", "received_at", "age_s"]);
+
+    await upsertBeat(skew, "failing", "sender ahead", ahead);
+    row = beatFor(await readBeats(), skew);
+    assert.equal(row.status, "failing", "a future beat_at is still accepted");
+    assert.equal(row.detail, "sender ahead");
+    assert.equal(row.beat_at, ahead);
+    assert.ok(row.age_s < 30, `a future beat_at must not zero the age by itself, got ${row.age_s}`);
+
+    // An older sender instant still overwrites. beat_at is not a version.
+    await upsertBeat(skew, "paused", "older sender wins", behind);
+    row = beatFor(await readBeats(), skew);
+    assert.equal(row.status, "paused");
+    assert.equal(row.detail, "older sender wins");
+    assert.equal(row.beat_at, behind);
+
+    await sql()`update watch_beats set received_at = clock_timestamp() - interval '2 days' where source = ${skew}`;
+    const rewound = beatFor(await readBeats(), skew);
+    assert.ok(rewound.age_s >= 2 * 86400 - 5, `rewound age should be about two days, got ${rewound.age_s}`);
+    await upsertBeat(skew, "held", "refreshed", behind);
+    row = beatFor(await readBeats(), skew);
+    assert.equal(row.status, "held");
+    assert.equal(row.detail, "refreshed");
+    assert.ok(row.age_s < 30, `the conflict update must stamp received_at again, got ${row.age_s}`);
+
+    await sql()`update watch_beats set received_at = clock_timestamp() + interval '2 days' where source = ${skew}`;
+    assert.equal(beatFor(await readBeats(), skew).age_s, 0, "age_s floors at zero when received_at is ahead of the database clock");
+
+    const micros = `${tag}-micros`;
+    await upsertBeat(micros, "unknown", "", "2026-10-26T12:00:00.123456Z");
+    const storedUs = await sql()`
+      select to_char(beat_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as beat
+      from watch_beats where source = ${micros}
+    `;
+    assert.equal(String(storedUs[0].beat), "2026-10-26T12:00:00.123456Z");
+    const offset = `${tag}-offset`;
+    await upsertBeat(offset, "ok", "", "2026-10-26T12:00:00-05:00");
+    assert.equal(beatFor(await readBeats(), offset).beat_at, "2026-10-26T17:00:00.000Z");
+
+    const emoji = "😀".repeat(500);
+    const wide = `${tag}-wide`;
+    await upsertBeat(wide, "stale", emoji, "2026-10-28T00:00:00Z");
+    assert.equal(beatFor(await readBeats(), wide).detail, emoji);
+    await upsertBeat(`${tag}-empty-detail`, "ok", "", "2026-10-28T00:00:00Z");
+
+    const hostile = `${tag}-'); drop table watch_beats; --`;
+    await upsertBeat(hostile, "ok", "still here", "2026-10-28T00:00:00Z");
+    assert.equal(beatFor(await readBeats(), hostile).detail, "still here");
+    const stillThere = await sql()`select to_regclass('public.watch_beats') as rel`;
+    assert.equal(stillThere[0].rel, "watch_beats");
+
+    const sources = [`${tag}-c`, `${tag}-a`, `${tag}-b`];
+    for (const source of sources) await upsertBeat(source, "ok", source, "2026-10-28T00:00:00Z");
+    const ordered = (await readBeats()).map((item) => item.source).filter((source) => sources.includes(source));
+    assert.deepEqual(ordered, [...sources].sort(), "readBeats orders by source");
+    const distinct = await sql()`select count(*)::int as n from watch_beats where source like ${`${tag}-%`}`;
+    assert.ok(Number(distinct[0].n) >= sources.length);
+
+    const race = `${tag}-race`;
+    await Promise.all(Array.from({ length: 12 }, (_, i) => upsertBeat(
+      race,
+      WATCH_STATUSES[i % WATCH_STATUSES.length],
+      `n${i}`,
+      new Date(Date.now() - i * 1000).toISOString(),
+    )));
+    const raceCount = await sql()`select count(*)::int as n from watch_beats where source = ${race}`;
+    assert.equal(Number(raceCount[0].n), 1, "concurrent same-source writes leave one row");
+
+    const same = `${tag}-same`;
+    await upsertBeat(same, "ok", "one", "2026-10-28T00:00:00Z");
+    await upsertBeat(same, "unknown", "two", "2026-10-28T00:00:01Z");
+    const sameCount = await sql()`select count(*)::int as n, max(detail) as detail from watch_beats where source = ${same}`;
+    assert.equal(Number(sameCount[0].n), 1);
+    assert.equal(String(sameCount[0].detail), "two");
+    await upsertBeat(`${tag}-other`, "held", "separate", "2026-10-28T00:00:00Z");
+    const pair = await sql()`select count(*)::int as n from watch_beats where source in (${same}, ${`${tag}-other`})`;
+    assert.equal(Number(pair[0].n), 2, "different sources stay separate");
+
+    const kept = `${tag}-kept`;
+    await upsertBeat(kept, "ok", "do not touch", "2026-10-27T01:02:03Z");
+    const before = await sql()`
+      select status, detail,
+             extract(epoch from beat_at) as beat_epoch,
+             extract(epoch from received_at) as received_epoch
+      from watch_beats where source = ${kept}
+    `;
+    await applyCanonicalSchema();
+    await applyCanonicalSchema();
+    const after = await sql()`
+      select status, detail,
+             extract(epoch from beat_at) as beat_epoch,
+             extract(epoch from received_at) as received_epoch
+      from watch_beats where source = ${kept}
+    `;
+    assert.deepEqual(after, before, "applying the canonical schema twice leaves the beat unchanged");
+
+    const badSource = `${tag}-bad`;
+    await assert.rejects(
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values ('', 'ok', '', now(), now())`,
+      (err: unknown) => pgCode(err) === "23514",
+      "empty source",
+    );
+    await assert.rejects(
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'nope', '', now(), now())`,
+      (err: unknown) => pgCode(err) === "23514",
+      "invalid status",
+    );
+    await assert.rejects(
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'OK', '', now(), now())`,
+      (err: unknown) => pgCode(err) === "23514",
+      "status is case-sensitive",
+    );
+    await assert.rejects(
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'ok', ${"a".repeat(501)}, now(), now())`,
+      (err: unknown) => pgCode(err) === "23514",
+      "501 code points",
+    );
+    await assert.rejects(
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'ok', ${"😀".repeat(501)}, now(), now())`,
+      (err: unknown) => pgCode(err) === "23514",
+      "501 emoji code points",
+    );
+    const nullWrites = [
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (null, 'ok', '', now(), now())`,
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, null, '', now(), now())`,
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'ok', null, now(), now())`,
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'ok', '', null, now())`,
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'ok', '', now(), null)`,
+    ];
+    for (const write of nullWrites) {
+      await assert.rejects(write, (err: unknown) => pgCode(err) === "23502");
+    }
+    const badLeft = await sql()`select count(*)::int as n from watch_beats where source = ${badSource} or source = ''`;
+    assert.equal(Number(badLeft[0].n), 0, "rejected rows are not stored");
+
+    const admin = new Client({ connectionString: process.env.DATABASE_URL });
+    await admin.connect();
+    try {
+      await admin.query("alter table watch_beats rename to watch_beats_hidden");
+      await assert.rejects(readBeats, (err: unknown) => pgCode(err) === "42P01");
+      await assert.rejects(
+        () => upsertBeat("missing-table", "ok", "", "2026-10-28T00:00:00Z"),
+        (err: unknown) => pgCode(err) === "42P01",
+      );
+    } finally {
+      await admin.query("alter table if exists watch_beats_hidden rename to watch_beats");
+      await admin.end();
+    }
+
+    delete process.env.DATABASE_URL;
+    try {
+      await assert.rejects(readBeats, /DATABASE_URL is not set/);
+      await assert.rejects(
+        () => upsertBeat("unconfigured", "ok", "", new Date()),
+        /DATABASE_URL is not set/,
+      );
+    } finally {
+      process.env.DATABASE_URL = previousUrl;
+    }
+  } finally {
+    if (process.env.DATABASE_URL !== previousUrl) process.env.DATABASE_URL = previousUrl;
+    await restoreWatchBeatsName();
+    await sql()`delete from watch_beats`;
   }
 }
 

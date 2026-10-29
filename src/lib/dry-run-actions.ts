@@ -2,6 +2,7 @@
  * Server side of a dry run. The preview helpers only read. The tool helpers
  * write only when dry_run is not true, and they are what the MCP handlers call.
  */
+import { readReceipt, withReceipt } from "./activity";
 import { memoryKeyError, mcpToolError, type McpToolResult } from "./api-error";
 import { isConfigured } from "./db";
 import {
@@ -14,6 +15,7 @@ import {
 } from "./dry-run";
 import { demoRememberTool, demoUpdateTaskTool } from "./demo-store";
 import { absentRevision } from "./revision";
+import { currentActor } from "./actor";
 import { readMemoryForPreview, readTaskForPreview, remember, report, updateTask } from "./store";
 import type { TaskStatus } from "./types";
 
@@ -46,9 +48,8 @@ export async function rememberForTool(args: {
     return { content: [{ type: "text", text: JSON.stringify(preview) }] };
   }
   const item = await remember(args);
-  return {
-    content: [{ type: "text", text: `Stored memory #${item.id}${item.key ? ` (key: ${item.key})` : ""}.` }],
-  };
+  const text = `Stored memory #${item.id}${item.key ? ` (key: ${item.key})` : ""}.`;
+  return withReceipt(text, readReceipt(item));
 }
 
 export async function updateTaskForTool(args: {
@@ -71,13 +72,27 @@ export async function updateTaskForTool(args: {
     result: args.result,
     cost_usd: args.cost_usd,
   });
+  // The task row and its receipt are already committed. A later status
+  // report must not turn that success into an error.
+  let note = "";
   if (args.status && args.agent_id) {
-    await report({
-      agent_id: args.agent_id,
-      kind: args.status === "failed" ? "error" : "status",
-      title: `Task #${task.id} → ${args.status}: ${task.title}`,
-      detail: { task_id: task.id },
-    });
+    const actor = currentActor();
+    try {
+      await report({
+        agent_id: args.agent_id,
+        kind: args.status === "failed" ? "error" : "status",
+        title: `Task #${task.id} → ${args.status}: ${task.title}`,
+        detail: {
+          task_id: task.id,
+          tool: "update_task",
+          actor_type: actor?.actor_type ?? null,
+          actor_id: actor?.actor_id ?? null,
+        },
+      });
+    } catch (e) {
+      console.error("[activity] status report failed after the task receipt", e);
+      note = "\nnote: the status event was not recorded";
+    }
   }
-  return { content: [{ type: "text", text: `Task #${task.id} updated (${task.status}).` }] };
+  return withReceipt(`Task #${task.id} updated (${task.status}).${note}`, readReceipt(task));
 }

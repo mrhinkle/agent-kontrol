@@ -10,7 +10,8 @@ import { INGEST_KINDS } from "@/lib/store";
 import { TASK_STATUSES } from "@/lib/types";
 import { USAGE_SOURCES } from "@/lib/usage-types";
 import { USAGE_WINDOWS } from "@/lib/usage-window";
-import { LIST_MAX } from "./list-params";
+import { ACTIVITY_LIST, LIST_MAX } from "./list-params";
+import { RUNTIMES } from "./skills/types";
 
 /**
  * OpenAPI 3.1 for the documented REST routes.
@@ -28,6 +29,16 @@ import { LIST_MAX } from "./list-params";
 const ERROR_CODES = [...new Set([...Object.keys(API_ERRORS), "insufficient_scope"])];
 
 type Json = Record<string, unknown>;
+
+/** The nine names list_activity and GET /api/activity return. fields= may omit some. */
+const ACTIVITY_ITEM_PROPERTIES: Json = Object.fromEntries(
+  ACTIVITY_LIST.allow.map((name) => {
+    if (name === "id") return [name, { type: "integer" }];
+    if (name === "created_at") return [name, { type: "string", format: "date-time" }];
+    if (name === "detail") return [name, { type: ["object", "null"], additionalProperties: true }];
+    return [name, { type: ["string", "null"] }];
+  }),
+);
 
 const INGEST_PLATFORMS = [
   "claude-code",
@@ -112,6 +123,8 @@ function body(schema: Json): Json {
 const cookieOrBearer = [{ cookieAuth: [] }, { bearerAuth: [] }];
 const bearerOnly = [{ bearerAuth: [] }];
 const sessionOnly = [{ cookieAuth: [] }];
+/** Dashboard session or MC_TOKEN. Not the generic bearer that accepts an agent credential. */
+const operatorSessionOrMcToken = [{ cookieAuth: [] }, { mcToken: [] }];
 
 /** Server-set. A request body cannot write these. */
 const actorType: Json = {
@@ -191,6 +204,7 @@ export function openApiDocument(): Json {
       { name: "settings" },
       { name: "usage" },
       { name: "traces" },
+      { name: "activity" },
       { name: "skills" },
       { name: "auth" },
       { name: "mcp" },
@@ -202,6 +216,12 @@ export function openApiDocument(): Json {
           type: "http",
           scheme: "bearer",
           description: "MC_TOKEN, an akc_ agent credential, or an OAuth access token on the MCP transport.",
+        },
+        mcToken: {
+          type: "http",
+          scheme: "bearer",
+          bearerFormat: "MC_TOKEN",
+          description: "Operator MC_TOKEN. An agent credential and an OAuth access token are not accepted on operations that use this scheme.",
         },
       },
       schemas: {
@@ -1416,6 +1436,36 @@ export function openApiDocument(): Json {
           },
         }),
       },
+      "/api/activity": {
+        get: operation({
+          operationId: "listActivity",
+          tags: ["activity"],
+          summary: "Write receipts and other events, newest first.",
+          description:
+            "Operator only. Authenticate with a dashboard session or MC_TOKEN. An agent credential is denied, including one with fleet:read. Same boundary as GET /api/traces. actor is an exact actor_id. kind is an exact event kind. since and until are inclusive ISO timestamps; a since later than until is 400 validation_failed. With no database the body is the in-memory demo event log (demo true), not a static sample, and the filters still apply. next_cursor is absent unless limit or cursor was passed.",
+          security: operatorSessionOrMcToken,
+          parameters: [
+            query("actor", { type: "string" }, "Exact actor_id. Empty means no filter. Longer than 200 characters is 400."),
+            query("kind", { type: "string" }, "Exact event kind. Empty means no filter. Anything other than 1 to 64 letters, digits, or _ . : - is 400."),
+            query("since", { type: "string", format: "date-time" }, "Inclusive start. A value that is not an ISO timestamp is 400."),
+            query("until", { type: "string", format: "date-time" }, "Inclusive end, through that millisecond. A value that is not an ISO timestamp, or a value before since, is 400."),
+            listLimitParam(50),
+            listCursor,
+            listFields,
+          ],
+          responses: {
+            "200": jsonResponse("demo and activity. next_cursor is absent unless limit or cursor was passed.", {
+              type: "object",
+              properties: {
+                demo: { type: "boolean" },
+                activity: { type: "array", items: { type: "object", properties: ACTIVITY_ITEM_PROPERTIES } },
+                next_cursor: nextCursor,
+              },
+            }),
+            ...flatErrors,
+          },
+        }),
+      },
       "/api/traces": {
         get: operation({
           operationId: "listTraces",
@@ -1486,7 +1536,7 @@ export function openApiDocument(): Json {
             "Agent credentials need skills:read. runtime filters to skills compatible with that runtime. An unknown runtime is 400 validation_failed. q matches name and description, case-insensitive. category is an exact case-insensitive match on the stored category. The value uncategorized matches a null category. The taxonomy is not enforced. Each skill includes category (string or null) and tags (string array), plus lastScheduledAt and nextDueAt (ISO strings or null). Removed skills are omitted. With no database the body is demo true and a fixture list.",
           security: cookieOrBearer,
           parameters: [
-            query("runtime", { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] }, "Compatible runtime. Omit to return every skill."),
+            query("runtime", { type: "string", enum: [...RUNTIMES] }, "Compatible runtime. Omit to return every skill."),
             query("q", { type: "string" }, "Case-insensitive match on name and description."),
             query("category", { type: "string" }, "Exact category, case-insensitive. uncategorized matches a null category."),
           ],
@@ -1506,7 +1556,7 @@ export function openApiDocument(): Json {
           security: cookieOrBearer,
           parameters: [
             query("lane", { type: "string" }, "Lane name. Selected-scope skills match only an exact lane.", { required: true }),
-            query("runtime", { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] }, "Runtime that will read the file.", { required: true }),
+            query("runtime", { type: "string", enum: [...RUNTIMES] }, "Runtime that will read the file.", { required: true }),
             query("format", { type: "string", enum: ["json", "text"] }, "json (default) or text."),
           ],
           responses: {
@@ -1529,12 +1579,35 @@ export function openApiDocument(): Json {
             required: ["lane", "runtime"],
             properties: {
               lane: { type: "string" },
-              runtime: { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] },
+              runtime: { type: "string", enum: [...RUNTIMES] },
               agents_md: { type: ["string", "null"] },
             },
           }),
           responses: {
             "200": jsonResponse("demo, lane, runtime, empty, changed, and content (string or null).", { type: "object" }),
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/skill-bundles": {
+        get: operation({
+          operationId: "exportSkills",
+          tags: ["skills"],
+          summary: "Download a skill tree for one runtime.",
+          description:
+            "Operator only. Authenticate with a dashboard session or MC_TOKEN. An agent credential is denied, including one with skills:read or skills:write. runtime is required and is claude, codex, grok, hermes, mini, or nemoclaw. lane is optional. Visibility is the list_skills check. Trigger off is omitted. A trigger other than off, on_request, auto_inject, or scheduled is treated as off and listed with reason invalid trigger. A selected scope is omitted unless lane is set and admits it. category and q match list_skills. The body is a gzip-compressed tar. Paths are relative. The directory is the skill id, which is the upstream directory slug. The frontmatter name is a display string and may differ. The folder is the id. Category is a Hermes folder only. Claude, Codex, Grok, mini, and NemoClaw leave category out of the path, so a category value does not omit the skill for those runtimes. NemoClaw uses .agents/skills/<id>/SKILL.md. Its frontmatter is name and description, plus license, user_invocable, and metadata.author or metadata.tags only when the stored file already has them. A Hermes category or a skill id that does not already match ^[a-z0-9][a-z0-9-_]*$ is omitted and listed. The stored text is left as it is. When two skills would write one archive path, every one of those skills is omitted and listed. A reference that is unsafe, that collides case-insensitively, or that does not fit a ustar name and prefix is omitted and listed with its path, and the skill is still exported. A skill whose SKILL.md cannot be written is omitted as a whole. Each omission is {skill, path?, reason}. When the list is not empty, manifest.json at the archive root contains every entry. The x-ak-skipped header carries count, the first 20 entries, and the text see manifest.json. The header is at most 4 KB. The archive contains each path once. A skill with no category is under uncategorized/ in the Hermes layout. hermes uses <category>/<id>/SKILL.md. With no database the archive is the demo fixture under the same rules. A repeated runtime, lane, category, or q is 400 validation_failed.",
+          security: operatorSessionOrMcToken,
+          parameters: [
+            query("runtime", { type: "string", enum: [...RUNTIMES] }, "Runtime the tree is rendered for.", { required: true }),
+            query("lane", { type: "string" }, "When omitted, skills whose scope is selected are omitted."),
+            query("category", { type: "string" }, "Exact category, case-insensitive. uncategorized matches a null category."),
+            query("q", { type: "string" }, "Case-insensitive match on the skill id and the description."),
+          ],
+          responses: {
+            "200": {
+              description: "gzip-compressed tar of the rendered tree. x-ak-demo is true when no database is configured.",
+              content: { "application/gzip": { schema: { type: "string", contentEncoding: "gzip" } } },
+            },
             ...flatErrors,
           },
         }),

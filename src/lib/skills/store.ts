@@ -1,6 +1,7 @@
 import { sql } from "../db";
 import {
   flagsFromStored,
+  isTrigger,
   scopeFromStored,
   triggerFromStored,
   type RunRecord,
@@ -372,6 +373,7 @@ export async function listSettings(): Promise<SettingsRecord[]> {
   return rows.map((row) => ({
     skill_id: String(row.skill_id),
     trigger: triggerFromStored(row.trigger),
+    triggerInvalid: !(typeof row.trigger === "string" && isTrigger(row.trigger)),
     scope: asScope(row.scope),
     schedule: row.schedule == null ? null : String(row.schedule),
     updated_by: row.updated_by == null ? null : String(row.updated_by),

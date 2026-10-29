@@ -1,6 +1,6 @@
 # Agent Kontrol MCP Server
 
-Agent Kontrol exposes fleet coordination to AI coding agents over the Model Context Protocol. This document covers how to connect, the 18 tools, how shared memory works, and a block of standing instructions you can paste into an agent.
+Agent Kontrol exposes fleet coordination to AI coding agents over the Model Context Protocol. This document covers how to connect, the 19 tools, how shared memory works, and a block of standing instructions you can paste into an agent.
 
 An agent that only has the deployment URL can start at [/llms.txt](/llms.txt).
 
@@ -21,7 +21,7 @@ Without valid auth the endpoint answers `401` with a `WWW-Authenticate` header p
 { "error": "The credential does not have the tasks:write scope.", "code": "insufficient_scope", "fix": "Use a credential that has the tasks:write scope", "retryable": false }
 ```
 
-A tool that is not in the table below is denied for every caller, including `MC_TOKEN` and OAuth.
+A tool name that is not registered is denied for every caller, including `MC_TOKEN` and OAuth. `list_activity` is registered and is not in the scope table below. An agent credential cannot call it. `MC_TOKEN` and OAuth can.
 
 ### Scopes
 
@@ -42,9 +42,9 @@ A tool that is not in the table below is denied for every caller, including `MC_
 
 `reply_to_mark` is the deprecated alias of `reply_to_operator` and requires the same scope.
 
-`send_message` is the MCP form of operator `POST /api/messages`. That REST route stays off this table, so an agent credential still cannot call it. The tool requires `messages:write`. `delete_note` uses `memory:write`. There is no memory DELETE route. `requeue_task` uses `tasks:write`, the same scope as `PATCH /api/tasks/:id`.
+`send_message` is the MCP form of operator `POST /api/messages`. That REST route stays off this table, so an agent credential still cannot call it. The tool requires `messages:write`. `delete_note` uses `memory:write`. There is no memory DELETE route. `requeue_task` uses `tasks:write`, the same scope as `PATCH /api/tasks/:id`. `list_activity` and `GET /api/activity` are operator-only, the same boundary as traces. No agent scope grants them, including `fleet:read`. `MC_TOKEN` and an OAuth access token can call `list_activity`. The dashboard session and `MC_TOKEN` can call `GET /api/activity`.
 
-Collector and operator routes are not in this table. An agent credential cannot call them. `MC_TOKEN` and the dashboard session still can. That set is `POST /api/progress/ingest`, `POST /api/usage/ingest`, `GET /api/usage`, `POST /api/v1/traces`, `GET /api/traces`, `GET /api/traces/:traceId`, `POST /api/messages`, `PATCH /api/messages`, `GET /api/decisions`, `POST /api/decisions`, `PATCH /api/skills/:id`, `POST /api/skills/sync`, `POST /api/skills/drift`, and `GET`/`PUT /api/settings/repos`. `GET`/`POST`/`DELETE /api/settings/credentials` accepts only the dashboard session. `PATCH /api/decisions/:id` is the `decisions:write` row above. There is no MCP tool for decisions yet.
+Collector and operator routes are not in this table. An agent credential cannot call them. `MC_TOKEN` and the dashboard session still can. That set is `POST /api/progress/ingest`, `POST /api/usage/ingest`, `GET /api/usage`, `POST /api/v1/traces`, `GET /api/traces`, `GET /api/traces/:traceId`, `GET /api/activity`, `POST /api/messages`, `PATCH /api/messages`, `GET /api/decisions`, `POST /api/decisions`, `PATCH /api/skills/:id`, `POST /api/skills/sync`, `POST /api/skills/drift`, `GET /api/skill-bundles`, and `GET`/`PUT /api/settings/repos`. `GET`/`POST`/`DELETE /api/settings/credentials` accepts only the dashboard session. `PATCH /api/decisions/:id` is the `decisions:write` row above. There is no MCP tool for decisions yet.
 
 `check_inbox` and `GET /api/messages?ack=true` can mark inbox rows delivered. That side effect is part of `messages:read`, which is how the inbox already worked.
 
@@ -90,13 +90,15 @@ A `401` on this request means the token does not match `MC_TOKEN` on the deploym
 
 ## Tools
 
-The server exposes 18 tools: `report_status`, `get_fleet_status`, `get_progress_digest`, `get_morning_brief`, `remember`, `recall`, `check_inbox`, `reply_to_operator`, `create_task`, `get_task_queue`, `claim_task`, `update_task`, `list_skills`, `get_skill`, `run_skill`, `send_message`, `requeue_task`, `delete_note`.
+The server exposes 19 tools: `report_status`, `get_fleet_status`, `get_progress_digest`, `get_morning_brief`, `remember`, `recall`, `check_inbox`, `reply_to_operator`, `create_task`, `get_task_queue`, `claim_task`, `update_task`, `list_skills`, `get_skill`, `run_skill`, `send_message`, `requeue_task`, `delete_note`, `list_activity`.
+
+A successful write keeps the sentence it already returned and adds one line after it: `receipt: {"id":"<event id>","kind":"<kind>","at":"<iso>"}`. `structuredContent.receipt` is the same object. Callers that read the first line see the same words. `dry_run`, a validation error, `stale_write`, `not_found`, and an empty claim do not add that line and do not write an event. `check_inbox` does not write a receipt. `reply_to_operator` in demo mode stays `Demo mode; reply not stored.` and writes nothing. `run_skill` is not stored.
 
 Tool names are part of the public API and will not change within 1.x.
 
 ### Demo mode
 
-With no `DATABASE_URL`, `report_status`, `remember`, `create_task`, `claim_task`, `update_task`, `send_message`, `requeue_task`, and `delete_note` store in memory for the life of the process. `get_fleet_status`, `recall`, and `get_task_queue` return what those tools wrote. A successful result starts with `[demo — in-memory, cleared when this process restarts]`. A `dry_run: true` preview is JSON with `applied: false` and does not start with that banner. The store is cleared when the process restarts. It is not the sample data the dashboard shows. REST writes are still dropped, including `POST /api/messages`. `check_inbox` and `reply_to_operator` are not stored. `get_progress_digest` stays on sample data. `run_skill` still returns `DATABASE_URL not set; skill run not stored.`
+With no `DATABASE_URL`, `report_status`, `remember`, `create_task`, `claim_task`, `update_task`, `send_message`, `requeue_task`, and `delete_note` store in memory for the life of the process. `get_fleet_status`, `recall`, `get_task_queue`, and `list_activity` return what those tools wrote. `list_activity` reads the in-memory event log, and so does `GET /api/activity`. A successful result starts with `[demo — in-memory, cleared when this process restarts]`. A `dry_run: true` preview is JSON with `applied: false` and does not start with that banner, and it does not appear in the activity log. The store is cleared when the process restarts. It is not the sample data the dashboard shows. REST writes are still dropped, including `POST /api/messages`. `check_inbox` and `reply_to_operator` are not stored. `get_progress_digest` stays on sample data. `run_skill` still returns `DATABASE_URL not set; skill run not stored.`
 
 `remember` with a `key` upserts that key. Memory is shared across agents, the same as the database. `dry_run: true` previews and writes nothing. A non-boolean `dry_run` is `validation_failed`. `create_task` idempotency matches the database: the same key, actor, and arguments replay the original task; different arguments are `idempotency_conflict`. `claim_task` on a task that is already claimed or done is the same empty result as a database with nothing queued (`No queued tasks for your platform.`). Two claims in one process yield one winner. `update_task` on a missing id is `task_not_found`. The store caps tasks, notes, agents, events, sessions, and idempotency keys. Sessions are capped per agent, and the oldest session for that agent is dropped past the cap. Past the other caps, the oldest row is dropped. Dropping a task at the cap does not drop its idempotency key. That key still returns the original result for 24 hours and does not queue a second task. Actor fields come from the credential, the same way they do with a database.
 
@@ -267,7 +269,7 @@ List skills the caller is allowed to see. Trigger `off` is omitted. There is no 
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
-| `runtime` | enum | no | `claude`, `codex`, `grok`, `hermes`, or `mini`. When omitted, the result says the runtime filter is off and does not hide incompatible skills. The server cannot infer a runtime from `agent_id`. |
+| `runtime` | enum | no | `claude`, `codex`, `grok`, `hermes`, `mini`, or `nemoclaw`. When omitted, the result says the runtime filter is off and does not hide incompatible skills. The server cannot infer a runtime from `agent_id`. |
 | `lane` | string | no | When omitted, skills whose scope is `selected` are hidden. `all` admits every lane. |
 | `query` | string | no | Case-insensitive match on the skill id and the description. |
 | `category` | string | no | Exact category, compared case-insensitively after trimming. The value `uncategorized` matches a skill whose category is null, and a skill whose category is that word. Any other value does not match a null category. The master-skills taxonomy is not enforced. |
@@ -286,6 +288,8 @@ Return the mirrored SKILL.md, or one reference file. The header states the conte
 | `lane` | string | no | Required when the skill's scope is `selected`. |
 
 A missing skill, a removed skill, and a skill whose trigger is `off` are the same `not_found` result: `Skill is not available.`
+
+When `runtime` is `hermes`, the instruction text includes a Hermes `SKILL.md`. The frontmatter is `name`, `description`, and `version`, plus `author`, `license`, `platforms`, `metadata.hermes.tags`, `metadata.hermes.related_skills`, and `prerequisites` when the stored skill has them. `version` is the stored version, or the content SHA when the skill has none. Tags are the store's tags, written at `metadata.hermes.tags`. A field the store does not have is omitted. `runtime` `claude`, `mini`, or omitted keeps the previous text: the preamble and the body, with no Hermes frontmatter. `runtime` `codex` or `grok` puts an Agent Skills `SKILL.md` (`name`, `description`, and `license`, `compatibility`, `metadata`, or `allowed-tools` only when the stored frontmatter already has them) in that same preamble. `runtime` `nemoclaw` puts a NemoClaw `SKILL.md` in that preamble: `name`, `description`, and `license`, `user_invocable`, `metadata.author`, or `metadata.tags` only when the stored frontmatter already has them. Store tags are not copied into `metadata.tags`. `run_skill` uses the same document on start.
 
 ### run_skill
 
@@ -352,6 +356,16 @@ Delete one shared memory note by key. Requires `memory:write`. There is no REST 
 
 A successful result is `Deleted memory key "<key>".`
 
+### list_activity
+
+List write receipts and other events, newest first.
+
+Operator only, the same boundary as `GET /api/traces`. An agent credential is denied, including one with `fleet:read`. `MC_TOKEN` and an OAuth access token can call it. `actor` is an exact actor id. `kind` is an exact event kind (`create_task`, `task_claimed`, `task_updated`, `task_requeued`, `remember`, `delete_note`, `send_message`, `reply_to_operator`, `status`, and the other event kinds already stored). `since` and `until` are inclusive ISO timestamps. A `since` later than `until`, a timestamp that is not ISO, an `actor` longer than 200 characters, or a `kind` outside 1 to 64 letters, digits, or `_ . : -` is `validation_failed` and reads nothing. `limit` is 1 to 200 and defaults to 50. `cursor` is the opaque `next_cursor` from the previous page. `fields` is a comma-separated allowlist; `id` is always included. Omitting `limit` and `cursor` omits the `next_cursor` line. A cursor for another list is `validation_failed`.
+
+With no database this reads the in-memory demo log and the text starts with the demo banner. There is no static sample. `GET /api/activity` returns the same rows.
+
+Task status changes (`update_task`, `claim_task`, `requeue_task`) record the receipt in the same statement as the write. A statement that changes no row writes no event. `report_status` writes the agent, the session, and the event in one statement. If that statement fails, none of those rows change. `update_task` still returns its own receipt when a later status report fails. The result then adds `note: the status event was not recorded` and the task row stays as written. `create_task`, `reply_to_operator`, and `send_message` record the receipt after the idempotent write commits, and a replay returns the original receipt instead of inserting a second row. `remember` and `delete_note` record a new event on every successful write, including an overwrite of the same memory key.
+
 ## Errors
 
 A tool failure returns `isError: true`. The text of the result is JSON with the same keys as a REST error:
@@ -376,7 +390,7 @@ The HTTP `401` for a missing or invalid bearer is unchanged: `WWW-Authenticate` 
 | `forbidden` | no | `reply_to_operator` when `in_reply_to` belongs to a different agent. `get_skill` or `run_skill` when the runtime is incompatible or the lane is outside the skill's scope. `run_skill` when a different actor finishes a run, or when the caller has no actor. `requeue_task` when a claimed, running, or review task is held by another agent. `error` is `Task is running under another agent.` |
 | `identity_mismatch` | no | `run_skill` when an agent credential or an OAuth client passes an `agent_id` other than the authenticated id. The message names that id. Omit `agent_id`, or pass the same id. The call writes no run and no span. `MC_TOKEN` and a dashboard session do not return this code: a supplied `agent_id` there is the span attribute `reported_agent_id` only. |
 | `not_found` | no | `reply_to_operator` when `in_reply_to` does not exist. `get_skill` or `run_skill` when the skill is missing, removed, or trigger `off`. `run_skill` when `run_id` does not exist or is not a canonical UUID. `send_message` when the agent does not exist (`error` is `Agent not found`). `delete_note` when the key does not exist (`error` is `Memory not found`). |
-| `validation_failed` | no | `create_task`, `reply_to_operator`, or `send_message` when `idempotency_key` is longer than 200 characters or contains a control character. `send_message` when `body` is empty or longer than 8000 characters. `requeue_task` or `delete_note` when `dry_run` is not a boolean or `expected_revision` is empty, non-string, or longer than 200 characters. `run_skill` when a start omits `id` or `runtime`, when `complete` is true without `run_id`, when `run_id` is set without `complete: true`, when `id` on completion does not match the skill on the run, or when `note` is longer than 500 characters. A privacy refusal on `POST /api/usage/ingest` is this code. Schema failures are the SDK message, not this JSON. |
+| `validation_failed` | no | `create_task`, `reply_to_operator`, or `send_message` when `idempotency_key` is longer than 200 characters or contains a control character. `send_message` when `body` is empty or longer than 8000 characters. `requeue_task` or `delete_note` when `dry_run` is not a boolean or `expected_revision` is empty, non-string, or longer than 200 characters. `list_activity` when `since`, `until`, `actor`, `kind`, `limit`, `cursor`, or `fields` is not usable. `run_skill` when a start omits `id` or `runtime`, when `complete` is true without `run_id`, when `run_id` is set without `complete: true`, when `id` on completion does not match the skill on the run, or when `note` is longer than 500 characters. A privacy refusal on `POST /api/usage/ingest` is this code. Schema failures are the SDK message, not this JSON. |
 | `invalid_json` | no | Not a tool result. Authenticated `POST /api/mcp` returns HTTP 400 when the body is empty or not JSON. A missing bearer stays HTTP 401 with `WWW-Authenticate`. |
 | `missing_field` | no | Not returned by a tool. The input schema rejects a missing argument first. |
 | `rate_limited` | yes | Not returned by a tool. `POST /api/login` only. The OAuth consent form shares that limiter and answers with HTML, not this JSON. |
@@ -427,7 +441,9 @@ Reference files are text only. A file over 256 KB, or a file that would push the
 
 ### REST
 
-`GET /api/skills` and `GET /api/skills/:id` require `skills:read` for an agent credential. `PATCH /api/skills/:id`, `POST /api/skills/sync`, and `POST /api/skills/drift` are not in the agent scope table. A dashboard session or `MC_TOKEN` can call them. An agent credential cannot, including one that holds `skills:write`.
+`GET /api/skills` and `GET /api/skills/:id` require `skills:read` for an agent credential. `PATCH /api/skills/:id`, `POST /api/skills/sync`, `POST /api/skills/drift`, and `GET /api/skill-bundles` are not in the agent scope table. A dashboard session or `MC_TOKEN` can call them. An agent credential cannot, including one that holds `skills:write`. `GET /api/skills/:id` stays on `skills:read` when the id is `export`.
+
+`GET /api/skill-bundles?runtime=hermes&lane=` downloads a gzip tar of the tree for that runtime. The filter is the `list_skills` visibility check: trigger `off` is omitted, a trigger outside `off`, `on_request`, `auto_inject`, and `scheduled` is listed as `invalid trigger`, and a selected scope is omitted unless `lane` admits it. The directory is the skill id, the upstream directory slug. The frontmatter name may differ. The folder is the id. Category is a Hermes folder only (`<category>/<id>/SKILL.md`, or `uncategorized` when the category is blank). Claude, Codex, Grok, mini, and NemoClaw do not put category in the path. Codex, Grok, and NemoClaw use `.agents/skills/<id>/SKILL.md`. A Hermes category or an id outside `^[a-z0-9][a-z0-9-_]*$` is omitted and listed. The stored text is left as it is. Two skills that would share an archive path are both omitted. A reference that is unsafe, that collides case-insensitively, or that does not fit ustar is listed, and the skill is still exported. `manifest.json` holds the full skip list. `x-ak-skipped` carries the count, the first 20 entries, and `see manifest.json`, and is at most 4 KB. See [API.md](API.md#skill-bundles).
 
 `GET /api/skills?runtime=&q=&category=` returns `{ demo, upstream, skills }`. Each skill's `runtimes` is an array of names. Each skill also has `category` (string or null) and `tags` (array of strings), copied from SKILL.md frontmatter. `category` is one trimmed string. `tags` is a list of trimmed strings. A scalar string tag is kept as a one-element list. A missing key, a blank string, or any other shape is null or `[]`. Declared text is stored as written. It is not checked against the 16-value list in master-skills `TAXONOMY.md`. `category` on the query string is an exact case-insensitive match. The value `uncategorized` matches a null category. `GET /api/skills/:id` returns that same skill with `runtimes` as an object of booleans, plus `body`, `references` (paths only), `schedule`, and `triggers` (newest first, at most 50). An unknown runtime is HTTP 400. An unknown id is HTTP 404.
 
@@ -435,9 +451,9 @@ Reference files are text only. A file over 256 KB, or a file that would push the
 
 `runtimes` is optional in SKILL.md. Of the 161 skills in the default sources, 3 declare `runtimes`. Inference is the common path.
 
-An explicit `runtimes` list in the SKILL.md frontmatter wins. The same key in `skill.json` or `manifest.json` is used only when the frontmatter has no `runtimes` key. The names are `claude`, `codex`, `grok`, `hermes`, and `mini`. An unknown name is ignored and does not add the other runtimes. A value that is not a list of names is stored as Claude-only. That is a failure of evaluation. It is not a decision that the skill runs on every runtime. Frontmatter that cannot be parsed is not stored. An existing skill row and its settings stay. A skill that was not stored yet is skipped. The sync is failed.
+An explicit `runtimes` list in the SKILL.md frontmatter wins. The same key in `skill.json` or `manifest.json` is used only when the frontmatter has no `runtimes` key. The names are `claude`, `codex`, `grok`, `hermes`, `mini`, and `nemoclaw`. An unknown name is ignored and does not add the other runtimes. A value that is not a list of names is stored as Claude-only. That is a failure of evaluation. It is not a decision that the skill runs on every runtime. Frontmatter that cannot be parsed is not stored. An existing skill row and its settings stay. A skill that was not stored yet is skipped. The sync is failed.
 
-With no list, a skill is Claude-only when the frontmatter has `allowed-tools`, or when the body contains `mcp__`, `AskUserQuestion`, `TodoWrite`, `Skill tool`, `Agent tool`, or `ExitPlanMode`. Anything else is compatible with all five runtimes.
+With no list, a skill is Claude-only when the frontmatter has `allowed-tools`, or when the body contains `mcp__`, `AskUserQuestion`, `TodoWrite`, `Skill tool`, `Agent tool`, or `ExitPlanMode`. Anything else is compatible with all six runtimes. A stored row that has no `nemoclaw` boolean stays false for that flag until a sync rewrites it. That is the same rule a row stored before `hermes` existed already uses.
 
 `PATCH` accepts `trigger`, `scope`, and `schedule`. Unknown keys are HTTP 400. `trigger` is `off`, `on_request`, `auto_inject`, or `scheduled`. `scope.mode` `all` stores `lanes` as `[]`. `selected` requires at least one lane. `scheduled` requires a five-field cron (`*`, numbers, ranges, lists, and steps; no names). Any other trigger clears `schedule`. A present non-null `schedule` that is not a five-field cron is HTTP 400. `dry_run` is rejected. The task dry-run helper does not apply to skill settings. Saving a skill whose runtimes are all false is allowed and adds `warnings`.
 
@@ -476,7 +492,7 @@ curl -s -X POST https://YOUR-DEPLOY.example/api/skills/schedule/tick \
 On each tick, for every skill whose trigger is `scheduled`, whose skill row is not removed, and whose cron has a due minute in the last `AK_SKILL_SCHEDULE_CATCHUP_MINUTES` minutes (default 10, allowed 1 to 1440), it queues one task:
 
 - Title `Run scheduled skill <id>`. The description names the skill, the scope (all lanes, or the selected lanes), the due slot (`Scheduled slot: 2026-10-27T12:10Z`), the compatible runtimes, and the three `run_skill` steps. The task is created by the actor `skill-scheduler`, not by the caller of the route.
-- Routing follows the skill's runtime flags. A skill compatible with exactly one of `claude`, `codex`, `grok`, or `hermes` gets that platform (`claude-code`, `codex`, `grok`, `hermes`). Any other skill gets platform `any`, and the description lists the runtimes so a worker that is not listed leaves it. A skill compatible with only `mini` is also platform `any`, and is pinned to the machine in `AK_SKILL_MINI_MACHINE` when that is set. A skill with no compatible runtime is skipped as `no_runtime`.
+- Routing follows the skill's runtime flags. A skill compatible with exactly one of `claude`, `codex`, `grok`, or `hermes` gets that platform (`claude-code`, `codex`, `grok`, `hermes`). Any other skill gets platform `any`, and the description lists the runtimes so a worker that is not listed leaves it. A skill compatible with only `mini` is also platform `any`, and is pinned to the machine in `AK_SKILL_MINI_MACHINE` when that is set. A skill compatible with only `nemoclaw` is platform `any` and is not pinned to a machine. A skill with no compatible runtime is skipped as `no_runtime`.
 - The task carries the idempotency key `skill-schedule:<id>:<slot>`, so two ticks for the same minute, from any caller, make one task.
 
 A tick queues nothing for a skill when:

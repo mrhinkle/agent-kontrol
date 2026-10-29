@@ -144,3 +144,19 @@ export function scopeAdmits(scope: SkillScope, lane: string | null | undefined):
   if (!lane) return false;
   return scope.lanes.includes(lane);
 }
+
+/**
+ * The list_skills visibility check for trigger and lane.
+ * Callers still apply runtime, category, and query.
+ * Trigger off is hidden. A trigger outside off, on_request, auto_inject, and
+ * scheduled is hidden the same way. A selected scope with no lane is hidden.
+ * The lane has to be in scope.
+ */
+export function isListSkillVisible(
+  skill: { trigger: string; scope: SkillScope },
+  lane: string | null | undefined,
+): boolean {
+  if (!isTrigger(skill.trigger) || skill.trigger === "off") return false;
+  if (skill.scope.mode === "selected" && !lane) return false;
+  return scopeAdmits(skill.scope, lane);
+}
