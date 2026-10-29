@@ -16,6 +16,7 @@ import {
   interpretSlackResponse,
   interpretTelegramResponse,
   loadConfig,
+  main,
   parseBeatsResponse,
   parseJsonBody,
   readBeatsWithRetry,
@@ -640,35 +641,132 @@ describe("watch dry-run and redaction", () => {
     assert.equal(writes, 0);
   });
 
-  it("rejects a fixture path argument instead of reading it", async () => {
+  it("rejects a fixture path outside the working directory and temp", async () => {
     const result = await runCli(["--dry-run", "--fixture", "/etc/passwd"], {
       WATCH_STATE_PATH: path.join(os.tmpdir(), "watch83-state-rejected.json"),
     });
     assert.equal(result.code, 1);
     const output = `${result.out}\n${result.err}`;
-    assert.match(output, /unknown argument/);
+    assert.match(output, /fixture path rejected/);
     assert.equal(output.includes("root:"), false);
+    assert.equal(output.includes("dry-run decision"), false);
+  });
+
+  it("dry-run with credentials performs no HTTP and writes no state", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "watch83-"));
+    const state = path.join(dir, "missing", "state.json");
+    const calls: unknown[] = [];
+    const writes: unknown[] = [];
+    const logs: string[] = [];
+    const code = await main(
+      ["--dry-run"],
+      {
+        WATCH_AK_URL: "https://ak.example.test",
+        WATCH_AK_KEY: "akc_watch_check_secret_83_do_not_print",
+        WATCH_SLACK_WEBHOOK: "https://hooks.slack.com/services/T83/B83/SECRET83HOOK",
+        WATCH_TELEGRAM_TOKEN: "999:TELEGRAMSECRET83",
+        WATCH_TELEGRAM_CHAT: "4242",
+        WATCH_STATE_PATH: state,
+      },
+      {
+        http: async (call: unknown) => {
+          calls.push(call);
+          return { status: 200, body: "{\"beats\":[]}" };
+        },
+        stateStore: {
+          read: async () => null,
+          write: async (value: unknown) => {
+            writes.push(value);
+          },
+        },
+        log: (line: string) => logs.push(line),
+      },
+    );
+    assert.equal(code, 0);
+    assert.equal(calls.length, 0);
+    assert.equal(writes.length, 0);
+    assert.equal(fs.existsSync(state), false);
+    assert.deepEqual(logs, ["dry-run: no fixture, nothing evaluated"]);
+  });
+
+  it("dry-run with a fixture prints decisions and sends nothing", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "watch83-"));
+    const fixture = path.join(dir, "beats.json");
+    const state = path.join(dir, "missing", "state.json");
+    const secret = "akc_watch_check_secret_83_do_not_print";
+    fs.writeFileSync(fixture, JSON.stringify({ beats: [row({ status: "failing", age_s: 4, detail: secret })] }));
+    const calls: unknown[] = [];
+    const notes: unknown[] = [];
+    const posts: unknown[] = [];
+    const writes: unknown[] = [];
+    const logs: string[] = [];
+    const code = await main(
+      ["--dry-run", "--fixture", fixture],
+      {
+        WATCH_AK_URL: "https://ak.example.test",
+        WATCH_AK_KEY: secret,
+        WATCH_SLACK_WEBHOOK: "https://hooks.slack.com/services/T83/B83/SECRET83HOOK",
+        WATCH_TELEGRAM_TOKEN: "999:TELEGRAMSECRET83",
+        WATCH_TELEGRAM_CHAT: "4242",
+        WATCH_STATE_PATH: state,
+      },
+      {
+        http: async (call: unknown) => {
+          calls.push(call);
+          return { status: 200, body: "{\"beats\":[]}" };
+        },
+        notify: async (message: unknown) => {
+          notes.push(message);
+          return { ok: true };
+        },
+        postBeat: async (beat: unknown) => {
+          posts.push(beat);
+          return { ok: true };
+        },
+        stateStore: {
+          read: async () => null,
+          write: async (value: unknown) => {
+            writes.push(value);
+          },
+        },
+        log: (line: string) => logs.push(line),
+      },
+    );
+    assert.equal(code, 1);
+    assert.equal(calls.length, 0);
+    assert.equal(notes.length, 0);
+    assert.equal(posts.length, 0);
+    assert.equal(writes.length, 0);
+    assert.equal(fs.existsSync(state), false);
+    const output = logs.join("\n");
+    assert.match(output, /dry-run decision mini unhealthy:failing/);
+    assert.match(output, /dry-run alert slack slack\|mini\|unhealthy:failing/);
+    assert.match(output, /dry-run alert telegram telegram\|mini\|unhealthy:failing/);
+    assert.equal(output.includes(secret), false);
+    assert.equal(output.includes("SECRET83HOOK"), false);
+    assert.equal(output.includes("TELEGRAMSECRET83"), false);
+    assert.equal(output.includes("Authorization"), false);
   });
 
   it("CLI dry-run writes no state and prints no secret", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "watch83-"));
     const state = path.join(dir, "missing", "state.json");
+    const fixture = path.join(dir, "beats.json");
     const secret = "akc_watch_check_secret_83_do_not_print";
     const hook = "https://hooks.slack.com/services/T83/B83/SECRET83HOOK";
-    const result = await runCli(
-      ["--dry-run", "--fixture"],
-      {
-        WATCH_STATE_PATH: state,
-        WATCH_AK_KEY: secret,
-        WATCH_SLACK_WEBHOOK: hook,
-        WATCH_TELEGRAM_TOKEN: "999:TELEGRAMSECRET83",
-        WATCH_TELEGRAM_CHAT: "4242",
-      },
-      JSON.stringify({ beats: [row({ status: "failing", age_s: 4, detail: secret })] }),
-    );
+    fs.writeFileSync(fixture, JSON.stringify({ beats: [row({ status: "failing", age_s: 4, detail: secret })] }));
+    const result = await runCli(["--dry-run", "--fixture", fixture], {
+      WATCH_STATE_PATH: state,
+      WATCH_AK_URL: "https://ak.example.test",
+      WATCH_AK_KEY: secret,
+      WATCH_SLACK_WEBHOOK: hook,
+      WATCH_TELEGRAM_TOKEN: "999:TELEGRAMSECRET83",
+      WATCH_TELEGRAM_CHAT: "4242",
+    });
     assert.equal(result.code, 1);
     assert.equal(fs.existsSync(state), false);
     const output = `${result.out}\n${result.err}`;
+    assert.match(output, /dry-run decision mini unhealthy:failing/);
     assert.equal(output.includes(secret), false);
     assert.equal(output.includes("SECRET83HOOK"), false);
     assert.equal(output.includes("TELEGRAMSECRET83"), false);
@@ -708,7 +806,7 @@ describe("watch workflow", () => {
     const text = fs.readFileSync(workflowPath, "utf8");
     const doc = parseWorkflow(text) as {
       on: Record<string, unknown>;
-      permissions: { contents: string; actions: string };
+      permissions: { contents: string };
       concurrency: { group: string; "cancel-in-progress": boolean };
       jobs: {
         watch: {
@@ -726,8 +824,7 @@ describe("watch workflow", () => {
     assert.equal(doc.concurrency["cancel-in-progress"], false);
     assert.equal(doc.jobs.watch["timeout-minutes"], 5);
     assert.equal(doc.jobs.watch["runs-on"], "ubuntu-latest");
-    assert.equal(doc.permissions.contents, "read");
-    assert.equal(doc.permissions.actions, "write");
+    assert.deepEqual(doc.permissions, { contents: "read" });
     const steps = doc.jobs.watch.steps;
     const setup = steps.find((step) => step.uses === "actions/setup-node@v7");
     assert.equal(setup?.with?.["node-version"], "22");
@@ -736,8 +833,10 @@ describe("watch workflow", () => {
     assert.equal(restore?.with?.key, "watch-state-v1-${{ github.run_id }}-${{ github.run_attempt }}");
     assert.equal(restore?.with?.["restore-keys"], "watch-state-v1-");
     assert.equal(save?.with?.key, "watch-state-v1-${{ github.run_id }}-${{ github.run_attempt }}");
-    assert.match(String(save?.if), /always\(\)/);
     const live = "github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && vars.WATCH_ENABLED == 'true'";
+    assert.equal(restore?.if, `\${{ ${live} }}`);
+    assert.match(String(save?.if), /always\(\)/);
+    assert.ok(String(save?.if).includes(live));
     let secretSteps = 0;
     for (const step of steps) {
       if (!JSON.stringify(step).includes("secrets.")) continue;

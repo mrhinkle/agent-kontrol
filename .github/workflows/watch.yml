@@ -5,7 +5,9 @@
 # compares github.ref to refs/heads/<default_branch>.
 # Any other schedule or workflow_dispatch is a dry-run. secrets.* appear only
 # in the env of the gated "Watch check" step.
-# Cache save needs actions:write. The token cannot push (contents stays read).
+# Cache restore and save use the runner's scoped cache token. The job token
+# stays contents:read and cannot push. Both cache steps use the live gate,
+# so a dry-run or disabled run never creates a cache entry.
 
 name: Watch
 
@@ -16,7 +18,6 @@ on:
 
 permissions:
   contents: read
-  actions: write
 
 concurrency:
   group: watch
@@ -40,6 +41,7 @@ jobs:
           node-version: "22"
 
       - name: Restore watch state
+        if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && vars.WATCH_ENABLED == 'true' }}
         uses: actions/cache/restore@v4
         with:
           path: .watch-state
@@ -62,7 +64,7 @@ jobs:
         run: set +e; node scripts/watch-check.mjs; code=$?; echo "code=$code" >> "$GITHUB_OUTPUT"; exit 0
 
       - name: Save watch state
-        if: always() && hashFiles('.watch-state/state.json') != ''
+        if: ${{ always() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && vars.WATCH_ENABLED == 'true' && hashFiles('.watch-state/state.json') != '' }}
         continue-on-error: true
         uses: actions/cache/save@v4
         with:

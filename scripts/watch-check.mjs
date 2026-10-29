@@ -4,8 +4,11 @@
  *
  * Pure functions parse the beats document, compare it to scripts/watch.config.json,
  * and decide which alerts to send from the previous state. The CLI injects the
- * clock, sleep, HTTP, notifiers, and state store. `--dry-run` sends nothing,
- * posts no beat, and writes no state.
+ * clock, sleep, HTTP, notifiers, and state store. `--dry-run` performs no network
+ * I/O to Agent Kontrol, Slack, or Telegram. With `--fixture <path>` it evaluates
+ * that document and prints the decisions. It sends nothing, posts no beat, and
+ * writes no state. With no fixture it prints "dry-run: no fixture, nothing evaluated"
+ * and exits 0.
  *
  * Suppression boundary: a successful delivery is repeated when
  * now >= lastDeliveredAt + 12h, and held back one millisecond earlier.
@@ -651,8 +654,9 @@ function beatDetail(readOk, deliveryFailed) {
 
 /**
  * One watcher pass. Adapters: clock/now, sleep, request or readResult,
- * notify, postBeat, stateStore, log. Dry-run returns before any of those
- * side effects except the read, which the caller may already have stubbed.
+ * notify, postBeat, stateStore, log. Dry-run prints each finding and planned
+ * send, then returns before notify, postBeat, or a state write. The read is
+ * the caller's fixture or an already stubbed readResult.
  */
 export async function runWatch(options) {
   const now = typeof options.now === "number" ? options.now : options.clock();
@@ -680,6 +684,12 @@ export async function runWatch(options) {
   );
 
   if (dryRun) {
+    for (const finding of findings) {
+      safeLog(`dry-run decision ${finding.source} ${finding.condition}`);
+    }
+    for (const action of plan.actions) {
+      safeLog(`dry-run ${action.kind} ${action.destination} ${action.key}`);
+    }
     return watchExitCode({
       dryRun: true,
       readOk,
@@ -831,16 +841,6 @@ export function fileStateStore(file) {
   };
 }
 
-function readStdin() {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (chunk) => chunks.push(chunk));
-    process.stdin.on("end", () => resolve(chunks.join("")));
-    process.stdin.on("error", reject);
-  });
-}
-
 function collectSecrets(env) {
   return [env.WATCH_AK_KEY, env.WATCH_SLACK_WEBHOOK, env.WATCH_TELEGRAM_TOKEN, env.WATCH_TELEGRAM_CHAT].filter(
     (value) => typeof value === "string" && value.length > 0,
@@ -854,16 +854,43 @@ function destinationsFromEnv(env) {
   return list;
 }
 
+function parseWatchArgs(argv) {
+  let dryRun = false;
+  let fixturePath;
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--dry-run") {
+      dryRun = true;
+      continue;
+    }
+    if (arg === "--fixture") {
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith("--")) return { error: "watch fixture requires a path" };
+      if (fixturePath !== undefined) return { error: "watch unknown argument" };
+      fixturePath = next;
+      i += 1;
+      continue;
+    }
+    return { error: "watch unknown argument" };
+  }
+  if (fixturePath !== undefined && !dryRun) return { error: "watch fixture requires --dry-run" };
+  return { dryRun, fixturePath };
+}
+
 export async function main(argv, env, adapters = {}) {
   const log = adapters.log ?? ((line) => console.log(line));
   const secrets = collectSecrets(env);
   const safeLog = (line) => log(redact(line, secrets));
-  const dryRun = argv.includes("--dry-run");
-  const useFixture = argv.includes("--fixture");
-  for (const arg of argv) {
-    if (arg === "--dry-run" || arg === "--fixture") continue;
-    safeLog("watch unknown argument");
+  const parsed = parseWatchArgs(argv);
+  if (parsed.error) {
+    safeLog(parsed.error);
     return 1;
+  }
+  const dryRun = parsed.dryRun === true;
+
+  if (dryRun && parsed.fixturePath === undefined) {
+    safeLog("dry-run: no fixture, nothing evaluated");
+    return 0;
   }
 
   let configRaw;
@@ -879,19 +906,15 @@ export async function main(argv, env, adapters = {}) {
     return 1;
   }
 
-  if (dryRun && !useFixture && !env.WATCH_AK_URL) {
-    safeLog("dry-run: WATCH_AK_URL unset; skipped evaluation");
-    return 0;
-  }
-
   let fixtureBody;
-  if (useFixture) {
-    if (process.stdin.isTTY) {
-      safeLog("watch fixture expects a document on stdin");
+  if (parsed.fixturePath !== undefined) {
+    const resolved = resolveInsideRoots(parsed.fixturePath);
+    if (!resolved) {
+      safeLog("watch fixture path rejected");
       return 1;
     }
     try {
-      fixtureBody = await readStdin();
+      fixtureBody = await readFile(resolved, "utf8");
     } catch {
       safeLog("watch fixture unreadable");
       return 1;
@@ -907,36 +930,52 @@ export async function main(argv, env, adapters = {}) {
   const sleep = adapters.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const clock = adapters.clock ?? (() => Date.now());
 
-  let origin = "";
-  if (!dryRun || (fixtureBody === undefined && env.WATCH_AK_URL)) {
-    const checked = assertWatchUrl(env.WATCH_AK_URL);
-    if (!checked.ok) {
-      safeLog("watch AK URL rejected");
+  if (dryRun) {
+    try {
+      return await runWatch({
+        config: loaded.config,
+        destinations: destinationsFromEnv(env),
+        dryRun: true,
+        now: adapters.now,
+        clock,
+        sleep,
+        fixtureBody,
+        notify: adapters.notify ?? (async () => ({ ok: false })),
+        postBeat: adapters.postBeat ?? (async () => ({ ok: false })),
+        stateStore: adapters.stateStore ?? fileStateStore(statePath),
+        log,
+        secrets,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "error";
+      safeLog(`watch failed ${message}`);
       return 1;
     }
-    origin = checked.origin;
   }
-  if (!dryRun && !env.WATCH_AK_KEY) {
+
+  const checked = assertWatchUrl(env.WATCH_AK_URL);
+  if (!checked.ok) {
+    safeLog("watch AK URL rejected");
+    return 1;
+  }
+  const origin = checked.origin;
+  if (!env.WATCH_AK_KEY) {
     safeLog("watch AK credential missing");
     return 1;
   }
 
-  let request;
-  if (fixtureBody === undefined) {
-    const headers = { accept: "application/json" };
-    if (env.WATCH_AK_KEY) headers.authorization = `Bearer ${env.WATCH_AK_KEY}`;
-    request = async () =>
-      http({
-        url: `${origin}/api/watch/beats`,
-        method: "GET",
-        headers,
-        timeoutMs: READ_TIMEOUT_MS,
-      });
-  }
+  const headers = { accept: "application/json", authorization: `Bearer ${env.WATCH_AK_KEY}` };
+  const request = async () =>
+    http({
+      url: `${origin}/api/watch/beats`,
+      method: "GET",
+      headers,
+      timeoutMs: READ_TIMEOUT_MS,
+    });
 
-  let postBeat = adapters.postBeat;
-  if (!dryRun && !postBeat) {
-    postBeat = async (beat) => {
+  const postBeat =
+    adapters.postBeat ??
+    (async (beat) => {
       const response = await http({
         url: `${origin}/api/watch/beat`,
         method: "POST",
@@ -948,8 +987,7 @@ export async function main(argv, env, adapters = {}) {
         timeoutMs: DELIVERY_TIMEOUT_MS,
       });
       return interpretBeatResponse(response);
-    };
-  }
+    });
 
   const notify =
     adapters.notify ??
@@ -968,12 +1006,11 @@ export async function main(argv, env, adapters = {}) {
     return await runWatch({
       config: loaded.config,
       destinations: destinationsFromEnv(env),
-      dryRun,
+      dryRun: false,
       now: adapters.now,
       clock,
       sleep,
       request,
-      fixtureBody,
       notify,
       postBeat,
       stateStore: adapters.stateStore ?? fileStateStore(statePath),
