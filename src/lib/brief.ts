@@ -217,9 +217,23 @@ function num(value: unknown): number | null {
   return value;
 }
 
-function delta(now: number | null, then: number | null): number | null {
-  if (now === null || then === null) return null;
-  return Math.max(0, now - then);
+/**
+ * One window count from a cumulative counter.
+ *
+ * A missing side falls back to the 24h column: the first tick has no baseline.
+ * A decrease is a reset or rollback. That delta is null, and the 24h column
+ * is not a stand-in for a number the counter no longer supports.
+ */
+function windowCount(
+  windowHours: 24 | 72,
+  day: number | null,
+  latest: number | null,
+  baseline: number | null,
+): { value: number | null; reset: boolean } {
+  if (windowHours === 24) return { value: day, reset: false };
+  if (latest !== null && baseline !== null && latest < baseline) return { value: null, reset: true };
+  if (latest === null || baseline === null) return { value: day, reset: false };
+  return { value: latest - baseline, reset: false };
 }
 
 function median(values: number[]): number | null {
@@ -329,7 +343,7 @@ function leadHours(createdAt: string, mergedAt: string): number | null {
 }
 
 function mergedFromDetail(detail: SnapshotDetail | null, windowHours: number, nowIso: string): {
-  list: BriefMergedPr[];
+  list: BriefMergedPr[] | null;
   median: number | null;
   fromTimestamps: boolean;
 } {
@@ -361,11 +375,14 @@ function mergedFromDetail(detail: SnapshotDetail | null, windowHours: number, no
       author: typeof row.author === "string" ? row.author : null,
       lead_hours: num(row.lead_hours),
     }));
+  // A 72h list comes only from detail.merged. The 24h display list is a
+  // different window, so its absence here is unmeasured, not an empty array.
+  if (windowHours !== 24) return { list: null, median: null, fromTimestamps: false };
   const storedMedian = num(detail?.median_lead_hours);
   const leads = list.map((row) => row.lead_hours).filter((hours): hours is number => hours !== null);
   return {
-    list: windowHours === 24 ? list : [],
-    median: windowHours === 24 ? (storedMedian ?? median(leads)) : null,
+    list,
+    median: storedMedian ?? median(leads),
     fromTimestamps: false,
   };
 }
@@ -410,22 +427,18 @@ export function repoSection(args: {
   const { cfg, snap } = args;
   if (!snap) return incompleteSection(cfg, ["no snapshot"]);
   const detail = snap.detail;
-  let merged = args.windowHours === 24 ? snap.merged_prs_24h : delta(snap.total_prs_merged, args.baseline?.total_prs_merged ?? null);
-  let opened = args.windowHours === 24 ? snap.issues_opened_24h : delta(snap.total_issues_created, args.baseline?.total_issues_created ?? null);
-  let closed = args.windowHours === 24 ? snap.issues_closed_24h : delta(snap.total_issues_closed, args.baseline?.total_issues_closed ?? null);
-  if (args.windowHours !== 24) {
-    merged = merged ?? snap.merged_prs_24h;
-    opened = opened ?? snap.issues_opened_24h;
-    closed = closed ?? snap.issues_closed_24h;
-  }
+  const merged = windowCount(args.windowHours, snap.merged_prs_24h, snap.total_prs_merged, args.baseline?.total_prs_merged ?? null);
+  const opened = windowCount(args.windowHours, snap.issues_opened_24h, snap.total_issues_created, args.baseline?.total_issues_created ?? null);
+  const closed = windowCount(args.windowHours, snap.issues_closed_24h, snap.total_issues_closed, args.baseline?.total_issues_closed ?? null);
+  const reset = merged.reset || opened.reset || closed.reset;
   if (
     snap.open_issues === null ||
     snap.open_prs === null ||
-    merged === null ||
-    opened === null ||
-    closed === null
+    merged.value === null ||
+    opened.value === null ||
+    closed.value === null
   ) {
-    return incompleteSection(cfg, ["counts not measured"]);
+    return incompleteSection(cfg, [reset ? "cumulative counter decreased" : "counts not measured"]);
   }
   const mergedRows = mergedFromDetail(detail, args.windowHours, args.nowIso);
   const staleIssues = num(detail?.stale_issues);
@@ -439,11 +452,11 @@ export function repoSection(args: {
     short: cfg.short,
     incomplete: false,
     errors: [],
-    merged_prs: merged,
+    merged_prs: merged.value,
     median_lead_hours: mergedRows.median,
-    issues_opened: opened,
-    issues_closed: closed,
-    net_backlog: opened - closed,
+    issues_opened: opened.value,
+    issues_closed: closed.value,
+    net_backlog: opened.value - closed.value,
     open_issues: snap.open_issues,
     open_prs: snap.open_prs,
     drafts: num(detail?.drafts),
@@ -699,8 +712,15 @@ export function formatBriefText(
   lines.push("");
   for (const repo of brief.repos) {
     if (repo.merged_prs == null || repo.merged_prs <= 0) continue;
+    // A positive count with no measured list is not an empty heading.
+    // An empty array is a measured window with nothing to print.
+    if (repo.merged_list == null) {
+      lines.push(`SHIPPED: DATA INCOMPLETE \u2014 ${repo.label}`);
+      continue;
+    }
+    if (repo.merged_list.length === 0) continue;
     lines.push(`SHIPPED \u2014 ${repo.label}:`);
-    for (const pr of repo.merged_list ?? []) {
+    for (const pr of repo.merged_list) {
       const lead = pr.lead_hours == null ? "" : `${tenths(pr.lead_hours)}h`;
       lines.push(`  #${pr.number}  ${sliceText(pr.title, 80)}  (${pr.author ?? ""}, ${lead})`);
     }
@@ -852,7 +872,21 @@ export async function coordinatorFromDb(settings: BriefSettings, nowIso: string)
   }
 }
 
-export async function loadBrief(window: BriefWindow, now = new Date()): Promise<MorningBrief> {
+const DECISION_READ_LIMIT = 1000;
+
+/** Production reads at most 1000. A test may pass a smaller integer. Anything else stays 1000. */
+function decisionReadLimit(value: number | undefined): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > DECISION_READ_LIMIT) {
+    return DECISION_READ_LIMIT;
+  }
+  return value;
+}
+
+export async function loadBrief(
+  window: BriefWindow,
+  now = new Date(),
+  options?: { decisionLimit?: number },
+): Promise<MorningBrief> {
   const settings = briefConfig();
   const hours: 24 | 72 = window === "72h" ? 72 : 24;
   const nowIso = toSecondIso(now);
@@ -903,12 +937,21 @@ export async function loadBrief(window: BriefWindow, now = new Date()): Promise<
   let table: BriefDecision[] = [];
   let incompleteRepos: string[] = [];
   let decisionsMeasured = false;
+  const decisionLimit = decisionReadLimit(options?.decisionLimit);
   try {
-    const rows = await listDecisions({ status: "open", repo: null, source: null, limit: 1000, shape: "brief" });
-    const part = partitionBrief(rows, nowIso);
-    table = part.decisions;
-    incompleteRepos = part.incomplete_repos;
-    decisionsMeasured = true;
+    const rows = await listDecisions({ status: "open", repo: null, source: null, limit: decisionLimit, shape: "brief" });
+    if (rows.length >= decisionLimit) {
+      // A full page can hide another row. The set is unmeasured, so the page
+      // stays out of the list and the total stays null.
+      table = [];
+      incompleteRepos = watched.repos.map((repo) => repo.repo);
+      decisionsMeasured = true;
+    } else {
+      const part = partitionBrief(rows, nowIso);
+      table = part.decisions;
+      incompleteRepos = part.incomplete_repos;
+      decisionsMeasured = true;
+    }
   } catch {
     decisionsMeasured = false;
   }

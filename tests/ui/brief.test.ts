@@ -88,6 +88,25 @@ function jq(program: string, args: string[]): unknown {
   return JSON.parse(out);
 }
 
+/** The shell's SHIPPED block, fed a brief object on stdin. */
+function shellShipped(brief: unknown): string {
+  const script = fs.readFileSync("scripts/morning-brief.sh", "utf8");
+  const start = script.indexOf("shipped_lines() {");
+  const end = script.indexOf("# END shipped_lines");
+  assert.ok(start >= 0 && end > start, "shipped_lines markers");
+  const fn = script.slice(start, end);
+  return execFileSync("bash", ["-c", `${fn}\nshipped_lines`], {
+    input: JSON.stringify(brief),
+    encoding: "utf8",
+  });
+}
+
+/** Lines the text brief prints for shipped work, in order. */
+function shippedBlock(text: string): string {
+  const lines = text.split("\n").filter((line) => line.startsWith("SHIPPED") || /^  #\d+/.test(line));
+  return lines.length === 0 ? "" : `${lines.join("\n")}\n`;
+}
+
 function decision(repo: string, number: number, age: number, title: string): BriefDecision {
   return {
     repo,
@@ -1911,6 +1930,479 @@ describe("GET /api/brief", { concurrency: false }, () => {
     assert.equal(empty.totals.decisions, 0);
     assert.deepEqual(empty.incomplete_repos, []);
     assert.match(formatBriefText(empty, clock), /DECISIONS FOR YOU: none open\./);
+  });
+
+  it("a 72h merge count with no detail.merged does not print an empty SHIPPED heading", () => {
+    const now = "2026-10-27T12:00:00Z";
+    const clock = { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] };
+    const cfg = { repo: "acme/app", label: "Acme", short: "app", blockedLabel: null };
+    const decoy = { number: 1, title: "stored-decoy", url: "https://example.test/1", author: "a", lead_hours: 99 };
+    const snap = (over: Partial<RepoSnapshot> = {}): RepoSnapshot => ({
+      repo: "acme/app",
+      label: "Acme",
+      collected_at: now,
+      kind: "tick",
+      open_issues: 2,
+      open_prs: 1,
+      blocked_issues: 0,
+      merged_prs_24h: 1,
+      issues_closed_24h: 1,
+      issues_opened_24h: 1,
+      total_issues_created: 10,
+      total_issues_closed: 8,
+      total_prs_merged: 4,
+      review_rounds: null,
+      no_verdict_rate: null,
+      detail: { merged_list: [decoy], median_lead_hours: 99, stuck_prs: [] },
+      ...over,
+    });
+    const baseline = snap({ collected_at: "2026-10-24T12:00:00Z", total_prs_merged: 1 });
+    const weekend = repoSection({ cfg, snap: snap(), baseline, windowHours: 72, nowIso: now });
+    assert.equal(weekend.incomplete, false);
+    assert.equal(weekend.merged_prs, 3);
+    assert.equal(weekend.merged_list, null);
+    assert.equal(weekend.median_lead_hours, null);
+    const text = formatBriefText(assembleBrief({
+      generatedAt: now,
+      windowHours: 72,
+      repoSource: "dashboard",
+      stuckPrHours: 48,
+      staleIssueDays: 21,
+      coordinator: { configured: false, agent_id: null },
+      repos: [weekend],
+    }), clock);
+    assert.match(text, /SHIPPED: DATA INCOMPLETE — Acme/);
+    assert.equal(text.includes("SHIPPED — Acme:"), false);
+    assert.equal(text.includes("stored-decoy"), false);
+    assert.equal(/^SHIPPED — .+:\s*$/m.test(text), false);
+
+    const stamped = repoSection({
+      cfg,
+      snap: snap({
+        detail: {
+          merged: [{
+            number: 7,
+            title: "older",
+            url: "https://example.test/7",
+            author: "ada",
+            created_at: "2026-10-26T00:00:00Z",
+            merged_at: "2026-10-26T12:00:00Z",
+          }],
+        },
+      }),
+      baseline,
+      windowHours: 72,
+      nowIso: now,
+    });
+    assert.equal(stamped.merged_list?.[0]?.number, 7);
+    const stampedText = formatBriefText(assembleBrief({
+      generatedAt: now,
+      windowHours: 72,
+      repoSource: "dashboard",
+      stuckPrHours: 48,
+      staleIssueDays: 21,
+      coordinator: { configured: false, agent_id: null },
+      repos: [stamped],
+    }), clock);
+    assert.match(stampedText, /SHIPPED — Acme:\n {2}#7 {2}older {2}\(ada, 12h\)/);
+    assert.equal(stampedText.includes("SHIPPED: DATA INCOMPLETE"), false);
+
+    const measuredEmpty = repoSection({
+      cfg,
+      snap: snap({ detail: { merged: [] } }),
+      baseline,
+      windowHours: 72,
+      nowIso: now,
+    });
+    assert.deepEqual(measuredEmpty.merged_list, []);
+    assert.equal(measuredEmpty.merged_prs, 3);
+    const emptyText = formatBriefText(assembleBrief({
+      generatedAt: now,
+      windowHours: 72,
+      repoSource: "dashboard",
+      stuckPrHours: 48,
+      staleIssueDays: 21,
+      coordinator: { configured: false, agent_id: null },
+      repos: [measuredEmpty],
+    }), clock);
+    assert.equal(emptyText.includes("SHIPPED"), false);
+
+    const mixedRepos = [
+      section({
+        repo: "acme/app",
+        short: "app",
+        label: "Acme",
+        merged_prs: 3,
+        issues_opened: 0,
+        issues_closed: 0,
+        net_backlog: 0,
+        open_issues: 0,
+        open_prs: 0,
+        stuck_prs: [],
+        decisions: [],
+        merged_list: null,
+      }),
+      section({
+        repo: "beta/app",
+        short: "beta",
+        label: "Beta",
+        merged_prs: 1,
+        issues_opened: 0,
+        issues_closed: 0,
+        net_backlog: 0,
+        open_issues: 0,
+        open_prs: 0,
+        stuck_prs: [],
+        decisions: [],
+        merged_list: [{ number: 8, title: "landed", url: "https://example.test/8", author: "ada", lead_hours: 2 }],
+      }),
+      section({
+        repo: "gamma/app",
+        short: "gamma",
+        label: "Gamma",
+        merged_prs: 4,
+        issues_opened: 0,
+        issues_closed: 0,
+        net_backlog: 0,
+        open_issues: 0,
+        open_prs: 0,
+        stuck_prs: [],
+        decisions: [],
+        merged_list: [],
+      }),
+    ];
+    const mixed = assembleBrief({
+      generatedAt: now,
+      windowHours: 72,
+      repoSource: "dashboard",
+      stuckPrHours: 48,
+      staleIssueDays: 21,
+      coordinator: { configured: false, agent_id: null },
+      repos: mixedRepos,
+    });
+    const mixedText = formatBriefText(mixed, clock);
+    const shell = shellShipped({
+      repos: mixedRepos.map((repo) => ({ label: repo.label, merged_prs: repo.merged_prs, merged_list: repo.merged_list })),
+    });
+    assert.equal(shippedBlock(mixedText), shell);
+    assert.match(shell, /SHIPPED: DATA INCOMPLETE — Acme/);
+    assert.match(shell, /SHIPPED — Beta:\n {2}#8 {2}landed {2}\(ada, 2h\)/);
+    assert.equal(shell.includes("SHIPPED — Acme:"), false);
+    assert.equal(shell.includes("SHIPPED — Gamma:"), false);
+    assert.equal(shell.includes("Gamma"), false);
+
+    const odd = shellShipped({
+      repos: [
+        { label: "Acme", merged_prs: 2, merged_list: "missing" },
+        { label: "Beta", merged_prs: 2, merged_list: { number: 1 } },
+        { label: "Gamma", merged_prs: 0, merged_list: null },
+        { label: "Delta", merged_prs: null, merged_list: null },
+      ],
+    });
+    assert.equal(odd, "SHIPPED: DATA INCOMPLETE — Acme\nSHIPPED: DATA INCOMPLETE — Beta\n");
+  });
+
+  it("a decreased cumulative counter is null and DATA INCOMPLETE", async () => {
+    const now = "2026-10-27T12:00:00Z";
+    const clock = { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] };
+    const cfg = { repo: "acme/app", label: "Acme", short: "app", blockedLabel: null };
+    const base = (over: Partial<RepoSnapshot> = {}): RepoSnapshot => ({
+      repo: "acme/app",
+      label: "Acme",
+      collected_at: "2026-10-24T12:00:00Z",
+      kind: "tick",
+      open_issues: 2,
+      open_prs: 1,
+      blocked_issues: 0,
+      merged_prs_24h: 7,
+      issues_closed_24h: 5,
+      issues_opened_24h: 4,
+      total_issues_created: 20,
+      total_issues_closed: 16,
+      total_prs_merged: 10,
+      review_rounds: null,
+      no_verdict_rate: null,
+      detail: { stuck_prs: [], merged: [] },
+      ...over,
+    });
+    const render = (row: BriefRepo) => formatBriefText(assembleBrief({
+      generatedAt: now,
+      windowHours: 72,
+      repoSource: "dashboard",
+      stuckPrHours: 48,
+      staleIssueDays: 21,
+      coordinator: { configured: false, agent_id: null },
+      repos: [row],
+    }), clock);
+    const drops: { field: "total_prs_merged" | "total_issues_created" | "total_issues_closed"; latest: number }[] = [
+      { field: "total_prs_merged", latest: 9 },
+      { field: "total_issues_created", latest: 3 },
+      { field: "total_issues_closed", latest: 1 },
+    ];
+    for (const drop of drops) {
+      const section = repoSection({
+        cfg,
+        snap: base({ collected_at: now, [drop.field]: drop.latest }),
+        baseline: base(),
+        windowHours: 72,
+        nowIso: now,
+      });
+      assert.equal(section.incomplete, true, drop.field);
+      assert.deepEqual(section.errors, ["cumulative counter decreased"], drop.field);
+      assert.equal(section.merged_prs, null, drop.field);
+      assert.equal(section.issues_opened, null, drop.field);
+      assert.equal(section.issues_closed, null, drop.field);
+      assert.equal(section.net_backlog, null, drop.field);
+      const text = render(section);
+      assert.match(text, /DATA INCOMPLETE/, drop.field);
+      assert.match(text, /cumulative counter decreased/, drop.field);
+      assert.equal(/\d+ PRs merged/.test(text), false, drop.field);
+      assert.equal(text.includes("SHIPPED"), false, drop.field);
+      const table = text.split("\n").find((line) => line.startsWith("!! Acme"));
+      assert.ok(table, drop.field);
+      assert.equal(/\b0\b/.test(table), false, drop.field);
+      assert.equal(table.includes("7"), false, drop.field);
+    }
+
+    const held = repoSection({
+      cfg,
+      snap: base({ collected_at: now }),
+      baseline: base(),
+      windowHours: 72,
+      nowIso: now,
+    });
+    assert.equal(held.incomplete, false);
+    assert.equal(held.merged_prs, 0);
+    assert.equal(held.issues_opened, 0);
+    assert.equal(held.issues_closed, 0);
+    assert.match(render(held), /0 PRs merged, 0 issues closed, 0 opened — the queue held level\./);
+
+    const grew = repoSection({
+      cfg,
+      snap: base({ collected_at: now, total_prs_merged: 16, total_issues_created: 23, total_issues_closed: 19 }),
+      baseline: base(),
+      windowHours: 72,
+      nowIso: now,
+    });
+    assert.equal(grew.incomplete, false);
+    assert.equal(grew.merged_prs, 6);
+    assert.equal(grew.issues_opened, 3);
+    assert.equal(grew.issues_closed, 3);
+
+    const noBaseline = repoSection({
+      cfg,
+      snap: base({ collected_at: now, merged_prs_24h: 3, issues_opened_24h: 2, issues_closed_24h: 1 }),
+      baseline: null,
+      windowHours: 72,
+      nowIso: now,
+    });
+    assert.equal(noBaseline.incomplete, false);
+    assert.equal(noBaseline.merged_prs, 3);
+    assert.equal(noBaseline.issues_opened, 2);
+    assert.equal(noBaseline.issues_closed, 1);
+
+    const repo = "example-org/app-server";
+    installSnapshotSql([
+      snapshotRow({
+        repo,
+        label: "App Server",
+        collected_at: "2026-10-24T12:00:00.000Z",
+        open_issues: 2,
+        open_prs: 1,
+        merged_prs_24h: 7,
+        issues_opened_24h: 4,
+        issues_closed_24h: 5,
+        total_issues_created: 20,
+        total_issues_closed: 16,
+        total_prs_merged: 10,
+      }),
+      snapshotRow({
+        repo,
+        label: "App Server",
+        collected_at: "2026-10-27T14:00:00.000Z",
+        open_issues: 2,
+        open_prs: 1,
+        merged_prs_24h: 7,
+        issues_opened_24h: 4,
+        issues_closed_24h: 5,
+        total_issues_created: 23,
+        total_issues_closed: 19,
+        total_prs_merged: 4,
+      }),
+    ]);
+    const loaded = await loadBrief("72h", new Date("2026-10-27T15:00:00Z"));
+    const loadedRepo = loaded.repos.find((row) => row.repo === repo);
+    assert.equal(loadedRepo?.incomplete, true);
+    assert.equal(loadedRepo?.merged_prs, null);
+    assert.ok(loadedRepo?.errors.includes("cumulative counter decreased"));
+    assert.equal(loaded.totals.merged_prs, null);
+    const loadedText = formatBriefText(loaded, clock);
+    assert.match(loadedText, /DATA INCOMPLETE/);
+    assert.equal(/\d+ PRs merged/.test(loadedText), false);
+
+    const day = await loadBrief("24h", new Date("2026-10-27T15:00:00Z"));
+    const dayRepo = day.repos.find((row) => row.repo === repo);
+    assert.equal(dayRepo?.incomplete, false);
+    assert.equal(dayRepo?.merged_prs, 7);
+    assert.equal(dayRepo?.errors.includes("cumulative counter decreased"), false);
+  });
+
+  it("a decisions page at the read limit is incomplete", async () => {
+    const now = new Date("2026-10-27T12:00:00Z");
+    const clock = { clock: "Tue 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] };
+    const names = ["example-org/app-server", "example-org/web-studio", "example-org/agent-harness"];
+    const snapshots = names.map((name) => snapshotRow({
+      repo: name,
+      label: name,
+      collected_at: "2026-10-27T14:00:00.000Z",
+      open_issues: 3,
+      open_prs: 1,
+      merged_prs_24h: 1,
+      issues_opened_24h: 0,
+      issues_closed_24h: 0,
+      detail: { stuck_prs: [], merged: [] },
+    }));
+    const titles = ["first gate", "second gate", "third gate"];
+    const decisions = names.map((name, index) => ({
+      id: index + 1,
+      key: `github:${name}#${index + 1}`,
+      source: "github-label",
+      repo: name,
+      repo_short: name.split("/")[1],
+      number: index + 1,
+      url: `https://example.test/${name}/issues/${index + 1}`,
+      title: titles[index],
+      status: "open",
+      kind: "issue",
+      labels: ["needs-owner"],
+      opened_at: "2026-10-20T12:00:00Z",
+      github_present: true,
+      first_seen_at: "2026-10-20T12:00:00Z",
+    }));
+    const seen = { limit: null as number | null };
+    const install = () => {
+      seen.limit = null;
+      env.DATABASE_URL = "postgres://brief:brief@127.0.0.1:9/brief_test";
+      setSqlForTests(async (strings, ...values) => {
+        const text = strings.join(" ");
+        if (text.includes("from watched_repos")) return [];
+        if (text.includes("from decisions")) {
+          for (let i = 0; i < strings.length - 1; i++) {
+            if (/\blimit\s*$/.test(strings[i])) seen.limit = Number(values[i]);
+          }
+          const limit = seen.limit ?? decisions.length;
+          return decisions.slice(0, limit);
+        }
+        if (text.includes("from agents") || text.includes("from events")) return [];
+        if (!text.includes("from repo_snapshots")) throw new Error(`unexpected sql: ${text}`);
+        return snapshots;
+      });
+    };
+
+    install();
+    const full = await loadBrief("24h", now, { decisionLimit: 2 });
+    assert.equal(seen.limit, 2);
+    assert.equal(full.totals.decisions, null);
+    assert.equal(full.totals.merged_prs, 3);
+    assert.deepEqual(full.decisions, []);
+    assert.equal(full.repos.every((row) => row.decisions === null), true);
+    assert.equal(full.repos.every((row) => row.incomplete === false), true);
+    assert.equal(full.repos.every((row) => row.errors.includes("decisions incomplete")), true);
+    const fullText = formatBriefText(full, clock);
+    assert.match(fullText, /DECISIONS FOR YOU: DATA INCOMPLETE\./);
+    assert.match(fullText, /3 PRs merged/);
+    assert.equal(/DECISIONS FOR YOU \(\d+\)/.test(fullText), false);
+    assert.equal(fullText.includes("none open"), false);
+    assert.equal(fullText.includes("Fleet totals stay unknown"), false);
+    for (const title of titles) assert.equal(fullText.includes(title), false, title);
+
+    install();
+    const exact = await loadBrief("24h", now, { decisionLimit: 3 });
+    assert.equal(seen.limit, 3);
+    assert.equal(exact.totals.decisions, null);
+    assert.deepEqual(exact.decisions, []);
+    assert.match(formatBriefText(exact, clock), /DECISIONS FOR YOU: DATA INCOMPLETE\./);
+
+    install();
+    const under = await loadBrief("24h", now, { decisionLimit: 4 });
+    assert.equal(seen.limit, 4);
+    assert.equal(under.totals.decisions, 3);
+    assert.deepEqual(under.decisions.map((row) => row.number).sort((a, b) => a - b), [1, 2, 3]);
+    assert.equal(under.repos.every((row) => Array.isArray(row.decisions)), true);
+    assert.equal(under.incomplete_repos.length, 0);
+    const underText = formatBriefText(under, clock);
+    assert.match(underText, /DECISIONS FOR YOU \(3\)/);
+    for (const title of titles) assert.match(underText, new RegExp(title));
+    assert.equal(underText.includes("DATA INCOMPLETE"), false);
+
+    install();
+    const defaults = await loadBrief("24h", now);
+    assert.equal(seen.limit, 1000);
+    assert.equal(defaults.totals.decisions, 3);
+
+    for (const bad of [0, -1, 1.5, 1001]) {
+      install();
+      const brief = await loadBrief("24h", now, { decisionLimit: bad });
+      assert.equal(seen.limit, 1000, String(bad));
+      assert.equal(brief.totals.decisions, 3, String(bad));
+    }
+  });
+
+  it("demo mode keeps the brief DATA INCOMPLETE and does not serve demo progress", async () => {
+    setSqlForTests(async () => {
+      throw new Error("demo brief must not query");
+    });
+    delete env.DATABASE_URL;
+    const now = new Date("2026-10-27T12:00:00Z");
+    const clock = { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] };
+    for (const window of ["24h", "72h"] as const) {
+      const brief = await loadBrief(window, now);
+      assert.equal((brief as { demo?: unknown }).demo, undefined, window);
+      assert.equal(brief.totals.merged_prs, null, window);
+      assert.equal(brief.totals.issues_opened, null, window);
+      assert.equal(brief.totals.issues_closed, null, window);
+      assert.equal(brief.totals.net_backlog, null, window);
+      assert.equal(brief.totals.open_issues, null, window);
+      assert.equal(brief.totals.open_prs, null, window);
+      assert.equal(brief.totals.stuck_prs, null, window);
+      assert.equal(brief.totals.decisions, null, window);
+      assert.equal(brief.totals.repos_counted, 0, window);
+      assert.ok(brief.repos.length > 0, window);
+      for (const repo of brief.repos) {
+        assert.equal(repo.incomplete, true, window);
+        assert.deepEqual(repo.errors, ["no snapshot"], window);
+        assert.equal(repo.merged_prs, null, window);
+        assert.equal(repo.open_issues, null, window);
+        assert.equal(repo.decisions, null, window);
+        assert.equal(repo.stuck_prs, null, window);
+      }
+      const encoded = JSON.stringify(brief);
+      assert.equal(encoded.includes('"open_issues":40'), false, window);
+      assert.equal(encoded.includes('"open_issues":100'), false, window);
+      assert.equal(encoded.includes('"open_issues":60'), false, window);
+      assert.equal(encoded.includes('"merged_prs":12'), false, window);
+      const text = formatBriefText(brief, clock);
+      assert.match(text, /DATA INCOMPLETE for \d+ of \d+ repos/, window);
+      assert.match(text, /PRs merged, issues closed, and issues opened: DATA INCOMPLETE\./, window);
+      assert.match(text, /DECISIONS FOR YOU: DATA INCOMPLETE\./, window);
+      assert.match(text, /STUCK PRs: DATA INCOMPLETE\./, window);
+      assert.equal(/\d+ PRs merged/.test(text), false, window);
+      assert.equal(/\bnone\b/i.test(text), false, window);
+      assert.equal(text.includes("no snapshot"), true, window);
+    }
+
+    const res = await GET(briefRequest("?window=72h", { accept: "application/json" }));
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.demo, undefined);
+    assert.equal(body.totals.merged_prs, null);
+    assert.equal(body.totals.repos_counted, 0);
+    assert.ok(body.repos.every((repo: { incomplete: boolean; errors: string[]; open_issues: number | null }) =>
+      repo.incomplete && repo.errors.includes("no snapshot") && repo.open_issues === null));
+    const text = await bodyText(await GET(briefRequest("?window=72h")));
+    assert.match(text, /DATA INCOMPLETE/);
+    assert.equal(/\d+ PRs merged/.test(text), false);
+    assert.equal(text.includes("undefined"), false);
   });
 
   it("shell workKinds accepts the array form the TypeScript reader accepts", () => {
