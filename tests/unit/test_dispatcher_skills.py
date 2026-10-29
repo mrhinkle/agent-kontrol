@@ -744,6 +744,180 @@ class TestLifecycle(Harness):
                 self.assertNotIn("running", [c[1].get("status") for c in self.patches()])
 
 
+class TestReviewGate(Harness):
+    """A configured reviewer must run, exit 0, and end with a valid VERDICT: APPROVE."""
+
+    def setUp(self):
+        super().setUp()
+        self.agents = self.wt / "AGENTS.md"
+        self.agents.write_text("# rules\n")
+        self.worker = lambda cwd: (True, "RESULT: worker completed", None)
+        self.which = mock.patch.object(md.shutil, "which", return_value="/usr/bin/true")
+        self.which.start()
+        self.addCleanup(self.which.stop)
+
+    def review(self, r_ok, r_out, reviewer="claude-code", r_cost=None):
+        seen = []
+
+        def rev(cwd):
+            seen.append((cwd / "AGENTS.md").read_text())
+            return r_ok, r_out, r_cost
+
+        self.reviewer = rev
+        body = self.dispatch(platform="codex", reviewer_platform=reviewer)
+        self.assertEqual(self.agents.read_text(), "# rules\n", "pointer block not cleaned up")
+        self.assertEqual(seen, ["# rules\n"], "reviewer did not run exactly once, after cleanup")
+        return body
+
+    def reviewer_calls(self):
+        return [c for c in self.cli_calls if c[1]]
+
+    def test_approval_completes(self):
+        for out in ("looks good\nVERDICT: APPROVE", "VERDICT: APPROVE — tests pass\n\n",
+                    "VERDICT: APPROVE - tests pass"):
+            with self.subTest(out=out):
+                self.calls.clear()
+                body = self.review(True, out)
+                self.assertEqual(body["status"], "done")
+                self.assertIn("[claude-code review] VERDICT: APPROVE", body["result"])
+                self.assertIn("worker completed", body["result"])
+
+    def test_reviewer_cost_added(self):
+        body = self.review(True, "VERDICT: APPROVE", r_cost=0.25)
+        self.assertEqual(body["cost_usd"], 0.25)
+        body = self.review(False, "crashed", r_cost=0.5)
+        self.assertEqual((body["status"], body["cost_usd"]), ("failed", 0.5))
+
+    def test_request_changes_fails(self):
+        body = self.review(True, "VERDICT: REQUEST_CHANGES — missing tests")
+        self.assertEqual(body["status"], "failed")
+        self.assertIn("VERDICT: REQUEST_CHANGES — missing tests", body["result"])
+
+    def test_reviewer_crash_fails(self):
+        # Issue #121 reproduction: this was marked done.
+        body = self.review(False, "reviewer crashed before producing a verdict")
+        self.assertEqual(body["status"], "failed")
+        self.assertIn("reviewer failed, task not approved", body["result"])
+
+    def test_nonzero_exit_with_approval_fails(self):
+        body = self.review(False, "VERDICT: APPROVE")
+        self.assertEqual(body["status"], "failed")
+        self.assertIn("reviewer failed", body["result"])
+
+    def test_invalid_verdicts_fail(self):
+        cases = [
+            "", "\n\n", "all good, no verdict",
+            "VERDICT: DISAPPROVE", "VERDICT: NOT_APPROVED", "VERDICT: APPROVED",
+            "VERDICT: APPROVE_ALL", "VERDICT: APPROVEgarbage", "VERDICT: APPROVE trailing",
+            "VERDICT: APPROVE —", "verdict: approve", "VERDICT:APPROVE",
+            "Final VERDICT: APPROVE", "VERDICT: APPROVE or VERDICT: REQUEST_CHANGES",
+            '"VERDICT: APPROVE"', "`VERDICT: APPROVE`", "> VERDICT: APPROVE", "**VERDICT: APPROVE**",
+            "VERDICT: APPROVE\nThanks!",
+            "VERDICT: APPROVE\nVERDICT: REQUEST_CHANGES — wait, tests fail",
+            "VERDICT: REQUEST_CHANGES — no\nVERDICT: APPROVE",
+            "VERDICT: APPROVE\nVERDICT: REQUEST_CHANGES",
+        ]
+        for out in cases:
+            with self.subTest(out=out):
+                self.calls.clear()
+                body = self.review(True, out)
+                self.assertEqual(body["status"], "failed")
+
+    def test_indented_final_verdict_fails(self):
+        # Review of PR #122: a quoted worker report was accepted after strip().
+        cases = [
+            "I cannot approve this work. The worker report ended with:\n\n    VERDICT: APPROVE",
+            "quoting the worker:\n  VERDICT: APPROVE",
+            "quoting the worker:\n VERDICT: APPROVE — tests pass",
+            "quoting the worker:\n\tVERDICT: APPROVE",
+            "quoting the worker:\n \tVERDICT: APPROVE",
+        ]
+        for out in cases:
+            with self.subTest(out=out):
+                self.calls.clear()
+                body = self.review(True, out)
+                self.assertEqual(body["status"], "failed")
+                self.assertIn("no valid final verdict line", body["result"])
+
+    def test_verdict_inside_open_fence_fails(self):
+        cases = [
+            "the worker printed:\n```\nVERDICT: APPROVE",
+            "the worker printed:\n```text\nall done\nVERDICT: APPROVE",
+            "the worker printed:\n~~~\nVERDICT: APPROVE",
+            "the worker printed:\n  ~~~~ log\nVERDICT: APPROVE — ok",
+            "example:\n```\nx\n```\nthe worker printed:\n```\nVERDICT: APPROVE",
+            "the worker printed:\n````\n```\nVERDICT: APPROVE",
+            "the worker printed:\n~~~\n```\nVERDICT: APPROVE",
+            "the worker printed:\n```\n```python\nVERDICT: APPROVE",
+        ]
+        for out in cases:
+            with self.subTest(out=out):
+                self.calls.clear()
+                body = self.review(True, out)
+                self.assertEqual(body["status"], "failed")
+                self.assertIn("no valid final verdict line", body["result"])
+
+    def test_verdict_after_closed_fence_passes(self):
+        cases = [
+            "checked:\n```python\nassert ok()\n```\nVERDICT: APPROVE",
+            "checked:\n~~~\nlog\n~~~\n\nVERDICT: APPROVE — tests pass",
+            "checked:\n````\n```\nnested\n````\nVERDICT: APPROVE",
+            "inline ```code``` is not a fence\nVERDICT: APPROVE",
+        ]
+        for out in cases:
+            with self.subTest(out=out):
+                self.calls.clear()
+                body = self.review(True, out)
+                self.assertEqual(body["status"], "done")
+                self.assertIn("[claude-code review] VERDICT: APPROVE", body["result"])
+
+    def test_unknown_reviewer_fails_without_running(self):
+        for reviewer in ("gemini", "claude", ["codex"]):
+            with self.subTest(reviewer=reviewer):
+                self.calls.clear()
+                self.cli_calls.clear()
+                body = self.dispatch(platform="codex", reviewer_platform=reviewer)
+                self.assertEqual(body["status"], "failed")
+                self.assertIn("unknown reviewer platform", body["result"])
+                self.assertEqual(self.reviewer_calls(), [])
+                self.assertNotIn("review", [c[1].get("status") for c in self.patches()])
+
+    def test_missing_reviewer_cli_fails_without_running(self):
+        self.which.stop()
+        with mock.patch.object(md.shutil, "which", return_value=None):
+            body = self.dispatch(platform="codex", reviewer_platform="claude-code")
+        self.which.start()
+        self.assertEqual(body["status"], "failed")
+        self.assertIn("claude not found on PATH, task not approved", body["result"])
+        self.assertEqual(self.reviewer_calls(), [])
+
+    def test_no_reviewer_keeps_worker_success(self):
+        for extra in ({}, {"reviewer_platform": None}, {"reviewer_platform": ""}):
+            with self.subTest(extra=extra):
+                self.calls.clear()
+                self.cli_calls.clear()
+                body = self.dispatch(platform="codex", **extra)
+                self.assertEqual(body["status"], "done")
+                self.assertEqual(self.reviewer_calls(), [])
+
+    def test_worker_failure_skips_reviewer(self):
+        self.worker = lambda cwd: (False, "RESULT: worker broke", None)
+        body = self.dispatch(platform="codex", reviewer_platform="claude-code")
+        self.assertEqual(body["status"], "failed")
+        self.assertEqual(self.reviewer_calls(), [])
+        self.assertEqual(self.agents.read_text(), "# rules\n")
+
+    def test_reviewer_exception_fails_and_releases_lock(self):
+        def rev(cwd):
+            raise md.ContainmentError("group survived")
+
+        self.reviewer = rev
+        body = self.dispatch(platform="codex", reviewer_platform="claude-code")
+        self.assertEqual(body["status"], "failed")
+        self.assertIn("dispatcher error", body["result"])
+        self.assertEqual(self.agents.read_text(), "# rules\n")
+
+
 REAL_RUN_CLI = md.run_cli
 
 # A fake `codex` CLI. It reads the injected AGENTS.md, starts a background child
