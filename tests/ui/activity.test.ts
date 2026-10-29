@@ -39,10 +39,11 @@ import {
   setDemoClockForTests,
 } from "../../src/lib/demo-store";
 import { rememberForTool, updateTaskForTool } from "../../src/lib/dry-run-actions";
+import { setSqlForTests } from "../../src/lib/db";
 import { ACTIVITY_LIST, encodeCursor, TASK_REST } from "../../src/lib/list-params";
 import { listActivityResult } from "../../src/lib/list-read";
 import { deleteNoteTool, requeueTaskTool, sendMessageTool } from "../../src/lib/operator-actions";
-import { authorizeTool } from "../../src/lib/scopes";
+import { authorizeRoute, authorizeTool, scopeForRoute, SCOPES } from "../../src/lib/scopes";
 
 /**
  * A successful tools/call goes through mcp-handler, which keeps a session
@@ -570,7 +571,7 @@ describe("activity log", { concurrency: false }, () => {
     assert.equal(toolLimit.isError, true);
   });
 
-  it("F5 missing auth is 401 and a credential without fleet:read is 403", async () => {
+  it("F5 missing auth is 401 and an agent credential is 403", async () => {
     env.MC_DASHBOARD_PASSWORD = "activity-gate";
     env.MC_TOKEN = "activity-legacy";
     const open = await getActivity(new Request("http://localhost/api/activity"));
@@ -591,20 +592,19 @@ describe("activity log", { concurrency: false }, () => {
     assert.equal(denied.status, 403);
     const deniedBody = await denied.json() as { code: string; fix: string };
     assert.equal(deniedBody.code, "insufficient_scope");
-    assert.equal(deniedBody.fix, "Use a credential that has the fleet:read scope");
+    assert.equal(deniedBody.fix, "This route is not granted by any agent scope.");
     assert.equal(JSON.stringify(deniedBody).includes(reader.token), false);
     const toolDenied = authorizeTool({ kind: "agent", id: "tasks-only", scopes: ["tasks:read"] }, "list_activity");
     assert.equal(toolDenied.ok, false);
 
-    const allowedCred = await createCredential({ label: "fleet", scopes: ["fleet:read"] });
-    assert.equal(allowedCred.ok, true);
-    if (!allowedCred.ok) return;
-    const allowed = await getActivity(new Request("http://localhost/api/activity", {
-      headers: { authorization: `Bearer ${allowedCred.token}` },
+    const fleetCred = await createCredential({ label: "fleet", scopes: ["fleet:read"] });
+    assert.equal(fleetCred.ok, true);
+    if (!fleetCred.ok) return;
+    const fleetRead = await getActivity(new Request("http://localhost/api/activity", {
+      headers: { authorization: `Bearer ${fleetCred.token}` },
     }));
-    assert.equal(allowed.status, 200);
-    assert.equal(((await allowed.json()) as ActivityJson).demo, true);
-    assert.equal(authorizeTool({ kind: "agent", id: allowedCred.credential.id, scopes: ["fleet:read"] }, "list_activity").ok, true);
+    assert.equal(fleetRead.status, 403);
+    assert.equal(authorizeTool({ kind: "agent", id: fleetCred.credential.id, scopes: ["fleet:read"] }, "list_activity").ok, false);
 
     const legacy = await getActivity(new Request("http://localhost/api/activity", {
       headers: { authorization: "Bearer activity-legacy" },
@@ -633,9 +633,9 @@ describe("activity log", { concurrency: false }, () => {
     const noScopeBody = await noScope.json() as { code: string };
     assert.equal(noScopeBody.code, "insufficient_scope");
     assert.equal(JSON.stringify(noScopeBody).includes(reader.token), false);
-    const ok = await postMcp(call(allowedCred.token));
-    assert.notEqual(ok.status, 401);
-    assert.notEqual(ok.status, 403);
+    const fleetCall = await postMcp(call(fleetCred.token));
+    assert.equal(fleetCall.status, 403);
+    await fleetCall.json().catch(() => undefined);
   });
 
   it("F6 write text is the previous sentence plus one receipt line", async () => {
@@ -777,6 +777,147 @@ describe("activity log", { concurrency: false }, () => {
     assert.deepEqual(replayedTask.receipt, created.receipt);
     assert.deepEqual(replayedMessage.receipt, sent.receipt);
     assert.equal(demoStoreSize().events, before, "a replay does not insert a receipt");
+  });
+
+  it("F10 an agent credential with fleet:read is forbidden on activity the same way traces are", async () => {
+    env.MC_DASHBOARD_PASSWORD = "activity-gate";
+    env.MC_TOKEN = "activity-legacy";
+    const fleet = await createCredential({ label: "fleet reader", scopes: ["fleet:read"] });
+    assert.equal(fleet.ok, true);
+    if (!fleet.ok) return;
+    const everyScope = { kind: "agent" as const, id: "every-scope", scopes: [...SCOPES] };
+
+    const rest = await getActivity(new Request("http://localhost/api/activity", {
+      headers: { authorization: `Bearer ${fleet.token}` },
+    }));
+    assert.equal(rest.status, 403);
+    const restBody = await rest.json() as { code: string; fix: string; retryable: boolean };
+    assert.equal(restBody.code, "insufficient_scope");
+    assert.equal(restBody.retryable, false);
+    assert.equal(restBody.fix, "This route is not granted by any agent scope.");
+    assert.equal(JSON.stringify(restBody).includes(fleet.token), false);
+
+    assert.equal(scopeForRoute("GET", "/api/activity"), null);
+    assert.equal(scopeForRoute("GET", "/api/traces"), null);
+    assert.equal(authorizeRoute({ kind: "agent", id: fleet.credential.id, scopes: ["fleet:read"] }, "GET", "/api/activity").ok, false);
+    assert.equal(authorizeRoute(everyScope, "GET", "/api/activity").ok, false);
+    assert.equal(authorizeRoute({ kind: "legacy" }, "GET", "/api/activity").ok, true);
+    assert.equal(authorizeRoute({ kind: "session" }, "GET", "/api/activity").ok, true);
+
+    const tool = authorizeTool({ kind: "agent", id: fleet.credential.id, scopes: ["fleet:read"] }, "list_activity");
+    assert.equal(tool.ok, false);
+    if (!tool.ok) {
+      assert.equal(tool.status, 403);
+      assert.equal(tool.body.code, "insufficient_scope");
+      assert.equal(tool.body.fix, "This route is not granted by any agent scope.");
+      assert.equal(tool.body.retryable, false);
+    }
+    assert.equal(authorizeTool(everyScope, "list_activity").ok, false);
+    assert.equal(authorizeTool({ kind: "legacy" }, "list_activity").ok, true);
+    assert.equal(authorizeTool({ kind: "session" }, "list_activity").ok, true);
+    assert.equal(authorizeTool({ kind: "oauth", id: "oauth-client" }, "list_activity").ok, true);
+
+    const call = (token: string) => new Request("http://localhost/api/mcp", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "list_activity", arguments: {} },
+      }),
+    });
+    const denied = await postMcp(call(fleet.token));
+    assert.equal(denied.status, 403);
+    const deniedBody = await denied.json() as { code: string; fix: string };
+    assert.equal(deniedBody.code, "insufficient_scope");
+    assert.equal(deniedBody.fix, "This route is not granted by any agent scope.");
+    assert.equal(JSON.stringify(deniedBody).includes(fleet.token), false);
+
+    const legacy = await postMcp(call("activity-legacy"));
+    assert.notEqual(legacy.status, 401);
+    assert.notEqual(legacy.status, 403);
+    await legacy.arrayBuffer().catch(() => undefined);
+
+    const doc = openApiDocument() as {
+      paths: Record<string, { get?: { security?: { cookieAuth?: unknown[]; bearerAuth?: unknown[]; mcToken?: unknown[] }[] } }>;
+    };
+    assert.deepEqual(doc.paths["/api/activity"]?.get?.security, [{ cookieAuth: [] }, { mcToken: [] }]);
+    assert.equal(JSON.stringify(doc.paths["/api/activity"]?.get?.security).includes("bearerAuth"), false);
+  });
+
+  it("F11 a failed secondary status report still returns the task receipt", async () => {
+    env.DATABASE_URL = "postgres://test:test@127.0.0.1:5432/ak_activity";
+    const seen: { text: string; values: unknown[] }[] = [];
+    setSqlForTests(async (strings, ...values) => {
+      const text = strings.join(" ");
+      seen.push({ text, values });
+      if (/\bupdate\s+tasks\b/i.test(text) && /insert into events/i.test(text)) {
+        return [{
+          id: 7,
+          title: "Fix the form",
+          description: null,
+          project: null,
+          platform: "grok",
+          machine: null,
+          priority: 2,
+          status: "done",
+          reviewer_platform: null,
+          assigned_agent: null,
+          session_id: null,
+          result: null,
+          cost_usd: null,
+          created_by: "dashboard",
+          actor_type: null,
+          actor_id: null,
+          created_at: "2026-10-28T12:00:00.000Z",
+          claimed_at: null,
+          updated_at: "2026-10-28T12:00:01.000Z",
+          completed_at: "2026-10-28T12:00:01.000Z",
+          receipt_id: "41",
+          receipt_kind: "task_updated",
+          receipt_at: "2026-10-28T12:00:01.000Z",
+        }];
+      }
+      if (/insert into agents/i.test(text) || /insert into events/i.test(text) || /insert into sessions/i.test(text)) {
+        throw new Error("simulated events insert failure");
+      }
+      return [];
+    });
+    const logged: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => {
+      logged.push(args.map((part) => (part instanceof Error ? part.message : String(part))).join(" "));
+    };
+    try {
+      const result = await updateTaskForTool({ id: 7, status: "done", agent_id: "lane" });
+      assert.equal(result.isError, undefined);
+      const text = result.content[0].text;
+      assert.match(text, /^Task #7 updated \(done\)\./);
+      assert.match(text, /note: the status event was not recorded/);
+      const receiptLine = text.split("\n").at(-1) ?? "";
+      assert.equal(receiptLine, 'receipt: {"id":"41","kind":"task_updated","at":"2026-10-28T12:00:01.000Z"}');
+      const structured = result.structuredContent as { receipt?: { id: string; kind: string; at: string } } | undefined;
+      assert.deepEqual(structured?.receipt, {
+        id: "41",
+        kind: "task_updated",
+        at: "2026-10-28T12:00:01.000Z",
+      });
+      assert.equal(text.split("\n")[0], "Task #7 updated (done).");
+      assert.ok(seen.some((query) => (
+        /\bupdate\s+tasks\b/i.test(query.text)
+        && /insert into events/i.test(query.text)
+        && query.values.includes("task_updated")
+      )));
+      assert.ok(logged.some((line) => line.includes("simulated events insert failure")));
+    } finally {
+      console.error = original;
+      setSqlForTests(null);
+    }
   });
 
   it("F9 OpenAPI activity items list the fields list_activity returns", () => {

@@ -21,14 +21,14 @@ Without valid auth the endpoint answers `401` with a `WWW-Authenticate` header p
 { "error": "The credential does not have the tasks:write scope.", "code": "insufficient_scope", "fix": "Use a credential that has the tasks:write scope", "retryable": false }
 ```
 
-A tool that is not in the table below is denied for every caller, including `MC_TOKEN` and OAuth.
+A tool name that is not registered is denied for every caller, including `MC_TOKEN` and OAuth. `list_activity` is registered and is not in the scope table below. An agent credential cannot call it. `MC_TOKEN` and OAuth can.
 
 ### Scopes
 
 | Scope | MCP tools | REST routes an agent credential may call |
 | --- | --- | --- |
 | `status:write` | `report_status` | `POST /api/ingest` |
-| `fleet:read` | `get_fleet_status`, `list_activity` | `GET /api/fleet`, `GET /api/activity` |
+| `fleet:read` | `get_fleet_status` | `GET /api/fleet` |
 | `tasks:read` | `get_task_queue` | `GET /api/tasks` |
 | `tasks:write` | `create_task`, `claim_task`, `update_task`, `requeue_task` | `POST /api/tasks`, `POST /api/tasks/claim`, `PATCH /api/tasks/:id` |
 | `memory:read` | `recall` | `GET /api/memory` |
@@ -42,9 +42,9 @@ A tool that is not in the table below is denied for every caller, including `MC_
 
 `reply_to_mark` is the deprecated alias of `reply_to_operator` and requires the same scope.
 
-`send_message` is the MCP form of operator `POST /api/messages`. That REST route stays off this table, so an agent credential still cannot call it. The tool requires `messages:write`. `delete_note` uses `memory:write`. There is no memory DELETE route. `requeue_task` uses `tasks:write`, the same scope as `PATCH /api/tasks/:id`. `list_activity` and `GET /api/activity` use `fleet:read`, the same read as the fleet feed. They are not operator-only the way traces are.
+`send_message` is the MCP form of operator `POST /api/messages`. That REST route stays off this table, so an agent credential still cannot call it. The tool requires `messages:write`. `delete_note` uses `memory:write`. There is no memory DELETE route. `requeue_task` uses `tasks:write`, the same scope as `PATCH /api/tasks/:id`. `list_activity` and `GET /api/activity` are operator-only, the same boundary as traces. No agent scope grants them, including `fleet:read`. `MC_TOKEN` and an OAuth access token can call `list_activity`. The dashboard session and `MC_TOKEN` can call `GET /api/activity`.
 
-Collector and operator routes are not in this table. An agent credential cannot call them. `MC_TOKEN` and the dashboard session still can. That set is `POST /api/progress/ingest`, `POST /api/usage/ingest`, `GET /api/usage`, `POST /api/v1/traces`, `GET /api/traces`, `GET /api/traces/:traceId`, `POST /api/messages`, `PATCH /api/messages`, `GET /api/decisions`, `POST /api/decisions`, `PATCH /api/skills/:id`, `POST /api/skills/sync`, `POST /api/skills/drift`, `GET /api/skill-bundles`, and `GET`/`PUT /api/settings/repos`. `GET`/`POST`/`DELETE /api/settings/credentials` accepts only the dashboard session. `PATCH /api/decisions/:id` is the `decisions:write` row above. There is no MCP tool for decisions yet.
+Collector and operator routes are not in this table. An agent credential cannot call them. `MC_TOKEN` and the dashboard session still can. That set is `POST /api/progress/ingest`, `POST /api/usage/ingest`, `GET /api/usage`, `POST /api/v1/traces`, `GET /api/traces`, `GET /api/traces/:traceId`, `GET /api/activity`, `POST /api/messages`, `PATCH /api/messages`, `GET /api/decisions`, `POST /api/decisions`, `PATCH /api/skills/:id`, `POST /api/skills/sync`, `POST /api/skills/drift`, `GET /api/skill-bundles`, and `GET`/`PUT /api/settings/repos`. `GET`/`POST`/`DELETE /api/settings/credentials` accepts only the dashboard session. `PATCH /api/decisions/:id` is the `decisions:write` row above. There is no MCP tool for decisions yet.
 
 `check_inbox` and `GET /api/messages?ack=true` can mark inbox rows delivered. That side effect is part of `messages:read`, which is how the inbox already worked.
 
@@ -360,11 +360,11 @@ A successful result is `Deleted memory key "<key>".`
 
 List write receipts and other events, newest first.
 
-Requires `fleet:read`. `actor` is an exact actor id. `kind` is an exact event kind (`create_task`, `task_claimed`, `task_updated`, `task_requeued`, `remember`, `delete_note`, `send_message`, `reply_to_operator`, `status`, and the other event kinds already stored). `since` and `until` are inclusive ISO timestamps. A `since` later than `until`, a timestamp that is not ISO, an `actor` longer than 200 characters, or a `kind` outside 1 to 64 letters, digits, or `_ . : -` is `validation_failed` and reads nothing. `limit` is 1 to 200 and defaults to 50. `cursor` is the opaque `next_cursor` from the previous page. `fields` is a comma-separated allowlist; `id` is always included. Omitting `limit` and `cursor` omits the `next_cursor` line. A cursor for another list is `validation_failed`.
+Operator only, the same boundary as `GET /api/traces`. An agent credential is denied, including one with `fleet:read`. `MC_TOKEN` and an OAuth access token can call it. `actor` is an exact actor id. `kind` is an exact event kind (`create_task`, `task_claimed`, `task_updated`, `task_requeued`, `remember`, `delete_note`, `send_message`, `reply_to_operator`, `status`, and the other event kinds already stored). `since` and `until` are inclusive ISO timestamps. A `since` later than `until`, a timestamp that is not ISO, an `actor` longer than 200 characters, or a `kind` outside 1 to 64 letters, digits, or `_ . : -` is `validation_failed` and reads nothing. `limit` is 1 to 200 and defaults to 50. `cursor` is the opaque `next_cursor` from the previous page. `fields` is a comma-separated allowlist; `id` is always included. Omitting `limit` and `cursor` omits the `next_cursor` line. A cursor for another list is `validation_failed`.
 
 With no database this reads the in-memory demo log and the text starts with the demo banner. There is no static sample. `GET /api/activity` returns the same rows.
 
-Task status changes (`update_task`, `claim_task`, `requeue_task`) record the receipt in the same statement as the write. A statement that changes no row writes no event. `create_task`, `reply_to_operator`, and `send_message` record the receipt after the idempotent write commits, and a replay returns the original receipt instead of inserting a second row. `remember` and `delete_note` record a new event on every successful write, including an overwrite of the same memory key.
+Task status changes (`update_task`, `claim_task`, `requeue_task`) record the receipt in the same statement as the write. A statement that changes no row writes no event. `report_status` writes the agent, the session, and the event in one statement. If that statement fails, none of those rows change. `update_task` still returns its own receipt when a later status report fails. The result then adds `note: the status event was not recorded` and the task row stays as written. `create_task`, `reply_to_operator`, and `send_message` record the receipt after the idempotent write commits, and a replay returns the original receipt instead of inserting a second row. `remember` and `delete_note` record a new event on every successful write, including an overwrite of the same memory key.
 
 ## Errors
 

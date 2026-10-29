@@ -72,19 +72,27 @@ export async function updateTaskForTool(args: {
     result: args.result,
     cost_usd: args.cost_usd,
   });
+  // The task row and its receipt are already committed. A later status
+  // report must not turn that success into an error.
+  let note = "";
   if (args.status && args.agent_id) {
     const actor = currentActor();
-    await report({
-      agent_id: args.agent_id,
-      kind: args.status === "failed" ? "error" : "status",
-      title: `Task #${task.id} → ${args.status}: ${task.title}`,
-      detail: {
-        task_id: task.id,
-        tool: "update_task",
-        actor_type: actor?.actor_type ?? null,
-        actor_id: actor?.actor_id ?? null,
-      },
-    });
+    try {
+      await report({
+        agent_id: args.agent_id,
+        kind: args.status === "failed" ? "error" : "status",
+        title: `Task #${task.id} → ${args.status}: ${task.title}`,
+        detail: {
+          task_id: task.id,
+          tool: "update_task",
+          actor_type: actor?.actor_type ?? null,
+          actor_id: actor?.actor_id ?? null,
+        },
+      });
+    } catch (e) {
+      console.error("[activity] status report failed after the task receipt", e);
+      note = "\nnote: the status event was not recorded";
+    }
   }
-  return withReceipt(`Task #${task.id} updated (${task.status}).`, readReceipt(task));
+  return withReceipt(`Task #${task.id} updated (${task.status}).${note}`, readReceipt(task));
 }

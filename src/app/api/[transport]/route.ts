@@ -562,7 +562,7 @@ const handler = createMcpHandler(
         title: "List activity",
         annotations: READ_ONLY,
         description:
-          "List write receipts and other events, newest first. Filter by actor (the authenticated actor id), kind, since, and until. since and until are inclusive ISO timestamps. limit, cursor, and fields match the other lists: limit is 1 to 200, cursor is the opaque next_cursor, and fields is a comma-separated allowlist. Requires fleet:read. With no database, this reads the in-memory demo log.",
+          "List write receipts and other events, newest first. Filter by actor (the authenticated actor id), kind, since, and until. since and until are inclusive ISO timestamps. limit, cursor, and fields match the other lists: limit is 1 to 200, cursor is the opaque next_cursor, and fields is a comma-separated allowlist. Operator only, the same boundary as traces. An agent credential is denied, including one with fleet:read. MC_TOKEN and an OAuth access token can call it. With no database, this reads the in-memory demo log.",
         inputSchema: {
           actor: z.string().optional().describe("Exact actor_id. Omit to include every actor."),
           kind: z.string().optional().describe("Exact event kind, such as task_updated or status."),

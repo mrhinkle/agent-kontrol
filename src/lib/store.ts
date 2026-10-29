@@ -80,112 +80,101 @@ export async function report(input: ReportInput): Promise<Receipt | null> {
   const platform = input.platform ?? null;
   const machine = input.machine ?? null;
   const displayName = input.display_name ?? null;
-  try {
-    await db`
-      insert into agents (id, platform, machine, display_name, last_seen_at)
-      values (
-        ${agentId},
-        coalesce(${platform}, 'other'),
-        ${machine},
-        ${displayName},
-        ${now}
-      )
-      on conflict (id) do update set
-        last_seen_at = excluded.last_seen_at,
-        platform = coalesce(${platform}, agents.platform),
-        machine = coalesce(${machine}, agents.machine),
-        display_name = coalesce(${displayName}, agents.display_name)
-    `;
-  } catch (e) {
-    throw new Error(`agents upsert: ${errMsg(e)}`);
-  }
+  const sessionId = input.session_id ? input.session_id : null;
+  const status = input.status ?? KIND_TO_STATUS[input.kind] ?? "active";
+  const project = input.project ?? null;
+  const summary = input.summary ?? null;
+  // A closed session only reopens on an explicit session_start / active
+  // report — a straggling Stop/heartbeat can't resurrect it.
+  const reopens = input.kind === "session_start" || input.status === "active";
+  const setEndedAt = input.kind === "session_end";
+  const title = input.title ?? null;
+  const detail = JSON.stringify(input.detail ?? null);
 
-  if (input.session_id) {
-    const status = input.status ?? KIND_TO_STATUS[input.kind] ?? "active";
-    let existing: { id: string; status: string } | null = null;
-    try {
-      const rows = await db`
-        select id, status from sessions where id = ${input.session_id} limit 1
-      `;
-      existing = (rows[0] as { id: string; status: string } | undefined) ?? null;
-    } catch (e) {
-      throw new Error(`sessions select: ${errMsg(e)}`);
-    }
-
-    const isClosed = existing?.status === "done" || existing?.status === "failed";
-    const reopens = input.kind === "session_start" || input.status === "active";
-
-    if (!existing) {
-      const project = input.project ?? null;
-      const summary = input.summary ?? null;
-      const endedAt = input.kind === "session_end" ? now : null;
-      try {
-        await db`
-          insert into sessions (id, agent_id, status, updated_at, ended_at, project, summary)
-          values (
-            ${input.session_id},
-            ${agentId},
-            ${status},
-            ${now},
-            ${endedAt},
-            ${project},
-            ${summary}
-          )
-          on conflict (id) do update set
-            agent_id = excluded.agent_id,
-            status = excluded.status,
-            updated_at = excluded.updated_at,
-            ended_at = excluded.ended_at,
-            project = coalesce(excluded.project, sessions.project),
-            summary = coalesce(excluded.summary, sessions.summary)
-        `;
-      } catch (e) {
-        throw new Error(`sessions insert: ${errMsg(e)}`);
-      }
-    } else if (!isClosed || reopens) {
-      // A closed session only reopens on an explicit session_start / active
-      // report — a straggling Stop/heartbeat can't resurrect it.
-      const project = input.project ?? null;
-      const summary = input.summary ?? null;
-      const setEndedAt = input.kind === "session_end";
-      const clearEndedAt = Boolean(isClosed && reopens);
-      try {
-        await db`
-          update sessions set
-            status = ${status},
-            updated_at = ${now},
-            project = coalesce(${project}, project),
-            summary = coalesce(${summary}, summary),
-            ended_at = case
-              when ${setEndedAt} then ${now}::timestamptz
-              when ${clearEndedAt} then null
-              else ended_at
-            end
-          where id = ${input.session_id}
-        `;
-      } catch (e) {
-        throw new Error(`sessions update: ${errMsg(e)}`);
-      }
-    }
-  }
-
+  // One statement. The event insert depends on the agent and session
+  // writes, so a rejecting events trigger rolls all of them back.
   let receipt: Receipt | null = null;
   try {
     const rows = await db`
-      insert into events (agent_id, session_id, kind, title, detail)
-      values (
-        ${agentId},
-        ${input.session_id ?? null},
-        ${input.kind},
-        ${input.title ?? null},
-        ${JSON.stringify(input.detail ?? null)}::jsonb
+      with agent_row as (
+        insert into agents (id, platform, machine, display_name, last_seen_at)
+        values (
+          ${agentId},
+          coalesce(${platform}::text, 'other'),
+          ${machine}::text,
+          ${displayName}::text,
+          ${now}::timestamptz
+        )
+        on conflict (id) do update set
+          last_seen_at = excluded.last_seen_at,
+          platform = coalesce(${platform}::text, agents.platform),
+          machine = coalesce(${machine}::text, agents.machine),
+          display_name = coalesce(${displayName}::text, agents.display_name)
+        returning id
+      ),
+      prior_session as (
+        select id, status
+        from sessions
+        where id = ${sessionId}::text
+      ),
+      session_insert as (
+        insert into sessions (id, agent_id, status, updated_at, ended_at, project, summary)
+        select
+          ${sessionId}::text,
+          agent_row.id,
+          ${status},
+          ${now}::timestamptz,
+          case when ${setEndedAt}::boolean then ${now}::timestamptz else null end,
+          ${project}::text,
+          ${summary}::text
+        from agent_row
+        where ${sessionId}::text is not null
+          and not exists (select 1 from prior_session)
+        on conflict (id) do update set
+          agent_id = excluded.agent_id,
+          status = excluded.status,
+          updated_at = excluded.updated_at,
+          ended_at = excluded.ended_at,
+          project = coalesce(excluded.project, sessions.project),
+          summary = coalesce(excluded.summary, sessions.summary)
+        returning id
+      ),
+      session_update as (
+        update sessions as s set
+          status = ${status},
+          updated_at = now(),
+          project = coalesce(${project}::text, s.project),
+          summary = coalesce(${summary}::text, s.summary),
+          ended_at = case
+            when ${setEndedAt}::boolean then ${now}::timestamptz
+            when p.status in ('done', 'failed') and ${reopens}::boolean then null
+            else s.ended_at
+          end
+        from prior_session as p
+        where s.id = p.id
+          and ${sessionId}::text is not null
+          and (p.status not in ('done', 'failed') or ${reopens}::boolean)
+        returning s.id
+      ),
+      event_row as (
+        insert into events (agent_id, session_id, kind, title, detail)
+        select
+          agent_row.id,
+          ${sessionId}::text,
+          ${input.kind},
+          ${title}::text,
+          ${detail}::jsonb
+        from agent_row
+        where (select count(*) from session_insert) >= 0
+          and (select count(*) from session_update) >= 0
+        returning id, kind, created_at
       )
-      returning id, kind, created_at
+      select id, kind, created_at from event_row
     `;
     const row = rows[0] as Record<string, unknown> | undefined;
     receipt = row ? receiptFromParts(row.id, row.kind, row.created_at) : null;
   } catch (e) {
-    throw new Error(`events insert: ${errMsg(e)}`);
+    throw new Error(`report: ${errMsg(e)}`);
   }
 
   // Any platform that ends a session (hook, watcher, or an MCP report with status

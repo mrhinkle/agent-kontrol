@@ -1,11 +1,14 @@
 /**
  * Scopes for per-agent credentials.
  *
- * One table maps every MCP tool and every agent-facing REST route to exactly
- * one scope. `requireScope` is the only allow decision. A tool that is not in
- * the table is denied for every principal. A REST route that is not in the
- * table is denied for an agent credential; the legacy MC_TOKEN, the dashboard
- * session, and OAuth keep the access they already had.
+ * One table maps every agent-facing MCP tool and every agent-facing REST
+ * route to exactly one scope. `requireScope` is the only allow decision.
+ * A tool name that is not registered is denied for every principal.
+ * `list_activity` is registered and is not in the table: an agent credential
+ * is denied, and the legacy MC_TOKEN, the dashboard session, and OAuth can
+ * call it. A REST route that is not in the table is denied for an agent
+ * credential; the legacy MC_TOKEN, the dashboard session, and OAuth keep the
+ * access they already had.
  *
  * OAuth tokens are still issued with the scope string "mcp". That string is
  * not an entry in this table and is not what we check.
@@ -55,7 +58,6 @@ export const TOOL_SCOPES: Record<string, Scope> = {
   send_message: "messages:write",
   requeue_task: "tasks:write",
   delete_note: "memory:write",
-  list_activity: "fleet:read",
 };
 
 /**
@@ -65,7 +67,9 @@ export const TOOL_SCOPES: Record<string, Scope> = {
  */
 const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   { method: "GET", path: /^\/api\/fleet$/, scope: "fleet:read" },
-  { method: "GET", path: /^\/api\/activity$/, scope: "fleet:read" },
+  // GET /api/activity stays off this table, same as GET /api/traces.
+  // An agent credential cannot read the activity stream. MC_TOKEN and the
+  // dashboard session still can.
   { method: "POST", path: /^\/api\/ingest$/, scope: "status:write" },
   { method: "GET", path: /^\/api\/memory$/, scope: "memory:read" },
   { method: "POST", path: /^\/api\/memory$/, scope: "memory:write" },
@@ -148,8 +152,17 @@ export function requireScope(principal: Principal, scope: Scope | null): ScopeDe
   return { ok: false, status: 403, body: insufficientScopeBody(scope) };
 }
 
+/**
+ * Registered tools with the traces boundary: no agent scope grants them.
+ * Unrestricted principals (legacy MC_TOKEN, dashboard session, OAuth,
+ * dev-open) are allowed. An unknown name is still denied for every
+ * principal, including those.
+ */
+const OPERATOR_TOOLS: ReadonlySet<string> = new Set(["list_activity"]);
+
 /** Tool calls fail closed for every principal when the name is not mapped. */
 export function authorizeTool(principal: Principal, tool: string): ScopeDecision {
+  if (OPERATOR_TOOLS.has(tool)) return requireScope(principal, null);
   const scope = TOOL_SCOPES[tool];
   if (!scope) {
     return { ok: false, status: 403, body: insufficientScopeBody(null) };

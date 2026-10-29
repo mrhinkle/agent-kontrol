@@ -18,6 +18,7 @@ The `agent_credentials` table stores the label, the first 8 characters of the to
 | --- | --- |
 | Dashboard UI and data routes (default) | Session cookie `mc_auth`, or `Authorization: Bearer <MC_TOKEN>` |
 | `GET` and `POST /api/decisions` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `decisions:write` |
+| `GET /api/activity` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `fleet:read`. Same boundary as `GET /api/traces` |
 | `PATCH /api/decisions/:id` | Session cookie, `MC_TOKEN`, or an agent credential with `decisions:write` |
 | Ingest routes: `POST /api/v1/traces`, `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, `POST /api/usage/ingest` | `Authorization: Bearer <MC_TOKEN>`, or an agent credential whose scope covers the route (`status:write` for `POST /api/ingest`, `messages:write` for `POST /api/messages/reply`); the other ingest routes take `MC_TOKEN` only |
 | MCP transport: `/api/mcp` | `Authorization: Bearer <MC_TOKEN>`, an agent credential, or an OAuth access token (JWT) issued by this server |
@@ -45,7 +46,7 @@ Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI
 | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- |
 | GET | `/api/fleet` | Cookie or bearer | Everything the dashboard needs in one call |
-| GET | `/api/activity` | Cookie, bearer, or `fleet:read` | Write receipts and other events, newest first. Filters: `actor`, `kind`, `since`, `until`. Same `limit`, `cursor`, and `fields` rules as the other lists. Default limit 50. |
+| GET | `/api/activity` | Session or MC_TOKEN | Write receipts and other events, newest first. An agent credential is denied, including `fleet:read`. Filters: `actor`, `kind`, `since`, `until`. Same `limit`, `cursor`, and `fields` rules as the other lists. Default limit 50. |
 | POST | `/api/ingest` | Bearer | Deterministic telemetry from hooks, watchers, and daemons |
 | GET | `/api/memory` | Cookie or bearer | Memory browser feed |
 | POST | `/api/memory` | Cookie or bearer | Store a note, or preview an overwrite with `dry_run` |

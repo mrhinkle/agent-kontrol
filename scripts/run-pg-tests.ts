@@ -10,7 +10,8 @@ import { sql } from "../src/lib/db";
 import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
 import { StaleWrite } from "../src/lib/revision";
 import { readReceipt } from "../src/lib/activity";
-import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview, findAgent, deleteMemory } from "../src/lib/store";
+import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview, findAgent, deleteMemory, slugify } from "../src/lib/store";
+import { updateTaskForTool } from "../src/lib/dry-run-actions";
 import { getWatchedRepos, replaceWatchedRepos } from "../src/lib/watched-repos";
 import type { RepoConfig } from "../src/lib/progress-config";
 import { getTrace, listTraces, pruneSpans, upsertSpans } from "../src/lib/trace-store";
@@ -340,6 +341,7 @@ async function main() {
   }
 
   await testActivityReceiptAtomic(tag);
+  await testReportStatusAtomic(tag);
   await testDecisions(tag);
   await testSkillLeaseFence(tag);
   await testSkillSchedule(tag);
@@ -502,6 +504,148 @@ async function testActivityReceiptAtomic(tag: string) {
     await sql()`delete from tasks where platform like ${`pgtest-act-%${tag}`}`;
     await sql()`delete from memory where key like ${`%${tag}%`}`;
     await sql()`delete from idempotency_keys where idempotency_key like ${`%${tag}%`}`;
+  }
+}
+
+/**
+ * report() writes the agent, the session, and the event in one statement.
+ * A rejecting events insert leaves both rows as they were. updateTaskForTool
+ * still returns the task receipt when the later status report fails.
+ */
+async function testReportStatusAtomic(tag: string) {
+  const agentId = slugify(`${tag}-rpt`);
+  // main() already stores a writeback session at `${tag}-sess`. A colliding id
+  // would make the rollback count look like a leftover insert.
+  const sessionId = `${tag}-rpt-sess`;
+  const laneId = slugify(`${tag}-lane`);
+  const platform = `pgtest-rpt-${tag}`;
+  const install = async () => {
+    await sql()`
+      create or replace function ak_test_fail_status_event()
+      returns trigger
+      language plpgsql
+      as $fn$
+      begin
+        if new.kind = 'status' then
+          raise exception 'simulated events insert failure';
+        end if;
+        return new;
+      end;
+      $fn$
+    `;
+    await sql()`drop trigger if exists ak_test_fail_status_event on events`;
+    await sql()`
+      create trigger ak_test_fail_status_event
+      before insert on events
+      for each row
+      execute procedure ak_test_fail_status_event()
+    `;
+  };
+  const drop = async () => {
+    await sql()`drop trigger if exists ak_test_fail_status_event on events`;
+    await sql()`drop function if exists ak_test_fail_status_event()`;
+  };
+  try {
+    await install();
+    await assert.rejects(
+      () => report({
+        agent_id: agentId,
+        platform: "codex",
+        machine: "m1",
+        display_name: "Should Not Stick",
+        session_id: sessionId,
+        kind: "status",
+        title: "ghost",
+        project: "p",
+        summary: "ghost summary",
+      }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const newAgents = await sql()`select count(*)::int as n from agents where id = ${agentId}`;
+    const newSessions = await sql()`select count(*)::int as n from sessions where id = ${sessionId}`;
+    const ghosts = await sql()`select count(*)::int as n from events where kind = 'status' and title = 'ghost'`;
+    assert.equal(Number(newAgents[0].n), 0, "a failed event insert leaves no new agent");
+    assert.equal(Number(newSessions[0].n), 0, "a failed event insert leaves no new session");
+    assert.equal(Number(ghosts[0].n), 0, "a failed event insert leaves no status event");
+
+    await drop();
+    const seeded = await report({
+      agent_id: agentId,
+      platform: "codex",
+      display_name: "Kept",
+      session_id: sessionId,
+      kind: "session_start",
+      title: "hello",
+      project: "p",
+      summary: "kept",
+    });
+    assert.equal(seeded?.kind, "session_start");
+    const beforeAgent = await sql()`select platform, display_name, last_seen_at from agents where id = ${agentId}`;
+    const beforeSession = await sql()`select status, summary, project, ended_at from sessions where id = ${sessionId}`;
+    assert.equal(beforeAgent.length, 1);
+    assert.equal(beforeSession.length, 1);
+    await install();
+    await assert.rejects(
+      () => report({
+        agent_id: agentId,
+        platform: "hermes",
+        display_name: "Changed",
+        session_id: sessionId,
+        kind: "status",
+        status: "failed",
+        title: "ghost-update",
+        summary: "changed",
+      }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const afterAgent = await sql()`select platform, display_name, last_seen_at from agents where id = ${agentId}`;
+    const afterSession = await sql()`select status, summary, project, ended_at from sessions where id = ${sessionId}`;
+    assert.equal(String(afterAgent[0].platform), String(beforeAgent[0].platform));
+    assert.equal(String(afterAgent[0].display_name), String(beforeAgent[0].display_name));
+    assert.equal(new Date(afterAgent[0].last_seen_at as string | Date).toISOString(), new Date(beforeAgent[0].last_seen_at as string | Date).toISOString());
+    assert.equal(String(afterSession[0].status), String(beforeSession[0].status));
+    assert.equal(String(afterSession[0].summary), String(beforeSession[0].summary));
+    assert.equal(String(afterSession[0].project), String(beforeSession[0].project));
+    const endedBefore = beforeSession[0].ended_at == null ? null : new Date(beforeSession[0].ended_at as string | Date).toISOString();
+    const endedAfter = afterSession[0].ended_at == null ? null : new Date(afterSession[0].ended_at as string | Date).toISOString();
+    assert.equal(endedAfter, endedBefore);
+    const updates = await sql()`select count(*)::int as n from events where kind = 'status' and title = 'ghost-update'`;
+    assert.equal(Number(updates[0].n), 0, "a failed event insert leaves no status event on an existing session");
+
+    const task = await createTask({ title: `secondary ${tag}`, platform });
+    const result = await updateTaskForTool({ id: task.id, status: "done", agent_id: `${tag}-lane` });
+    assert.equal(result.isError, undefined);
+    const text = result.content[0]?.text ?? "";
+    assert.match(text, new RegExp(`^Task #${task.id} updated \\(done\\)\\.`));
+    assert.match(text, /note: the status event was not recorded/);
+    const receiptLine = text.split("\n").at(-1) ?? "";
+    assert.match(receiptLine, /^receipt: \{/);
+    const receipt = JSON.parse(receiptLine.slice("receipt: ".length)) as { id: string; kind: string };
+    assert.equal(receipt.kind, "task_updated");
+    const structured = result.structuredContent as { receipt?: { id: string; kind: string } } | undefined;
+    assert.equal(structured?.receipt?.id, receipt.id);
+    assert.equal(structured?.receipt?.kind, "task_updated");
+    const stored = await sql()`select status from tasks where id = ${task.id}`;
+    assert.equal(String(stored[0].status), "done");
+    const lane = await sql()`select count(*)::int as n from agents where id = ${laneId}`;
+    assert.equal(Number(lane[0].n), 0, "a failed secondary report writes no agent");
+    const statusEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'status' and detail->>'task_id' = ${String(task.id)}
+    `;
+    assert.equal(Number(statusEvents[0].n), 0, "a failed secondary report writes no status event");
+    const taskEvents = await sql()`
+      select id::text as id from events
+      where kind = 'task_updated' and detail->>'task_id' = ${String(task.id)}
+    `;
+    assert.equal(taskEvents.length, 1);
+    assert.equal(String(taskEvents[0].id), receipt.id);
+  } finally {
+    await drop();
+    await sql()`delete from tasks where platform = ${platform}`;
+    await sql()`delete from events where agent_id in (${agentId}, ${laneId}) or session_id = ${sessionId}`;
+    await sql()`delete from sessions where id = ${sessionId}`;
+    await sql()`delete from agents where id in (${agentId}, ${laneId})`;
   }
 }
 
