@@ -17,7 +17,8 @@ import { StaleWrite } from "../src/lib/revision";
 import { readReceipt } from "../src/lib/activity";
 import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview, findAgent, deleteMemory, slugify } from "../src/lib/store";
 import { updateTaskForTool } from "../src/lib/dry-run-actions";
-import { getWatchedRepos, replaceWatchedRepos } from "../src/lib/watched-repos";
+import { getWatchedRepos, replaceWatchedRepos, setRepoOverride } from "../src/lib/watched-repos";
+import { applyOwnerDiscovery } from "../src/lib/watched-owners";
 import type { RepoConfig } from "../src/lib/progress-config";
 import { getTrace, listTraces, pruneSpans, upsertSpans } from "../src/lib/trace-store";
 import { pruneAutomaticNotes, upsertAutomaticNote } from "../src/lib/session-memory";
@@ -360,7 +361,9 @@ async function main() {
   await testWatchBeatRoute(tag);
   await testListCursors(tag);
   await testBriefAlerts(tag);
+  await testZeroMergeCaseFold(tag);
   await testDecisionWritebackHardening(tag);
+  await testRepoCaseIdentity(tag);
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
 }
@@ -1932,6 +1935,137 @@ async function testBriefAlerts(tag: string): Promise<void> {
     setBeforeClaimForTests(null);
     setBriefSettingsForTests(null);
     await cleanup();
+  }
+}
+
+/**
+ * Snapshot rows stored as `PgCase/A…` count for the watched row `pgcase/a…`.
+ * One quiet window sends one lowercase latch. A second evaluate sends nothing.
+ * A sent latch under the stored casing is not cleared as absent.
+ */
+async function testZeroMergeCaseFold(tag: string): Promise<void> {
+  const slug = tag.replace(/\W/g, "").slice(-12);
+  const watched = `pgcase/a${slug}`;
+  const stored = `PgCase/A${slug}`;
+  const key = `zero-merge:${watched}`;
+  const oldKey = `zero-merge:${stored}`;
+  const now = new Date("2026-10-28T12:00:00.000Z");
+  const hour = 3_600_000;
+  const minute = 60_000;
+  const iso = (delta: number) => new Date(now.getTime() + delta).toISOString();
+  const settings: BriefSettings = {
+    decisionLabels: ["needs-owner"],
+    stuckPrHours: 48,
+    staleIssueDays: 21,
+    coordinator: { agentId: null, maxSilenceHours: 3, workKinds: ["session_end"] },
+    alerts: {
+      enabled: true,
+      coordinatorRepeatHours: 12,
+      zeroMergeHours: 72,
+      zeroMergeLookbackDays: 7,
+      decisionAgeDays: 14,
+    },
+  };
+  const cleanup = async () => {
+    await sql()`delete from messages where created_by = 'brief-alerts' and body like ${"%" + slug + "%"}`;
+    await sql()`delete from brief_alerts where key = ${key} or key = ${oldKey}`;
+    await sql()`delete from repo_snapshots where lower(repo) = lower(${watched})`;
+    await sql()`delete from watched_repos where lower(repo) = lower(${watched})`;
+  };
+  await cleanup();
+  try {
+    await sql()`
+      insert into watched_repos (repo, label, short, color, position)
+      values (${watched}, 'Case', ${`c${slug}`.slice(0, 12)}, '#000000', 0)
+    `;
+    await sql()`
+      insert into repo_snapshots (repo, collected_at, detail)
+      values (
+        ${stored},
+        ${iso(0)}::timestamptz,
+        ${JSON.stringify({ merged: [{ merged_at: iso(-72 * hour) }] })}::jsonb
+      )
+    `;
+    const count = async () => {
+      const rows = await sql()`
+        select count(*)::int as n from messages
+        where created_by = 'brief-alerts' and position(${`brief-alert ${key}\n`} in body) > 0
+      `;
+      return Number(rows[0].n);
+    };
+    const first = await evaluateAlerts({ now, settings });
+    assert.equal(first.alerts.find((alert) => alert.key === key)?.condition, "firing");
+    assert.equal(first.alerts.some((alert) => alert.key === oldKey), false);
+    assert.equal(await count(), 1, "quiet history under another casing sends one lowercase alert");
+
+    const second = await evaluateAlerts({ now: new Date(now.getTime() + minute), settings });
+    assert.equal(second.alerts.find((alert) => alert.key === key)?.condition, "firing");
+    assert.equal(await count(), 1, "a second evaluate sends nothing more");
+
+    await sql()`
+      insert into brief_alerts (key, first_sent_at, last_sent_at)
+      values (${oldKey}, ${iso(-hour)}::timestamptz, ${iso(-hour)}::timestamptz)
+    `;
+    const later = new Date(now.getTime() + 2 * minute);
+    await evaluateAlerts({ now: later, settings });
+    const kept = await sql()`select cleared_at from brief_alerts where key = ${oldKey}`;
+    assert.equal(kept.length, 1);
+    assert.equal(kept[0]?.cleared_at ?? null, null, "a case-variant latch of a visible repo is not cleared");
+  } finally {
+    setBriefSettingsForTests(null);
+    await cleanup();
+  }
+}
+
+/** Case-insensitive repo identity and a swept_at activity cutoff, on real SQL. */
+async function testRepoCaseIdentity(tag: string): Promise<void> {
+  const slug = tag.replace(/\D/g, "").slice(-10);
+  const owner = `pgc${slug}`;
+  const stored = `${owner}/app`;
+  const short = `s${slug}`.slice(0, 12);
+  const brand = `Bn${slug}`;
+  try {
+    await sql()`insert into watched_owners (owner, activity_days) values (${owner}, 30)`;
+    await sql()`
+      insert into watched_repos (repo, label, short, color, position, origin)
+      values (${stored}, 'App', ${short}, '#2563eb', 0, 'manual')
+    `;
+    const outcome = await applyOwnerDiscovery(
+      { owner, activityDays: 30, includeForks: false, includeArchived: false },
+      [],
+      {
+        repos: [
+          { name: "App", pushedAt: "2026-01-15T00:00:00.000Z", isFork: false, isArchived: false },
+          { name: brand, pushedAt: "2026-01-01T00:00:00.000Z", isFork: false, isArchived: false },
+          { name: `Old${slug}`, pushedAt: "2025-12-31T23:59:59.999Z", isFork: false, isArchived: false },
+        ],
+        error: null,
+        sweptAt: "2026-01-31T00:00:00.000Z",
+      },
+      new Date("2026-10-29T00:00:00.000Z"),
+    );
+    assert.equal(outcome.failure, null, outcome.failure ?? "");
+    const rows = await sql()`
+      select repo, pinned
+      from watched_repos
+      where lower(repo) like ${`${owner.toLowerCase()}/%`}
+      order by repo
+    `;
+    const names = rows.map((row) => String(row.repo));
+    assert.deepEqual(names.filter((name) => name.toLowerCase() === stored.toLowerCase()), [stored]);
+    assert.ok(names.includes(`${owner}/${brand}`), `expected GitHub casing, saw ${names.join(", ")}`);
+    assert.equal(names.some((name) => name.toLowerCase().includes("old")), false);
+    const pinned = await setRepoOverride(stored.toUpperCase(), { pinned: true });
+    assert.equal(pinned, true);
+    const after = await sql()`
+      select repo, pinned from watched_repos where lower(repo) = lower(${stored})
+    `;
+    assert.equal(after.length, 1);
+    assert.equal(after[0]?.repo, stored);
+    assert.equal(after[0]?.pinned, true);
+  } finally {
+    await sql()`delete from watched_repos where lower(repo) like ${`${owner.toLowerCase()}/%`}`;
+    await sql()`delete from watched_owners where owner = ${owner}`;
   }
 }
 

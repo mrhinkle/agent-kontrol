@@ -3,6 +3,7 @@ import { enforceApi } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { diffRepoList, readDryRun } from "@/lib/dry-run";
+import { repoIdentity } from "@/lib/owner-discovery";
 import { REPOS } from "@/lib/progress-config";
 import { MAX_REPOS, retainedAutoShortErrors, validateRepoList, type RepoError, type RepoInput } from "@/lib/repo-validation";
 import { getWatchedRepos, listVersion, loadTrackedRepos, replaceWatchedRepos, setRepoOverride } from "@/lib/watched-repos";
@@ -227,7 +228,7 @@ export async function PATCH(req: Request) {
   };
   if (!isConfigured()) {
     if (dry.dryRun) {
-      const found = REPOS.find((item) => item.repo === repo);
+      const found = REPOS.find((item) => repoIdentity(item.repo) === repoIdentity(repo));
       if (!found) return repoNotFound();
       const before = { pinned: false, hidden: false };
       const after = {
@@ -251,7 +252,7 @@ export async function PATCH(req: Request) {
   }
   try {
     const tracked = await loadTrackedRepos();
-    const found = tracked.find((item) => item.repo === repo);
+    const found = tracked.find((item) => repoIdentity(item.repo) === repoIdentity(repo));
     if (!found) return repoNotFound();
     const after = {
       pinned: patch.pinned ?? found.pinned,

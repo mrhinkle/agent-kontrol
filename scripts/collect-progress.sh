@@ -664,7 +664,15 @@ discover_watched_owners() {
   if [[ "$status" != "200" ]]; then
     log "owners: discovery post returned $status; tracked repos unchanged"
   else
-    log "owners: discovery posted ($(jq -r '.results | length' <"$resp" 2>/dev/null || echo '?') results)"
+    local stale_owners applied
+    stale_owners="$(jq -r '[.results[]? | select(.skipped == "stale") | .owner] | join(" ")' <"$resp" 2>/dev/null || true)"
+    if [[ -n "$stale_owners" ]]; then
+      log "owners: discovery skipped stale sweep for ${stale_owners}"
+    fi
+    applied="$(jq -r '[.results[]? | select(.skipped != "stale")] | length' <"$resp" 2>/dev/null || echo '?')"
+    if [[ "$applied" != "0" ]]; then
+      log "owners: discovery posted (${applied} results)"
+    fi
   fi
   rm -f "$resp"
 }

@@ -3,7 +3,7 @@
  * cancelling or updating a task, and overwriting a memory key.
  * Pure. Safe to import from a client component. Nothing here touches the database.
  */
-import { planOverrideResets } from "./owner-discovery";
+import { planOverrideResets, repoIdentity } from "./owner-discovery";
 import type { OwnerInput } from "./owner-validation";
 import type { RepoInput } from "./repo-validation";
 import type { MemoryItem, Task, TaskStatus } from "./types";
@@ -113,19 +113,19 @@ type ListedRepo = RepoInput & { fieldsOverridden?: boolean | null };
 
 /**
  * Diff two watched-repo lists the way `replaceWatchedRepos` matches rows:
- * the repo string is the primary key, so a case change is a remove plus an add.
- * An omitted auto row stays. When that row's fields were overridden, the diff
- * reports the reset back to the discovery defaults.
+ * identity is case-insensitive `owner/name`, so a case-only change is not a
+ * remove plus an add. An omitted auto row stays. When that row's fields were
+ * overridden, the diff reports the reset back to the discovery defaults.
  */
 export function diffRepoList(current: ListedRepo[], next: RepoInput[], wouldWrite = true): DryRunResult {
-  const currentAt = new Map(current.map((repo, index) => [repo.repo, index]));
-  const nextAt = new Map(next.map((repo, index) => [repo.repo, index]));
+  const currentAt = new Map(current.map((repo, index) => [repoIdentity(repo.repo), index]));
+  const nextAt = new Map(next.map((repo, index) => [repoIdentity(repo.repo), index]));
   const resets = new Map(planOverrideResets(current, next).map((row) => [row.repo, row]));
   const changes: DryRunChange[] = [];
   const affected: Record<string, unknown>[] = [];
 
   current.forEach((repo, index) => {
-    if (nextAt.has(repo.repo)) return;
+    if (nextAt.has(repoIdentity(repo.repo))) return;
     // Auto-discovered rows stay when a manual save omits them. The save
     // does not hide them and does not delete them. An override is cleared.
     const reset = resets.get(repo.repo);
@@ -161,7 +161,7 @@ export function diffRepoList(current: ListedRepo[], next: RepoInput[], wouldWrit
   });
 
   next.forEach((repo, index) => {
-    const from = currentAt.get(repo.repo);
+    const from = currentAt.get(repoIdentity(repo.repo));
     if (from === undefined) {
       const after = repoRecord(repo, index);
       changes.push({

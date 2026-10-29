@@ -7,7 +7,8 @@
  * Hide wins over pin. A repo marked gone is not shown, including when it is pinned.
  * Forks and archived repos are not added unless that owner's flag says so.
  * A pin still shows a fork or archive that is already stored.
- * Identity is `owner/name`, never the short name.
+ * Identity is `owner/name`, compared case-insensitively. The stored casing
+ * is kept. The short name is not an identity.
  */
 
 import { PALETTE } from "./repo-settings-helpers";
@@ -96,6 +97,78 @@ export function repoName(repo: string): string {
 /** Canonical `owner/name`, lowercased. Short names are not an identity. */
 export function repoIdentity(repo: string): string {
   return `${repoOwner(repo)}/${repoName(repo).toLowerCase()}`;
+}
+
+/**
+ * RFC 3339 timestamp: calendar date, `T`/`t`, time, optional fraction,
+ * and `Z` or a numeric offset. A date that is not a real civil day is rejected.
+ */
+const RFC3339_RE = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$/i;
+
+/** A collector clock may sit this far ahead of the server before discovery rejects it. */
+export const SWEPT_AT_FUTURE_SKEW_MS = 5 * 60 * 1000;
+
+export function isRfc3339(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const match = RFC3339_RE.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  if (month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 || second > 60) return false;
+  const civil = new Date(Date.UTC(year, month - 1, day));
+  if (civil.getUTCFullYear() !== year || civil.getUTCMonth() !== month - 1 || civil.getUTCDate() !== day) return false;
+  return !Number.isNaN(Date.parse(value));
+}
+
+/**
+ * `swept_at` from the collector. Required, RFC 3339, and not more than
+ * five minutes ahead of `now`. The returned value is the parsed instant.
+ */
+export function parseCollectorSweptAt(
+  raw: unknown,
+  now: Date,
+): { ok: true; sweptAt: string } | { ok: false; error: string } {
+  if (raw == null || raw === "") return { ok: false, error: "swept_at is required." };
+  if (!isRfc3339(raw)) return { ok: false, error: "swept_at must be an RFC 3339 timestamp." };
+  const ms = Date.parse(raw);
+  if (ms > now.getTime() + SWEPT_AT_FUTURE_SKEW_MS) {
+    return { ok: false, error: "swept_at must not be more than 5 minutes in the future." };
+  }
+  return { ok: true, sweptAt: new Date(ms).toISOString() };
+}
+
+/**
+ * New-repo activity uses the collector's `sweptAt` when it parses.
+ * Callers that have not been given one still use `now`.
+ */
+export function discoveryCutoff(sweep: { sweptAt?: string | null }, now: Date): Date {
+  const at = parseActivity(sweep.sweptAt ?? null);
+  return at === null ? now : new Date(at);
+}
+
+/**
+ * When a stored row matches by case-insensitive identity, keep that row's
+ * casing. The first stored row wins. A name with no match keeps the
+ * casing the payload or GitHub sent.
+ */
+export function alignRepoCasing<T extends { repo: string }>(
+  stored: readonly { repo: string }[],
+  incoming: readonly T[],
+): T[] {
+  const storedById = new Map<string, string>();
+  for (const row of stored) {
+    const id = repoIdentity(row.repo);
+    if (!storedById.has(id)) storedById.set(id, row.repo);
+  }
+  return incoming.map((row) => {
+    const kept = storedById.get(repoIdentity(row.repo));
+    if (!kept || kept === row.repo) return row;
+    return { ...row, repo: kept };
+  });
 }
 
 export function parseActivity(value: string | null): number | null {
@@ -206,15 +279,15 @@ export function planOverrideResets<T extends {
   blockedLabel: null;
   fieldsOverridden: false;
 }> {
-  const submittedIds = new Set(submitted.map((row) => row.repo));
+  const submittedIds = new Set(submitted.map((row) => repoIdentity(row.repo)));
   const resetting = stored.filter(
-    (row) => row.origin === "auto" && row.fieldsOverridden === true && !submittedIds.has(row.repo),
+    (row) => row.origin === "auto" && row.fieldsOverridden === true && !submittedIds.has(repoIdentity(row.repo)),
   );
   const resettingIds = new Set(resetting.map((row) => row.repo));
   const used = new Set<string>();
   for (const row of submitted) used.add(row.short.toLowerCase());
   for (const row of stored) {
-    if (resettingIds.has(row.repo) || submittedIds.has(row.repo)) continue;
+    if (resettingIds.has(row.repo) || submittedIds.has(repoIdentity(row.repo))) continue;
     if (row.origin !== "auto") continue;
     used.add(row.short.toLowerCase());
   }
@@ -253,12 +326,17 @@ export function planDiscovery(
   }
 
   const byIdentity = new Map<string, TrackedRepo>();
-  for (const row of existing) byIdentity.set(repoIdentity(row.repo), { ...row });
+  for (const row of existing) {
+    const id = repoIdentity(row.repo);
+    // First stored casing wins, so a later case-variant is not a second repo.
+    if (!byIdentity.has(id)) byIdentity.set(id, { ...row });
+  }
   const usedShorts = new Set(existing.map((row) => row.short.toLowerCase()));
   let nextPosition = existing.reduce((max, row) => Math.max(max, row.position), -1) + 1;
   const seen = new Set<string>();
   const added: string[] = [];
   const updated: string[] = [];
+  const cutoff = discoveryCutoff(sweep, now);
 
   for (const item of listed) {
     const repo = `${ownerKey}/${item.name}`;
@@ -266,9 +344,9 @@ export function planDiscovery(
     if (seen.has(id)) continue;
     seen.add(id);
     const activity = parseActivity(item.pushedAt);
-    const inWindow = activity !== null && now.getTime() - activity <= owner.activityDays * MS_PER_DAY;
     const current = byIdentity.get(id);
     if (!current) {
+      const inWindow = item.pushedAt != null && withinActivityWindow(item.pushedAt, owner.activityDays, cutoff);
       if (!eligible(item, owner) || !inWindow) continue;
       const created: TrackedRepo = {
         repo,
@@ -307,7 +385,7 @@ export function planDiscovery(
       next.isArchived !== current.isArchived ||
       next.lastActivityAt !== current.lastActivityAt
     ) {
-      updated.push(repo);
+      updated.push(current.repo);
     }
     byIdentity.set(id, next);
   }

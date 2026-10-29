@@ -3,7 +3,7 @@ import { apiError, publicError } from "@/lib/api-error";
 import { deny, resolveApiAccess } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import { validateOwnerName } from "@/lib/owner-validation";
-import type { GhListedRepo } from "@/lib/owner-discovery";
+import { isRfc3339, parseCollectorSweptAt, type GhListedRepo } from "@/lib/owner-discovery";
 import { loadTrackedRepos } from "@/lib/watched-repos";
 import {
   applyOwnerDiscovery,
@@ -29,9 +29,10 @@ export const dynamic = "force-dynamic";
 
 const NAME_RE = /^[\w.-]+$/;
 
-function parseRepos(raw: unknown): { ok: true; repos: GhListedRepo[] } | { ok: false; error: string } {
+function parseRepos(raw: unknown): { ok: true; repos: GhListedRepo[] } | { ok: false; error: string; status?: 400 } {
   if (!Array.isArray(raw)) return { ok: false, error: "repos must be an array" };
   const repos: GhListedRepo[] = [];
+  const seen = new Set<string>();
   for (const item of raw) {
     if (!item || typeof item !== "object" || Array.isArray(item)) {
       return { ok: false, error: "a repo entry was not an object" };
@@ -40,8 +41,13 @@ function parseRepos(raw: unknown): { ok: true; repos: GhListedRepo[] } | { ok: f
     if (typeof row.name !== "string" || !NAME_RE.test(row.name) || row.name.length > 100) {
       return { ok: false, error: "a repo name was not safe to store" };
     }
-    if (row.pushedAt != null && typeof row.pushedAt !== "string") {
-      return { ok: false, error: "pushedAt must be a string or null" };
+    const nameKey = row.name.toLowerCase();
+    if (seen.has(nameKey)) {
+      return { ok: false, status: 400, error: "A repo name was repeated with different casing." };
+    }
+    seen.add(nameKey);
+    if (row.pushedAt != null && (typeof row.pushedAt !== "string" || !isRfc3339(row.pushedAt))) {
+      return { ok: false, status: 400, error: "pushedAt must be an RFC 3339 timestamp or null." };
     }
     if (typeof row.isArchived !== "boolean" || typeof row.isFork !== "boolean") {
       return { ok: false, error: "isArchived and isFork must be booleans" };
@@ -54,14 +60,6 @@ function parseRepos(raw: unknown): { ok: true; repos: GhListedRepo[] } | { ok: f
     });
   }
   return { ok: true, repos };
-}
-
-function parseSweptAt(raw: unknown): { ok: true; sweptAt: string } | { ok: false; error: string } {
-  if (raw == null || raw === "") return { ok: false, error: "swept_at is required." };
-  if (typeof raw !== "string" || Number.isNaN(Date.parse(raw))) {
-    return { ok: false, error: "swept_at must be an ISO timestamp." };
-  }
-  return { ok: true, sweptAt: new Date(raw).toISOString() };
 }
 
 /** Every discovery 409, including a short-name conflict, uses this body. */
@@ -86,7 +84,7 @@ function discoveryConflictResponse(parsed: DiscoveryRequest[], message: string, 
   });
 }
 
-function parseResult(raw: unknown): { ok: true; request: DiscoveryRequest } | { ok: false; error: string } {
+function parseResult(raw: unknown, now: Date): { ok: true; request: DiscoveryRequest } | { ok: false; error: string } {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return { ok: false, error: "Each result must be an object." };
   }
@@ -100,11 +98,14 @@ function parseResult(raw: unknown): { ok: true; request: DiscoveryRequest } | { 
   if (row.truncated !== undefined && typeof row.truncated !== "boolean") {
     return { ok: false, error: "truncated must be true or false." };
   }
-  const swept = parseSweptAt(row.swept_at);
+  const swept = parseCollectorSweptAt(row.swept_at, now);
   if (!swept.ok) return { ok: false, error: swept.error };
   if (!row.ok) return { ok: true, request: { owner: name.owner, ok: false, error, sweptAt: swept.sweptAt } };
   const repos = parseRepos(row.repos);
-  if (!repos.ok) return { ok: true, request: { owner: name.owner, ok: false, error: repos.error, sweptAt: swept.sweptAt } };
+  if (!repos.ok) {
+    if (repos.status === 400) return { ok: false, error: repos.error };
+    return { ok: true, request: { owner: name.owner, ok: false, error: repos.error, sweptAt: swept.sweptAt } };
+  }
   return {
     ok: true,
     request: {
@@ -134,9 +135,10 @@ export async function POST(req: Request) {
       fields: { results: "Expected an array." },
     });
   }
+  const now = new Date();
   const parsed: DiscoveryRequest[] = [];
   for (const item of results) {
-    const one = parseResult(item);
+    const one = parseResult(item, now);
     if (!one.ok) {
       return apiError("validation_failed", { message: one.error, fields: { results: one.error } });
     }
@@ -172,7 +174,6 @@ export async function POST(req: Request) {
     }
     const owners = listed.owners;
     let existing = await loadTrackedRepos();
-    const now = new Date();
     const out = [];
     for (const item of parsed) {
       const stored = owners.find((owner) => owner.owner === item.owner);

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { Actor } from "./actor";
 import { isConfigured, sql, withTransaction, type Row } from "./db";
 import {
+  alignRepoCasing,
   DISCOVERY_WRITE_LOCK,
   planDiscovery,
   repoIdentity,
@@ -76,7 +77,7 @@ export interface WatchedOwnerRead {
   owners: StoredOwner[];
 }
 
-export type DiscoverySkip = "owner_removed" | "rule_changed";
+export type DiscoverySkip = "owner_removed" | "rule_changed" | "stale";
 
 export interface DiscoveryApplyOutcome extends DiscoveryOutcome {
   /** Set when the locked owner row no longer matches the sweep that was planned. */
@@ -261,6 +262,19 @@ function skippedOutcome(existing: TrackedRepo[], skipped: DiscoverySkip): Discov
   return { ...unchanged(existing, `skipped: ${skipped}`), skipped };
 }
 
+/** A stale sweep is not a failure. It writes nothing and keeps the newer stamp. */
+function staleOutcome(existing: TrackedRepo[]): DiscoveryApplyOutcome {
+  return {
+    failure: null,
+    warning: null,
+    repos: existing.map((row) => ({ ...row })),
+    added: [],
+    updated: [],
+    markedGone: [],
+    skipped: "stale",
+  };
+}
+
 async function applyOwnerDiscoveryOnce(
   rule: OwnerRule,
   existing: TrackedRepo[],
@@ -279,14 +293,16 @@ async function applyOwnerDiscoveryOnce(
     if (!stored) return skippedOutcome(existing, "owner_removed");
     if (!sameDiscoveryRule(rule, stored)) return skippedOutcome(existing, "rule_changed");
     if (isStaleDiscovery(sweptAt, stored.lastDiscoveredAt)) {
-      return unchanged(existing, "stale discovery sweep");
+      return staleOutcome(existing);
     }
     // Failures do not depend on the repo snapshot. A success plans again
     // from the rows read under this lock, not from `existing`.
     const preview = planDiscovery(existing, rule, sweep, now);
-    const outcome = preview.failure
-      ? preview
-      : planDiscovery(await readTrackedRepos(q), rule, sweep, now);
+    const locked = preview.failure ? null : await readTrackedRepos(q);
+    let outcome = preview.failure ? preview : planDiscovery(locked ?? [], rule, sweep, now);
+    if (!outcome.failure && locked) {
+      outcome = { ...outcome, repos: alignRepoCasing(locked, outcome.repos) };
+    }
     const visibleError = outcome.failure ?? outcome.warning;
     const discoveredAt = sweptAt ?? now.toISOString();
     const owned = outcome.failure

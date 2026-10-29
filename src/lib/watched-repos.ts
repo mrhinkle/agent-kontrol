@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { isConfigured, sql, withTransaction, type SqlTag } from "./db";
 import {
+  alignRepoCasing,
   briefShown,
   DISCOVERY_WRITE_LOCK,
   planOverrideResets,
@@ -213,8 +214,9 @@ export async function replaceWatchedRepos(repos: RepoInput[], expectedVersion?: 
     if (expectedVersion !== undefined && expectedVersion !== versionOf(stored)) {
       return { ok: false, reason: "stale" };
     }
-    const resets = planOverrideResets(stored, repos);
-    await writeReplacedRepos(q, repos, resets);
+    const aligned = alignRepoCasing(stored, repos);
+    const resets = planOverrideResets(stored, aligned);
+    await writeReplacedRepos(q, aligned, resets);
     return { ok: true };
   });
 }
@@ -255,7 +257,7 @@ async function writeReplacedRepos(q: SqlTag, repos: RepoInput[], resets: Tracked
       )
       delete from watched_repos w
       where w.origin is distinct from 'auto'
-        and not exists (select 1 from incoming i where i.repo = w.repo)
+        and not exists (select 1 from incoming i where lower(i.repo) = lower(w.repo))
     `;
     return;
   }
@@ -342,7 +344,7 @@ async function writeReplacedRepos(q: SqlTag, repos: RepoInput[], resets: Tracked
     )
     delete from watched_repos w
     where w.origin is distinct from 'auto'
-      and not exists (select 1 from incoming i where i.repo = w.repo)
+      and not exists (select 1 from incoming i where lower(i.repo) = lower(w.repo))
   `;
 }
 
@@ -364,7 +366,7 @@ export async function setRepoOverride(
         pinned = coalesce(${patch.pinned ?? null}::boolean, pinned),
         hidden = coalesce(${patch.hidden ?? null}::boolean, hidden),
         updated_at = now()
-      where repo = ${repo}
+      where lower(repo) = lower(${repo})
       returning repo
     `;
     return rows.length > 0;
