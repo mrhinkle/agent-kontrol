@@ -1924,12 +1924,18 @@ async function testDecisionWritebackHardening(tag: string) {
     await sql()`
       update decisions
       set writeback = null,
+          writeback_lock = null,
+          writeback_lock_at = null,
+          decided_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS - 30}),
           updated_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS - 30})
       where id = ${inside.id}
     `;
     await sql()`
       update decisions
       set writeback = null,
+          writeback_lock = null,
+          writeback_lock_at = null,
+          decided_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30}),
           updated_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30})
       where id = ${outside.id}
     `;
@@ -1942,6 +1948,62 @@ async function testDecisionWritebackHardening(tag: string) {
           updated_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30})
       where id = ${written.id}
     `;
+
+    // A claimed row whose process died before the stamp. The collector
+    // upserts the still-labeled row and refreshes updated_at. The lock
+    // timestamp and decided_at stay, so an expired claim is still due.
+    const expiredSeed = await upsertDecision(body(8));
+    const expiredDecided = await decide(expiredSeed.decision.id, expiredSeed.decision.revision);
+    const expiredClaim = await claimDecisionWriteback(expiredDecided.id, expiredDecided.revision);
+    assert.ok(expiredClaim);
+    await sql()`
+      update decisions
+      set writeback_lock_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30}),
+          decided_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30})
+      where id = ${expiredDecided.id}
+    `;
+    const expiredAgain = await upsertDecision(body(8));
+    assert.equal(expiredAgain.decision.id, expiredDecided.id);
+    assert.equal(expiredAgain.status_held, true);
+    assert.equal(expiredAgain.decision.writeback, null);
+    const expiredRow = await sql()`
+      select writeback_lock, writeback,
+        writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as lock_old,
+        decided_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as decided_old,
+        updated_at >= now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as updated_fresh
+      from decisions where id = ${expiredDecided.id}
+    `;
+    assert.equal(expiredRow[0].writeback_lock, expiredClaim.token);
+    assert.equal(expiredRow[0].writeback, null);
+    assert.equal(expiredRow[0].lock_old === true || expiredRow[0].lock_old === "t", true);
+    assert.equal(expiredRow[0].decided_old === true || expiredRow[0].decided_old === "t", true);
+    assert.equal(expiredRow[0].updated_fresh === true || expiredRow[0].updated_fresh === "t", true);
+
+    // Same crash, but the claim is still inside its lease. The collector
+    // refresh must not put that row in the retry population.
+    const liveSeed = await upsertDecision(body(9));
+    const liveDecided = await decide(liveSeed.decision.id, liveSeed.decision.revision);
+    const liveClaim = await claimDecisionWriteback(liveDecided.id, liveDecided.revision);
+    assert.ok(liveClaim);
+    await sql()`
+      update decisions
+      set writeback_lock_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS - 30}),
+          decided_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30})
+      where id = ${liveDecided.id}
+    `;
+    const liveAgain = await upsertDecision(body(9));
+    assert.equal(liveAgain.decision.id, liveDecided.id);
+    assert.equal(liveAgain.decision.writeback, null);
+    const liveRow = await sql()`
+      select writeback_lock,
+        writeback_lock_at >= now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as lock_live,
+        updated_at >= now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as updated_fresh
+      from decisions where id = ${liveDecided.id}
+    `;
+    assert.equal(liveRow[0].writeback_lock, liveClaim.token);
+    assert.equal(liveRow[0].lock_live === true || liveRow[0].lock_live === "t", true);
+    assert.equal(liveRow[0].updated_fresh === true || liveRow[0].updated_fresh === "t", true);
+
     const flags = await sql()`
       select id,
         (
@@ -1949,7 +2011,11 @@ async function testDecisionWritebackHardening(tag: string) {
           or (
             status = 'decided'
             and writeback is null
-            and updated_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+            and (
+              writeback_lock is null
+              or writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+            )
+            and coalesce(writeback_lock_at, decided_at, updated_at) < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
           )
         ) as due
       from decisions
@@ -1960,6 +2026,8 @@ async function testDecisionWritebackHardening(tag: string) {
     assert.equal(due.get(outside.id), true, "a null writeback older than the lease is due");
     assert.equal(due.get(freshStamp.id), true, "not_written stays due at any age");
     assert.equal(due.get(written.id), false, "written is not a retry");
+    assert.equal(due.get(expiredDecided.id), true, "an expired claim stays due after a collector upsert refreshes updated_at");
+    assert.equal(due.get(liveDecided.id), false, "a live claim stays out of the retry population after a collector upsert");
     const listed = await listDecisions({
       status: "decided",
       repo,

@@ -1270,7 +1270,7 @@ export function openApiDocument(): Json {
             query(
               "writeback",
               { type: "string", enum: ["written", "not_written"] },
-              "written keeps only written rows. not_written keeps rows stamped not_written and a decided row whose writeback is still null and whose updated_at is older than the 180 second write-back lease. Ignored when shape is brief.",
+              "written keeps only written rows. not_written keeps rows stamped not_written and a decided row whose writeback is still null, whose write-back claim is absent or older than the 180 second write-back lease, and whose writeback_lock_at, else decided_at, else updated_at, is older than that lease. Ignored when shape is brief.",
             ),
           ],
           responses: {

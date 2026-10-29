@@ -14,9 +14,11 @@ import { DECISION_MARKER, buildDecisionComment, decisionSourceHref } from "../..
 import { listDecisionsTool, requestDecisionTool, resolveDecisionTool } from "../../src/lib/decision-resolve";
 import { demoListActivity, resetDemoStoreForTests } from "../../src/lib/demo-store";
 import {
+  claimDecisionWriteback,
   listDecisions,
   nullWritebackPastLease,
   parseListQuery,
+  patchDecision as patchStoredDecision,
   presentDecision,
   setDecisionStoreForTests,
   setDecisionWriteback,
@@ -1426,10 +1428,16 @@ describe("decision resolve", { concurrency: false }, () => {
     };
     const insideRow = rowOf(inside.id);
     insideRow.writeback = null;
-    insideRow.updated_at = new Date(now - leaseMs + 5_000).toISOString();
+    insideRow.writeback_lock = null;
+    insideRow.writeback_lock_at = null;
+    insideRow.decided_at = new Date(now - leaseMs + 5_000).toISOString();
+    insideRow.updated_at = insideRow.decided_at;
     const outsideRow = rowOf(outside.id);
     outsideRow.writeback = null;
-    outsideRow.updated_at = new Date(now - leaseMs - 5_000).toISOString();
+    outsideRow.writeback_lock = null;
+    outsideRow.writeback_lock_at = null;
+    outsideRow.decided_at = new Date(now - leaseMs - 5_000).toISOString();
+    outsideRow.updated_at = outsideRow.decided_at;
     const postedRow = rowOf(posted.id);
     postedRow.writeback = "written";
     postedRow.updated_at = new Date(now - leaseMs - 5_000).toISOString();
@@ -1439,6 +1447,81 @@ describe("decision resolve", { concurrency: false }, () => {
     if (!parsed.ok) return;
     const pending = await listDecisions(parsed);
     assert.deepEqual(pending.map((item) => item.title).sort(), ["Outside", "Stamped"]);
+  });
+
+  it("keeps an expired claim in the retry population after a collector upsert refreshes updated_at", async () => {
+    const store = createMemoryDecisionStore();
+    setDecisionStoreForTests(store);
+    clearGitHubWriteClientForTests();
+    const leaseMs = WRITEBACK_LOCK_LEASE_SECONDS * 1000;
+    const past = new Date(Date.now() - leaseMs - 30_000).toISOString();
+    const liveAt = new Date(Date.now() - 30_000).toISOString();
+
+    async function crashedClaim(key: string, title: string, number: number, lockAt: string) {
+      const row = await seed({ key, title, number });
+      const decided = await patchStoredDecision(row.id, {
+        status: "decided",
+        decision: "ship",
+        setDecision: true,
+        decided_by: "mark",
+        setDecidedBy: true,
+        defer_until: null,
+        setDefer: false,
+        guardTerminal: true,
+        expectedRevision: row.revision,
+      });
+      assert.ok(decided);
+      assert.equal(decided.writeback, null);
+      const claim = await claimDecisionWriteback(decided.id, decided.revision);
+      assert.ok(claim);
+      const stored = store.rows.find((item) => item.id === row.id);
+      assert.ok(stored);
+      assert.equal(stored.writeback ?? null, null);
+      assert.equal(stored.writeback_lock, claim.token);
+      stored.writeback_lock_at = lockAt;
+      stored.decided_at = past;
+      const touchedAt = String(stored.updated_at);
+      const again = await upsertDecision({
+        key,
+        source: "github-label",
+        repo: "evil/other",
+        repo_short: "evil",
+        number,
+        url: null,
+        title,
+        why: "The page and the collector disagree.",
+        options: [
+          { id: "ship", label: "Ship the columns" },
+          { id: "wait", label: "Wait" },
+        ],
+        recommended: "wait",
+        requested_by: "collector",
+        kind: "issue",
+        labels: ["bug", "needs-owner", "decision"],
+        opened_at: "2026-10-01T00:00:00.000Z",
+        first_seen_at: "2026-10-01T00:00:00.000Z",
+        github_present: true,
+        force: false,
+      });
+      assert.equal(again.status_held, true);
+      assert.equal(again.decision.writeback, null);
+      assert.notEqual(again.decision.updated_at, touchedAt);
+      assert.equal(stored.writeback_lock, claim.token);
+      assert.equal(stored.writeback_lock_at, lockAt);
+      assert.equal(stored.decided_at, past);
+      assert.equal(stored.writeback ?? null, null);
+      return row.id;
+    }
+
+    const expiredId = await crashedClaim("github:acme/widgets#101", "Expired claim", 101, past);
+    const liveId = await crashedClaim("github:acme/widgets#102", "Live claim", 102, liveAt);
+    const parsed = parseListQuery(new URLSearchParams("status=decided&writeback=not_written"));
+    assert.equal(parsed.ok, true);
+    if (!parsed.ok) return;
+    const pending = await listDecisions(parsed);
+    const ids = pending.map((item) => item.id);
+    assert.equal(ids.includes(expiredId), true);
+    assert.equal(ids.includes(liveId), false);
   });
 
   it("request_decision and resolve_decision emit a receipt only after a successful write", async () => {

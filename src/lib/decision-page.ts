@@ -17,8 +17,10 @@ export function decisionQueueVisible(rows: Decision[] | null, loadFailed: boolea
 }
 
 /**
- * A decided row the page can still retry. `written` is done. Age filtering
- * stays in the list query, which is what puts a null writeback here.
+ * A decided row the page can still retry. `written` is done.
+ * Age stays in the list query: the claim is absent or expired, and
+ * coalesce(writeback_lock_at, decided_at, updated_at) is past the lease.
+ * This check does not read updated_at.
  */
 export function decisionAwaitingWriteback(row: Decision | null | undefined): row is Decision {
   return row != null && row.status === "decided" && row.writeback !== "written";

@@ -1,4 +1,4 @@
-import { nullWritebackPastLease, writebackLockUnexpired, type DecisionStore, type ListStatus, type PatchInput, type UpsertInput } from "../../src/lib/decisions";
+import { nullWritebackRetryDue, writebackLockUnexpired, type DecisionStore, type ListStatus, type PatchInput, type UpsertInput } from "../../src/lib/decisions";
 
 /** In-memory queue with the same hold, stale, and terminal rules as the SQL. */
 export function createMemoryDecisionStore(): DecisionStore & {
@@ -59,13 +59,14 @@ export function createMemoryDecisionStore(): DecisionStore & {
         if (query.shape !== "brief" && query.writeback) {
           if (row.writeback === query.writeback) return true;
           // A crash between the decision commit and the not_written stamp
-          // leaves writeback null. That row joins the retry population only
-          // once it is older than the write-back lease.
+          // leaves writeback null. The age clock matches the list SQL:
+          // no live claim, then coalesce(writeback_lock_at, decided_at, updated_at).
+          // A collector upsert refreshes updated_at and leaves the other two.
           if (
             query.writeback === "not_written"
             && row.status === "decided"
             && row.writeback == null
-            && nullWritebackPastLease(row.updated_at)
+            && nullWritebackRetryDue(row)
           ) return true;
           return false;
         }

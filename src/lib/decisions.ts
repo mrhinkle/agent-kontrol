@@ -43,16 +43,51 @@ export function writebackLockUnexpired(lock: unknown, lockAt: unknown, nowMs = D
   return nowMs - at < WRITEBACK_LOCK_LEASE_SECONDS * 1000;
 }
 
-/**
- * A decided row that never received a write-back stamp. Strictly older than
- * the claim lease, so a writer still inside that lease is not in the retry
- * population. Equal to the lease is still inside.
- */
-export function nullWritebackPastLease(updatedAt: unknown, nowMs = Date.now()): boolean {
-  const at = updatedAt instanceof Date ? updatedAt.getTime() : Date.parse(String(updatedAt ?? ""));
-  if (!Number.isFinite(at)) return false;
-  return nowMs - at > WRITEBACK_LOCK_LEASE_SECONDS * 1000;
+/** Milliseconds of a timestamp, or null when the value is missing or not a time. */
+function timeMs(value: unknown): number | null {
+  if (value == null || value === "") return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (value instanceof Date) {
+    const at = value.getTime();
+    return Number.isFinite(at) ? at : null;
+  }
+  const at = Date.parse(String(value));
+  return Number.isFinite(at) ? at : null;
 }
+
+/**
+ * Strictly older than the claim lease. Equal to the lease is still inside.
+ * One timestamp. The retry population uses `nullWritebackRetryDue`.
+ */
+export function nullWritebackPastLease(at: unknown, nowMs = Date.now()): boolean {
+  const ms = timeMs(at);
+  if (ms == null) return false;
+  return nowMs - ms > WRITEBACK_LOCK_LEASE_SECONDS * 1000;
+}
+
+/**
+ * A decided row with a null write-back stamp joins `writeback=not_written`
+ * on this predicate, the same one as the list SQL:
+ * the claim is absent or `writeback_lock_at` is strictly older than the
+ * lease, and coalesce(`writeback_lock_at`, `decided_at`, `updated_at`) is too.
+ * A collector upsert refreshes `updated_at` and leaves the other two columns
+ * alone, so `updated_at` by itself is not the age clock.
+ */
+export function nullWritebackRetryDue(
+  row: {
+    writeback_lock?: unknown;
+    writeback_lock_at?: unknown;
+    decided_at?: unknown;
+    updated_at?: unknown;
+  },
+  nowMs = Date.now(),
+): boolean {
+  const lockAbsent = row.writeback_lock == null;
+  if (!lockAbsent && !nullWritebackPastLease(row.writeback_lock_at, nowMs)) return false;
+  const clock = timeMs(row.writeback_lock_at) ?? timeMs(row.decided_at) ?? timeMs(row.updated_at);
+  return nullWritebackPastLease(clock, nowMs);
+}
+
 export type DecisionStatus = (typeof DECISION_STATUSES)[number];
 
 export const LIST_STATUSES = [...DECISION_STATUSES, "all"] as const;
@@ -915,7 +950,11 @@ export async function listDecisions(query: {
         ${query.writeback ?? null}::text = 'not_written'
         and status = 'decided'
         and writeback is null
-        and updated_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+        and (
+          writeback_lock is null
+          or writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+        )
+        and coalesce(writeback_lock_at, decided_at, updated_at) < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
       )
     )
     order by first_seen_at asc, id asc
