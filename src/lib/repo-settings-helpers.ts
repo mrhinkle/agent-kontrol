@@ -14,12 +14,28 @@ export function newRow(index: number): Row {
   return { id: nextId(), repo: "", label: "", short: "", color: PALETTE[index % PALETTE.length], blockedLabel: null };
 }
 
+/** Hand-added rows, plus auto rows whose label, short, color, or blocked label was overridden. */
+export function splitWatchedRepos<T extends { origin?: "manual" | "auto"; fieldsOverridden?: boolean | null }>(
+  repos: T[],
+): { editable: T[]; discovered: T[] } {
+  return {
+    editable: repos.filter((repo) => repo.origin !== "auto" || repo.fieldsOverridden === true),
+    discovered: repos.filter((repo) => repo.origin === "auto" && repo.fieldsOverridden !== true),
+  };
+}
+
 export function fromRepos(repos: RepoInput[]): Row[] {
   return repos.map((r) => ({ ...r, id: nextId() }));
 }
 
 export function toPayload(rows: Row[]): RepoInput[] {
-  return rows.map(({ repo, label, short, color, blockedLabel }) => ({ repo, label, short, color, blockedLabel }));
+  return rows.map(({ repo, label, short, color, blockedLabel, pinned, hidden, origin }) => {
+    const out: RepoInput = { repo, label, short, color, blockedLabel };
+    if (pinned !== undefined) out.pinned = pinned;
+    if (hidden !== undefined) out.hidden = hidden;
+    if (origin !== undefined) out.origin = origin;
+    return out;
+  });
 }
 
 /** Returns a new array with one row moved. Out-of-range or same-index moves keep the order. */
@@ -36,7 +52,15 @@ export function isDirty(initial: RepoInput[], rows: Row[]): boolean {
   if (initial.length !== rows.length) return true;
   return rows.some((r, i) => {
     const a = initial[i];
-    return a.repo !== r.repo || a.label !== r.label || a.short !== r.short || a.color !== r.color || a.blockedLabel !== r.blockedLabel;
+    return (
+      a.repo !== r.repo ||
+      a.label !== r.label ||
+      a.short !== r.short ||
+      a.color !== r.color ||
+      a.blockedLabel !== r.blockedLabel ||
+      (a.pinned === true) !== (r.pinned === true) ||
+      (a.hidden === true) !== (r.hidden === true)
+    );
   });
 }
 

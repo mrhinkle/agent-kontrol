@@ -253,10 +253,21 @@ function finishMemoryRead(text: string, params: unknown[]): Row[] {
 
 (
   globalThis as unknown as {
-    __mcPgPool?: { query: (text: string, params?: unknown[]) => Promise<{ rows: Row[] }>; on: () => void };
+    __mcPgPool?: {
+      query: (text: string, params?: unknown[]) => Promise<{ rows: Row[] }>;
+      connect: () => Promise<{ query: (text: string, params?: unknown[]) => Promise<{ rows: Row[] }>; release: () => void }>;
+      on: () => void;
+    };
   }
 ).__mcPgPool = {
   on() {},
+  async connect() {
+    const pool = (globalThis as unknown as { __mcPgPool: { query: (text: string, params?: unknown[]) => Promise<{ rows: Row[] }> } }).__mcPgPool;
+    return {
+      query: (text: string, params?: unknown[]) => pool.query(text, params),
+      release() {},
+    };
+  },
   async query(text: string, params: unknown[] = []) {
     queries.push(text);
     if (isWrite(text)) {

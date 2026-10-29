@@ -3,11 +3,14 @@
  * cancelling or updating a task, and overwriting a memory key.
  * Pure. Safe to import from a client component. Nothing here touches the database.
  */
+import { planOverrideResets } from "./owner-discovery";
+import type { OwnerInput } from "./owner-validation";
 import type { RepoInput } from "./repo-validation";
 import type { MemoryItem, Task, TaskStatus } from "./types";
 
 export type DryRunAction =
   | "replace_repos"
+  | "replace_owners"
   | "cancel_task"
   | "update_task"
   | "requeue_task"
@@ -91,7 +94,7 @@ export function refusedDryRun(action: DryRunAction, note: string): DryRunResult 
   };
 }
 
-const REPO_FIELDS = ["label", "short", "color", "blockedLabel"] as const;
+const REPO_FIELDS = ["label", "short", "color", "blockedLabel", "pinned", "hidden"] as const;
 
 function repoRecord(repo: RepoInput, position: number): Record<string, unknown> {
   return {
@@ -100,22 +103,53 @@ function repoRecord(repo: RepoInput, position: number): Record<string, unknown> 
     short: repo.short,
     color: repo.color,
     blockedLabel: repo.blockedLabel ?? null,
+    pinned: repo.pinned === true,
+    hidden: repo.hidden === true,
     position,
   };
 }
 
+type ListedRepo = RepoInput & { fieldsOverridden?: boolean | null };
+
 /**
  * Diff two watched-repo lists the way `replaceWatchedRepos` matches rows:
  * the repo string is the primary key, so a case change is a remove plus an add.
+ * An omitted auto row stays. When that row's fields were overridden, the diff
+ * reports the reset back to the discovery defaults.
  */
-export function diffRepoList(current: RepoInput[], next: RepoInput[], wouldWrite = true): DryRunResult {
+export function diffRepoList(current: ListedRepo[], next: RepoInput[], wouldWrite = true): DryRunResult {
   const currentAt = new Map(current.map((repo, index) => [repo.repo, index]));
   const nextAt = new Map(next.map((repo, index) => [repo.repo, index]));
+  const resets = new Map(planOverrideResets(current, next).map((row) => [row.repo, row]));
   const changes: DryRunChange[] = [];
   const affected: Record<string, unknown>[] = [];
 
   current.forEach((repo, index) => {
     if (nextAt.has(repo.repo)) return;
+    // Auto-discovered rows stay when a manual save omits them. The save
+    // does not hide them and does not delete them. An override is cleared.
+    const reset = resets.get(repo.repo);
+    if (repo.origin === "auto") {
+      if (!reset) return;
+      const before = repoRecord(repo, index);
+      const after = repoRecord(
+        { ...repo, label: reset.label, short: reset.short, color: reset.color, blockedLabel: null },
+        index,
+      );
+      const fields = (["label", "short", "color", "blockedLabel"] as const).filter(
+        (field) => (before[field] ?? null) !== (after[field] ?? null),
+      );
+      changes.push({
+        op: "update",
+        summary: fields.length > 0
+          ? `Reset ${repo.repo}: ${fields.join(", ")}.`
+          : `Reset ${repo.repo}: label, short, color, blockedLabel.`,
+        before,
+        after,
+      });
+      affected.push(before);
+      return;
+    }
     const before = repoRecord(repo, index);
     changes.push({
       op: "remove",
@@ -140,7 +174,10 @@ export function diffRepoList(current: RepoInput[], next: RepoInput[], wouldWrite
       return;
     }
     const previous = current[from];
-    const fields = REPO_FIELDS.filter((field) => (previous[field] ?? null) !== (repo[field] ?? null));
+    const fields = REPO_FIELDS.filter((field) => {
+      if (field === "pinned" || field === "hidden") return (previous[field] === true) !== (repo[field] === true);
+      return (previous[field] ?? null) !== (repo[field] ?? null);
+    });
     const moved = from !== index;
     if (fields.length === 0 && !moved) return;
     const before = repoRecord(previous, from);
@@ -170,6 +207,79 @@ export function diffRepoList(current: RepoInput[], next: RepoInput[], wouldWrite
     applied: false,
     would_write: wouldWrite,
     action: "replace_repos",
+    changes,
+    affected,
+    note,
+  };
+}
+
+function ownerRecord(owner: OwnerInput): Record<string, unknown> {
+  return {
+    owner: owner.owner,
+    activity_days: owner.activityDays,
+    include_forks: owner.includeForks,
+    include_archived: owner.includeArchived,
+  };
+}
+
+/** Diff two owner lists. The owner login is the key. Repos are not deleted with an owner. */
+export function diffOwnerList(current: OwnerInput[], next: OwnerInput[], wouldWrite = true): DryRunResult {
+  const currentAt = new Map(current.map((owner) => [owner.owner, owner]));
+  const nextAt = new Map(next.map((owner) => [owner.owner, owner]));
+  const changes: DryRunChange[] = [];
+  const affected: Record<string, unknown>[] = [];
+
+  for (const owner of current) {
+    if (nextAt.has(owner.owner)) continue;
+    const before = ownerRecord(owner);
+    changes.push({
+      op: "remove",
+      summary: `Stop discovering ${owner.owner}. Repos already tracked stay in the database.`,
+      before,
+      after: null,
+    });
+    affected.push(before);
+  }
+
+  for (const owner of next) {
+    const previous = currentAt.get(owner.owner);
+    const after = ownerRecord(owner);
+    if (!previous) {
+      changes.push({
+        op: "add",
+        summary: `Discover repos for ${owner.owner} (active within ${owner.activityDays} days).`,
+        before: null,
+        after,
+      });
+      affected.push(after);
+      continue;
+    }
+    const fields = (["activityDays", "includeForks", "includeArchived"] as const).filter(
+      (field) => previous[field] !== owner[field],
+    );
+    if (fields.length === 0) continue;
+    const before = ownerRecord(previous);
+    changes.push({
+      op: "update",
+      summary: `Update ${owner.owner}: ${fields.join(", ")}.`,
+      before,
+      after,
+    });
+    affected.push(before);
+  }
+
+  let note: string | undefined;
+  if (!wouldWrite) {
+    note = "No database is connected, so a save would be refused and nothing would be written.";
+  } else if (changes.length === 0) {
+    note = "Nothing in the owner list differs. Saving would still refresh the actor and timestamps.";
+  }
+
+  return {
+    dry_run: true,
+    applied: false,
+    would_write: wouldWrite,
+    action: "replace_owners",
     changes,
     affected,
     note,

@@ -36,7 +36,7 @@ import {
   type RepoConfig,
 } from "./progress-config";
 import { enqueueMessage } from "./store";
-import { getWatchedRepos } from "./watched-repos";
+import { getWatchedRepos, visibleOnBoard } from "./watched-repos";
 
 export type AlertKind = "coordinator_silent" | "zero_merge" | "decision_age";
 export type AlertCondition = "firing" | "clear" | "unknown";
@@ -301,7 +301,8 @@ function covers(intervals: Array<[number, number]>, start: number, end: number):
 async function readMerges(settings: BriefSettings, now: Date): Promise<Draft[]> {
   let repos: RepoConfig[];
   try {
-    repos = (await getWatchedRepos(REPOS)).repos;
+    // Same repo set as the brief: a hidden, gone, or out-of-window repo does not alert.
+    repos = (await getWatchedRepos(REPOS)).repos.filter(visibleOnBoard);
   } catch {
     return [unknownDraft("zero-merge", "zero_merge", "Watched repos could not be read.")];
   }

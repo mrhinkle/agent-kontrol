@@ -4,6 +4,7 @@ import { LABEL_MAX } from "@/lib/credentials";
 import { DECISION_STATUSES, LIST_SHAPES, LIST_STATUSES } from "@/lib/decisions";
 import { PROGRESS_INGEST_KINDS } from "@/lib/progress-store";
 import { WINDOWS } from "@/lib/progress-config";
+import { MAX_OWNERS } from "@/lib/owner-validation";
 import { MAX_REPOS } from "@/lib/repo-validation";
 import { SCOPES } from "@/lib/scopes";
 import { INGEST_KINDS } from "@/lib/store";
@@ -311,6 +312,103 @@ export function openApiDocument(): Json {
             short: { type: "string" },
             color: { type: "string", pattern: "^#[0-9a-fA-F]{6}$" },
             blockedLabel: { type: ["string", "null"] },
+            pinned: { type: "boolean", description: "Always show on the brief, including after the activity window. Hide wins over pin." },
+            hidden: { type: "boolean", description: "Collected, but omitted from the brief and the board. Hide wins over pin." },
+            origin: { type: "string", enum: ["manual", "auto"], description: "manual is hand-added. auto is discovered and is kept when a save omits it." },
+          },
+        },
+        WatchedOwnerInput: {
+          type: "object",
+          required: ["owner"],
+          properties: {
+            owner: { type: "string", maxLength: 39, description: "GitHub user or organization login. Stored lowercase." },
+            activity_days: { type: "integer", minimum: 1, maximum: 3650, description: "Repos with a push older than this drop off the brief. Default 30. The boundary day is still shown." },
+            activityDays: { type: "integer", minimum: 1, maximum: 3650, description: "Same as activity_days. Sending both is 400." },
+            include_forks: { type: "boolean", description: "Default false. Forks stay out of the brief unless this is true." },
+            includeForks: { type: "boolean" },
+            include_archived: { type: "boolean", description: "Default false." },
+            includeArchived: { type: "boolean" },
+          },
+        },
+        WatchedOwner: {
+          type: "object",
+          required: ["owner", "activity_days", "include_forks", "include_archived"],
+          properties: {
+            owner: { type: "string" },
+            activity_days: { type: "integer" },
+            include_forks: { type: "boolean" },
+            include_archived: { type: "boolean" },
+            last_error: { type: ["string", "null"], description: "Set when gh repo list failed, was rate-limited, or returned no repos. A truncated list stores a warning here and still sets last_discovered_at." },
+            last_error_at: { type: ["string", "null"], format: "date-time" },
+            last_discovered_at: { type: ["string", "null"], format: "date-time" },
+            actor_type: { type: ["string", "null"], enum: ["human", "agent", null] },
+            actor_id: { type: ["string", "null"] },
+          },
+        },
+        WatchedOwners: {
+          type: "object",
+          required: ["writable", "max", "version", "owners"],
+          properties: {
+            writable: { type: "boolean" },
+            max: { type: "integer", const: MAX_OWNERS },
+            version: { type: "string" },
+            owners: { type: "array", items: ref("WatchedOwner") },
+          },
+        },
+        OwnerList: {
+          type: "object",
+          required: ["owners"],
+          properties: {
+            version: { type: "string", description: "Version from the last GET. A mismatch is 409 stale and writes nothing." },
+            dry_run: dryRunFlag,
+            owners: { type: "array", maxItems: MAX_OWNERS, items: ref("WatchedOwnerInput") },
+          },
+        },
+        OwnerDiscovery: {
+          type: "object",
+          required: ["results"],
+          properties: {
+            results: {
+              type: "array",
+              items: {
+                type: "object",
+                required: ["owner", "ok", "swept_at"],
+                properties: {
+                  owner: { type: "string" },
+                  ok: { type: "boolean" },
+                  error: { type: ["string", "null"] },
+                  truncated: { type: "boolean", description: "True when gh repo list hit the 1000-repo cap. Seen repos are updated. Others are not marked gone." },
+                  swept_at: { type: "string", format: "date-time", description: "Required. Collector time just before gh repo list. A sweep that is not newer than last_discovered_at is ignored." },
+                  repos: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      required: ["name", "isArchived", "isFork"],
+                      properties: {
+                        name: { type: "string" },
+                        pushedAt: { type: ["string", "null"], format: "date-time" },
+                        isArchived: { type: "boolean" },
+                        isFork: { type: "boolean" },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        RepoOverride: {
+          type: "object",
+          required: ["repo"],
+          anyOf: [
+            { required: ["pinned"] },
+            { required: ["hidden"] },
+          ],
+          properties: {
+            repo: { type: "string", description: "owner/name" },
+            pinned: { type: "boolean" },
+            hidden: { type: "boolean", description: "Hide wins over pin. The repo stays collected and drops off the brief." },
+            dry_run: dryRunFlag,
           },
         },
         RepoList: {
@@ -327,6 +425,29 @@ export function openApiDocument(): Json {
             },
           },
         },
+        WatchedRepo: {
+          type: "object",
+          required: ["repo", "label", "short", "color", "blockedLabel"],
+          properties: {
+            repo: { type: "string", description: "owner/name" },
+            label: { type: "string" },
+            short: { type: "string" },
+            color: { type: "string" },
+            blockedLabel: { type: ["string", "null"] },
+            origin: { type: "string", enum: ["manual", "auto"] },
+            pinned: { type: "boolean", description: "Always show on the brief, including after the activity window. Hide wins over pin." },
+            hidden: { type: "boolean", description: "Collected, but omitted from the brief and the board. Hide wins over pin." },
+            gone: { type: "boolean", description: "True when the repo left the last successful non-truncated gh repo list. The row is kept. A gone repo is not shown, including when it is pinned." },
+            shown: { type: "boolean", description: "False drops the repo off the brief and the board. Omitted means show." },
+            isFork: { type: "boolean", description: "True when the repo is a fork." },
+            isArchived: { type: "boolean", description: "True when the repo is archived." },
+            lastActivityAt: { type: ["string", "null"], format: "date-time", description: "Last push time from gh. The activity window uses this." },
+            fieldsOverridden: {
+              type: ["boolean", "null"],
+              description: "True after a hand-added save overrode label, short, color, or blocked label on an auto row. False after a later save cleared that override. Null means discovery owns those fields. Omitting the field is the same as null.",
+            },
+          },
+        },
         WatchedRepos: {
           type: "object",
           required: ["source", "writable", "max", "version", "repos"],
@@ -335,7 +456,7 @@ export function openApiDocument(): Json {
             writable: { type: "boolean" },
             max: { type: "integer", const: MAX_REPOS },
             version: { type: "string" },
-            repos: { type: "array", items: ref("RepoInput") },
+            repos: { type: "array", items: ref("WatchedRepo") },
           },
         },
         UsageFact: {
@@ -592,7 +713,7 @@ export function openApiDocument(): Json {
             would_write: { type: "boolean" },
             action: {
               type: "string",
-              enum: ["replace_repos", "cancel_task", "update_task", "overwrite_memory", "insert_memory"],
+              enum: ["replace_repos", "replace_owners", "cancel_task", "update_task", "overwrite_memory", "insert_memory"],
             },
             changes: { type: "array", items: ref("DryRunChange") },
             affected: { type: "array", items: { type: "object", additionalProperties: true } },
@@ -1343,7 +1464,7 @@ export function openApiDocument(): Json {
           tags: ["settings"],
           summary: "Replace the watched-repo list, or preview that replace.",
           description:
-            "dry_run true returns the diff against the list GET would show (adds, removes, updates, reorders) and writes nothing. A stale version is still 409. With no database, a dry run returns that diff with would_write false instead of 409. A non-boolean dry_run is 400 and writes nothing.",
+            "dry_run true returns the diff against the list GET would show (adds, removes, updates, reorders) and writes nothing. An omitted auto row is not a remove. When that row has fieldsOverridden true, the diff reports an update that resets label, short, color, and blocked label to the discovery defaults. A stale version is still 409. The version is checked again under the discovery write lock in the same transaction as the replace. A pin or hide that changed the list is 409 stale and is kept. With no database, a dry run returns that diff with would_write false instead of 409. A non-boolean dry_run is 400 and writes nothing.",
           security: cookieOrBearer,
           requestBody: body(ref("RepoList")),
           responses: {
@@ -1356,6 +1477,100 @@ export function openApiDocument(): Json {
             "401": flatErrors["401"],
             "403": flatErrors["403"],
             "409": jsonResponse("No database, or version does not match the stored list.", ref("Error")),
+            "500": flatErrors["500"],
+          },
+        }),
+        patch: operation({
+          operationId: "patchWatchedRepo",
+          tags: ["settings"],
+          summary: "Pin or hide one watched repo.",
+          description:
+            "Sets pinned and hidden on one stored row. Takes the same advisory lock as discovery and repo replacement. Changing a flag changes the list version. Send at least one flag. Hide wins over pin: the repo stays collected and is left off the brief. A repo marked gone is not shown, including when it is pinned. Does not change origin. dry_run true returns before and after and writes nothing. With no database, the preview resolves the repo against the file fallback, returns before and after, and sets would_write false. An unknown repo is 404 in both modes.",
+          security: cookieOrBearer,
+          requestBody: body(ref("RepoOverride")),
+          responses: {
+            "200": jsonResponse("The stored list, or a preview that writes nothing.", {
+              oneOf: [ref("WatchedRepos"), ref("DryRunResult")],
+            }),
+            "400": flatErrors["400"],
+            "401": flatErrors["401"],
+            "403": flatErrors["403"],
+            "404": jsonResponse("That repo is not in the watched list.", ref("Error")),
+            "409": jsonResponse("No database is connected.", ref("Error")),
+            "500": flatErrors["500"],
+          },
+        }),
+      },
+      "/api/settings/owners": {
+        get: operation({
+          operationId: "getWatchedOwners",
+          tags: ["settings"],
+          summary: "GitHub owners whose repos are discovered.",
+          description:
+            "With no database, returns writable false and an empty owners list. A missing table is writable false and the same empty list, not a 500.",
+          security: cookieOrBearer,
+          responses: {
+            "200": jsonResponse("The current owner list and its version.", ref("WatchedOwners")),
+            ...flatErrors,
+          },
+        }),
+        put: operation({
+          operationId: "putWatchedOwners",
+          tags: ["settings"],
+          summary: "Replace the watched-owner list, or preview that replace.",
+          description:
+            "Auth matches PUT /api/settings/repos. An agent credential is 403 insufficient_scope. The actor is the principal, never a body field. dev-open stores null actor fields. Removing an owner does not delete repos already tracked. An empty owners list is allowed. dry_run true returns the diff and writes nothing. A stale version is 409. The version is checked again under a lock in the same transaction as the replace. With no database, or before the table exists, a dry run returns that diff with would_write false instead of 409, and a save is 409 conflict.",
+          security: cookieOrBearer,
+          requestBody: body(ref("OwnerList")),
+          responses: {
+            "200": jsonResponse("The stored list, or a preview that writes nothing.", {
+              oneOf: [ref("WatchedOwners"), ref("DryRunResult")],
+            }),
+            "400": jsonResponse("The list failed validation.", {
+              allOf: [ref("Error"), { type: "object", properties: { errors: { type: "array" } } }],
+            }),
+            "401": flatErrors["401"],
+            "403": flatErrors["403"],
+            "409": jsonResponse("No database, or version does not match the stored list.", ref("Error")),
+            "500": flatErrors["500"],
+          },
+        }),
+      },
+      "/api/settings/owners/discover": {
+        post: operation({
+          operationId: "discoverWatchedOwners",
+          tags: ["settings"],
+          summary: "Apply one collector tick of gh repo list results.",
+          description:
+            "Auth matches PUT /api/settings/repos. A result with ok false, a rate-limit error, or zero repos records last_error and does not change tracked repos. A truncated list updates the repos it saw, does not mark the others gone, and stores a warning on last_error while still setting last_discovered_at. An unknown owner is an error on that result and does not fail the batch. A duplicate owner in one request is 400 and writes nothing. A missing swept_at is 400. A repo name that is not safe to store fails that owner's sweep and writes no repo changes. One owner's metadata update and repo changes commit together, under one global advisory lock shared by every owner, after reloading tracked repos. The lock is not held during gh repo list. swept_at orders overlapping ticks: a sweep that is not newer than last_discovered_at writes nothing. A short-name unique violation replans once and then is 409 with results plus added, updated, and marked_gone as empty arrays on the response and on each result. Discovery does not change pin, hide, label, short, color, origin, fieldsOverridden, or the actor who saved the owner. No database, or a missing watched_owners table, is 409 and includes results plus added, updated, and marked_gone as empty arrays on the response and on each result.",
+          security: cookieOrBearer,
+          requestBody: body(ref("OwnerDiscovery")),
+          responses: {
+            "200": jsonResponse("One outcome per owner.", {
+              type: "object",
+              required: ["results"],
+              properties: {
+                results: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    required: ["owner", "ok", "added", "updated", "marked_gone"],
+                    properties: {
+                      owner: { type: "string" },
+                      ok: { type: "boolean" },
+                      error: { type: ["string", "null"] },
+                      added: { type: "integer" },
+                      updated: { type: "integer" },
+                      marked_gone: { type: "integer" },
+                    },
+                  },
+                },
+              },
+            }),
+            "400": flatErrors["400"],
+            "401": flatErrors["401"],
+            "403": flatErrors["403"],
+            "409": jsonResponse("No database is connected, or watched_owners does not exist yet.", ref("Error")),
             "500": flatErrors["500"],
           },
         }),

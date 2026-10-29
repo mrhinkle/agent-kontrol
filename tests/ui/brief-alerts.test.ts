@@ -57,7 +57,7 @@ interface World {
   clock: Date;
   agents: { id: string; last_seen_at: string | null }[];
   events: { agent_id: string; kind: string; created_at: string }[];
-  watched: { repo: string; label: string; short: string; color: string; blocked_label: string | null; position: number }[];
+  watched: { repo: string; label: string; short: string; color: string; blocked_label: string | null; position: number; hidden?: boolean }[];
   snapshots: { repo: string; collected_at: string; detail: unknown }[];
   decisions: {
     id: number;
@@ -451,6 +451,7 @@ const sqlFake: SqlTag = async (strings, ...values) => {
       .filter((event) => event.agent_id === agentId)
       .map((event, index) => ({ id: index + 1, kind: event.kind, created_at: event.created_at }));
   }
+  if (/from\s+watched_owners\b/i.test(text)) return [];
   if (/from\s+watched_repos\b/i.test(text)) {
     if (world.fail.has("watched")) throw new Error("watched repos down");
     return world.watched
@@ -462,6 +463,8 @@ const sqlFake: SqlTag = async (strings, ...values) => {
         short: row.short,
         color: row.color,
         blocked_label: row.blocked_label,
+        position: row.position,
+        hidden: row.hidden === true,
       }));
   }
   if (/from\s+repo_snapshots\b/i.test(text)) {
@@ -732,6 +735,24 @@ describe("threshold alerts", { concurrency: false }, () => {
     assert.equal(hit(configured, "coordinator-silent:carmack").condition, "firing");
     assert.match(hit(configured, "coordinator-silent:carmack").summary, /NOT WORKING/);
     assert.equal(messagesFor("coordinator-silent:carmack").length, 2);
+  });
+
+  it("a hidden repo does not raise a zero-merge alert", async () => {
+    useDb();
+    const on = settings({ enabled: true, agentId: null });
+    const shown = "example-org/shown-quiet";
+    const hidden = "example-org/hidden-quiet";
+    watch(shown, 0);
+    watch(hidden, 1);
+    world.watched[1].hidden = true;
+    snap(shown, at(T, 0), [{ merged_at: at(T, -72 * H - M) }]);
+    snap(hidden, at(T, 0), [{ merged_at: at(T, -72 * H - M) }]);
+    const result = await evaluateAlerts({ now: T, settings: on });
+    assert.equal(hit(result, `zero-merge:${shown}`).condition, "firing");
+    assert.ok(
+      !result.alerts.some((alert) => alert.key === `zero-merge:${hidden}`),
+      "hidden repo is not evaluated",
+    );
   });
 
   it("F4 zero-merge boundaries fire only for a quiet repo that merged inside the lookback", async () => {

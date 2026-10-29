@@ -105,8 +105,11 @@ Existing tables carry most of it. Additions:
   upserted by `key` (`github:<owner/repo>#<n>` for label-sourced rows, `agent:<id>:<slug>` for
   MCP-filed ones). `status` is `open | decided | deferred | withdrawn`; `decision`,
   `decided_by`, `decided_at` record the answer; `defer_until` lets a row disappear and come back.
-- **`watched_owners`** (planned): the GitHub owners whose repos are auto-discovered, with a
-  per-owner activity window. `watched_repos` stays as the override layer.
+- **`watched_owners`** (shipped, `supabase/migrations/20261028_watched_owners.sql`): the GitHub
+  owners whose repos are auto-discovered, with a per-owner activity window. `watched_repos`
+  stays as the override layer: pin and hide for discovered repos; label, short, color and blocked label for hand-added repos. Hide wins over pin. A repo
+  marked gone is not shown, including when it is pinned. A failed or empty `gh repo list`
+  records `last_error` and does not delete or hide tracked repos.
 
 ## API and MCP surface (planned)
 
@@ -221,7 +224,10 @@ and a resolve path, so those come before any page.
 4. `/api/brief` + `get_morning_brief` reading the database; scheduler switches to the route.
    Shipped 2026-10-27: `GET /api/brief` and MCP `get_morning_brief` read Postgres. The cron should `curl` the route. `scripts/morning-brief.sh` stays the fallback and still sweeps GitHub. The API does not. A 72h lead time uses `detail.merged` from the collector, not a live recompute. A positive 72h merge count with no `detail.merged` prints `SHIPPED: DATA INCOMPLETE` for that repo. A cumulative counter that went backwards is unmeasured (`DATA INCOMPLETE`), not 0. A decisions page that fills the 1000-row read is incomplete. With no database the route does not fill in the progress board's demo numbers.
 5. `/decisions` page; `request_decision` MCP tool.
-6. Owner-based repo discovery (`watched_owners`); Settings becomes the override layer.
+6. Owner-based repo discovery (`watched_owners`); Settings becomes the override layer. Shipped:
+   `GET`/`PUT /api/settings/owners`, `POST /api/settings/owners/discover`, `PATCH /api/settings/repos`,
+   and `discover_watched_owners` in `scripts/collect-progress.sh`. The morning brief drops a repo
+   only when `shown` is false. The collector still sweeps hidden and quiet repos and skips `gone`.
 7. Remaining threshold alerts (zero-merge repo, 14-day decision), plus the coordinator-silence
    re-send, behind `brief.alerts.enabled` (default false) until the owner's first backlog clear.
    Shipped as `GET /api/brief/alerts` and `POST /api/brief/alerts/evaluate`. Review-SLA alerts

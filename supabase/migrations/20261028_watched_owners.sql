@@ -1,0 +1,57 @@
+-- Owner discovery (#66). Changelog only. The same statements are in schema.sql.
+-- Additive: new table, new nullable-or-defaulted columns. No existing column changes.
+
+create table if not exists watched_owners (
+  owner text primary key,
+  activity_days integer not null default 30,
+  include_forks boolean not null default false,
+  include_archived boolean not null default false,
+  last_error text,
+  last_error_at timestamptz,
+  last_discovered_at timestamptz,
+  actor_type text,
+  actor_id text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+alter table watched_repos add column if not exists origin text not null default 'manual';
+alter table watched_repos add column if not exists pinned boolean not null default false;
+alter table watched_repos add column if not exists hidden boolean not null default false;
+alter table watched_repos add column if not exists gone boolean not null default false;
+alter table watched_repos add column if not exists is_fork boolean not null default false;
+alter table watched_repos add column if not exists is_archived boolean not null default false;
+alter table watched_repos add column if not exists last_activity_at timestamptz;
+-- null: discovery owns label, short, color, and blocked_label.
+-- true: a hand-added save overrode those fields. false: a later save cleared them.
+-- Nullable, no default.
+alter table watched_repos add column if not exists fields_overridden boolean;
+
+-- Deferrable so replaceWatchedRepos can swap two short names in one statement.
+-- Checked at the end of that statement (initially immediate). Discovery retries
+-- a 23505 once, then the route answers 409.
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'watched_repos_short_key'
+      and conrelid = 'watched_repos'::regclass
+  ) and exists (
+    select 1 from watched_repos group by short having count(*) > 1
+  ) then
+    -- Never fail the build on legacy data: every deploy applies this file. Skip the
+    -- constraint and say why; discovery's advisory lock still serializes allocation.
+    raise warning 'watched_repos has duplicate short names; watched_repos_short_key not added. Rename the duplicates, then redeploy.';
+  elsif not exists (
+    select 1
+    from pg_constraint
+    where conname = 'watched_repos_short_key'
+      and conrelid = 'watched_repos'::regclass
+  ) then
+    alter table watched_repos
+      add constraint watched_repos_short_key
+      unique (short)
+      deferrable initially immediate;
+  end if;
+end $$;

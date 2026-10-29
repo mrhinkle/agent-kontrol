@@ -2316,6 +2316,8 @@ describe("GET /api/brief", { concurrency: false }, () => {
       setSqlForTests(async (strings, ...values) => {
         const text = strings.join(" ");
         if (text.includes("from watched_repos")) return [];
+        // No saved owners: getWatchedRepos stays on the file list these fixtures use.
+        if (text.includes("from watched_owners")) return [];
         if (text.includes("from decisions")) {
           for (let i = 0; i < strings.length - 1; i++) {
             if (/\blimit\s*$/.test(strings[i])) seen.limit = Number(values[i]);
@@ -2532,6 +2534,8 @@ function installBriefSql(snapshots: Row[], decisions: Row[] | "missing" | "fail"
   setSqlForTests(async (strings, ...values) => {
     const text = strings.join(" ");
     if (text.includes("from watched_repos")) return [];
+    // No saved owners: getWatchedRepos stays on the file list these fixtures use.
+    if (text.includes("from watched_owners")) return [];
     if (text.includes("from decisions")) {
       if (decisions === "missing") {
         throw Object.assign(new Error('relation "decisions" does not exist'), { code: "42P01" });
@@ -2557,6 +2561,8 @@ function installSnapshotSql(rows: Row[]): void {
   setSqlForTests(async (strings, ...values) => {
     const text = strings.join(" ");
     if (text.includes("from watched_repos")) return [];
+    // No saved owners: getWatchedRepos stays on the file list these fixtures use.
+    if (text.includes("from watched_owners")) return [];
     if (text.includes("from decisions")) return [];
     if (!text.includes("from repo_snapshots")) throw new Error(`unexpected sql: ${text}`);
     const repos = new Set((values[0] as string[]) ?? []);
