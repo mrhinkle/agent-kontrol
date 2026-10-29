@@ -259,6 +259,49 @@ describe("OpenAPI document", () => {
     assert.equal(create.properties?.actor_id, undefined);
   });
 
+  it("declares source only on the PUT /api/settings/repos dry-run result", () => {
+    const doc = openApiDocument();
+    const sourceDescription =
+      "When a database is connected and source is file, that baseline is the empty stored list, not the file fallback.";
+    assert.match(
+      fs.readFileSync("docs/API.md", "utf8"),
+      /When a database is connected and `source` is `file`, that baseline is the empty stored list, not the file fallback\./,
+    );
+
+    type ResponseSchema = { oneOf?: { $ref?: string }[] };
+    type Operation = { responses?: Record<string, { content?: { "application/json"?: { schema?: ResponseSchema } } }> };
+    const paths = doc.paths as Record<string, Record<string, Operation>>;
+    function dryRunRefs(urlPath: string, method: string): string[] {
+      const branches = paths[urlPath]?.[method]?.responses?.["200"]?.content?.["application/json"]?.schema?.oneOf ?? [];
+      return branches.map((branch) => branch.$ref ?? "");
+    }
+
+    assert.deepEqual(dryRunRefs("/api/settings/repos", "put"), [
+      "#/components/schemas/WatchedRepos",
+      "#/components/schemas/RepoDryRunResult",
+    ]);
+
+    const repoDry = schemaOf(doc, "RepoDryRunResult") as Schema & {
+      allOf?: { properties?: Record<string, { enum?: string[]; description?: string }> }[];
+    };
+    const source = repoDry.allOf?.map((part) => part.properties?.source).find((property) => property);
+    assert.ok(source, "RepoDryRunResult declares source");
+    assert.deepEqual(source.enum, ["database", "file"]);
+    assert.equal(source.description, sourceDescription);
+    assert.equal(schemaOf(doc, "DryRunResult").properties?.source, undefined);
+
+    for (const [urlPath, method] of [
+      ["/api/memory", "post"],
+      ["/api/tasks/{id}", "patch"],
+      ["/api/settings/repos", "patch"],
+      ["/api/settings/owners", "put"],
+    ] as const) {
+      const refs = dryRunRefs(urlPath, method);
+      assert.equal(refs.includes("#/components/schemas/DryRunResult"), true, `${method} ${urlPath}`);
+      assert.equal(refs.includes("#/components/schemas/RepoDryRunResult"), false, `${method} ${urlPath}`);
+    }
+  });
+
   it("builds request schemas from the constants and interfaces the routes use", () => {
     const doc = openApiDocument();
     const report = schemaOf(doc, "ReportInput");
