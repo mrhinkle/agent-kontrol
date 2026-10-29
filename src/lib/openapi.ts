@@ -11,6 +11,7 @@ import { TASK_STATUSES } from "@/lib/types";
 import { USAGE_SOURCES } from "@/lib/usage-types";
 import { USAGE_WINDOWS } from "@/lib/usage-window";
 import { LIST_MAX } from "./list-params";
+import { RUNTIMES } from "./skills/types";
 
 /**
  * OpenAPI 3.1 for the documented REST routes.
@@ -1427,7 +1428,7 @@ export function openApiDocument(): Json {
             "Agent credentials need skills:read. runtime filters to skills compatible with that runtime. An unknown runtime is 400 validation_failed. q matches name and description, case-insensitive. category is an exact case-insensitive match on the stored category. The value uncategorized matches a null category. The taxonomy is not enforced. Each skill includes category (string or null) and tags (string array), plus lastScheduledAt and nextDueAt (ISO strings or null). Removed skills are omitted. With no database the body is demo true and a fixture list.",
           security: cookieOrBearer,
           parameters: [
-            query("runtime", { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] }, "Compatible runtime. Omit to return every skill."),
+            query("runtime", { type: "string", enum: [...RUNTIMES] }, "Compatible runtime. Omit to return every skill."),
             query("q", { type: "string" }, "Case-insensitive match on name and description."),
             query("category", { type: "string" }, "Exact category, case-insensitive. uncategorized matches a null category."),
           ],
@@ -1447,7 +1448,7 @@ export function openApiDocument(): Json {
           security: cookieOrBearer,
           parameters: [
             query("lane", { type: "string" }, "Lane name. Selected-scope skills match only an exact lane.", { required: true }),
-            query("runtime", { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] }, "Runtime that will read the file.", { required: true }),
+            query("runtime", { type: "string", enum: [...RUNTIMES] }, "Runtime that will read the file.", { required: true }),
             query("format", { type: "string", enum: ["json", "text"] }, "json (default) or text."),
           ],
           responses: {
@@ -1470,7 +1471,7 @@ export function openApiDocument(): Json {
             required: ["lane", "runtime"],
             properties: {
               lane: { type: "string" },
-              runtime: { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] },
+              runtime: { type: "string", enum: [...RUNTIMES] },
               agents_md: { type: ["string", "null"] },
             },
           }),
@@ -1486,10 +1487,10 @@ export function openApiDocument(): Json {
           tags: ["skills"],
           summary: "Download a skill tree for one runtime.",
           description:
-            "Operator only. Authenticate with a dashboard session or MC_TOKEN. An agent credential is denied, including one with skills:read or skills:write. runtime is required and is claude, codex, grok, hermes, or mini. lane is optional. Visibility is the list_skills check. Trigger off is omitted. A trigger other than off, on_request, auto_inject, or scheduled is treated as off and listed with reason invalid trigger. A selected scope is omitted unless lane is set and admits it. category and q match list_skills. The body is a gzip-compressed tar. Paths are relative. The directory is the skill id, which is the upstream directory slug. The frontmatter name is a display string and may differ. The folder is the id. Category is a Hermes folder only. Claude, Codex, Grok, and mini leave category out of the path, so a category value does not omit the skill for those runtimes. A Hermes category or a skill id that does not already match ^[a-z0-9][a-z0-9-_]*$ is omitted and listed. The stored text is left as it is. When two skills would write one archive path, every one of those skills is omitted and listed. A reference that is unsafe, that collides case-insensitively, or that does not fit a ustar name and prefix is omitted and listed with its path, and the skill is still exported. A skill whose SKILL.md cannot be written is omitted as a whole. Each omission is {skill, path?, reason}. When the list is not empty, manifest.json at the archive root contains every entry. The x-ak-skipped header carries count, the first 20 entries, and the text see manifest.json. The header is at most 4 KB. The archive contains each path once. A skill with no category is under uncategorized/ in the Hermes layout. hermes uses <category>/<id>/SKILL.md. With no database the archive is the demo fixture under the same rules. A repeated runtime, lane, category, or q is 400 validation_failed.",
+            "Operator only. Authenticate with a dashboard session or MC_TOKEN. An agent credential is denied, including one with skills:read or skills:write. runtime is required and is claude, codex, grok, hermes, mini, or nemoclaw. lane is optional. Visibility is the list_skills check. Trigger off is omitted. A trigger other than off, on_request, auto_inject, or scheduled is treated as off and listed with reason invalid trigger. A selected scope is omitted unless lane is set and admits it. category and q match list_skills. The body is a gzip-compressed tar. Paths are relative. The directory is the skill id, which is the upstream directory slug. The frontmatter name is a display string and may differ. The folder is the id. Category is a Hermes folder only. Claude, Codex, Grok, mini, and NemoClaw leave category out of the path, so a category value does not omit the skill for those runtimes. NemoClaw uses .agents/skills/<id>/SKILL.md. Its frontmatter is name and description, plus license, user_invocable, and metadata.author or metadata.tags only when the stored file already has them. A Hermes category or a skill id that does not already match ^[a-z0-9][a-z0-9-_]*$ is omitted and listed. The stored text is left as it is. When two skills would write one archive path, every one of those skills is omitted and listed. A reference that is unsafe, that collides case-insensitively, or that does not fit a ustar name and prefix is omitted and listed with its path, and the skill is still exported. A skill whose SKILL.md cannot be written is omitted as a whole. Each omission is {skill, path?, reason}. When the list is not empty, manifest.json at the archive root contains every entry. The x-ak-skipped header carries count, the first 20 entries, and the text see manifest.json. The header is at most 4 KB. The archive contains each path once. A skill with no category is under uncategorized/ in the Hermes layout. hermes uses <category>/<id>/SKILL.md. With no database the archive is the demo fixture under the same rules. A repeated runtime, lane, category, or q is 400 validation_failed.",
           security: operatorSessionOrMcToken,
           parameters: [
-            query("runtime", { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] }, "Runtime the tree is rendered for.", { required: true }),
+            query("runtime", { type: "string", enum: [...RUNTIMES] }, "Runtime the tree is rendered for.", { required: true }),
             query("lane", { type: "string" }, "When omitted, skills whose scope is selected are omitted."),
             query("category", { type: "string" }, "Exact category, case-insensitive. uncategorized matches a null category."),
             query("q", { type: "string" }, "Case-insensitive match on the skill id and the description."),

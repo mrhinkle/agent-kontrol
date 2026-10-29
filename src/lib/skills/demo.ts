@@ -195,7 +195,7 @@ export function demoSkillsDigest(window: TimeWindow): SkillsDigest {
   return {
     window,
     triggers_by_skill: [{ id: "verify-gibson", count: 2 }],
-    triggers_by_runtime: { claude: 1, codex: 1, grok: 0, hermes: 0, mini: 0 },
+    triggers_by_runtime: { claude: 1, codex: 1, grok: 0, hermes: 0, mini: 0, nemoclaw: 0 },
     stalled: [
       {
         run_id: "00000000-0000-4000-8000-000000000001",

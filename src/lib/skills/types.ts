@@ -6,7 +6,7 @@
  * commit. `commit_sha` is the upstream commit the file was copied from.
  */
 
-export const RUNTIMES = ["claude", "codex", "grok", "hermes", "mini"] as const;
+export const RUNTIMES = ["claude", "codex", "grok", "hermes", "mini", "nemoclaw"] as const;
 export type Runtime = (typeof RUNTIMES)[number];
 
 export const TRIGGERS = ["off", "on_request", "auto_inject", "scheduled"] as const;
@@ -24,6 +24,7 @@ export interface RuntimeFlags {
   grok: boolean;
   hermes: boolean;
   mini: boolean;
+  nemoclaw: boolean;
 }
 
 export interface SkillScope {
@@ -121,6 +122,7 @@ export const ALL_RUNTIMES: RuntimeFlags = {
   grok: true,
   hermes: true,
   mini: true,
+  nemoclaw: true,
 };
 
 export const CLAUDE_ONLY: RuntimeFlags = {
@@ -129,6 +131,7 @@ export const CLAUDE_ONLY: RuntimeFlags = {
   grok: false,
   hermes: false,
   mini: false,
+  nemoclaw: false,
 };
 
 export const NO_RUNTIMES: RuntimeFlags = {
@@ -137,7 +140,15 @@ export const NO_RUNTIMES: RuntimeFlags = {
   grok: false,
   hermes: false,
   mini: false,
+  nemoclaw: false,
 };
+
+/** The validation sentence for a runtime query. It follows RUNTIMES. */
+export function runtimeMustBeMessage(): string {
+  const head = RUNTIMES.slice(0, -1).join(", ");
+  const last = RUNTIMES[RUNTIMES.length - 1];
+  return `runtime must be ${head}, or ${last}.`;
+}
 
 export function isRuntime(value: string): value is Runtime {
   return (RUNTIMES as readonly string[]).includes(value);
@@ -171,6 +182,8 @@ export function scopeFromStored(value: unknown): SkillScope {
 
 /**
  * Explicit booleans are kept, including every flag false.
+ * A runtime key that is absent stays false. An old row does not gain a runtime
+ * that was added after the row was stored. That is the same rule hermes uses.
  * A value with no runtime booleans cannot be evaluated and is claude-only.
  */
 export function flagsFromStored(value: unknown): RuntimeFlags {

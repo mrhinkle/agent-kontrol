@@ -6,7 +6,7 @@ import { skillContentSha, shortSha } from "./sha";
 import { presentSkillDocument } from "./present";
 import { finishSkillRun, gateSkill, renderReferenceText, renderSkillText, startSkillRun } from "./runs";
 import { isUuid } from "./store";
-import { isRuntime, type Runtime } from "./types";
+import { isRuntime, runtimeMustBeMessage, type Runtime } from "./types";
 
 /**
  * MCP handlers for the skills mirror.
@@ -38,7 +38,7 @@ export async function listSkillsTool(args: {
   category?: string;
 }): Promise<McpToolResult> {
   if (args.runtime && !isRuntime(args.runtime)) {
-    return mcpToolError("validation_failed", { message: "runtime must be claude, codex, grok, hermes, or mini." });
+    return mcpToolError("validation_failed", { message: runtimeMustBeMessage() });
   }
   const runtimeLine = args.runtime
     ? `runtime filter: ${args.runtime}`

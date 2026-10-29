@@ -143,7 +143,7 @@ describe("skill frontmatter and runtimes", () => {
     assert.match(decision.problem ?? "", /not valid JSON/);
   });
 
-  it("defaults to all five runtimes when nothing says otherwise", () => {
+  it("defaults to every current runtime when nothing says otherwise", () => {
     const decision = resolveRuntimes({
       frontmatter: { name: "verify-gibson" },
       body: "Run the checks.",

@@ -8,6 +8,7 @@ import {
   DEFAULT_TRIGGER,
   isRuntime,
   isTrigger,
+  runtimeMustBeMessage,
   matchesCategory,
   type Runtime,
   type RuntimeFlags,
@@ -232,7 +233,7 @@ export function parseExportQuery(url: string): { ok: true; filter: ExportFilter 
     return { ok: false, message: "runtime is required", field: "runtime" };
   }
   if (!isRuntime(runtime)) {
-    return { ok: false, message: "runtime must be claude, codex, grok, hermes, or mini.", field: "runtime" };
+    return { ok: false, message: runtimeMustBeMessage(), field: "runtime" };
   }
   const lane = blankToNull(parsed.searchParams.get("lane"));
   const category = parsed.searchParams.get("category");
