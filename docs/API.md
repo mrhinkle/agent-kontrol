@@ -20,7 +20,7 @@ The `agent_credentials` table stores the label, the first 8 characters of the to
 | `GET` and `POST /api/decisions` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `decisions:write` |
 | `GET /api/activity` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `fleet:read`. Same boundary as `GET /api/traces` |
 | `PATCH /api/decisions/:id` | Session cookie, `MC_TOKEN`, or an agent credential with `decisions:write` |
-| Ingest routes: `POST /api/v1/traces`, `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, `POST /api/usage/ingest` | `Authorization: Bearer <MC_TOKEN>`, or an agent credential whose scope covers the route (`status:write` for `POST /api/ingest`, `messages:write` for `POST /api/messages/reply`); the other ingest routes take `MC_TOKEN` only |
+| Ingest routes: `POST /api/v1/traces`, `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, `POST /api/usage/ingest`, `POST /api/brief/alerts/evaluate` | `Authorization: Bearer <MC_TOKEN>`, or an agent credential whose scope covers the route (`status:write` for `POST /api/ingest`, `messages:write` for `POST /api/messages/reply`); the other ingest routes, including alert evaluate, take `MC_TOKEN` only |
 | MCP transport: `/api/mcp` | `Authorization: Bearer <MC_TOKEN>`, an agent credential, or an OAuth access token (JWT) issued by this server |
 | `GET /api/skill-bundles` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `skills:read` or `skills:write` |
 | Credential management: `GET`/`POST`/`DELETE /api/settings/credentials` | Dashboard session only |
@@ -57,6 +57,8 @@ Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI
 | GET | `/api/progress` | Cookie or bearer | Everything the progress board needs |
 | GET | `/api/progress/digest` | Cookie or bearer | The board as plain text, for schedulers and terminals. A failure is the JSON error body, not plain text. |
 | GET | `/api/brief` | Cookie, bearer, or `progress:read` | Morning brief. `text/plain` by default; `Accept: application/json` for the object. `window` is `24h` (default) or `72h`. A failure is the JSON error body. |
+| GET | `/api/brief/alerts` | Cookie, bearer, or `progress:read` | Threshold conditions and whether each was sent. Does not send. |
+| POST | `/api/brief/alerts/evaluate` | Bearer `MC_TOKEN` only | Compute the same conditions. Sends only when `brief.alerts.enabled` is true. |
 | POST | `/api/progress/ingest` | Bearer | One collection tick from `scripts/collect-progress.sh` |
 | GET | `/api/decisions` | Cookie or bearer | Decision queue, oldest first, each row with `age_days`. `shape=brief` is the morning-brief `.decisions` list |
 | POST | `/api/decisions` | Cookie or bearer | Upsert one decision, or reconcile a collector sweep |
@@ -214,6 +216,22 @@ Coordinator liveness uses `brief.coordinator` in `progress.config.json`. `agentI
 `scripts/morning-brief.sh` remains the fallback. A scheduler should `curl` this route. `repo_source` is `dashboard` when the watched list came from the database and `config` when it came from `progress.config.json`.
 
 With no `DATABASE_URL` the brief is database-only. It does not serve the synthetic progress board. Every configured repo is incomplete (`no snapshot`), the fleet totals are null, and the text says `DATA INCOMPLETE`. The JSON body has no `demo` field.
+
+### Threshold alerts
+
+`GET /api/brief/alerts` reports the between-brief conditions. It does not insert a message. Auth matches `GET /api/brief` (`progress:read` for an agent credential). `POST /api/brief/alerts/evaluate` is the only sender. Auth matches `POST /api/progress/ingest`: `MC_TOKEN` bearer. An agent credential is `403`, including one that holds `progress:read`. The POST body is ignored.
+
+`brief.alerts` in `progress.config.json` holds the thresholds. `enabled` defaults to `false`. Only a boolean `true` turns delivery on. A missing block, `0`, or the string `"true"` stays off. While delivery is off, evaluate still computes the conditions, `sent_count` is `0`, `delivery` is `disabled`, and no `brief_alerts` row is claimed or cleared. The owner turns the switch on after the first decision-backlog clear. Until then the channel stays quiet.
+
+The three conditions, and no others:
+
+- Coordinator work-event silence past `brief.coordinator.maxSilenceHours`. The work kinds are the brief's: `heartbeat`, `telemetry`, `turn_start`, `status_update`, and `error` never count. The alert re-sends every `coordinatorRepeatHours` (default 12) while the silence holds, then clears when a work event arrives.
+- A watched repo with at least one merge in the prior `zeroMergeLookbackDays` (default 7) and no merge for `zeroMergeHours` (default 72). A merge at exactly 72h counts as quiet. A merge one minute newer does not. A repo with no merges in the prior 7 days does not alert. The alert fires once per quiet episode and re-arms only after the episode clears. Firing requires the snapshots to cover `[now - zeroMergeHours, now]`. The newest snapshot may lag now by the collector cadence (15 minutes). An older gap is `unknown`. A merge timestamp inside that window is `clear` even when the tail is unmeasured. A snapshot whose `detail.merged` does not cover the lookback is `unknown`, not clear.
+- An open decision whose `opened_at` (else `first_seen_at`) is strictly older than `decisionAgeDays` (default 14). One message per decision row, ever. A resolved, withdrawn, or deferred row does not alert. Exactly 14 days has not crossed the line.
+
+`condition` is `firing`, `clear`, or `unknown`. A failed read, a missing timestamp, or incomplete merge coverage is `unknown`. Unknown never sends and never clears a latch that is already sent. `sent` is true when `brief_alerts.cleared_at` is null for that key, false when the latch table was read and that key is not latched, and null when the table could not be read. That read sets `latches` to `unknown`. Each send is one inbound row from `enqueueMessage` (`created_by` `brief-alerts`, actor fields from the caller) on the coordinator conversation, or `operator` when no coordinator is configured. Evaluate adds `failures` when a latch read, claim, clear, message, or restore throws.
+
+The claim is one `INSERT ... ON CONFLICT ... RETURNING` statement. It stores a random `claim_token` and the evaluation's compute instant. Episode and repeat claims re-arm a cleared latch only when `cleared_at` is null or older than that instant. A clear sets `cleared_at` to its own compute instant only when `cleared_at` is null and `last_sent_at` is older than that instant, so a delayed clear cannot overwrite a newer claim. A decision claim is `INSERT ... SELECT ... WHERE EXISTS` an open decision still old enough at the compute instant, `ON CONFLICT DO NOTHING`, so a decision resolved after compute is not alerted. An event that lands between compute and claim, with no concurrent evaluation, can still produce one alert; the next evaluation clears it. A failed message insert restores the previous row only where that token still matches and `cleared_at` is still the null the claim wrote, so a concurrent clear stays cleared. Two concurrent evaluates insert one message per alert. The progress collector does not call this route. The scheduler that curls the brief POSTs evaluate on its own tick. No other pushes.
 
 ### Decisions
 

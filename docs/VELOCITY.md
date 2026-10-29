@@ -141,14 +141,36 @@ when `MC_URL`/`MC_TOKEN` are set, and prints the brief. The scheduler (Hermes cr
 
 One message a day, same time, same shape, to wherever the owner already reads (Slack DM,
 Telegram, email). A second message only when something crosses a threshold during the day:
-coordinator silent past the limit, a repo with zero merges for 72h that had merges before, a
-review SLA breach, or a decision older than 14 days. No other pushes. A dashboard you have to
+coordinator silent past the limit, a repo with zero merges for 72h that had merges before, or
+a decision older than 14 days. No other pushes. A review-SLA breach is listed in the brief and
+is not a push. A dashboard you have to
 open tells you about a stall three days late; a chat that pings on every event trains you to
 ignore it.
 
+Those three pushes are `brief.alerts` in `progress.config.json`. `enabled` defaults to
+**false**. `POST /api/brief/alerts/evaluate` computes the conditions either way and inserts a
+message only when `enabled` is boolean true. `GET /api/brief/alerts` reports the same
+conditions and never sends. The progress collector does not evaluate alerts. The scheduler
+that curls `GET /api/brief` is what POSTs the evaluate route, on that same cadence, not on
+every collector tick. Nothing else inserts an alert message.
+
 Threshold alerts are **off until the owner has cleared the decision backlog once.** Importing
 two dozen stale decisions and alerting on every one of them on day one teaches the owner to
-ignore the channel; the first week is collection only.
+ignore the channel; the first week is collection only. The enable switch is that gate: leave
+`brief.alerts.enabled` false until that first clear, then set it to true. Defaults besides
+the switch: coordinator re-send 12h, zero-merge 72h after a merge in the prior 7 days,
+decision age 14 days. An unmeasured source is `unknown`. Unknown does not send and does not
+clear a latch.
+
+Each claim carries the evaluation's compute instant, the database clock used to judge the
+condition. A cleared latch is re-armed only when `cleared_at` is null or older than that
+instant, and a clear writes `cleared_at` only when the latch is still active and
+`last_sent_at` is older than the clear's own instant. A clear that saw newer evidence beats
+a stale claim, and a delayed clear cannot erase a newer claim. A decision alert is inserted
+only while that decision is still `open` and its `opened_at` (or `first_seen_at` when
+`opened_at` is null) is still at least `decisionAgeDays` old at the compute instant. One
+residual window remains: an event that lands between compute and claim, with no concurrent
+evaluation to clear the latch, can still produce one alert. The next evaluation clears it.
 
 The decision list is ordered by tier, then age. Strict age order lets a three-month-old
 naming question sit ahead of a consent decision.
@@ -200,5 +222,7 @@ and a resolve path, so those come before any page.
    Shipped 2026-10-27: `GET /api/brief` and MCP `get_morning_brief` read Postgres. The cron should `curl` the route. `scripts/morning-brief.sh` stays the fallback and still sweeps GitHub. The API does not. A 72h lead time uses `detail.merged` from the collector, not a live recompute. A positive 72h merge count with no `detail.merged` prints `SHIPPED: DATA INCOMPLETE` for that repo. A cumulative counter that went backwards is unmeasured (`DATA INCOMPLETE`), not 0. A decisions page that fills the 1000-row read is incomplete. With no database the route does not fill in the progress board's demo numbers.
 5. `/decisions` page; `request_decision` MCP tool.
 6. Owner-based repo discovery (`watched_owners`); Settings becomes the override layer.
-7. Remaining threshold alerts (zero-merge repo, review SLA, 14-day decision), enabled after
-   the owner's first backlog clear.
+7. Remaining threshold alerts (zero-merge repo, 14-day decision), plus the coordinator-silence
+   re-send, behind `brief.alerts.enabled` (default false) until the owner's first backlog clear.
+   Shipped as `GET /api/brief/alerts` and `POST /api/brief/alerts/evaluate`. Review-SLA alerts
+   are not sent. No other pushes.

@@ -9,6 +9,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "pg";
+import { evaluateAlerts, setBeforeClaimForTests, setBriefSettingsForTests } from "../src/lib/brief-alerts";
+import type { BriefSettings } from "../src/lib/progress-config";
 import { sql } from "../src/lib/db";
 import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
 import { StaleWrite } from "../src/lib/revision";
@@ -351,6 +353,7 @@ async function main() {
   await testSkillSchedule(tag);
   await testWatchBeats(tag);
   await testListCursors(tag);
+  await testBriefAlerts(tag);
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
 }
@@ -1544,6 +1547,239 @@ async function testListCursors(tag: string): Promise<void> {
     await sql()`delete from tasks where status = 'cursorprobe' and title like ${probe + "%"}`;
     await sql()`delete from memory where key like ${probe + "%"}`;
     await sql()`delete from spans where agent_id = ${agent}`;
+  }
+}
+
+/** Real claim SQL: one message per alert, a 12h repeat, and a migration that applies twice. */
+async function testBriefAlerts(tag: string): Promise<void> {
+  const slug = tag.replace(/\W/g, "").slice(-18);
+  const agentId = `alerta${slug}`;
+  const repo = `pgtest/z${slug}`;
+  const now = new Date("2026-10-28T12:00:00.000Z");
+  const hour = 3_600_000;
+  const minute = 60_000;
+  const day = 24 * hour;
+  const iso = (delta: number) => new Date(now.getTime() + delta).toISOString();
+  const settings: BriefSettings = {
+    decisionLabels: ["needs-owner"],
+    stuckPrHours: 48,
+    staleIssueDays: 21,
+    coordinator: { agentId, maxSilenceHours: 3, workKinds: ["session_end", "milestone", "status"] },
+    alerts: {
+      enabled: true,
+      coordinatorRepeatHours: 12,
+      zeroMergeHours: 72,
+      zeroMergeLookbackDays: 7,
+      decisionAgeDays: 14,
+    },
+  };
+  const coordKey = `coordinator-silent:${agentId}`;
+  const mergeKey = `zero-merge:${repo}`;
+  const cleanup = async () => {
+    await sql()`delete from messages where created_by = 'brief-alerts' and body like ${"%" + slug + "%"}`;
+    await sql()`delete from brief_alerts where key like ${"%" + slug + "%"}`;
+    await sql()`delete from events where agent_id = ${agentId}`;
+    await sql()`delete from agents where id = ${agentId}`;
+    await sql()`delete from repo_snapshots where repo = ${repo}`;
+    await sql()`delete from watched_repos where repo = ${repo}`;
+    await sql()`delete from decisions where repo = ${repo}`;
+  };
+
+  const migration = fs.readFileSync("supabase/migrations/20261028_brief_alerts.sql", "utf8");
+  const statements = migration
+    .split(";")
+    .map((part) => part.split("\n").filter((line) => !line.trim().startsWith("--")).join("\n").trim())
+    .filter(Boolean);
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    for (let pass = 0; pass < 2; pass += 1) {
+      for (const statement of statements) await client.query(statement);
+    }
+  } finally {
+    await client.end();
+  }
+  const cols = await sql()`
+    select column_name, is_nullable
+    from information_schema.columns
+    where table_schema = 'public' and table_name = 'brief_alerts'
+  `;
+  const nullable = new Map(cols.map((row) => [String(row.column_name), String(row.is_nullable)]));
+  assert.equal(nullable.get("key"), "NO");
+  assert.equal(nullable.get("first_sent_at"), "NO");
+  assert.equal(nullable.get("last_sent_at"), "NO");
+  assert.equal(nullable.get("cleared_at"), "YES");
+  assert.equal(nullable.get("claim_token"), "YES");
+
+  await cleanup();
+  try {
+    await sql()`insert into agents (id, platform) values (${agentId}, 'other')`;
+    await sql()`
+      insert into events (agent_id, kind, title, created_at)
+      values
+        (${agentId}, 'session_end', 'work', ${iso(-4 * hour)}::timestamptz),
+        (${agentId}, 'heartbeat', 'beat', ${iso(-minute)}::timestamptz),
+        (${agentId}, 'telemetry', 'tick', ${iso(-minute)}::timestamptz),
+        (${agentId}, 'turn_start', 'turn', ${iso(-minute)}::timestamptz),
+        (${agentId}, 'status_update', 'status', ${iso(-minute)}::timestamptz),
+        (${agentId}, 'error', 'boom', ${iso(-minute)}::timestamptz)
+    `;
+    await sql()`
+      insert into watched_repos (repo, label, short, color, position)
+      values (${repo}, 'Alert', ${slug.slice(0, 12)}, '#000000', 0)
+      on conflict (repo) do nothing
+    `;
+    await sql()`
+      insert into repo_snapshots (repo, collected_at, detail)
+      values (
+        ${repo},
+        ${iso(0)}::timestamptz,
+        ${JSON.stringify({ merged: [{ merged_at: iso(-72 * hour) }] })}::jsonb
+      )
+    `;
+    const oldDecision = await sql()`
+      insert into decisions (key, source, repo, number, title, status, opened_at, first_seen_at)
+      values (
+        ${`github:${repo}#1`}, 'github-label', ${repo}, 1, ${`old ${slug}`}, 'open',
+        ${iso(-14 * day - minute)}::timestamptz, ${iso(-14 * day - minute)}::timestamptz
+      )
+      returning id
+    `;
+    const youngDecision = await sql()`
+      insert into decisions (key, source, repo, number, title, status, opened_at, first_seen_at)
+      values (
+        ${`github:${repo}#2`}, 'github-label', ${repo}, 2, ${`young ${slug}`}, 'open',
+        ${iso(-14 * day + minute)}::timestamptz, ${iso(-14 * day + minute)}::timestamptz
+      )
+      returning id
+    `;
+    await sql()`
+      insert into decisions (key, source, repo, number, title, status, opened_at, first_seen_at)
+      values (
+        ${`github:${repo}#3`}, 'github-label', ${repo}, 3, ${`done ${slug}`}, 'decided',
+        ${iso(-40 * day)}::timestamptz, ${iso(-40 * day)}::timestamptz
+      )
+    `;
+    const oldId = Number(oldDecision[0].id);
+    const youngId = Number(youngDecision[0].id);
+    const count = async (needle: string) => {
+      const rows = await sql()`
+        select count(*)::int as n from messages
+        where created_by = 'brief-alerts' and position(${needle} in body) > 0
+      `;
+      return Number(rows[0].n);
+    };
+    const bodyKey = (key: string) => `brief-alert ${key}\n`;
+
+    const raced = await Promise.all([
+      evaluateAlerts({ now, settings }),
+      evaluateAlerts({ now, settings }),
+    ]);
+    assert.equal(raced.reduce((sum, report) => sum + report.sent_count, 0) >= 3, true);
+    assert.equal(await count(bodyKey(coordKey)), 1, "a recent heartbeat does not stop the silence alert");
+    assert.equal(await count(bodyKey(mergeKey)), 1, "a merge exactly 72h ago fires once");
+    assert.equal(await count(bodyKey(`decision:${oldId}`)), 1);
+    assert.equal(await count(bodyKey(`decision:${youngId}`)), 0, "14d minus one minute does not alert");
+    assert.equal(await count(`github:${repo}#3`), 0, "a decided row does not alert");
+
+    const hourLater = new Date(now.getTime() + hour);
+    const held = await evaluateAlerts({ now: hourLater, settings });
+    assert.equal(held.alerts.find((alert) => alert.key === coordKey)?.condition, "firing");
+    assert.equal(await count(bodyKey(coordKey)), 1, "one hour later does not repeat");
+
+    const halfDay = new Date(now.getTime() + 12 * hour);
+    const repeated = await evaluateAlerts({ now: halfDay, settings });
+    assert.equal(repeated.alerts.find((alert) => alert.key === coordKey)?.condition, "firing");
+    assert.equal(await count(bodyKey(coordKey)), 2, "exactly 12h repeats the coordinator alert");
+    assert.equal(await count(bodyKey(mergeKey)), 1, "a zero-merge episode does not repeat at 12h");
+    assert.equal(await count(bodyKey(`decision:${oldId}`)), 1, "a decision does not alert twice");
+
+    await sql()`
+      insert into events (agent_id, kind, title, created_at)
+      values (${agentId}, 'milestone', 'back', ${iso(12 * hour)}::timestamptz)
+    `;
+    const clearAt = new Date(halfDay.getTime() + minute);
+    const cleared = await evaluateAlerts({ now: clearAt, settings });
+    assert.equal(cleared.alerts.find((alert) => alert.key === coordKey)?.condition, "clear");
+    assert.equal(await count(bodyKey(coordKey)), 2, "a work event clears without another message");
+    const latch = await sql()`select cleared_at from brief_alerts where key = ${coordKey}`;
+    assert.ok(latch[0]?.cleared_at, "the coordinator latch is cleared");
+    const decisionLatch = await sql()`select cleared_at from brief_alerts where key = ${`decision:${oldId}`}`;
+    assert.equal(decisionLatch[0]?.cleared_at ?? null, null, "a decision latch is never cleared");
+
+    const instant = (value: unknown) => value instanceof Date ? value.getTime() : Date.parse(String(value));
+
+    // 1. A clear that observed a later instant rejects the stale claim.
+    const tClaim = new Date(now.getTime() + 30_000);
+    const tClear = new Date(now.getTime() + 90_000);
+    await sql()`delete from events where agent_id = ${agentId} and kind = 'milestone'`;
+    await sql()`
+      update brief_alerts
+      set cleared_at = null, last_sent_at = ${tClaim.toISOString()}::timestamptz
+      where key = ${coordKey}
+    `;
+    const beforeStale = await count(bodyKey(coordKey));
+    const seen: { report: Awaited<ReturnType<typeof evaluateAlerts>> | null } = { report: null };
+    setBeforeClaimForTests(async (key) => {
+      if (key !== coordKey) return;
+      setBeforeClaimForTests(null);
+      await sql()`
+        insert into events (agent_id, kind, title, created_at)
+        values (${agentId}, 'milestone', 'later-clear', ${tClear.toISOString()}::timestamptz)
+      `;
+      seen.report = await evaluateAlerts({ now: tClear, settings });
+    });
+    const stale = await evaluateAlerts({ now: tClaim, settings });
+    setBeforeClaimForTests(null);
+    const concurrentClear = seen.report;
+    if (!concurrentClear) throw new Error("the later clear ran before the stale claim");
+    assert.equal(concurrentClear.alerts.find((alert) => alert.key === coordKey)?.condition, "clear");
+    assert.equal(stale.failures, undefined, "the stale claim statement ran");
+    assert.equal(await count(bodyKey(coordKey)), beforeStale, "a later clear rejects the stale claim");
+    assert.equal(stale.sent_count, 0);
+    const staleLatch = await sql()`select cleared_at, last_sent_at from brief_alerts where key = ${coordKey}`;
+    assert.equal(instant(staleLatch[0]?.cleared_at), tClear.getTime(), "the later clear stays cleared");
+    assert.equal(instant(staleLatch[0]?.last_sent_at), tClaim.getTime(), "the stale claim does not rewrite last_sent_at");
+
+    // 2. A delayed clear with an earlier compute instant leaves the newer claim.
+    const tNewer = new Date(now.getTime() + 30 * hour);
+    const tOlder = new Date(now.getTime() + 29 * hour);
+    await sql()`delete from events where agent_id = ${agentId} and kind = 'milestone'`;
+    const newerClaim = await evaluateAlerts({ now: tNewer, settings });
+    assert.equal(newerClaim.alerts.find((alert) => alert.key === coordKey)?.condition, "firing");
+    const afterNewer = await count(bodyKey(coordKey));
+    assert.equal(afterNewer, beforeStale + 1, "silence after the clear arms a fresh claim");
+    await sql()`
+      insert into events (agent_id, kind, title, created_at)
+      values (${agentId}, 'milestone', 'already-claimed', ${tNewer.toISOString()}::timestamptz)
+    `;
+    const delayed = await evaluateAlerts({ now: tOlder, settings });
+    assert.equal(delayed.alerts.find((alert) => alert.key === coordKey)?.condition, "clear");
+    assert.equal(await count(bodyKey(coordKey)), afterNewer, "a delayed clear sends nothing");
+    const kept = await sql()`select cleared_at from brief_alerts where key = ${coordKey}`;
+    assert.equal(kept[0]?.cleared_at ?? null, null, "a delayed clear does not erase the newer claim");
+
+    // 3. A decision resolved between compute and claim inserts nothing.
+    const dKey = `decision:${oldId}`;
+    await sql()`delete from messages where created_by = 'brief-alerts' and position(${bodyKey(dKey)} in body) > 0`;
+    await sql()`delete from brief_alerts where key = ${dKey}`;
+    assert.equal(await count(bodyKey(dKey)), 0);
+    setBeforeClaimForTests(async (key) => {
+      if (key !== dKey) return;
+      setBeforeClaimForTests(null);
+      await sql()`update decisions set status = 'decided' where id = ${oldId}`;
+    });
+    const resolvedLate = await evaluateAlerts({ now, settings });
+    setBeforeClaimForTests(null);
+    assert.equal(resolvedLate.alerts.find((alert) => alert.key === dKey)?.condition, "firing");
+    assert.equal(resolvedLate.alerts.find((alert) => alert.key === dKey)?.sent, false);
+    assert.equal(await count(bodyKey(dKey)), 0, "a decision resolved before the claim sends nothing");
+    const gone = await sql()`select key from brief_alerts where key = ${dKey}`;
+    assert.equal(gone.length, 0, "a resolved decision does not leave a latch");
+  } finally {
+    setBeforeClaimForTests(null);
+    setBriefSettingsForTests(null);
+    await cleanup();
   }
 }
 

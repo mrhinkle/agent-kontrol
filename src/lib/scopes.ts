@@ -78,6 +78,10 @@ const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   { method: "GET", path: /^\/api\/progress$/, scope: "progress:read" },
   { method: "GET", path: /^\/api\/progress\/digest$/, scope: "progress:read" },
   { method: "GET", path: /^\/api\/brief$/, scope: "progress:read" },
+  { method: "GET", path: /^\/api\/brief\/alerts$/, scope: "progress:read" },
+  // POST /api/brief/alerts/evaluate stays off this table. The cron uses
+  // MC_TOKEN, the same way POST /api/progress/ingest does. An agent
+  // credential cannot send alerts.
   { method: "GET", path: /^\/api\/tasks$/, scope: "tasks:read" },
   { method: "POST", path: /^\/api\/tasks$/, scope: "tasks:write" },
   { method: "POST", path: /^\/api\/tasks\/claim$/, scope: "tasks:write" },

@@ -402,6 +402,27 @@ alter table decisions add column if not exists github_present boolean;
 create index if not exists decisions_status_first_seen_idx on decisions (status, first_seen_at);
 create index if not exists decisions_repo_number_idx on decisions (repo, number);
 
+-- Threshold-alert dedupe (see supabase/migrations/20261028_brief_alerts.sql).
+-- One row per alert key. Coordinator silence re-claims while last_sent_at is
+-- older than the repeat interval, and only when cleared_at is null or older
+-- than the claim's compute instant. A zero-merge row re-arms only after
+-- cleared_at is set, and only when that clear is older than the claim.
+-- A decision row is inserted once, and only while the decision is still open
+-- and old enough. A clear cannot overwrite a newer last_sent_at.
+-- cleared_at is nullable: null means the alert is still latched.
+-- claim_token is the attempt that owns a claim. A failed message insert
+-- restores the previous row only while this token still matches and
+-- cleared_at is still the null the claim wrote.
+create table if not exists brief_alerts (
+  key text primary key,
+  first_sent_at timestamptz not null,
+  last_sent_at timestamptz not null,
+  cleared_at timestamptz,
+  claim_token text
+);
+alter table brief_alerts add column if not exists cleared_at timestamptz;
+alter table brief_alerts add column if not exists claim_token text;
+
 -- Client idempotency keys for create_task, operator messages, and replies.
 -- scope is actor_type:actor_id:route, so two callers can reuse one key string.
 -- response is null until the write stores a result. The resource insert

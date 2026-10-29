@@ -246,6 +246,45 @@ export function openApiDocument(): Json {
           required: ["error"],
           properties: { error: { type: "string" } },
         },
+        BriefAlert: {
+          type: "object",
+          required: ["key", "kind", "condition", "sent", "last_sent_at", "summary"],
+          properties: {
+            key: { type: "string" },
+            kind: { type: "string", enum: ["coordinator_silent", "zero_merge", "decision_age"] },
+            condition: { type: "string", enum: ["firing", "clear", "unknown"] },
+            sent: {
+              type: ["boolean", "null"],
+              description: "True when a latch is active. False when the table was read and this key is not latched. Null when the latch table could not be read.",
+            },
+            last_sent_at: { type: ["string", "null"], format: "date-time" },
+            summary: { type: "string" },
+          },
+        },
+        BriefAlerts: {
+          type: "object",
+          required: ["enabled", "delivery", "generated_at", "sent_count", "alerts"],
+          properties: {
+            enabled: { type: "boolean" },
+            delivery: { type: "string", enum: ["read", "disabled", "live"] },
+            generated_at: { type: "string", format: "date-time" },
+            sent_count: { type: "integer" },
+            alerts: { type: "array", items: ref("BriefAlert") },
+            latches: { type: "string", enum: ["ok", "unknown"] },
+            failures: {
+              type: "array",
+              items: {
+                type: "object",
+                required: ["step"],
+                properties: {
+                  step: { type: "string", enum: ["latches", "claim", "clear", "message", "restore"] },
+                  key: { type: "string" },
+                },
+              },
+            },
+            note: { type: "string" },
+          },
+        },
         ReportInput: {
           type: "object",
           required: ["agent_id", "kind"],
@@ -1243,6 +1282,34 @@ export function openApiDocument(): Json {
                 "application/json": { schema: { type: "object", additionalProperties: true } },
               },
             },
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/brief/alerts": {
+        get: operation({
+          operationId: "getBriefAlerts",
+          tags: ["progress"],
+          summary: "Threshold alert conditions. Does not send.",
+          description:
+            "Auth matches GET /api/brief: session cookie, MC_TOKEN, or an agent credential with progress:read. Returns the coordinator-silence, zero-merge, and decision-age conditions. condition is firing, clear, or unknown. unknown means that source could not be read or the merge history does not cover the window; it is not a clear. sent is true only when a brief_alerts latch exists and cleared_at is null, false when that table was read and the key is not latched, and null when the table could not be read. latches is unknown in that case. This route never inserts a message. With no database every condition is unknown.",
+          security: cookieOrBearer,
+          responses: {
+            "200": jsonResponse("Current conditions and latch state.", ref("BriefAlerts")),
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/brief/alerts/evaluate": {
+        post: operation({
+          operationId: "evaluateBriefAlerts",
+          tags: ["progress"],
+          summary: "Evaluate threshold alerts and send newly claimed ones.",
+          description:
+            "Auth matches POST /api/progress/ingest: Authorization Bearer MC_TOKEN. An agent credential is 403, including one with progress:read. The body is ignored. When brief.alerts.enabled is false the conditions are still computed, sent_count is 0, delivery is disabled, and no brief_alerts row is claimed or cleared. When enabled, one operator message is inserted per alert whose claim statement returns a row. The claim stores a claim_token and the evaluation's compute instant. Episode and repeat claims re-arm a cleared latch only when cleared_at is null or older than that instant. A clear writes cleared_at only when last_sent_at is older than the clear's instant. A decision claim inserts only while that decision is still open and still old enough. An event between compute and claim with no concurrent evaluation can still send once; the next evaluation clears it. A failed message insert restores the previous row only while that token still matches and cleared_at is still null. Coordinator silence re-claims after coordinatorRepeatHours. A zero-merge alert re-arms only after it clears. A decision alerts once per row. Unknown conditions are not claimed and do not clear an existing latch. failures names a latch read, claim, clear, message, or restore that threw.",
+          security: bearerOnly,
+          responses: {
+            "200": jsonResponse("Conditions, plus sent_count for this call.", ref("BriefAlerts")),
             ...flatErrors,
           },
         }),
