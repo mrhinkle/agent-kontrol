@@ -13,6 +13,7 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -719,6 +720,190 @@ class TestLifecycle(Harness):
             self.dispatch()
         self.assertEqual(self.cli_calls, [])
         self.assertEqual(self.agents.read_text(), "# rules\n")
+
+    def test_head_probe_failure_writes_nothing_and_launches_nothing(self):
+        original = b"# rules\r\nkeep\r\n"
+        real_git = md.git
+        for exc in (subprocess.TimeoutExpired(["git"], 60), OSError("fork failed")):
+            with self.subTest(exc=type(exc).__name__):
+                self.calls.clear()
+                self.write_agents(original, 0o600)
+
+                def git(cwd, *args, exc=exc):
+                    if args[:2] == ("rev-parse", "--verify"):
+                        raise exc
+                    return real_git(cwd, *args)
+
+                with mock.patch.object(md, "git", side_effect=git):
+                    body = self.dispatch()
+                self.assertEqual(body["status"], "failed")
+                self.assertIn("could not read HEAD, no worker started", body["result"])
+                self.assertEqual(self.agents.read_bytes(), original)
+                self.assertEqual(stat.S_IMODE(os.stat(self.agents).st_mode), 0o600)
+                self.assertEqual(self.cli_calls, [])
+                self.assertNotIn("running", [c[1].get("status") for c in self.patches()])
+
+
+REAL_RUN_CLI = md.run_cli
+
+# A fake `codex` CLI. It reads the injected AGENTS.md, starts a background child
+# that rewrites it after FAKE_DELAY seconds, waits until the child is ready, then
+# hangs (FAKE_MODE=hang), exits 0 (ok), or exits 3 (fail).
+FAKE_CLI = """\
+import os, subprocess, sys, time
+state = os.environ["FAKE_STATE"]
+text = open("AGENTS.md").read()
+child = subprocess.Popen(
+    [sys.executable, "-c", os.environ["FAKE_CHILD"], text, state],
+    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+)
+open(os.path.join(state, "child.pid"), "w").write(str(child.pid))
+deadline = time.time() + 5
+while not os.path.exists(os.path.join(state, "child.ready")) and time.time() < deadline:
+    time.sleep(0.01)
+mode = os.environ["FAKE_MODE"]
+if mode == "hang":
+    time.sleep(60)
+print("RESULT: worker " + mode)
+sys.exit(3 if mode == "fail" else 0)
+"""
+FAKE_CHILD = """\
+import os, signal, sys, time
+text, state = sys.argv[1], sys.argv[2]
+if os.environ.get("FAKE_IGNORE_TERM"):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+open(os.path.join(state, "child.ready"), "w").close()
+time.sleep(float(os.environ["FAKE_DELAY"]))
+open("AGENTS.md", "w").write(text)
+open(os.path.join(state, "child.wrote"), "w").close()
+"""
+CHILD_DELAY = 1.0
+
+
+class TestProcessContainment(Harness):
+    """The real run_cli with a fake CLI whose background child writes AGENTS.md late."""
+
+    def setUp(self):
+        super().setUp()
+        self.agents = self.wt / "AGENTS.md"
+        self.agents.write_text("# rules\n")
+        self.bin = Path(self.tmp.name) / "bin"
+        self.bin.mkdir()
+        cli = self.bin / "codex"
+        cli.write_text(f"#!{sys.executable}\n{FAKE_CLI}")
+        cli.chmod(0o755)
+        self.state = Path(self.tmp.name) / "state"
+        self.state.mkdir()
+        env = mock.patch.dict(os.environ, {
+            "PATH": f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            "FAKE_STATE": str(self.state), "FAKE_CHILD": FAKE_CHILD, "FAKE_DELAY": str(CHILD_DELAY),
+            "FAKE_MODE": "ok",
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        for p in (mock.patch.object(md, "run_cli", REAL_RUN_CLI),
+                  mock.patch.object(md, "TASK_TIMEOUT", 0.5),
+                  mock.patch.object(md, "KILL_GRACE", 0.5)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def reset_state(self):
+        for f in self.state.iterdir():
+            f.unlink()
+
+    def assert_child_gone(self):
+        pid = int((self.state / "child.pid").read_text())
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        self.fail(f"background child {pid} outlived run_task")
+
+    def assert_no_late_write(self):
+        time.sleep(CHILD_DELAY + 0.5)
+        self.assertFalse((self.state / "child.wrote").exists(), "background child wrote after cleanup")
+        self.assertEqual(self.agents.read_text(), "# rules\n")
+
+    def test_background_child_stopped_on_every_exit(self):
+        cases = [("hang", "", "failed", "timed out after 0.5s"), ("ok", "", "done", "worker ok"),
+                 ("fail", "", "failed", "worker fail"), ("ok", "1", "done", "worker ok")]
+        for mode, ignore_term, status, needle in cases:
+            with self.subTest(mode=mode, ignore_term=bool(ignore_term)):
+                self.calls.clear()
+                self.reset_state()
+                with mock.patch.dict(os.environ, {"FAKE_MODE": mode, "FAKE_IGNORE_TERM": ignore_term}):
+                    body = self.dispatch(platform="codex")
+                self.assertEqual(body["status"], status)
+                self.assertIn(needle, body["result"])
+                self.assertEqual(self.agents.read_text(), "# rules\n")
+                self.assert_child_gone()
+                self.assert_no_late_write()
+
+    def test_timed_out_child_cannot_touch_next_task(self):
+        with mock.patch.dict(os.environ, {"FAKE_MODE": "hang", "FAKE_IGNORE_TERM": "1"}):
+            self.assertEqual(self.dispatch(platform="codex")["status"], "failed")
+        seen = []
+
+        def next_worker(platform, prompt, cwd, review=False):
+            time.sleep(CHILD_DELAY + 0.5)  # past the moment the first task's child would write
+            seen.append(((cwd / "AGENTS.md").read_text(), (self.state / "child.wrote").exists()))
+            return True, "RESULT: next", None
+
+        self.block = BLOCK_2
+        with mock.patch.object(md, "run_cli", side_effect=next_worker):
+            self.assertEqual(self.dispatch(platform="codex")["status"], "done")
+        self.assertEqual(seen, [(f"# rules\n\n{BLOCK_2}\n", False)])
+        self.assertEqual(self.agents.read_text(), "# rules\n")
+
+    def test_exception_while_waiting_stops_group(self):
+        real_wait = subprocess.Popen.wait
+
+        def wait(proc, timeout=None):
+            if str(proc.args[0]) == "codex":
+                deadline = time.monotonic() + 5
+                while not (self.state / "child.ready").exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                raise RuntimeError("wait interrupted")
+            return real_wait(proc, timeout)
+
+        with mock.patch.dict(os.environ, {"FAKE_MODE": "hang"}), \
+                mock.patch.object(subprocess.Popen, "wait", wait):
+            body = self.dispatch(platform="codex")
+        self.assertEqual(body["status"], "failed")
+        self.assertIn("wait interrupted", body["result"])
+        self.assertEqual(self.agents.read_text(), "# rules\n")
+        self.assert_child_gone()
+        self.assert_no_late_write()
+
+    def test_group_that_survives_kill_fails_task(self):
+        real_stop = md.stop_group
+
+        def stop(proc, grace):
+            real_stop(proc, grace)
+            return False
+
+        with mock.patch.object(md, "stop_group", side_effect=stop):
+            body = self.dispatch(platform="codex")
+        self.assertEqual(body["status"], "failed")
+        self.assertIn("still had members after SIGKILL", body["result"])
+        self.assertEqual(self.agents.read_text(), "# rules\n")
+
+    def test_group_is_the_cli_not_the_dispatcher(self):
+        groups = []
+        real_stop = md.stop_group
+
+        def stop(proc, grace):
+            groups.append(proc.pid)
+            return real_stop(proc, grace)
+
+        with mock.patch.object(md, "stop_group", side_effect=stop):
+            self.dispatch(platform="codex")
+        self.assertEqual(len(groups), 1)
+        self.assertNotEqual(groups[0], os.getpgrp())
+        self.assert_child_gone()
 
 
 if __name__ == "__main__":

@@ -38,7 +38,8 @@ dispatched agent per worktree: a lock in the worktree's own git dir is held
 from preparation to the end of review, so a second dispatcher on the same
 worktree fails the task without launching a CLI. Before the worker starts,
 the lane's skill pointers (GET /api/skills/pointers) are written into the
-worktree's AGENTS.md; they are taken out again before review. Anything
+worktree's AGENTS.md; they are taken out again before review, after the
+CLI's own process group (it runs in a new session) has been stopped. Anything
 requiring judgment beyond that should be a Cowork/interactive task, not a
 dispatched one. Review tasks always run read-only.
 
@@ -54,10 +55,12 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -105,6 +108,7 @@ LANE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}")
 MAX_POINTER_RESPONSE = 256_000
 MAX_POINTER_BLOCK = 64_000
 LOCK_NAME = "ak-dispatch.lock"
+KILL_GRACE = 5.0  # seconds a CLI's process group gets after SIGTERM, then again after SIGKILL
 
 
 def detect_platforms() -> list[str]:
@@ -182,6 +186,71 @@ def build_review_prompt(task: dict, worker_output: str) -> str:
     )
 
 
+class ContainmentError(Exception):
+    """A dispatched CLI's process group could not be stopped."""
+
+
+def stop_group(proc: subprocess.Popen, grace: float) -> bool:
+    """SIGTERM, then SIGKILL, the CLI's own process group. True once no member is left.
+
+    The group id is the CLI's pid (start_new_session), never this process's group.
+    A process that moved itself to another group or session is outside it.
+    """
+    pgid = proc.pid
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        deadline = time.monotonic() + grace
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            proc.poll()
+            return True
+        except PermissionError:
+            pass
+        while time.monotonic() < deadline:
+            proc.poll()  # reap the leader so its zombie does not keep the group alive
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return True
+            except PermissionError:
+                pass
+            time.sleep(0.05)
+    proc.poll()
+    return False
+
+
+def run_contained(cmd: list[str], cwd: Path, timeout: float) -> tuple[int, str, str]:
+    """Run cmd in a new session and stop its whole process group before returning.
+
+    Background children left by the CLI are stopped on exit, error, timeout, or
+    exception, so none of them outlives the worktree lock. Output goes to temp
+    files rather than pipes, so a child holding stdout open does not stall the wait.
+    """
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        proc = subprocess.Popen(
+            cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f,
+            start_new_session=True,
+        )
+        timed_out = False
+        try:
+            returncode = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        finally:
+            stopped = stop_group(proc, KILL_GRACE)
+        if not stopped:
+            raise ContainmentError(f"process group {proc.pid} still had members after SIGKILL")
+        if timed_out:
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        out_f.seek(0)
+        err_f.seek(0)
+        return (
+            returncode,
+            out_f.read().decode("utf-8", errors="replace"),
+            err_f.read().decode("utf-8", errors="replace"),
+        )
+
+
 def run_cli(platform: str, prompt: str, cwd: Path, review: bool = False) -> tuple[bool, str, float | None]:
     """Run one headless agent turn. Returns (ok, output_text, cost_usd)."""
     extra = os.environ.get(f"MC_{platform.split('-')[0].upper()}_ARGS", "").split()
@@ -200,24 +269,22 @@ def run_cli(platform: str, prompt: str, cwd: Path, review: bool = False) -> tupl
         return False, f"no CLI runner for platform {platform}", None
 
     try:
-        proc = subprocess.run(
-            cmd, cwd=str(cwd), capture_output=True, text=True, timeout=TASK_TIMEOUT
-        )
+        returncode, stdout, stderr = run_contained(cmd, cwd, TASK_TIMEOUT)
     except subprocess.TimeoutExpired:
         return False, f"timed out after {TASK_TIMEOUT}s", None
     except FileNotFoundError:
         return False, f"{cmd[0]} not found on PATH", None
 
-    out = (proc.stdout or "") + ("\n" + proc.stderr if proc.returncode != 0 and proc.stderr else "")
+    out = stdout + ("\n" + stderr if returncode != 0 and stderr else "")
     cost = None
     if platform == "claude-code":
         try:
-            payload = json.loads(proc.stdout)
+            payload = json.loads(stdout)
             cost = payload.get("total_cost_usd")
             out = payload.get("result") or out
         except Exception:
             pass
-    return proc.returncode == 0, out.strip(), cost
+    return returncode == 0, out.strip(), cost
 
 
 def extract_result(output: str) -> str:
@@ -397,13 +464,18 @@ def run_task(task: dict, platform: str, sem: threading.Semaphore) -> None:
         except Exception as e:
             fail_task(tid, agent_id, f"skill pointers unavailable, no worker started: {e}")
             return
+        # Read before injection: once the block is written, the next statement must be the cleanup try.
+        try:
+            head = git(cwd, "rev-parse", "--verify", "-q", "HEAD")
+        except (subprocess.SubprocessError, OSError) as e:
+            fail_task(tid, agent_id, f"could not read HEAD, no worker started: {e}")
+            return
+        base_head = head.stdout.strip() if head.returncode == 0 else None
         try:
             injection = ak_pointers.inject(cwd, block)
         except (ak_pointers.PointerFileError, OSError) as e:
             fail_task(tid, agent_id, f"could not write skill pointers, no worker started: {e}")
             return
-        head = git(cwd, "rev-parse", "--verify", "-q", "HEAD")
-        base_head = head.stdout.strip() if head.returncode == 0 else None
 
         cleanup_error: str | None = None
         try:

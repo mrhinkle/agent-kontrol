@@ -78,13 +78,26 @@ worktree, you merge or delete it.
      the swap (or the unlink, when cleanup removes a file the dispatcher
      created) is overwritten. The same applies to cleanup. This is why the
      worktree must be reserved for the dispatcher while a task runs.
-3. Run: headless CLI in the worktree. The prompt tells the worker the block is
-   temporary dispatch metadata not to edit, stage, or commit.
+   The worktree's `HEAD` is read before the block is written, so nothing can
+   fail between the write and the start of step 4's cleanup guard.
+3. Run: headless CLI in the worktree, in a new session with stdin from
+   `/dev/null`, so the CLI and everything it starts share one process group
+   of their own. The prompt tells the worker the block is temporary dispatch
+   metadata not to edit, stage, or commit. When the CLI exits (success or
+   error), times out, or the wait is interrupted by an exception, that process
+   group gets `SIGTERM`, then `SIGKILL` after 5 seconds, before cleanup runs
+   and before the worktree lock is released. Background children the CLI left
+   behind are stopped this way. If members are still there 5 seconds after
+   `SIGKILL`, the task fails. A process that deliberately moves itself out of
+   the group (`setsid`, `setpgid`, or a daemonizing double fork into a new
+   session) is not tracked and is unsupported; this is process-group
+   bookkeeping, not a sandbox.
    - `claude -p "<prompt>" --output-format json --permission-mode acceptEdits`
      (cost captured from `total_cost_usd`)
    - `codex exec --full-auto "<prompt>"`
    - `grok -p "<prompt>"`
-4. Clean up, whatever the worker did (success, failure, timeout, crash): the
+4. Clean up, whatever the worker did (success, failure, timeout, crash), once
+   its process group is stopped: the
    injected block comes out and the managed region goes back to what it held
    before, byte for byte when the worker did not touch `AGENTS.md`. Worker edits
    elsewhere in the file and in other files stay. If the block or the text right
@@ -135,8 +148,10 @@ the plist. Importing `mc_dispatcher` reads no file; only `main()` does.
 - Workers only run in a linked worktree strictly below `MC_WORKDIR`, one
   dispatched task per worktree at a time (see above).
 - Reviewers always run read-only.
-- `MC_TASK_TIMEOUT` (default 1h) kills runaway runs. Only the CLI process is
-  killed; a child it started that keeps writing after cleanup is not tracked.
+- `MC_TASK_TIMEOUT` (default 1h) stops runaway runs. The CLI's whole process
+  group is stopped on timeout and on every other exit, so its children cannot
+  keep writing after cleanup or into the next task. Children that detach into
+  their own session or group are not covered (see step 3).
 - Autonomy flags are conservative defaults (`acceptEdits`, `--full-auto`
   sandboxed). Raise them per-machine via `MC_CLAUDE_ARGS` / `MC_CODEX_ARGS`
   only if you accept the blast radius.
