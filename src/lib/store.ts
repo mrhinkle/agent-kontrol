@@ -1266,7 +1266,7 @@ export async function updateTask(input: {
             'Task #' || changed.id::text || ' → ' || changed.status || ': ' || coalesce(changed.title, ''),
             jsonb_build_object(
               'task_id', changed.id,
-              'tool', ${activityTool},
+              'tool', ${activityTool}::text,
               'status', changed.status,
               'actor_type', ${activityActorType}::text,
               'actor_id', ${activityActorId}::text
@@ -1308,7 +1308,7 @@ export async function updateTask(input: {
             'Task #' || changed.id::text || ' → ' || changed.status || ': ' || coalesce(changed.title, ''),
             jsonb_build_object(
               'task_id', changed.id,
-              'tool', ${activityTool},
+              'tool', ${activityTool}::text,
               'status', changed.status,
               'actor_type', ${activityActorType}::text,
               'actor_id', ${activityActorId}::text
