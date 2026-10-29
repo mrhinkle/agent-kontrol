@@ -107,7 +107,7 @@ Existing tables carry most of it. Additions:
   `decided_by`, `decided_at` record the answer; `defer_until` lets a row disappear and come back.
 - **`watched_owners`** (shipped, `supabase/migrations/20261028_watched_owners.sql`): the GitHub
   owners whose repos are auto-discovered, with a per-owner activity window. `watched_repos`
-  stays as the override layer (pin, hide, label, short, color). Hide wins over pin. A repo
+  stays as the override layer: pin and hide for discovered repos; label, short, color and blocked label for hand-added repos. Hide wins over pin. A repo
   marked gone is not shown, including when it is pinned. A failed or empty `gh repo list`
   records `last_error` and does not delete or hide tracked repos.
 
