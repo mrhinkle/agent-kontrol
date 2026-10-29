@@ -18,9 +18,11 @@ The `agent_credentials` table stores the label, the first 8 characters of the to
 | --- | --- |
 | Dashboard UI and data routes (default) | Session cookie `mc_auth`, or `Authorization: Bearer <MC_TOKEN>` |
 | `GET` and `POST /api/decisions` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `decisions:write` |
+| `GET /api/activity` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `fleet:read`. Same boundary as `GET /api/traces` |
 | `PATCH /api/decisions/:id` | Session cookie, `MC_TOKEN`, or an agent credential with `decisions:write` |
-| Ingest routes: `POST /api/v1/traces`, `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, `POST /api/usage/ingest` | `Authorization: Bearer <MC_TOKEN>`, or an agent credential whose scope covers the route (`status:write` for `POST /api/ingest`, `messages:write` for `POST /api/messages/reply`); the other ingest routes take `MC_TOKEN` only |
+| Ingest routes: `POST /api/v1/traces`, `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, `POST /api/usage/ingest`, `POST /api/brief/alerts/evaluate` | `Authorization: Bearer <MC_TOKEN>`, or an agent credential whose scope covers the route (`status:write` for `POST /api/ingest`, `messages:write` for `POST /api/messages/reply`); the other ingest routes, including alert evaluate, take `MC_TOKEN` only |
 | MCP transport: `/api/mcp` | `Authorization: Bearer <MC_TOKEN>`, an agent credential, or an OAuth access token (JWT) issued by this server |
+| `GET /api/skill-bundles` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `skills:read` or `skills:write` |
 | Credential management: `GET`/`POST`/`DELETE /api/settings/credentials` | Dashboard session only |
 | Login, OAuth, and discovery: `/login`, `/api/login`, `/oauth/*`, `/.well-known/*` | No cookie gate; these routes enforce their own auth |
 | Public agent docs: `GET /llms.txt`, `GET /docs/mcp.md`, `GET /docs/api.md`, `GET /docs/agents.md` | None. Any other `/docs` name stays behind the dashboard gate |
@@ -44,6 +46,7 @@ Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI
 | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- |
 | GET | `/api/fleet` | Cookie or bearer | Everything the dashboard needs in one call |
+| GET | `/api/activity` | Session or MC_TOKEN | Write receipts and other events, newest first. An agent credential is denied, including `fleet:read`. Filters: `actor`, `kind`, `since`, `until`. Same `limit`, `cursor`, and `fields` rules as the other lists. Default limit 50. |
 | POST | `/api/ingest` | Bearer | Deterministic telemetry from hooks, watchers, and daemons |
 | GET | `/api/memory` | Cookie or bearer | Memory browser feed |
 | POST | `/api/memory` | Cookie or bearer | Store a note, or preview an overwrite with `dry_run` |
@@ -54,6 +57,8 @@ Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI
 | GET | `/api/progress` | Cookie or bearer | Everything the progress board needs |
 | GET | `/api/progress/digest` | Cookie or bearer | The board as plain text, for schedulers and terminals. A failure is the JSON error body, not plain text. |
 | GET | `/api/brief` | Cookie, bearer, or `progress:read` | Morning brief. `text/plain` by default; `Accept: application/json` for the object. `window` is `24h` (default) or `72h`. A failure is the JSON error body. |
+| GET | `/api/brief/alerts` | Cookie, bearer, or `progress:read` | Threshold conditions and whether each was sent. Does not send. |
+| POST | `/api/brief/alerts/evaluate` | Bearer `MC_TOKEN` only | Compute the same conditions. Sends only when `brief.alerts.enabled` is true. |
 | POST | `/api/progress/ingest` | Bearer | One collection tick from `scripts/collect-progress.sh` |
 | GET | `/api/decisions` | Cookie or bearer | Decision queue, oldest first, each row with `age_days`. `shape=brief` is the morning-brief `.decisions` list |
 | POST | `/api/decisions` | Cookie or bearer | Upsert one decision, or reconcile a collector sweep |
@@ -76,6 +81,7 @@ Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI
 | GET | `/api/traces/:traceId` | Cookie or bearer | The spans of one trace |
 | GET | `/api/usage` | Cookie or bearer | Usage ledger |
 | POST | `/api/usage/ingest` | Bearer | Ingest usage facts |
+| GET | `/api/skill-bundles` | Session or MC_TOKEN | Download a gzip tar of the skill tree for one runtime. Operator only |
 | POST | `/api/login` | Own (rate-limited) | Dashboard password login |
 
 ### OAuth and discovery routes
@@ -215,6 +221,22 @@ Coordinator liveness uses `brief.coordinator` in `progress.config.json`. `agentI
 
 With no `DATABASE_URL` the brief is database-only. It does not serve the synthetic progress board. Every configured repo is incomplete (`no snapshot`), the fleet totals are null, and the text says `DATA INCOMPLETE`. The JSON body has no `demo` field.
 
+### Threshold alerts
+
+`GET /api/brief/alerts` reports the between-brief conditions. It does not insert a message. Auth matches `GET /api/brief` (`progress:read` for an agent credential). `POST /api/brief/alerts/evaluate` is the only sender. Auth matches `POST /api/progress/ingest`: `MC_TOKEN` bearer. An agent credential is `403`, including one that holds `progress:read`. The POST body is ignored.
+
+`brief.alerts` in `progress.config.json` holds the thresholds. `enabled` defaults to `false`. Only a boolean `true` turns delivery on. A missing block, `0`, or the string `"true"` stays off. While delivery is off, evaluate still computes the conditions, `sent_count` is `0`, `delivery` is `disabled`, and no `brief_alerts` row is claimed or cleared. The owner turns the switch on after the first decision-backlog clear. Until then the channel stays quiet.
+
+The three conditions, and no others:
+
+- Coordinator work-event silence past `brief.coordinator.maxSilenceHours`. The work kinds are the brief's: `heartbeat`, `telemetry`, `turn_start`, `status_update`, and `error` never count. The alert re-sends every `coordinatorRepeatHours` (default 12) while the silence holds, then clears when a work event arrives.
+- A watched repo the brief shows (not hidden, gone, or outside its owner's activity window) with at least one merge in the prior `zeroMergeLookbackDays` (default 7) and no merge for `zeroMergeHours` (default 72). A merge at exactly 72h counts as quiet. A merge one minute newer does not. A repo with no merges in the prior 7 days does not alert. The alert fires once per quiet episode and re-arms only after the episode clears. Firing requires the snapshots to cover `[now - zeroMergeHours, now]`. The newest snapshot may lag now by the collector cadence (15 minutes). An older gap is `unknown`. A merge timestamp inside that window is `clear` even when the tail is unmeasured. A snapshot whose `detail.merged` does not cover the lookback is `unknown`, not clear.
+- An open decision whose `opened_at` (else `first_seen_at`) is strictly older than `decisionAgeDays` (default 14). One message per decision row, ever. A resolved, withdrawn, or deferred row does not alert. Exactly 14 days has not crossed the line.
+
+`condition` is `firing`, `clear`, or `unknown`. A failed read, a missing timestamp, or incomplete merge coverage is `unknown`. Unknown never sends and never clears a latch that is already sent. `sent` is true when `brief_alerts.cleared_at` is null for that key, false when the latch table was read and that key is not latched, and null when the table could not be read. That read sets `latches` to `unknown`. Each send is one inbound row from `enqueueMessage` (`created_by` `brief-alerts`, actor fields from the caller) on the coordinator conversation, or `operator` when no coordinator is configured. Evaluate adds `failures` when a latch read, claim, clear, message, or restore throws.
+
+The claim is one `INSERT ... ON CONFLICT ... RETURNING` statement. It stores a random `claim_token` and the evaluation's compute instant. Episode and repeat claims re-arm a cleared latch only when `cleared_at` is null or older than that instant. A clear sets `cleared_at` to its own compute instant only when `cleared_at` is null and `last_sent_at` is older than that instant, so a delayed clear cannot overwrite a newer claim. A decision claim is `INSERT ... SELECT ... WHERE EXISTS` an open decision still old enough at the compute instant, `ON CONFLICT DO NOTHING`, so a decision resolved after compute is not alerted. An event that lands between compute and claim, with no concurrent evaluation, can still produce one alert; the next evaluation clears it. A failed message insert restores the previous row only where that token still matches and `cleared_at` is still the null the claim wrote, so a concurrent clear stays cleared. Two concurrent evaluates insert one message per alert. The progress collector does not call this route. The scheduler that curls the brief POSTs evaluate on its own tick. No other pushes.
+
 ### Decisions
 
 The morning brief's decisions list comes from this table when every brief-eligible row for that repo has `kind`, `labels`, `opened_at`, and `repo_short`. Those rows are `source` `github-label`, `status` not `withdrawn`, and `github_present` not `false` (a null `github_present` still counts as present). `repo` is `owner/name`. `repo_short` is the config short name and is display only. The brief joins a row onto a watched repo by `owner/name`, so two repos that share a short name do not both receive the row. `age_hours` drops fractional seconds before `Z`, subtracts the unix times, and divides by 3600. `age_days` is `floor(age_hours / 24)` from `opened_at` (GitHub `createdAt`). GitHub `createdAt` is stored as `opened_at` and, on insert only, as `first_seen_at`.
@@ -278,6 +300,20 @@ See [Telemetry and traces](TELEMETRY.md) for the full contract.
 - `GET /api/traces?agent=&errors=1&before=&limit=&cursor=&fields=` — `{ demo, traces: TraceSummary[] }`. Default limit is 50, maximum 200. Sort is `started_at` descending, then `trace_id` ascending when a page was requested. `fields` may name `trace_id`, `agent_id`, `root_name`, `started_at`, `ended_at`, `span_count`, `error_count`, `open_count`, `input_tokens`, `output_tokens`, `cost_usd`. `trace_id` is always returned. See [List pages](#list-pages).
 - `GET /api/traces/:traceId` — `{ demo, spans: Span[] }`. With a database, an unknown or pruned trace is `404` `not_found`. Demo mode returns `200` and an empty `spans` list.
 
+### Skill bundles
+
+`GET /api/skill-bundles?runtime=hermes&lane=` returns a gzip-compressed tar (`application/gzip`, `content-disposition` attachment). The caller is a dashboard session or `MC_TOKEN`. An agent credential is `403`, including one with `skills:read` or `skills:write`. `GET /api/skills/:id` is unchanged, including when the id is `export`.
+
+`runtime` is required: `claude`, `codex`, `grok`, `hermes`, `mini`, or `nemoclaw`. `lane`, `category`, and `q` are optional. The set of skills is the same set `list_skills` would show. Export calls that same visibility check. Trigger `off` is omitted. A trigger other than `off`, `on_request`, `auto_inject`, or `scheduled` is treated as off and listed with reason `invalid trigger`. A selected scope is omitted unless `lane` admits it, and the skill has to list that runtime. `category` is an exact case-insensitive match. `uncategorized` matches a null category. `q` matches the skill id and the description.
+
+The archive directory is the skill id. That id is the upstream directory slug, and it is the canonical folder name. The frontmatter `name` is a display string and may differ from the id. It is written into the document. The folder is the id. Category is a Hermes folder only: Hermes paths are `<category>/<id>/SKILL.md`, and a null or blank category is the folder `uncategorized`. Claude and mini use `skills/<id>/SKILL.md`. Codex, Grok, and NemoClaw use `.agents/skills/<id>/SKILL.md`. Those layouts leave category out of the path, so a category value does not omit the skill there. A NemoClaw `SKILL.md` writes `name` and `description`, plus `license`, `user_invocable`, and `metadata.author` or `metadata.tags` only when the stored frontmatter already has them. Reference files sit next to `SKILL.md`.
+
+A Hermes category or a skill id that does not already match `^[a-z0-9][a-z0-9-_]*$` is omitted. The stored value is left as it is. A path with `..` or an absolute path is omitted. When more than one skill would write the same archive path, every one of those skills is omitted. A reference that is unsafe, that collides with another reference in the same skill under a case-insensitive comparison, or that does not fit a ustar name and prefix is omitted, and the skill is still exported. A skill whose `SKILL.md` cannot be written is omitted as a whole.
+
+Every omission is one entry `{skill, path?, reason}`. `path` is set for a reference. When the list is not empty, `manifest.json` at the archive root contains every entry. The `x-ak-skipped` header carries `count`, the first 20 entries, and the text `see manifest.json`. The header is at most 4 KB. A longer list keeps the count and drops header entries until it fits. Each archive path appears once.
+
+With no database the archive is the demo fixture and the response sets `x-ak-demo: true`. A missing or unknown `runtime`, or a repeated `runtime`, `lane`, `category`, or `q`, is `400`.
+
 ### Login
 
 `POST /api/login` takes body `{password}` and, on success, establishes the `mc_auth` session cookie. A wrong password answers `401` with `"error": "wrong password"` and `code` `unauthorized`. The route allows 5 attempts per 10 minutes per client IP, shared with the OAuth consent form; past that it answers `429` with a `Retry-After` header in seconds and `code` `rate_limited`. The limiter is in memory and per serverless instance.
@@ -306,7 +342,7 @@ OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this sha
 | `forbidden` | 403 | no | `POST /api/messages/reply` when `in_reply_to` names a message that belongs to a different agent. |
 | `identity_mismatch` | 403 | no | MCP `run_skill` when an agent credential or an OAuth client passes an `agent_id` other than the authenticated id. The call writes no run. Omit `agent_id`, or pass that id. |
 | `not_found` | 404 | no | Unknown trace id on `GET /api/traces/:traceId` when a database is connected (demo mode returns 200 and an empty `spans` list), `POST /api/messages/reply` when `in_reply_to` names a message that does not exist, `PATCH /api/decisions/:id` when a database is connected and that id does not exist (`error` stays `Decision not found`), or `POST /api/memory` when `expected_revision` is present and that key does not exist (`error` is `not found`). A missing key with no `expected_revision` still inserts. Demo mode does not look the decision id up. |
-| `validation_failed` | 400 | no | A field is present but not usable: a bad `before` on `GET /api/traces`, a bad `limit`, `cursor`, or `fields` on `GET /api/tasks`, `GET /api/memory`, or `GET /api/traces` (and on MCP `recall` and `get_task_queue`), a bad `since` and `until` pair on `GET /api/usage` (a `since` without `until` is ignored), a bad `collected_at` on usage or progress ingest, a bad task, trace, or decision id, a decision body or `status` the parser rejected, a privacy refusal, an OTLP body the parser rejected, or an idempotency key longer than 200 characters or containing a control character. |
+| `validation_failed` | 400 | no | A field is present but not usable: a bad `before` on `GET /api/traces`, a bad `limit`, `cursor`, or `fields` on `GET /api/tasks`, `GET /api/memory`, `GET /api/traces`, or `GET /api/activity` (and on MCP `recall`, `get_task_queue`, and `list_activity`), a bad `since`, `until`, `actor`, or `kind` on `GET /api/activity` (a `since` later than `until` is rejected; a bad timestamp is rejected), a bad `since` and `until` pair on `GET /api/usage` (a `since` without `until` is ignored), a bad `collected_at` on usage or progress ingest, a bad task, trace, or decision id, a decision body or `status` the parser rejected, a privacy refusal, an OTLP body the parser rejected, or an idempotency key longer than 200 characters or containing a control character. |
 | `invalid_json` | 400 | no | The body is not JSON. On `POST /api/login` the `error` string stays `invalid request`. On `POST /api/mcp` an empty or non-JSON body uses this code and `error` `invalid JSON`. A missing bearer on that route is still `401` with `WWW-Authenticate`. |
 | `missing_field` | 400 | no | A required field is absent. `fields` names it. |
 | `rate_limited` | 429 | yes | More than 5 `POST /api/login` attempts in 10 minutes from one client IP. `Retry-After` is seconds. The OAuth consent form shares this limiter and answers with HTML, not this JSON. |
@@ -327,18 +363,20 @@ OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this sha
 
 ## List pages
 
-`GET /api/tasks`, `GET /api/memory`, and `GET /api/traces` take three optional parameters. Omitting all three leaves the JSON body as it was: no `next_cursor` field. `fields` by itself narrows each row and still omits `next_cursor`.
+`GET /api/tasks`, `GET /api/memory`, `GET /api/traces`, and `GET /api/activity` take three optional parameters. Omitting all three leaves the JSON body as it was: no `next_cursor` field. `fields` by itself narrows each row and still omits `next_cursor`.
 
-- `limit` — integer from 1 to 200. The default stays the route default (tasks 100, memory 50, traces 50) when it is omitted. `0`, a negative, a non-integer (`1.5`, `1e2`, `01`, `+10`), or a value above 200 is `400` `validation_failed`. The error text does not echo the value.
+- `limit` — integer from 1 to 200. The default stays the route default (tasks 100, memory 50, traces 50, activity 50) when it is omitted. `0`, a negative, a non-integer (`1.5`, `1e2`, `01`, `+10`), or a value above 200 is `400` `validation_failed`. The error text does not echo the value.
 - `cursor` — opaque token. It is the base64url of the sort key and id of the last row on the previous page. The next page is the rows strictly after that point, so a row inserted ahead of the cursor does not shift the rest of the walk and does not repeat a row. Rows that share a timestamp are ordered by id ascending (`trace_id` ascending for traces). A garbage token, a token for a different list, or a token whose id is not the id shape for that list is `400`, not the first page and not `500`. A well-formed cursor past the last row is `200` with an empty list and `next_cursor: null`.
 - `fields` — comma-separated names from that route's allowlist. `id` (or `trace_id`) is always included and is first. An unknown name, an empty entry, or any text that is not an allowlisted name rejects the whole request with `400`. Columns outside the allowlist, including credential hashes, are not returned. Names are copied in the server after the query. They are not placed into SQL.
 - `next_cursor` — string or null. Present only when the request passed `limit` or `cursor`.
 
 `before` on traces still means "started before this instant". It does not by itself add `next_cursor`.
 
-With no database, those three GET routes keep returning the static sample, and they keep ignoring `status`, `query`, `tag`, `agent`, `errors`, and `before` (including a `before` that is not a timestamp), until the request passes `limit`, `cursor`, or `fields`. After that, the sample is filtered, ordered, and paged with the same rules as the database. That sample is not the in-memory store MCP writes use.
+With no database, tasks, memory, and traces keep returning the static sample, and they keep ignoring `status`, `query`, `tag`, `agent`, `errors`, and `before` (including a `before` that is not a timestamp), until the request passes `limit`, `cursor`, or `fields`. After that, the sample is filtered, ordered, and paged with the same rules as the database. That sample is not the in-memory store MCP writes use.
 
-MCP `recall` and `get_task_queue` take the same three parameters. Omitting them keeps the previous text, including the demo banner and the defaults (recall 20, task queue 40). Passing `limit` or `cursor` adds a final `next_cursor:` line. Passing `fields` returns one JSON object per line. The maximum is 200. The tool names are unchanged.
+`GET /api/activity` is the exception. With no database it reads the in-memory demo event log, not a static sample, and it applies `actor`, `kind`, `since`, and `until` even when `limit`, `cursor`, and `fields` are omitted. An empty log is `{ "demo": true, "activity": [] }`. Rows are newest `created_at` first, and rows that share a millisecond are ordered by `id` ascending. `since` is inclusive. `until` includes that whole millisecond. The actor filter matches `detail.actor_id`. The kind filter is an exact `events.kind`.
+
+MCP `recall`, `get_task_queue`, and `list_activity` take the same three paging parameters. Omitting them keeps the previous text for recall and the task queue, including the demo banner and the defaults (recall 20, task queue 40, activity 50). Passing `limit` or `cursor` adds a final `next_cursor:` line. Passing `fields` returns one JSON object per line. The maximum is 200. The tool names are unchanged. `list_activity` reads the in-memory demo log when no database is set, and its text starts with the demo banner.
 
 ## Demo mode
 
@@ -347,7 +385,7 @@ With no `DATABASE_URL` set (demo mode):
 - The auth gate is open.
 - GET routes return demo data, usually with `demo: true` in the response. `GET /api/decisions` returns `{ "demo": true, "decisions": [] }`. `GET /api/brief` does not. The brief is database-only: with no `DATABASE_URL` every configured repo is incomplete and the text says `DATA INCOMPLETE`. In the JSON, a fleet total that is unmeasured is `null`, and the top-level `stuck_prs` / `decisions` lists are `null` (not `[]`) when that total is unmeasured and no row is known; known rows are still listed when some were measured. See [Brief](#brief).
 - Ingest routes answer `{"ok": true, "demo": true}` and drop the data. `POST /api/decisions` does the same and adds `note`. `PATCH /api/decisions/:id` answers `{ "ok": true, "demo": true }` and does not look the id up.
-- MCP `report_status`, `remember`, `create_task`, `claim_task`, and `update_task` store in memory for this process. `get_fleet_status`, `recall`, and `get_task_queue` read that store. Successful text starts with `[demo — in-memory, cleared when this process restarts]`. The store is cleared when the process restarts. Those rows are not mixed into the sample data on GET routes.
+- MCP `report_status`, `remember`, `create_task`, `claim_task`, and `update_task` store in memory for this process. `get_fleet_status`, `recall`, `get_task_queue`, and `list_activity` read that store. `GET /api/activity` reads the same in-memory event log. Successful text starts with `[demo — in-memory, cleared when this process restarts]`. The store is cleared when the process restarts. Those rows are not mixed into the sample data on the other GET routes.
 - REST `POST` and `PATCH` in demo mode still answer `{ "ok": true, "demo": true }` (memory adds `note`) and do not write the in-memory store.
 
 ## Versioning

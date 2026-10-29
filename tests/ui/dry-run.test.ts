@@ -842,7 +842,10 @@ describe("stale preview confirmations", () => {
     assert.equal(storedMemory()?.content, "newer note");
     assert.equal(fixtureSnapshot(), before);
     assert.equal(appliedWrites(), 0);
-    assert.equal(queries[0]?.includes("select"), false);
+    // The receipt is selected from the updated row inside this statement. A leading select would read before the write.
+    assert.doesNotMatch(queries[0] ?? "", /^\s*(with\s+\w+\s+as\s*\(\s*)?select/i);
+    assert.match(queries[0] ?? "", /update\s+memory/i);
+    assert.match(queries[0] ?? "", /insert\s+into\s+events/i);
     assert.match(queries.find((sql) => /update\s+memory/i.test(sql)) ?? "", /md5\(\s*m::text\s*\)/);
     assert.equal(writes.some((sql) => /insert\s+into\s+memory/i.test(sql)), false);
   });
@@ -1284,7 +1287,10 @@ describe("stale preview confirmations", () => {
     assert.equal(storedMemory()?.content, "concurrent note");
     assert.equal(body.current_revision, stableRowRevision(storedMemoryRow()));
     assert.notEqual(body.current_revision, seen);
-    assert.equal(queries[0]?.includes("select"), false);
+    // The receipt is selected from the updated row inside this statement. A leading select would read before the write.
+    assert.doesNotMatch(queries[0] ?? "", /^\s*(with\s+\w+\s+as\s*\(\s*)?select/i);
+    assert.match(queries[0] ?? "", /update\s+memory/i);
+    assert.match(queries[0] ?? "", /insert\s+into\s+events/i);
   });
 
   it("two racing absent-key confirms return one 200 and one 409", async () => {
