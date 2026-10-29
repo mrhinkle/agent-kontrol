@@ -404,8 +404,11 @@ create index if not exists decisions_repo_number_idx on decisions (repo, number)
 
 -- Threshold-alert dedupe (see supabase/migrations/20261028_brief_alerts.sql).
 -- One row per alert key. Coordinator silence re-claims while last_sent_at is
--- older than the repeat interval. A zero-merge row re-arms only after
--- cleared_at is set. A decision row is inserted once and never replaced.
+-- older than the repeat interval, and only when cleared_at is null or older
+-- than the claim's compute instant. A zero-merge row re-arms only after
+-- cleared_at is set, and only when that clear is older than the claim.
+-- A decision row is inserted once, and only while the decision is still open
+-- and old enough. A clear cannot overwrite a newer last_sent_at.
 -- cleared_at is nullable: null means the alert is still latched.
 -- claim_token is the attempt that owns a claim. A failed message insert
 -- restores the previous row only while this token still matches and

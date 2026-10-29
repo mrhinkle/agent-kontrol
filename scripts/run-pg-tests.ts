@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import { Client } from "pg";
-import { evaluateAlerts, setBriefSettingsForTests } from "../src/lib/brief-alerts";
+import { evaluateAlerts, setBeforeClaimForTests, setBriefSettingsForTests } from "../src/lib/brief-alerts";
 import type { BriefSettings } from "../src/lib/progress-config";
 import { sql } from "../src/lib/db";
 import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
@@ -1138,14 +1138,86 @@ async function testBriefAlerts(tag: string): Promise<void> {
       insert into events (agent_id, kind, title, created_at)
       values (${agentId}, 'milestone', 'back', ${iso(12 * hour)}::timestamptz)
     `;
-    const cleared = await evaluateAlerts({ now: halfDay, settings });
+    const clearAt = new Date(halfDay.getTime() + minute);
+    const cleared = await evaluateAlerts({ now: clearAt, settings });
     assert.equal(cleared.alerts.find((alert) => alert.key === coordKey)?.condition, "clear");
     assert.equal(await count(bodyKey(coordKey)), 2, "a work event clears without another message");
     const latch = await sql()`select cleared_at from brief_alerts where key = ${coordKey}`;
     assert.ok(latch[0]?.cleared_at, "the coordinator latch is cleared");
     const decisionLatch = await sql()`select cleared_at from brief_alerts where key = ${`decision:${oldId}`}`;
     assert.equal(decisionLatch[0]?.cleared_at ?? null, null, "a decision latch is never cleared");
+
+    const instant = (value: unknown) => value instanceof Date ? value.getTime() : Date.parse(String(value));
+
+    // 1. A clear that observed a later instant rejects the stale claim.
+    const tClaim = new Date(now.getTime() + 30_000);
+    const tClear = new Date(now.getTime() + 90_000);
+    await sql()`delete from events where agent_id = ${agentId} and kind = 'milestone'`;
+    await sql()`
+      update brief_alerts
+      set cleared_at = null, last_sent_at = ${tClaim.toISOString()}::timestamptz
+      where key = ${coordKey}
+    `;
+    const beforeStale = await count(bodyKey(coordKey));
+    const seen: { report: Awaited<ReturnType<typeof evaluateAlerts>> | null } = { report: null };
+    setBeforeClaimForTests(async (key) => {
+      if (key !== coordKey) return;
+      setBeforeClaimForTests(null);
+      await sql()`
+        insert into events (agent_id, kind, title, created_at)
+        values (${agentId}, 'milestone', 'later-clear', ${tClear.toISOString()}::timestamptz)
+      `;
+      seen.report = await evaluateAlerts({ now: tClear, settings });
+    });
+    const stale = await evaluateAlerts({ now: tClaim, settings });
+    setBeforeClaimForTests(null);
+    const concurrentClear = seen.report;
+    if (!concurrentClear) throw new Error("the later clear ran before the stale claim");
+    assert.equal(concurrentClear.alerts.find((alert) => alert.key === coordKey)?.condition, "clear");
+    assert.equal(stale.failures, undefined, "the stale claim statement ran");
+    assert.equal(await count(bodyKey(coordKey)), beforeStale, "a later clear rejects the stale claim");
+    assert.equal(stale.sent_count, 0);
+    const staleLatch = await sql()`select cleared_at, last_sent_at from brief_alerts where key = ${coordKey}`;
+    assert.equal(instant(staleLatch[0]?.cleared_at), tClear.getTime(), "the later clear stays cleared");
+    assert.equal(instant(staleLatch[0]?.last_sent_at), tClaim.getTime(), "the stale claim does not rewrite last_sent_at");
+
+    // 2. A delayed clear with an earlier compute instant leaves the newer claim.
+    const tNewer = new Date(now.getTime() + 30 * hour);
+    const tOlder = new Date(now.getTime() + 29 * hour);
+    await sql()`delete from events where agent_id = ${agentId} and kind = 'milestone'`;
+    const newerClaim = await evaluateAlerts({ now: tNewer, settings });
+    assert.equal(newerClaim.alerts.find((alert) => alert.key === coordKey)?.condition, "firing");
+    const afterNewer = await count(bodyKey(coordKey));
+    assert.equal(afterNewer, beforeStale + 1, "silence after the clear arms a fresh claim");
+    await sql()`
+      insert into events (agent_id, kind, title, created_at)
+      values (${agentId}, 'milestone', 'already-claimed', ${tNewer.toISOString()}::timestamptz)
+    `;
+    const delayed = await evaluateAlerts({ now: tOlder, settings });
+    assert.equal(delayed.alerts.find((alert) => alert.key === coordKey)?.condition, "clear");
+    assert.equal(await count(bodyKey(coordKey)), afterNewer, "a delayed clear sends nothing");
+    const kept = await sql()`select cleared_at from brief_alerts where key = ${coordKey}`;
+    assert.equal(kept[0]?.cleared_at ?? null, null, "a delayed clear does not erase the newer claim");
+
+    // 3. A decision resolved between compute and claim inserts nothing.
+    const dKey = `decision:${oldId}`;
+    await sql()`delete from messages where created_by = 'brief-alerts' and position(${bodyKey(dKey)} in body) > 0`;
+    await sql()`delete from brief_alerts where key = ${dKey}`;
+    assert.equal(await count(bodyKey(dKey)), 0);
+    setBeforeClaimForTests(async (key) => {
+      if (key !== dKey) return;
+      setBeforeClaimForTests(null);
+      await sql()`update decisions set status = 'decided' where id = ${oldId}`;
+    });
+    const resolvedLate = await evaluateAlerts({ now, settings });
+    setBeforeClaimForTests(null);
+    assert.equal(resolvedLate.alerts.find((alert) => alert.key === dKey)?.condition, "firing");
+    assert.equal(resolvedLate.alerts.find((alert) => alert.key === dKey)?.sent, false);
+    assert.equal(await count(bodyKey(dKey)), 0, "a decision resolved before the claim sends nothing");
+    const gone = await sql()`select key from brief_alerts where key = ${dKey}`;
+    assert.equal(gone.length, 0, "a resolved decision does not leave a latch");
   } finally {
+    setBeforeClaimForTests(null);
     setBriefSettingsForTests(null);
     await cleanup();
   }

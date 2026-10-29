@@ -10,11 +10,18 @@
  * computes every condition and sends nothing, including no clear and no re-arm.
  * Unknown (a failed or incomplete read) never sends and never clears.
  *
- * The claim is one INSERT ... ON CONFLICT statement. Two ticks can both try;
- * only the statement that returns a row inserts an operator message. The
- * statement stores a random claim_token. A failed message insert puts the
- * previous row back only while that token still matches and cleared_at is
- * still the null the claim wrote, so a concurrent clear stays cleared.
+ * The claim is one INSERT ... ON CONFLICT statement. It carries the compute
+ * instant. Episode and repeat claims re-arm a cleared latch only when
+ * cleared_at is null or older than that instant, so a clear that observed
+ * newer evidence wins. A clear writes cleared_at only when the latch is
+ * still active and last_sent_at is older than the clear's instant, so a
+ * delayed clear cannot erase a newer claim. A decision claim inserts only
+ * while that row is still open and still old enough. An event that lands
+ * between compute and claim, with no concurrent evaluation, can still send
+ * once; the next evaluation clears it. The statement stores a random
+ * claim_token. A failed message insert puts the previous row back only
+ * while that token still matches and cleared_at is still the null the claim
+ * wrote, so a concurrent clear stays cleared.
  */
 
 import { randomUUID } from "node:crypto";
@@ -85,6 +92,20 @@ interface ClaimPrev {
 type ClaimMode = "repeat" | "episode" | "once";
 
 let settingsOverride: BriefSettings | null = null;
+
+/**
+ * Tests only. Runs after compute and before the claim statement, so a test
+ * can clear the latch or resolve the decision the statement is about to check.
+ * Production leaves this null.
+ */
+let beforeClaimForTests: ((key: string, computedAt: string) => Promise<void>) | null = null;
+
+/** Tests interleave a concurrent write between compute and the claim statement. */
+export function setBeforeClaimForTests(
+  hook: ((key: string, computedAt: string) => Promise<void>) | null,
+): void {
+  beforeClaimForTests = hook;
+}
 
 /** Tests pin thresholds without editing progress.config.json. Production never calls this. */
 export function setBriefSettingsForTests(value: BriefSettings | null): void {
@@ -442,10 +463,21 @@ function claimMode(draft: Draft): ClaimMode {
   return "once";
 }
 
+/** `decision:<id>` keys are the decisions.id the once-claim rechecks. */
+function decisionIdFromKey(key: string): number | null {
+  const match = /^decision:(\d+)$/.exec(key);
+  if (!match) return null;
+  const id = Number(match[1]);
+  return Number.isSafeInteger(id) ? id : null;
+}
+
 /**
  * One statement. RETURNING is empty when this caller did not win the claim.
- * `prior` is the row as it was before this statement, so a failed message
- * insert can put that row back.
+ * `nowIso` is the compute instant. Episode and repeat re-arm only when
+ * `cleared_at` is null or older than that instant. A decision insert runs
+ * only while the row is still open and still old enough. `prior` is the row
+ * as it was before this statement, so a failed message insert can put that
+ * row back.
  */
 async function claimSend(
   draft: Draft,
@@ -455,6 +487,9 @@ async function claimSend(
   const mode = claimMode(draft);
   const hours = alerts.coordinatorRepeatHours;
   const token = randomUUID();
+  if (beforeClaimForTests) await beforeClaimForTests(draft.key, nowIso);
+  const decisionId = decisionIdFromKey(draft.key);
+  const decisionAgeDays = alerts.decisionAgeDays;
   const rows = mode === "once"
     ? await sql()`
         -- brief-alert-claim:once
@@ -465,7 +500,19 @@ async function claimSend(
         ),
         claimed as (
           insert into brief_alerts (key, first_sent_at, last_sent_at, cleared_at, claim_token)
-          values (${draft.key}, ${nowIso}::timestamptz, ${nowIso}::timestamptz, null, ${token})
+          select ${draft.key}, ${nowIso}::timestamptz, ${nowIso}::timestamptz, null, ${token}
+          where exists (
+            select 1 from decisions
+            where id = ${decisionId}
+              and status = 'open'
+              and (
+                opened_at <= ${nowIso}::timestamptz - (${decisionAgeDays}::numeric * interval '1 day')
+                or (
+                  opened_at is null
+                  and first_seen_at <= ${nowIso}::timestamptz - (${decisionAgeDays}::numeric * interval '1 day')
+                )
+              )
+          )
           on conflict (key) do nothing
           returning key
         )
@@ -492,6 +539,10 @@ async function claimSend(
                 cleared_at = null,
                 claim_token = excluded.claim_token
             where brief_alerts.cleared_at is not null
+              and (
+                brief_alerts.cleared_at is null
+                or brief_alerts.cleared_at < ${nowIso}::timestamptz
+              )
             returning key
           )
           select claimed.key,
@@ -515,8 +566,14 @@ async function claimSend(
             set last_sent_at = excluded.last_sent_at,
                 cleared_at = null,
                 claim_token = excluded.claim_token
-            where brief_alerts.cleared_at is not null
-               or brief_alerts.last_sent_at <= ${nowIso}::timestamptz - (${hours}::numeric * interval '1 hour')
+            where (
+                brief_alerts.cleared_at is not null
+                or brief_alerts.last_sent_at <= ${nowIso}::timestamptz - (${hours}::numeric * interval '1 hour')
+              )
+              and (
+                brief_alerts.cleared_at is null
+                or brief_alerts.cleared_at < ${nowIso}::timestamptz
+              )
             returning key
           )
           select claimed.key,
@@ -575,6 +632,7 @@ async function clearLatch(key: string, nowIso: string): Promise<void> {
     set cleared_at = ${nowIso}::timestamptz
     where key = ${key}
       and cleared_at is null
+      and last_sent_at < ${nowIso}::timestamptz
     returning key
   `;
 }

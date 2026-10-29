@@ -162,6 +162,16 @@ the switch: coordinator re-send 12h, zero-merge 72h after a merge in the prior 7
 decision age 14 days. An unmeasured source is `unknown`. Unknown does not send and does not
 clear a latch.
 
+Each claim carries the evaluation's compute instant, the database clock used to judge the
+condition. A cleared latch is re-armed only when `cleared_at` is null or older than that
+instant, and a clear writes `cleared_at` only when the latch is still active and
+`last_sent_at` is older than the clear's own instant. A clear that saw newer evidence beats
+a stale claim, and a delayed clear cannot erase a newer claim. A decision alert is inserted
+only while that decision is still `open` and its `opened_at` (or `first_seen_at` when
+`opened_at` is null) is still at least `decisionAgeDays` old at the compute instant. One
+residual window remains: an event that lands between compute and claim, with no concurrent
+evaluation to clear the latch, can still produce one alert. The next evaluation clears it.
+
 The decision list is ordered by tier, then age. Strict age order lets a three-month-old
 naming question sit ahead of a consent decision.
 

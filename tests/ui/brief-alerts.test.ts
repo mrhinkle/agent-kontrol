@@ -7,6 +7,7 @@ import {
   classifyZeroMerge,
   evaluateAlerts,
   readAlerts,
+  setBeforeClaimForTests,
   setBriefSettingsForTests,
   type AlertEvaluation,
 } from "../../src/lib/brief-alerts";
@@ -75,6 +76,7 @@ interface World {
   claimWaiters: Array<() => void>;
   maxClaimWaiters: number;
   claimTexts: string[];
+  clearTexts: string[];
   restoreTexts: string[];
   /** Runs after a claim and before the message insert, so a second evaluate can clear. */
   beforeMessageInsert: (() => void) | null;
@@ -100,6 +102,7 @@ function freshWorld(): World {
     claimWaiters: [],
     maxClaimWaiters: 0,
     claimTexts: [],
+    clearTexts: [],
     restoreTexts: [],
     beforeMessageInsert: null,
   };
@@ -131,6 +134,7 @@ beforeEach(() => {
 afterEach(() => {
   setSqlForTests(null);
   setBriefSettingsForTests(null);
+  setBeforeClaimForTests(null);
   resetCredentialsForTests();
   restoreEnv();
 });
@@ -204,6 +208,41 @@ function notDistinct(left: string | null | undefined, right: unknown): boolean {
   return left === right;
 }
 
+/**
+ * The claim SQL re-arms a cleared latch only when it says
+ * `cleared_at is null or brief_alerts.cleared_at < computedAt`.
+ * Without that predicate the fake keeps the old behavior: any clear re-arms.
+ */
+function newerClearBlocksRearm(text: string, existing: Latch, computedAt: string): boolean {
+  const guarded = /cleared_at\s+is\s+null\s+or\s+brief_alerts\.cleared_at\s*</i.test(text);
+  if (!guarded) return false;
+  if (existing.cleared == null) return false;
+  return Date.parse(existing.cleared) >= Date.parse(computedAt);
+}
+
+/**
+ * A once-claim inserts only when its SQL still sees an open decision old
+ * enough at computedAt. Without that EXISTS check the fake inserts anyway.
+ */
+function decisionStillOpen(text: string, values: unknown[], computedAt: string): boolean {
+  const guarded = /from\s+decisions/i.test(text)
+    && /status\s*=\s*'open'/i.test(text)
+    && /opened_at\s*<=/i.test(text);
+  if (!guarded) return true;
+  const key = alertKey(values);
+  const match = key && /^decision:(\d+)$/.exec(key);
+  if (!match) return false;
+  const id = Number(match[1]);
+  const row = world.decisions.find((decision) => decision.id === id);
+  if (!row || row.status !== "open") return false;
+  const opened = row.opened_at ?? row.first_seen_at;
+  if (!opened) return false;
+  const numbers = values.filter((value): value is number => typeof value === "number");
+  const days = [...new Set(numbers)].find((value) => value !== id) ?? numbers[0];
+  if (typeof days !== "number") return false;
+  return Date.parse(opened) <= Date.parse(computedAt) - days * D;
+}
+
 function latchRow(key: string, latch: Latch): Row {
   return {
     key,
@@ -231,8 +270,11 @@ function applyClaim(text: string, values: unknown[]): Row[] {
   const atomic = Boolean(marker)
     && /on conflict\s*\(\s*key\s*\)/i.test(text)
     && /returning/i.test(text);
+  const onceOk = marker?.[1] !== "once" || decisionStillOpen(text, values, now);
   let won = false;
-  if (!existing || !atomic) {
+  if (!onceOk) {
+    won = false;
+  } else if (!existing || !atomic) {
     world.alerts.set(key, claimedRow(existing?.first ?? now));
     won = true;
   } else if (marker![1] === "once") {
@@ -245,7 +287,8 @@ function applyClaim(text: string, values: unknown[]): Row[] {
       && typeof hours === "number";
     const due = whereRepeat && Date.parse(existing.last) <= Date.parse(now) - (hours as number) * H;
     const rearm = whereCleared && existing.cleared != null;
-    if (rearm || due || (!whereCleared && !whereRepeat)) {
+    const blocked = newerClearBlocksRearm(text, existing, now);
+    if ((rearm || due || (!whereCleared && !whereRepeat)) && !blocked) {
       world.alerts.set(key, claimedRow(existing.first));
       won = true;
     }
@@ -381,6 +424,7 @@ const sqlFake: SqlTag = async (strings, ...values) => {
     return [];
   }
   if (/update\s+brief_alerts/i.test(text)) {
+    world.clearTexts.push(text);
     if (world.fail.has("clear")) throw new Error("clear failed");
     const key = alertKey(values);
     const now = isoValues(values)[0];
@@ -388,6 +432,8 @@ const sqlFake: SqlTag = async (strings, ...values) => {
     const row = world.alerts.get(key);
     if (!row) return [];
     if (row.cleared && /cleared_at\s+is\s+null/i.test(text)) return [];
+    // A delayed clear loses when the statement requires last_sent_at < computedAt.
+    if (/last_sent_at\s*</i.test(text) && Date.parse(row.last) >= Date.parse(now)) return [];
     world.alerts.set(key, { ...row, cleared: now });
     return [{ key }];
   }
@@ -637,7 +683,8 @@ describe("threshold alerts", { concurrency: false }, () => {
     assert.equal(messagesFor("coordinator-silent:carmack").length, 2);
 
     world.events.push({ agent_id: "carmack", kind: "milestone", created_at: at(later, 0) });
-    const cleared = await evaluateAlerts({ now: later, settings: on });
+    const clearedAt = new Date(later.getTime() + M);
+    const cleared = await evaluateAlerts({ now: clearedAt, settings: on });
     assert.equal(hit(cleared, "coordinator-silent:carmack").condition, "clear");
     assert.equal(hit(cleared, "coordinator-silent:carmack").sent, false);
     assert.equal(cleared.sent_count, 0);
@@ -645,7 +692,7 @@ describe("threshold alerts", { concurrency: false }, () => {
     assert.equal(world.alerts.get("coordinator-silent:carmack")?.cleared != null, true);
 
     world.events = world.events.filter((event) => event.kind !== "milestone");
-    const rearmed = await evaluateAlerts({ now: later, settings: on });
+    const rearmed = await evaluateAlerts({ now: new Date(later.getTime() + 2 * M), settings: on });
     assert.equal(hit(rearmed, "coordinator-silent:carmack").condition, "firing");
     assert.equal(rearmed.sent_count, 1);
     assert.equal(messagesFor("coordinator-silent:carmack").length, 3);
@@ -670,8 +717,9 @@ describe("threshold alerts", { concurrency: false }, () => {
     assert.equal(messagesFor("coordinator-silent:carmack").length, 1);
 
     world.events.push({ agent_id: "carmack", kind: "status", created_at: at(T, -M) });
-    const worked = await evaluateAlerts({ now: T, settings: on });
+    const worked = await evaluateAlerts({ now: new Date(T.getTime() + M), settings: on });
     assert.equal(hit(worked, "coordinator-silent:carmack").condition, "clear");
+    assert.equal(hit(worked, "coordinator-silent:carmack").sent, false);
     assert.equal(messagesFor("coordinator-silent:carmack").length, 1);
 
     const noiseOnly = settings({
@@ -680,7 +728,7 @@ describe("threshold alerts", { concurrency: false }, () => {
       workKinds: ["heartbeat", "telemetry", "turn_start", "status_update", "error"],
     });
     world.events = [{ agent_id: "carmack", kind: "heartbeat", created_at: at(T, -M) }];
-    const configured = await evaluateAlerts({ now: T, settings: noiseOnly });
+    const configured = await evaluateAlerts({ now: new Date(T.getTime() + 2 * M), settings: noiseOnly });
     assert.equal(hit(configured, "coordinator-silent:carmack").condition, "firing");
     assert.match(hit(configured, "coordinator-silent:carmack").summary, /NOT WORKING/);
     assert.equal(messagesFor("coordinator-silent:carmack").length, 2);
@@ -762,7 +810,7 @@ describe("threshold alerts", { concurrency: false }, () => {
 
     world.snapshots = world.snapshots.filter((row) => row.repo !== repos.exact);
     snap(repos.exact, at(later, 0), [{ merged_at: at(later, -80 * H) }]);
-    const again = await evaluateAlerts({ now: later, settings: on });
+    const again = await evaluateAlerts({ now: new Date(later.getTime() + M), settings: on });
     assert.equal(hit(again, `zero-merge:${repos.exact}`).condition, "firing");
     assert.equal(again.sent_count, 1);
     assert.equal(messagesFor(`zero-merge:${repos.exact}`).length, 2);
@@ -1082,6 +1130,100 @@ describe("threshold alerts", { concurrency: false }, () => {
     assert.equal(row.cleared, T.toISOString().replace(/\.\d{3}Z$/, "Z"));
     assert.match(world.restoreTexts.join("\n"), /claim_token\s*=/);
     assert.match(world.restoreTexts.join("\n"), /cleared_at\s+is\s+not\s+distinct\s+from/i);
+  });
+
+  it("a later clear rejects a stale coordinator and zero-merge claim", async () => {
+    useDb();
+    const on = settings({ enabled: true });
+    const coord = "coordinator-silent:carmack";
+    const repo = "example-org/app-server";
+    const merge = `zero-merge:${repo}`;
+    silence(T, 4 * H);
+    watch(repo);
+    snap(repo, at(T, 0), [{ merged_at: at(T, -80 * H) }]);
+    world.alerts.set(coord, { first: at(T, -H), last: at(T, -H), cleared: null });
+    world.alerts.set(merge, { first: at(T, -D), last: at(T, -D), cleared: null });
+    const later = new Date(T.getTime() + 5 * M);
+    const laterIso = at(later, 0).replace(/\.\d{3}Z$/, "Z");
+    let concurrent: AlertEvaluation | null = null;
+    setBeforeClaimForTests(async () => {
+      setBeforeClaimForTests(null);
+      world.events.push({ agent_id: "carmack", kind: "milestone", created_at: at(later, 0) });
+      world.snapshots = [{
+        repo,
+        collected_at: at(later, 0),
+        detail: { merged: [{ merged_at: at(later, -H) }] },
+      }];
+      concurrent = await evaluateAlerts({ now: later, settings: on });
+    });
+    const stale = await evaluateAlerts({ now: T, settings: on });
+    assert.ok(concurrent, "the concurrent clear ran before the stale claim");
+    assert.equal(hit(concurrent, coord).condition, "clear");
+    assert.equal(hit(concurrent, merge).condition, "clear");
+    assert.equal(stale.sent_count, 0);
+    assert.equal(messagesFor(coord).length, 0);
+    assert.equal(messagesFor(merge).length, 0);
+    assert.equal(world.alerts.get(coord)?.cleared, laterIso);
+    assert.equal(world.alerts.get(merge)?.cleared, laterIso);
+    assert.equal(hit(stale, coord).sent, false);
+    assert.equal(hit(stale, merge).sent, false);
+    const claims = world.claimTexts.join("\n");
+    assert.match(claims, /brief-alert-claim:repeat/);
+    assert.match(claims, /brief-alert-claim:episode/);
+    assert.match(claims, /cleared_at\s+is\s+null\s+or\s+brief_alerts\.cleared_at\s*</i);
+  });
+
+  it("a delayed clear does not erase a newer claim", async () => {
+    useDb();
+    const on = settings({ enabled: true });
+    const key = "coordinator-silent:carmack";
+    const newer = T;
+    const early = new Date(T.getTime() - H);
+    silence(newer, 4 * H);
+    watch("example-org/app-server");
+    snap("example-org/app-server", at(newer, 0), [{ merged_at: at(newer, -H) }]);
+    const sent = await evaluateAlerts({ now: newer, settings: on });
+    assert.equal(messagesFor(key).length, 1);
+    assert.equal(hit(sent, key).sent, true);
+    world.events.push({ agent_id: "carmack", kind: "milestone", created_at: at(newer, 0) });
+    const delayed = await evaluateAlerts({ now: early, settings: on });
+    assert.equal(hit(delayed, key).condition, "clear");
+    assert.equal(delayed.sent_count, 0);
+    assert.equal(messagesFor(key).length, 1);
+    assert.equal(world.alerts.get(key)?.cleared ?? null, null);
+    assert.equal(hit(delayed, key).sent, true);
+    const clears = world.clearTexts.join("\n");
+    assert.match(clears, /brief-alert-clear/);
+    assert.match(clears, /cleared_at\s+is\s+null/i);
+    assert.match(clears, /last_sent_at\s*</i);
+  });
+
+  it("a decision resolved after compute is not claimed", async () => {
+    useDb();
+    const on = settings({ enabled: true, agentId: null });
+    decision(9, "open", at(T, -20 * D));
+    watch("example-org/app-server");
+    snap("example-org/app-server", at(T, 0), [{ merged_at: at(T, -H) }]);
+    setBeforeClaimForTests(async (key) => {
+      if (key !== "decision:9") return;
+      setBeforeClaimForTests(null);
+      world.decisions = world.decisions.map((row) => (
+        row.id === 9 ? { ...row, status: "decided" } : row
+      ));
+    });
+    const raced = await evaluateAlerts({ now: T, settings: on });
+    assert.equal(hit(raced, "decision:9").condition, "firing");
+    assert.equal(hit(raced, "decision:9").sent, false);
+    assert.equal(raced.sent_count, 0);
+    assert.equal(messagesFor("decision:9").length, 0);
+    assert.equal(world.alerts.has("decision:9"), false);
+    const claims = world.claimTexts.join("\n");
+    assert.match(claims, /brief-alert-claim:once/);
+    assert.match(claims, /insert\s+into\s+brief_alerts\s*\([^)]*\)\s*select/i);
+    assert.match(claims, /from\s+decisions/i);
+    assert.match(claims, /status\s*=\s*'open'/i);
+    assert.match(claims, /opened_at\s*<=/i);
+    assert.match(claims, /on conflict\s*\(\s*key\s*\)\s*do nothing/i);
   });
 
   it("a missing brief_alerts table makes GET report latches unknown", async () => {
