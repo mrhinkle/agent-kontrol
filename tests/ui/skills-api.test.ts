@@ -461,6 +461,7 @@ describe("skills routes", { concurrency: false }, () => {
         params: Promise.resolve({ id: "nightly" }),
       });
       const detail = await detailRes.json() as { schedule: string | null; scope: unknown };
+      assert.equal(detail.schedule, "15 6 * * 1-5");
       const listed = (await list()).get("nightly");
       assert.equal(detail.schedule, listed?.schedule);
       assert.deepEqual(detail.scope, listed?.scope);
