@@ -696,6 +696,13 @@ refresh_repos_from_dashboard() {
       log "repos: dashboard list is only gone repos; not sweeping them"
       return 0
     fi
+    # An empty database list is the owner's answer (owners watched, nothing eligible yet),
+    # not a missing list: sweep nothing rather than the local config's repos.
+    if jq -e '.source == "database"' >/dev/null 2>&1 <<<"$body"; then
+      REPOS=()
+      log "repos: dashboard database list is empty; not sweeping local-config repos"
+      return 0
+    fi
     log "repos: dashboard list was empty, using ${#REPOS[@]} from the local config"; return 0
   fi
   REPOS=()

@@ -33,6 +33,17 @@ begin
     from pg_constraint
     where conname = 'watched_repos_short_key'
       and conrelid = 'watched_repos'::regclass
+  ) and exists (
+    select 1 from watched_repos group by short having count(*) > 1
+  ) then
+    -- Never fail the build on legacy data: every deploy applies this file. Skip the
+    -- constraint and say why; discovery's advisory lock still serializes allocation.
+    raise warning 'watched_repos has duplicate short names; watched_repos_short_key not added. Rename the duplicates, then redeploy.';
+  elsif not exists (
+    select 1
+    from pg_constraint
+    where conname = 'watched_repos_short_key'
+      and conrelid = 'watched_repos'::regclass
   ) then
     alter table watched_repos
       add constraint watched_repos_short_key

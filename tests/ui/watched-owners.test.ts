@@ -988,6 +988,24 @@ describe("watched owners discovery", () => {
     assert.match(fn, /swept_at/);
   });
 
+  it("the collector sweeps nothing when the dashboard's database repo list is empty", () => {
+    // Round-5 review: an empty database list fell back to the local config's repos.
+    const collector = fs.readFileSync("scripts/collect-progress.sh", "utf8");
+    const start = collector.indexOf("refresh_repos_from_dashboard() {");
+    const end = collector.indexOf("\n}\n", start) + 3;
+    const fn = collector.slice(start, end);
+    const run = (body: string) => execFileSync("bash", ["-c", [
+      'log() { :; }',
+      `curl() { printf '%s' '${body}'; }`,
+      fn,
+      'REPOS=("acme/local|Local||local")',
+      'MC_URL=http://dash MC_TOKEN=t refresh_repos_from_dashboard',
+      'printf "%s" "${#REPOS[@]}"',
+    ].join("\n")], { encoding: "utf8" });
+    assert.equal(run('{"source":"database","repos":[]}'), "0");
+    assert.equal(run('{"source":"file","repos":[]}'), "1", "a file-source empty list keeps the local config");
+  });
+
   it("a configured owner with zero repos stays on the database source", async () => {
     env.DATABASE_URL = FIXTURE_URL;
     env.MC_DB_DRIVER = "pg";
