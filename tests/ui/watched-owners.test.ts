@@ -1145,6 +1145,31 @@ describe("watched owners discovery", () => {
     assert.deepEqual(stored.map((row) => row.repo).sort(), ["acme/app", "beta/app"]);
   });
 
+  it("discovery rejects a non-boolean truncated flag", async () => {
+    // Round-7 review: "truncated": "true" read as a complete listing and could mark repos gone.
+    env.NODE_ENV = "test";
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+    let calls = 0;
+    setSqlForTests(async () => {
+      calls += 1;
+      return [{ owner: "acme", activity_days: 30, include_forks: false, include_archived: false }];
+    });
+    const res = await postDiscover(new Request("http://localhost/api/settings/owners/discover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        results: [{ owner: "acme", ok: true, truncated: "true", swept_at: new Date().toISOString(), repos: [{ name: "app", pushedAt: atAge(1), isFork: false, isArchived: false }] }],
+      }),
+    }));
+    assert.equal(res.status, 400, JSON.stringify(await res.clone().json()));
+    const body = await res.json() as { code?: string; fields?: { results?: string } };
+    assert.match(body.fields?.results ?? "", /truncated/);
+    assert.equal(calls, 0, "a malformed truncated flag must not touch the database");
+  });
+
   it("discovery rejects a missing swept_at", async () => {
     env.NODE_ENV = "test";
     env.DATABASE_URL = FIXTURE_URL;

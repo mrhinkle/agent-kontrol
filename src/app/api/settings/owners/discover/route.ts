@@ -74,6 +74,10 @@ function parseResult(raw: unknown): { ok: true; request: DiscoveryRequest } | { 
   if (typeof row.ok !== "boolean") return { ok: false, error: "ok must be true or false." };
   const error = row.error == null ? null : typeof row.error === "string" ? row.error : null;
   if (row.error != null && typeof row.error !== "string") return { ok: false, error: "error must be a string." };
+  // A malformed flag must not read as a complete listing: that would mark absent repos gone.
+  if (row.truncated !== undefined && typeof row.truncated !== "boolean") {
+    return { ok: false, error: "truncated must be true or false." };
+  }
   const swept = parseSweptAt(row.swept_at);
   if (!swept.ok) return { ok: false, error: swept.error };
   if (!row.ok) return { ok: true, request: { owner: name.owner, ok: false, error, sweptAt: swept.sweptAt } };
