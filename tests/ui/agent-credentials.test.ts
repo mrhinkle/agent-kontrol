@@ -91,7 +91,7 @@ describe("scope table", { concurrency: false }, () => {
       ...Array.from(src.matchAll(/registerTool\(\s*"([^"]+)"/g), (m) => m[1]),
       ...Array.from(src.matchAll(/name:\s*"([^"]+)"/g), (m) => m[1]),
     ]);
-    const operatorOnly = new Set(["list_activity"]);
+    const operatorOnly = new Set(["list_activity", "get_settings", "set_watched_repos"]);
     for (const name of [
       "report_status",
       "get_fleet_status",
@@ -116,6 +116,8 @@ describe("scope table", { concurrency: false }, () => {
       "requeue_task",
       "delete_note",
       "list_activity",
+      "get_settings",
+      "set_watched_repos",
     ]) {
       assert.ok(names.has(name), `route source is missing ${name}`);
       if (operatorOnly.has(name)) {

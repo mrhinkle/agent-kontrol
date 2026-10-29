@@ -5,8 +5,10 @@ import { isConfigured } from "@/lib/db";
 import { diffRepoList, readDryRun } from "@/lib/dry-run";
 import { repoIdentity } from "@/lib/owner-discovery";
 import { REPOS } from "@/lib/progress-config";
-import { MAX_REPOS, retainedAutoShortErrors, validateRepoList, type RepoError, type RepoInput } from "@/lib/repo-validation";
-import { getWatchedRepos, listVersion, loadTrackedRepos, replaceWatchedRepos, setRepoOverride } from "@/lib/watched-repos";
+import { repoErrorFields, retainedAutoShortErrorsForSave, validateReposForSave } from "@/lib/repo-save";
+import type { RepoInput } from "@/lib/repo-validation";
+import { readRepoSettings } from "@/lib/settings-read";
+import { loadTrackedRepos, replaceWatchedRepos, setRepoOverride } from "@/lib/watched-repos";
 
 export const dynamic = "force-dynamic";
 
@@ -37,54 +39,19 @@ export const dynamic = "force-dynamic";
  * route (it is not in the scope table). The collector uses MC_TOKEN.
  */
 async function current() {
-  const { source, repos } = await getWatchedRepos(REPOS);
-  return { source, writable: isConfigured(), max: MAX_REPOS, version: listVersion(repos), repos };
-}
-
-function repoFields(errors: RepoError[]): Record<string, string> {
-  const fields: Record<string, string> = {};
-  for (const row of errors) {
-    const key = row.index < 0 ? row.field : `${row.index}.${row.field}`;
-    fields[key] = fields[key] ? `${fields[key]} ${row.message}` : row.message;
-  }
-  return fields;
+  return readRepoSettings();
 }
 
 // Log the real error server-side; the response stays generic so database details never reach the browser.
-/**
- * An empty list still means "add at least one repo", unless auto-discovered
- * rows are already stored. Those stay, so the operator can clear every
- * hand-added override without wiping discovery.
- */
-async function validateForSave(raw: unknown) {
-  if (Array.isArray(raw) && raw.length === 0 && isConfigured()) {
-    try {
-      const tracked = await loadTrackedRepos();
-      if (tracked.some((repo) => repo.origin === "auto")) {
-        return { ok: true as const, repos: [] as RepoInput[] };
-      }
-    } catch {
-      // Fall through to the ordinary "at least one repo" error.
-    }
-  }
-  return validateRepoList(raw);
-}
-
 /** 400 when a submitted short name belongs to an auto row this save will keep. */
 async function rejectRetainedShorts(repos: RepoInput[]): Promise<Response | null> {
-  if (!isConfigured() || repos.length === 0) return null;
-  try {
-    const collisions = retainedAutoShortErrors(repos, await loadTrackedRepos());
-    if (collisions.length === 0) return null;
-    return apiError("repo_list_invalid", {
-      message: collisions[0]?.message ?? "The repo list is invalid.",
-      fields: repoFields(collisions),
-      extra: { errors: collisions },
-    });
-  } catch {
-    // A store error surfaces on the write. A concurrent unique violation is 409.
-    return null;
-  }
+  const collisions = await retainedAutoShortErrorsForSave(repos);
+  if (!collisions) return null;
+  return apiError("repo_list_invalid", {
+    message: collisions[0]?.message ?? "The repo list is invalid.",
+    fields: repoErrorFields(collisions),
+    extra: { errors: collisions },
+  });
 }
 
 function failure(e: unknown, what: string) {
@@ -121,11 +88,11 @@ export async function PUT(req: Request) {
     });
   }
   const rawRepos = (body as { repos?: unknown } | null)?.repos;
-  const checked = await validateForSave(rawRepos);
+  const checked = await validateReposForSave(rawRepos);
   if (!checked.ok) {
     return apiError("repo_list_invalid", {
       message: checked.errors[0]?.message ?? "The repo list is invalid.",
-      fields: repoFields(checked.errors),
+      fields: repoErrorFields(checked.errors),
       extra: { errors: checked.errors },
     });
   }

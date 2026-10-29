@@ -26,6 +26,7 @@ import { demoProgress } from "@/lib/demo-progress";
 import { listDecisionsTool, requestDecisionTool, resolveDecisionTool } from "@/lib/decision-resolve";
 import { getSkillTool, listSkillsTool, runSkillTool } from "@/lib/skills/mcp";
 import { deleteNoteTool, requeueTaskTool, sendMessageTool } from "@/lib/operator-actions";
+import { getSettingsTool, setWatchedReposTool } from "@/lib/settings-tools";
 
 export const maxDuration = 60;
 
@@ -654,6 +655,49 @@ const handler = createMcpHandler(
         },
       },
       async (args) => guardTool("list_activity", () => listActivityResult(args, isConfigured())),
+    );
+
+    server.registerTool(
+      "get_settings",
+      {
+        title: "Get settings",
+        annotations: READ_ONLY,
+        description:
+          "Read the watched repo list and the watched owners. The repos object matches GET /api/settings/repos, including source and version. The owners object matches GET /api/settings/owners. Operator only, the same boundary as list_activity. An agent credential is denied. MC_TOKEN and an OAuth access token can call it. With no database, this matches those GETs: file repos and an empty owner list.",
+        inputSchema: {},
+      },
+      async () => guardTool("get_settings", () => getSettingsTool()),
+    );
+
+    server.registerTool(
+      "set_watched_repos",
+      {
+        title: "Set watched repos",
+        annotations: WRITE_DESTRUCTIVE,
+        description:
+          "Replace the hand-added watched repo list. Same validation and replace as PUT /api/settings/repos, including case-insensitive owner/name. Operator only, the same boundary as list_activity. An agent credential is denied. MC_TOKEN and an OAuth access token can call it. expected_version is required unless dry_run is true. Send the version from get_settings. A mismatch is stale and writes nothing. dry_run true returns the diff (added, removed, and changed repos) and the current version and writes nothing. A successful write records one activity receipt for the authenticated actor. Auto rows the body omits stay.",
+        inputSchema: {
+          repos: z
+            .array(
+              z.object({
+                repo: z.string(),
+                label: z.string(),
+                short: z.string(),
+                color: z.string(),
+                blockedLabel: z.string().nullable().optional(),
+                pinned: z.boolean().optional(),
+                hidden: z.boolean().optional(),
+              }),
+            )
+            .describe("Hand-added repos, the same objects as PUT /api/settings/repos."),
+          expected_version: z
+            .string()
+            .optional()
+            .describe("version from get_settings. Required unless dry_run is true. A mismatch is stale and writes nothing."),
+          dry_run: z.boolean().optional().describe("True returns the diff and the current version and writes nothing."),
+        },
+      },
+      async (args) => guardTool("set_watched_repos", () => setWatchedReposTool(args)),
     );
   },
   {},

@@ -330,7 +330,7 @@ describe("operator MCP tools", () => {
     }
   });
 
-  it("F9 keeps the previous tool names and adds exactly these three", () => {
+  it("F9 keeps the previous tool names and appends the operator tools", () => {
     const src = fs.readFileSync("src/app/api/[transport]/route.ts", "utf8");
     const previous = [
       "report_status",
@@ -353,8 +353,8 @@ describe("operator MCP tools", () => {
     ];
     const registered = [...src.matchAll(/registerTool\(\s*"([^"]+)"/g)].map((match) => match[1]);
     assert.deepEqual(registered.slice(0, previous.length), previous);
-    assert.deepEqual(registered.slice(previous.length), ["send_message", "requeue_task", "delete_note", "list_activity"]);
-    assert.equal(src.match(/server\.registerTool\(/g)?.length, 22);
+    assert.deepEqual(registered.slice(previous.length), ["send_message", "requeue_task", "delete_note", "list_activity", "get_settings", "set_watched_repos"]);
+    assert.equal(src.match(/server\.registerTool\(/g)?.length, 24);
     assert.match(src, /title: "Send message",\n\s+annotations: WRITE,/);
     assert.match(src, /title: "Requeue task",\n\s+annotations: WRITE,/);
     assert.match(src, /title: "Delete note",\n\s+annotations: WRITE_DESTRUCTIVE,/);
