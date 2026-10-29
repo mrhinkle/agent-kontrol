@@ -98,7 +98,7 @@ const defaultDeps: TickDeps = {
     }),
 };
 
-const PLATFORM: Record<Exclude<Runtime, "mini">, string> = {
+const PLATFORM: Record<Exclude<Runtime, "mini" | "nemoclaw">, string> = {
   claude: "claude-code",
   codex: "codex",
   grok: "grok",
@@ -106,16 +106,18 @@ const PLATFORM: Record<Exclude<Runtime, "mini">, string> = {
 };
 
 /**
- * One compatible runtime other than mini pins the platform. Anything else is
- * "any", and the description names the runtimes so a worker that is not
- * listed leaves the task alone. AK_SKILL_MINI_MACHINE pins a mini-only skill
- * to that machine's dispatcher.
+ * One compatible runtime other than mini or nemoclaw pins the platform.
+ * nemoclaw has no task platform, so a nemoclaw-only skill is "any", the same
+ * as any other mix. The description names the runtimes so a worker that is
+ * not listed leaves the task alone. AK_SKILL_MINI_MACHINE pins a mini-only
+ * skill to that machine's dispatcher.
  */
 export function routeFor(
   runtimes: Runtime[],
   env: Env = process.env,
 ): { platform: string; machine?: string } {
-  if (runtimes.length === 1 && runtimes[0] !== "mini") return { platform: PLATFORM[runtimes[0]] };
+  const only = runtimes.length === 1 ? runtimes[0] : null;
+  if (only && only !== "mini" && only !== "nemoclaw") return { platform: PLATFORM[only] };
   const miniMachine = env.AK_SKILL_MINI_MACHINE?.trim();
   if (runtimes.length === 1 && runtimes[0] === "mini" && miniMachine) {
     return { platform: "any", machine: miniMachine };

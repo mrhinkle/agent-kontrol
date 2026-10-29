@@ -790,7 +790,7 @@ function skillRecord(id: string, body: string): SkillRecord {
     commit_sha: "b".repeat(40),
     body,
     references: [],
-    runtimes: { claude: true, codex: false, grok: false, hermes: false, mini: false },
+    runtimes: { claude: true, codex: false, grok: false, hermes: false, mini: false, nemoclaw: false },
     category: null,
     tags: [],
     frontmatter: {},

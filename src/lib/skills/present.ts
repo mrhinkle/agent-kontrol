@@ -31,6 +31,7 @@ export function isStalled(run: Pick<RunRecord, "ended_at" | "started_at">, now: 
 /**
  * The skill text get_skill and run_skill put under the preamble.
  * hermes gets Hermes frontmatter. codex and grok get an Agent Skills document.
+ * nemoclaw gets the NemoClaw frontmatter subset in the Agent Skills directory.
  * claude, mini, and a call with no runtime keep the stored body.
  */
 export function presentSkillDocument(skill: FormatSkill, runtime: Runtime | null): string {

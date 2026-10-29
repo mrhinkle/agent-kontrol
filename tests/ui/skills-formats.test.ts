@@ -51,7 +51,7 @@ function skill(partial: Partial<MemSkill> & Pick<MemSkill, "id">): MemSkill {
     commit_sha: "c".repeat(40),
     body: partial.body ?? "Follow these steps.",
     references: partial.references ?? [],
-    runtimes: partial.runtimes ?? { claude: true, codex: true, grok: true, hermes: true, mini: true },
+    runtimes: partial.runtimes ?? { claude: true, codex: true, grok: true, hermes: true, mini: true, nemoclaw: true },
     category: partial.category ?? null,
     tags: partial.tags ?? [],
     frontmatter: partial.frontmatter ?? {},
@@ -76,7 +76,7 @@ function bundleSkill(partial: Partial<BundleSkill["skill"]> & Pick<BundleSkill["
     },
     trigger: partial.trigger ?? "on_request",
     scope: partial.scope ?? { mode: "all", lanes: [] },
-    runtimes: partial.runtimes ?? { claude: true, codex: true, grok: true, hermes: true, mini: true },
+    runtimes: partial.runtimes ?? { claude: true, codex: true, grok: true, hermes: true, mini: true, nemoclaw: true },
   };
 }
 
@@ -348,8 +348,9 @@ describe("Hermes format adapters", () => {
     }
   });
 
-  it("does not add a nemoclaw runtime or invent Agent Skills fields", () => {
-    assert.equal(RUNTIMES.includes("nemoclaw" as never), false);
+  it("does not invent Agent Skills fields for codex or grok", () => {
+    assert.equal(RUNTIMES.includes("nemoclaw"), true);
+    assert.equal(formatForRuntime("nemoclaw"), "nemoclaw");
     assert.equal(formatForRuntime("hermes"), "hermes");
     assert.equal(formatForRuntime("codex"), "agentskills");
     assert.equal(formatForRuntime("grok"), "agentskills");
@@ -563,8 +564,8 @@ describe("skill export route", { concurrency: false }, () => {
     assert.equal((await missing.json()).code, "validation_failed");
     const repeated = await GET(new Request("http://localhost/api/skill-bundles?runtime=hermes&runtime=claude"));
     assert.equal(repeated.status, 400);
-    const nemoclaw = await GET(new Request("http://localhost/api/skill-bundles?runtime=nemoclaw"));
-    assert.equal(nemoclaw.status, 400);
+    const unknown = await GET(new Request("http://localhost/api/skill-bundles?runtime=openclaw"));
+    assert.equal(unknown.status, 400);
 
     const pure = visibleForExport([
       bundleSkill({ id: "off", trigger: "off" }),

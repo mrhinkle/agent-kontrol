@@ -40,4 +40,4 @@ export type RenderTree =
   | { ok: true; files: RenderedFile[]; rejected: RejectedPath[] }
   | { ok: false; reason: string };
 
-export type SkillFormatId = "claude" | "agentskills" | "hermes";
+export type SkillFormatId = "claude" | "agentskills" | "hermes" | "nemoclaw";
