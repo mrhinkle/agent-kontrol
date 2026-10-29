@@ -568,12 +568,19 @@ const handler = createMcpHandler(
       async (args) => guardTool("delete_note", () => deleteNoteTool(args)),
     );
   },
-  {},
-  {
-    basePath: "/api",
-    maxDuration: 60,
-  }
 );
+
+/**
+ * mcp-handler 2.x serves whatever request it is given and no longer accepts
+ * basePath. This file is the /api/[transport] route, so only /api/mcp is the
+ * streamable HTTP endpoint. Any other transport is 404 after auth.
+ */
+function mcpAtEndpoint(req: Request): Promise<Response> {
+  if (new URL(req.url).pathname !== "/api/mcp") {
+    return Promise.resolve(new Response("Not Found", { status: 404 }));
+  }
+  return handler(req);
+}
 
 /**
  * Accept either a legacy MC_TOKEN bearer OR a valid OAuth access JWT.
@@ -664,8 +671,8 @@ const authed = withMcpAuth(
     const denied = await enforceMcpScope(req);
     if (denied) return denied;
     const principal = principalFromMcpAuth(req.auth);
-    if (!principal) return handler(req);
-    return runWithActor(actorFromPrincipal(principal), () => handler(req));
+    if (!principal) return mcpAtEndpoint(req);
+    return runWithActor(actorFromPrincipal(principal), () => mcpAtEndpoint(req));
   },
   verifyToken,
   {
