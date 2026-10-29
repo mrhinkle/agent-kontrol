@@ -1,7 +1,7 @@
 import { mcpToolError, type McpToolResult } from "../api-error";
 import { isConfigured } from "../db";
 import { demoDetail, demoList, demoReference, demoSkillRows } from "./demo";
-import { scopeAdmits } from "./settings";
+import { isListSkillVisible, scopeAdmits } from "./settings";
 import { skillContentSha, shortSha } from "./sha";
 import { presentSkillDocument } from "./present";
 import { finishSkillRun, gateSkill, renderReferenceText, renderSkillText, startSkillRun } from "./runs";
@@ -142,20 +142,13 @@ async function liveList(args: { runtime?: string; lane?: string; category?: stri
     q: null,
     category: args.category ?? null,
   });
-  return listed.skills.filter((skill) => {
-    if (skill.trigger === "off") return false;
-    if (skill.scope.mode === "selected" && !args.lane) return false;
-    if (!scopeAdmits(skill.scope, args.lane)) return false;
-    return true;
-  });
+  return listed.skills.filter((skill) => isListSkillVisible(skill, args.lane));
 }
 
 function demoVisible(args: { runtime?: string; lane?: string; category?: string }) {
-  return demoList({ runtime: args.runtime ?? null, q: null, category: args.category ?? null }).filter((skill) => {
-    if (skill.trigger === "off") return false;
-    if (skill.scope.mode === "selected" && !args.lane) return false;
-    return scopeAdmits(skill.scope, args.lane);
-  });
+  return demoList({ runtime: args.runtime ?? null, q: null, category: args.category ?? null }).filter((skill) =>
+    isListSkillVisible(skill, args.lane),
+  );
 }
 
 function demoGet(args: { id: string; path?: string; runtime?: string; lane?: string }): McpToolResult {

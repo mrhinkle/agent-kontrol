@@ -650,6 +650,109 @@ describe("skill export route", { concurrency: false }, () => {
     assert.match(get.description ?? "", /dashboard session/i);
     assert.match(get.description ?? "", /MC_TOKEN/);
     assert.match(get.description ?? "", /agent credential/i);
+    assert.match(`${api}\n${get.description ?? ""}`, /invalid trigger/);
+    assert.match(`${api}\n${get.description ?? ""}`, /see manifest.json/);
+    assert.match(`${api}\n${mcp}\n${get.description ?? ""}`, /Hermes/);
+    assert.match(`${api}\n${get.description ?? ""}`, /4 KB/);
+  });
+
+  it("stored malformed trigger is skipped and reported", async () => {
+    installSkillsSql();
+    env.DATABASE_URL = "postgres://skills:skills@127.0.0.1:9/skills_test";
+    env.MC_TOKEN = "test-mc-token";
+    skillsMemory.skills.push(
+      skill({ id: "bad-trigger", category: "apple", body: "bad trigger body" }),
+      skill({ id: "disabled", category: "apple", body: "disabled body" }),
+    );
+    skillsMemory.settings.push(
+      { skill_id: "bad-trigger", trigger: "nope" as "off", scope: { mode: "all", lanes: [] }, schedule: null, updated_by: null, updated_at: NOW },
+      { skill_id: "disabled", trigger: "off", scope: { mode: "all", lanes: [] }, schedule: null, updated_by: null, updated_at: NOW },
+    );
+    const { GET } = await import("../../src/app/api/skill-bundles/route");
+    const open = await GET(new Request("http://localhost/api/skill-bundles?runtime=hermes", {
+      headers: { authorization: "Bearer test-mc-token" },
+    }));
+    assert.equal(open.status, 200);
+    const files = readArchive(Buffer.from(await open.arrayBuffer()));
+    assert.equal([...files.values()].join("\n").includes("bad trigger body"), false);
+    assert.equal([...files.values()].join("\n").includes("disabled body"), false);
+    const header = open.headers.get("x-ak-skipped") ?? "";
+    assert.match(header, /see manifest.json/);
+    const parsed = JSON.parse(header) as { count: number; skipped: { skill?: string; reason?: string }[] };
+    assert.equal(parsed.skipped.some((entry) => entry.skill === "bad-trigger" && entry.reason === "invalid trigger"), true);
+    assert.equal(parsed.skipped.some((entry) => entry.skill === "disabled"), false);
+    const manifest = JSON.parse(files.get("manifest.json") ?? "") as { skipped: { skill?: string; reason?: string }[] };
+    assert.equal(manifest.skipped.some((entry) => entry.skill === "bad-trigger" && entry.reason === "invalid trigger"), true);
+    assert.equal(manifest.skipped.some((entry) => entry.skill === "disabled"), false);
+  });
+
+  it("skip header is bounded at 20 while manifest.json has every skip", async () => {
+    installSkillsSql();
+    env.DATABASE_URL = "postgres://skills:skills@127.0.0.1:9/skills_test";
+    env.MC_TOKEN = "test-mc-token";
+    for (let i = 0; i < 25; i += 1) {
+      const id = `Bad Name ${i}`;
+      skillsMemory.skills.push(skill({ id, category: "notes", body: `body ${i}` }));
+      skillsMemory.settings.push({
+        skill_id: id,
+        trigger: "on_request",
+        scope: { mode: "all", lanes: [] },
+        schedule: null,
+        updated_by: null,
+        updated_at: NOW,
+      });
+    }
+    const { GET } = await import("../../src/app/api/skill-bundles/route");
+    const open = await GET(new Request("http://localhost/api/skill-bundles?runtime=hermes", {
+      headers: { authorization: "Bearer test-mc-token" },
+    }));
+    assert.equal(open.status, 200);
+    const header = open.headers.get("x-ak-skipped") ?? "";
+    assert.ok(Buffer.byteLength(header, "utf8") <= 4096, `header is ${Buffer.byteLength(header, "utf8")} bytes`);
+    assert.match(header, /see manifest.json/);
+    const parsed = JSON.parse(header) as { count: number; skipped: { skill?: string }[] };
+    assert.equal(parsed.count, 25);
+    assert.equal(parsed.skipped.length, 20);
+    const files = readArchive(Buffer.from(await open.arrayBuffer()));
+    const manifest = JSON.parse(files.get("manifest.json") ?? "") as { skipped: { skill?: string }[] };
+    assert.equal(manifest.skipped.length, 25);
+    for (let i = 0; i < 25; i += 1) {
+      assert.equal(manifest.skipped.some((entry) => entry.skill === `Bad Name ${i}`), true);
+      assert.equal([...files.values()].some((text) => text.includes(`body ${i}`)), false);
+    }
+  });
+
+  it("skip header stays within 4 KB when entries are large", async () => {
+    installSkillsSql();
+    env.DATABASE_URL = "postgres://skills:skills@127.0.0.1:9/skills_test";
+    env.MC_TOKEN = "test-mc-token";
+    for (let i = 0; i < 25; i += 1) {
+      const id = `${"b".repeat(300)}-${i}`;
+      skillsMemory.skills.push(skill({ id, category: "notes", body: `wide ${i}` }));
+      skillsMemory.settings.push({
+        skill_id: id,
+        trigger: "on_request",
+        scope: { mode: "all", lanes: [] },
+        schedule: null,
+        updated_by: null,
+        updated_at: NOW,
+      });
+    }
+    const { GET } = await import("../../src/app/api/skill-bundles/route");
+    const open = await GET(new Request("http://localhost/api/skill-bundles?runtime=hermes", {
+      headers: { authorization: "Bearer test-mc-token" },
+    }));
+    assert.equal(open.status, 200);
+    const header = open.headers.get("x-ak-skipped") ?? "";
+    assert.ok(Buffer.byteLength(header, "utf8") <= 4096, `header is ${Buffer.byteLength(header, "utf8")} bytes`);
+    assert.match(header, /see manifest.json/);
+    const parsed = JSON.parse(header) as { count: number; skipped: unknown[] };
+    assert.equal(parsed.count, 25);
+    assert.equal(parsed.skipped.length <= 20, true);
+    assert.equal(parsed.skipped.length < 25, true);
+    const files = readArchive(Buffer.from(await open.arrayBuffer()));
+    const manifest = JSON.parse(files.get("manifest.json") ?? "") as { skipped: { skill?: string }[] };
+    assert.equal(manifest.skipped.length, 25);
   });
 });
 
@@ -669,8 +772,8 @@ describe("archive path collisions", () => {
     assert.equal(names.some((name) => name.includes("foo bar")), false);
     const built = buildBundle(rows, filter);
     const skipped = built.skipped ?? [];
-    assert.equal(skipped.some((entry) => entry.id === "foo bar" && entry.reason.length > 0), true);
-    assert.equal(skipped.some((entry) => entry.id === "foo-bar"), false);
+    assert.equal(skipped.some((entry) => entry.skill === "foo bar" && entry.reason.length > 0), true);
+    assert.equal(skipped.some((entry) => entry.skill === "foo-bar"), false);
     const archived = readArchive(bundleGzip(rows, filter));
     assert.equal(archived.get("notes/foo-bar/SKILL.md")?.includes("dashed body"), true);
     assert.equal([...archived.values()].some((text) => text.includes("spaced body")), false);
@@ -689,9 +792,9 @@ describe("archive path collisions", () => {
     assert.equal(paths.includes("notes/Bad Name/SKILL.md"), false);
     assert.equal(paths.includes("notes/kept/SKILL.md"), true);
     const skipped = built.skipped ?? [];
-    assert.equal(skipped.some((entry) => entry.id === "safe-name" && /category/i.test(entry.reason)), true);
-    assert.equal(skipped.some((entry) => entry.id === "Bad Name" && /name/i.test(entry.reason)), true);
-    assert.equal(skipped.some((entry) => entry.id === "kept"), false);
+    assert.equal(skipped.some((entry) => entry.skill === "safe-name" && /category/i.test(entry.reason)), true);
+    assert.equal(skipped.some((entry) => entry.skill === "Bad Name" && /name/i.test(entry.reason)), true);
+    assert.equal(skipped.some((entry) => entry.skill === "kept"), false);
     const names = archiveNames(bundleGzip(rows, filter));
     assert.equal(new Set(names).size, names.length);
     assert.equal([...readArchive(bundleGzip(rows, filter)).values()].some((text) => text.includes("bad category body") || text.includes("bad name body")), false);
@@ -704,7 +807,7 @@ describe("archive path collisions", () => {
     ];
     const built = buildBundle(rows, filter);
     assert.equal(built.files.some((file) => file.path === "notes/same/SKILL.md"), false);
-    const skipped = (built.skipped ?? []).filter((entry) => entry.id === "same" && /duplicate/i.test(entry.reason));
+    const skipped = (built.skipped ?? []).filter((entry) => entry.skill === "same" && /duplicate/i.test(entry.reason));
     assert.equal(skipped.length, 2);
     const names = archiveNames(bundleGzip(rows, filter));
     assert.equal(names.includes("notes/same/SKILL.md"), false);
@@ -719,7 +822,7 @@ describe("archive path collisions", () => {
     ];
     const folded = buildBundle(uncategorized, filter);
     assert.equal(folded.files.some((file) => file.path === "uncategorized/notes/SKILL.md"), false);
-    assert.equal((folded.skipped ?? []).filter((entry) => entry.id === "notes" && /duplicate/i.test(entry.reason)).length, 2);
+    assert.equal((folded.skipped ?? []).filter((entry) => entry.skill === "notes" && /duplicate/i.test(entry.reason)).length, 2);
   });
 
   it("uses the skill id as the directory when the display name differs", () => {
@@ -743,5 +846,118 @@ describe("archive path collisions", () => {
     assert.equal(agents.ok, true);
     if (!agents.ok) return;
     assert.equal(agents.files[0]?.path, ".agents/skills/apple-notes/SKILL.md");
+  });
+
+  it("malformed trigger is skipped and reported", () => {
+    const rows = [
+      bundleSkill({ id: "bad-trigger", category: "apple", body: "bad trigger body", trigger: "nope" as "off" }),
+      bundleSkill({ id: "disabled", category: "apple", body: "disabled body", trigger: "off" }),
+      bundleSkill({ id: "shown", category: "apple", body: "shown body" }),
+    ];
+    const built = buildBundle(rows, filter);
+    assert.equal(built.files.some((file) => file.content.includes("bad trigger body")), false);
+    assert.equal(built.files.some((file) => file.content.includes("disabled body")), false);
+    assert.equal(built.files.some((file) => file.content.includes("shown body")), true);
+    assert.equal(built.skipped.some((entry) => entry.skill === "bad-trigger" && entry.reason === "invalid trigger"), true);
+    assert.equal(built.skipped.some((entry) => entry.skill === "disabled"), false);
+    const archived = readArchive(bundleGzip(rows, filter));
+    assert.equal([...archived.values()].some((text) => text.includes("bad trigger body")), false);
+    const manifest = JSON.parse(archived.get("manifest.json") ?? "") as { skipped: { skill?: string; reason?: string }[] };
+    assert.equal(manifest.skipped.some((entry) => entry.skill === "bad-trigger" && entry.reason === "invalid trigger"), true);
+  });
+
+  it("over-long nested reference path is skipped and reported", () => {
+    const segment = "a".repeat(80);
+    const relative = `${segment}/${segment}/${segment}`;
+    const full = `apple/notes/${relative}`;
+    assert.equal(isSafeArchivePath(full), true);
+    const rows = [bundleSkill({
+      id: "notes",
+      category: "apple",
+      body: "kept body",
+      references: [{ path: relative, content: "long reference body" }],
+    })];
+    const built = buildBundle(rows, filter);
+    assert.equal(built.files.some((file) => file.content.includes("kept body")), true);
+    assert.equal(built.files.some((file) => file.content === "long reference body"), false);
+    assert.equal(built.skipped.some((entry) => entry.skill === "notes" && entry.path === relative && /limit|ustar|archive/i.test(entry.reason)), true);
+    const archived = readArchive(bundleGzip(rows, filter));
+    assert.match(archived.get("apple/notes/SKILL.md") ?? "", /kept body/);
+    assert.equal([...archived.values()].some((text) => text.includes("long reference body")), false);
+    const manifest = JSON.parse(archived.get("manifest.json") ?? "") as { skipped: { skill?: string; path?: string }[] };
+    assert.equal(manifest.skipped.some((entry) => entry.skill === "notes" && entry.path === relative), true);
+  });
+
+  it("tarGzip throws on a path ustar cannot represent", () => {
+    const segment = "a".repeat(80);
+    const full = `apple/notes/${segment}/${segment}/${segment}`;
+    assert.equal(isSafeArchivePath(full), true);
+    assert.throws(() => tarGzip([{ path: full, content: "long reference body" }]));
+    const kept = tarGzip([{ path: "apple/notes/ok.md", content: "kept" }]);
+    assert.equal(readArchive(kept).get("apple/notes/ok.md"), "kept");
+  });
+
+  it("Guide.MD and guide.md collision is reported", () => {
+    const rows = [bundleSkill({
+      id: "notes",
+      category: "apple",
+      body: "kept body",
+      references: [
+        { path: "Guide.MD", content: "UPPER" },
+        { path: "guide.md", content: "lower" },
+      ],
+    })];
+    const built = buildBundle(rows, filter);
+    assert.equal(built.files.some((file) => file.path === "apple/notes/SKILL.md"), true);
+    const guide = built.files.find((file) => file.path === "apple/notes/guide.md");
+    assert.equal(guide?.content, "UPPER");
+    assert.equal(built.files.some((file) => file.content === "lower"), false);
+    assert.equal(built.skipped.some((entry) => entry.skill === "notes" && entry.path === "guide.md" && entry.reason.length > 0), true);
+    const archived = readArchive(bundleGzip(rows, filter));
+    assert.equal(archived.get("apple/notes/guide.md"), "UPPER");
+    assert.match(archived.get("apple/notes/SKILL.md") ?? "", /kept body/);
+    const manifest = JSON.parse(archived.get("manifest.json") ?? "") as { skipped: { skill?: string; path?: string }[] };
+    assert.equal(manifest.skipped.some((entry) => entry.skill === "notes" && entry.path === "guide.md"), true);
+  });
+
+  it("unsafe reference is reported and the skill is still exported", () => {
+    const rows = [bundleSkill({
+      id: "notes",
+      category: "apple",
+      body: "kept body",
+      references: [
+        { path: "references/guide.md", content: "guide body" },
+        { path: "../../etc/passwd", content: "secret" },
+      ],
+    })];
+    const built = buildBundle(rows, filter);
+    assert.equal(built.files.some((file) => file.path === "apple/notes/SKILL.md" && file.content.includes("kept body")), true);
+    assert.equal(built.files.some((file) => file.path === "apple/notes/references/guide.md"), true);
+    assert.equal(built.files.some((file) => file.content === "secret"), false);
+    assert.equal(built.skipped.some((entry) => entry.skill === "notes" && entry.path === "../../etc/passwd" && entry.reason.length > 0), true);
+    const archived = readArchive(bundleGzip(rows, filter));
+    assert.match(archived.get("apple/notes/SKILL.md") ?? "", /kept body/);
+    assert.equal([...archived.values()].some((text) => text.includes("secret")), false);
+    const manifest = JSON.parse(archived.get("manifest.json") ?? "") as { skipped: { path?: string }[] };
+    assert.equal(manifest.skipped.some((entry) => entry.path === "../../etc/passwd"), true);
+  });
+
+  it("skips a skill whose SKILL.md does not fit ustar and still exports a bad category for claude", () => {
+    const id = "i".repeat(80);
+    const category = "c".repeat(80);
+    const hermesRows = [bundleSkill({ id, category, body: "too long skill" })];
+    const hermes = buildBundle(hermesRows, filter);
+    assert.equal(hermes.files.some((file) => file.content.includes("too long skill")), false);
+    assert.equal(hermes.skipped.some((entry) => entry.skill === id && entry.path == null && /limit|ustar|archive/i.test(entry.reason)), true);
+    const claude = buildBundle([
+      bundleSkill({ id: "kept", category: "Bad Category", body: "kept body" }),
+    ], { runtime: "claude", lane: null, category: null, query: null });
+    assert.equal(claude.files.some((file) => file.path === "skills/kept/SKILL.md" && file.content.includes("kept body")), true);
+    assert.equal(claude.skipped.some((entry) => entry.skill === "kept"), false);
+    const agents = buildBundle([
+      bundleSkill({ id: "kept", category: "Bad Category", body: "kept body" }),
+    ], { runtime: "codex", lane: null, category: null, query: null });
+    assert.equal(agents.files.some((file) => file.path === ".agents/skills/kept/SKILL.md"), true);
+    assert.equal(agents.skipped.some((entry) => entry.skill === "kept"), false);
   });
 });

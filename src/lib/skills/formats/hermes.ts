@@ -1,6 +1,6 @@
 import { parseSkillMarkdown } from "../parse";
 import { skillSha } from "../sha";
-import { categoryFolder, joinArchive, safeReferencePath, skillFolder } from "./paths";
+import { attachReferences, categoryFolder, skillFolder } from "./paths";
 import type { FormatSkill, RenderTree } from "./types";
 import { asMap, emitFrontmatter, scalarString, stringList } from "./yaml";
 
@@ -112,26 +112,7 @@ export function renderHermesTree(skill: FormatSkill): RenderTree {
   const dir = `${folder.folder}/${name}`;
   const document = renderHermesDocument(skill);
   if (document == null) return { ok: false, reason: "frontmatter could not be rendered" };
-  const skillPath = joinArchive(dir, "SKILL.md");
-  if (!skillPath) return { ok: false, reason: "unsafe skill path" };
-  const files = [{ path: skillPath, content: document }];
-  const rejected: string[] = [];
-  const used = new Set<string>(["SKILL.md"]);
-  for (const ref of skill.references) {
-    const relative = safeReferencePath(ref.path);
-    if (!relative || used.has(relative)) {
-      rejected.push(ref.path);
-      continue;
-    }
-    const full = joinArchive(dir, relative);
-    if (!full) {
-      rejected.push(ref.path);
-      continue;
-    }
-    used.add(relative);
-    files.push({ path: full, content: ref.content });
-  }
-  return { ok: true, files, rejected };
+  return attachReferences(dir, document, skill.references);
 }
 
 function hermesBlock(frontmatter: Record<string, unknown>): Record<string, unknown> | null {

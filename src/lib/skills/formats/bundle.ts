@@ -1,23 +1,23 @@
 import { isConfigured } from "../../db";
 import { demoSkillRows } from "../demo";
 import { skillContentSha } from "../sha";
-import { scopeAdmits } from "../settings";
+import { isListSkillVisible } from "../settings";
 import { listSettings, listSkillRows } from "../store";
 import {
   DEFAULT_SCOPE,
   DEFAULT_TRIGGER,
   isRuntime,
+  isTrigger,
   matchesCategory,
   type Runtime,
   type RuntimeFlags,
   type SkillRecord,
   type SkillScope,
-  type Trigger,
 } from "../types";
 import { renderSkillTree } from "./index";
-import { isSafeArchivePath } from "./paths";
+import { isSafeArchivePath, ustarSplit } from "./paths";
 import { tarGzip } from "./tar";
-import type { FormatSkill, RenderedFile } from "./types";
+import type { FormatSkill, RejectedPath, RenderedFile, RenderTree } from "./types";
 
 export interface ExportFilter {
   runtime: Runtime;
@@ -28,86 +28,125 @@ export interface ExportFilter {
 
 export interface BundleSkill {
   skill: FormatSkill;
-  trigger: Trigger;
+  /** Stored trigger text. A value outside the supported set is invalid. */
+  trigger: string;
+  /** Set when the database value was not a supported trigger. `trigger` is then off. */
+  triggerInvalid?: boolean;
   scope: SkillScope;
   runtimes: RuntimeFlags;
 }
 
-export interface SkippedSkill {
-  id: string;
+/** One omission. `path` is set for a reference and omitted for a whole skill. */
+export interface SkippedEntry {
+  skill: string;
+  path?: string;
   reason: string;
 }
 
 export interface BuiltBundle {
   files: RenderedFile[];
-  /** Skills left out of the archive, in input order, with the reason. */
-  skipped: SkippedSkill[];
-  /** Reference paths left out of an otherwise exported skill. */
-  rejectedReferences: string[];
+  /** Omissions, in walk order. One list for skills and references. */
+  skipped: SkippedEntry[];
+}
+
+const SKIPPED_HEADER_MAX_ENTRIES = 20;
+const SKIPPED_HEADER_MAX_BYTES = 4096;
+
+function matchesQuery(row: BundleSkill, filter: ExportFilter): boolean {
+  const q = filter.query?.trim().toLowerCase() ?? "";
+  if (!q) return true;
+  return row.skill.id.toLowerCase().includes(q) || row.skill.description.toLowerCase().includes(q);
 }
 
 /**
- * Same visibility as list_skills: trigger off is hidden, a selected scope
- * with no lane is hidden, and the lane has to be in scope. The runtime has
- * to be one the skill lists.
+ * Same visibility as list_skills. Trigger and lane use `isListSkillVisible`.
+ * The runtime has to be one the skill lists. Category and query match the
+ * list_skills filters.
  */
 export function visibleForExport(skills: BundleSkill[], filter: ExportFilter): BundleSkill[] {
-  const q = filter.query?.trim().toLowerCase() ?? "";
   return skills.filter((row) => {
-    if (row.trigger === "off") return false;
+    if (!isListSkillVisible({ trigger: row.trigger, scope: row.scope }, filter.lane)) return false;
     if (!row.runtimes[filter.runtime]) return false;
-    if (row.scope.mode === "selected" && !filter.lane) return false;
-    if (!scopeAdmits(row.scope, filter.lane)) return false;
     if (!matchesCategory(row.skill.category, filter.category)) return false;
-    if (!q) return true;
-    return row.skill.id.toLowerCase().includes(q) || row.skill.description.toLowerCase().includes(q);
+    return matchesQuery(row, filter);
   });
+}
+
+/** A bad trigger that list_skills would have shown if the trigger were on. */
+function reportableInvalidTrigger(row: BundleSkill, filter: ExportFilter): boolean {
+  if (row.triggerInvalid !== true && isTrigger(row.trigger)) return false;
+  if (!row.runtimes[filter.runtime]) return false;
+  if (!matchesCategory(row.skill.category, filter.category)) return false;
+  if (!matchesQuery(row, filter)) return false;
+  return isListSkillVisible({ trigger: "on_request", scope: row.scope }, filter.lane);
 }
 
 interface RenderedSkill {
   id: string;
   files: RenderedFile[];
-  rejected: string[];
+  rejected: RejectedPath[];
+}
+
+function partitionSkill(row: BundleSkill, rendered: RenderTree): { skip: SkippedEntry } | { export: RenderedSkill } {
+  if (!rendered.ok) return { skip: { skill: row.skill.id, reason: rendered.reason } };
+  const doc = rendered.files.find((file) => file.path.endsWith("/SKILL.md"));
+  if (!doc || !isSafeArchivePath(doc.path)) return { skip: { skill: row.skill.id, reason: "unsafe skill path" } };
+  if (!ustarSplit(doc.path)) return { skip: { skill: row.skill.id, reason: "path exceeds archive limit" } };
+  const files = [doc];
+  const rejected = [...rendered.rejected];
+  for (const file of rendered.files) {
+    if (file === doc) continue;
+    if (file.path === doc.path || files.some((kept) => kept.path === file.path)) {
+      rejected.push({ path: file.path, reason: "duplicate reference path" });
+      continue;
+    }
+    if (!isSafeArchivePath(file.path)) {
+      rejected.push({ path: file.path, reason: "unsafe reference" });
+      continue;
+    }
+    if (!ustarSplit(file.path)) {
+      rejected.push({ path: file.path, reason: "path exceeds archive limit" });
+      continue;
+    }
+    files.push(file);
+  }
+  return { export: { id: row.skill.id, files, rejected } };
 }
 
 export function buildBundle(skills: BundleSkill[], filter: ExportFilter): BuiltBundle {
-  const skipped: SkippedSkill[] = [];
-  const renderedSkills: RenderedSkill[] = [];
-  for (const row of visibleForExport(skills, filter)) {
-    const rendered = renderSkillTree(filter.runtime, row.skill);
-    if (!rendered.ok) {
-      skipped.push({ id: row.skill.id, reason: rendered.reason });
-      continue;
-    }
-    const safeFiles: RenderedFile[] = [];
-    let unsafe = false;
-    for (const file of rendered.files) {
-      if (!isSafeArchivePath(file.path)) {
-        unsafe = true;
-        break;
+  const skipped: SkippedEntry[] = [];
+  const eligible: BundleSkill[] = [];
+  for (const row of skills) {
+    if (row.triggerInvalid === true || !isTrigger(row.trigger)) {
+      if (reportableInvalidTrigger(row, filter)) {
+        skipped.push({ skill: row.skill.id, reason: "invalid trigger" });
       }
-      safeFiles.push(file);
-    }
-    // A single unsafe path drops the whole skill. Leaving SKILL.md in while
-    // rejecting a sibling would still ship a tree the path check refused.
-    if (unsafe) {
-      skipped.push({ id: row.skill.id, reason: "unsafe skill path" });
       continue;
     }
-    renderedSkills.push({ id: row.skill.id, files: safeFiles, rejected: rendered.rejected });
+    eligible.push(row);
+  }
+  const renderedSkills: RenderedSkill[] = [];
+  for (const row of visibleForExport(eligible, filter)) {
+    const part = partitionSkill(row, renderSkillTree(filter.runtime, row.skill));
+    if ("skip" in part) {
+      skipped.push(part.skip);
+      continue;
+    }
+    renderedSkills.push(part.export);
   }
   const colliding = duplicateSkillIndexes(renderedSkills);
   const files: RenderedFile[] = [];
-  const rejectedReferences: string[] = [];
   renderedSkills.forEach((row, index) => {
     if (colliding.has(index)) {
-      skipped.push({ id: row.id, reason: "duplicate archive path" });
+      skipped.push({ skill: row.id, reason: "duplicate archive path" });
       return;
     }
     files.push(...row.files);
-    rejectedReferences.push(...row.rejected);
+    for (const rejected of row.rejected) {
+      skipped.push({ skill: row.id, path: rejected.path, reason: rejected.reason });
+    }
   });
-  return { files: uniqueArchiveFiles(files), skipped, rejectedReferences };
+  return { files: uniqueArchiveFiles(files), skipped };
 }
 
 /** Skills that share any archive path. Every one of them is omitted. */
@@ -131,11 +170,14 @@ function duplicateSkillIndexes(rows: RenderedSkill[]): Set<number> {
   return colliding;
 }
 
-/** Drop every file whose path appears more than once. The archive keeps one path once. */
+/** The collision pass already removed shared paths. A repeat here is a bug, so it throws instead of dropping a file. */
 function uniqueArchiveFiles(files: RenderedFile[]): RenderedFile[] {
-  const counts = new Map<string, number>();
-  for (const file of files) counts.set(file.path, (counts.get(file.path) ?? 0) + 1);
-  return files.filter((file) => counts.get(file.path) === 1);
+  const seen = new Set<string>();
+  for (const file of files) {
+    if (seen.has(file.path)) throw new Error(`archive path repeated after skip reporting: ${file.path}`);
+    seen.add(file.path);
+  }
+  return files;
 }
 
 const MANIFEST_PATH = "manifest.json";
@@ -148,6 +190,25 @@ export function archiveFiles(built: BuiltBundle): RenderedFile[] {
     ...built.files,
     { path: MANIFEST_PATH, content: `${JSON.stringify({ skipped: built.skipped })}\n` },
   ];
+}
+
+/**
+ * Response header for the skip list. Empty is `[]`.
+ * Otherwise `count`, the first 20 entries, and `see manifest.json`,
+ * shortened from the end until the UTF-8 value is at most 4 KB.
+ * The full list stays in manifest.json.
+ */
+export function skippedHeader(skipped: SkippedEntry[]): string {
+  if (skipped.length === 0) return "[]";
+  const count = skipped.length;
+  const note = "see manifest.json";
+  let take = Math.min(SKIPPED_HEADER_MAX_ENTRIES, skipped.length);
+  while (take > 0) {
+    const body = JSON.stringify({ count, skipped: skipped.slice(0, take), note });
+    if (Buffer.byteLength(body, "utf8") <= SKIPPED_HEADER_MAX_BYTES) return body;
+    take -= 1;
+  }
+  return JSON.stringify({ count, skipped: [], note });
 }
 
 export function bundleGzip(skills: BundleSkill[], filter: ExportFilter): Buffer {
@@ -190,6 +251,7 @@ export async function loadExportSkills(): Promise<{ demo: boolean; skills: Bundl
       return {
         skill: formatFromRecord(row),
         trigger: setting?.trigger ?? DEFAULT_TRIGGER,
+        triggerInvalid: setting?.triggerInvalid === true,
         scope: setting?.scope ?? DEFAULT_SCOPE,
         runtimes: row.runtimes,
       };

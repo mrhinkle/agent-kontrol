@@ -1,4 +1,4 @@
-import { joinArchive, safeReferencePath, skillFolder } from "./paths";
+import { attachReferences, skillFolder } from "./paths";
 import type { FormatSkill, RenderTree } from "./types";
 import { asMap, emitFrontmatter, scalarString, stringList } from "./yaml";
 
@@ -39,7 +39,7 @@ export function renderAgentSkillsTree(skill: FormatSkill): RenderTree {
   const dir = `.agents/skills/${name}`;
   const document = renderAgentSkillsDocument(skill);
   if (document == null) return { ok: false, reason: "frontmatter could not be rendered" };
-  return finishTree(dir, document, skill);
+  return attachReferences(dir, document, skill.references);
 }
 
 function stringMetadata(value: unknown): Record<string, string> | null {
@@ -51,27 +51,4 @@ function stringMetadata(value: unknown): Record<string, string> | null {
     out[key] = item;
   }
   return Object.keys(out).length > 0 ? out : null;
-}
-
-function finishTree(dir: string, document: string, skill: FormatSkill): RenderTree {
-  const skillPath = joinArchive(dir, "SKILL.md");
-  if (!skillPath) return { ok: false, reason: "unsafe skill path" };
-  const files = [{ path: skillPath, content: document }];
-  const rejected: string[] = [];
-  const used = new Set<string>(["SKILL.md"]);
-  for (const ref of skill.references) {
-    const relative = safeReferencePath(ref.path);
-    if (!relative || used.has(relative)) {
-      rejected.push(ref.path);
-      continue;
-    }
-    const full = joinArchive(dir, relative);
-    if (!full) {
-      rejected.push(ref.path);
-      continue;
-    }
-    used.add(relative);
-    files.push({ path: full, content: ref.content });
-  }
-  return { ok: true, files, rejected };
 }

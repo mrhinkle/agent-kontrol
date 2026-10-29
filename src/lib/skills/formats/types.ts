@@ -30,8 +30,14 @@ export interface RenderedFile {
   content: string;
 }
 
+/** A reference the tree left out. `path` is the stored reference path. */
+export interface RejectedPath {
+  path: string;
+  reason: string;
+}
+
 export type RenderTree =
-  | { ok: true; files: RenderedFile[]; rejected: string[] }
+  | { ok: true; files: RenderedFile[]; rejected: RejectedPath[] }
   | { ok: false; reason: string };
 
 export type SkillFormatId = "claude" | "agentskills" | "hermes";
