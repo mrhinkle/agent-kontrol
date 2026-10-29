@@ -4,8 +4,9 @@ import { apiError, publicError } from "@/lib/api-error";
 import { deny, resolveApiAccess } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import { diffOwnerList, readDryRun } from "@/lib/dry-run";
-import { MAX_OWNERS, validateOwnerList, type OwnerError, type OwnerInput } from "@/lib/owner-validation";
-import { listWatchedOwners, ownerListVersion, replaceWatchedOwners } from "@/lib/watched-owners";
+import { validateOwnerList, type OwnerError, type OwnerInput } from "@/lib/owner-validation";
+import { readOwnerSettings } from "@/lib/settings-read";
+import { replaceWatchedOwners } from "@/lib/watched-owners";
 
 export const dynamic = "force-dynamic";
 
@@ -42,23 +43,7 @@ function notReady(fix: string) {
 }
 
 async function current() {
-  const listed = await listWatchedOwners();
-  return {
-    writable: listed.writable,
-    max: MAX_OWNERS,
-    version: ownerListVersion(listed.owners),
-    owners: listed.owners.map((owner) => ({
-      owner: owner.owner,
-      activity_days: owner.activityDays,
-      include_forks: owner.includeForks,
-      include_archived: owner.includeArchived,
-      last_error: owner.lastError,
-      last_error_at: owner.lastErrorAt,
-      last_discovered_at: owner.lastDiscoveredAt,
-      actor_type: owner.actorType,
-      actor_id: owner.actorId,
-    })),
-  };
+  return readOwnerSettings();
 }
 
 function asOwnerInput(cur: Awaited<ReturnType<typeof current>>): OwnerInput[] {
@@ -73,9 +58,6 @@ function asOwnerInput(cur: Awaited<ReturnType<typeof current>>): OwnerInput[] {
 export async function GET(req: Request) {
   const access = await resolveApiAccess(req);
   if (!access.ok) return deny(access);
-  if (!isConfigured()) {
-    return NextResponse.json({ writable: false, max: MAX_OWNERS, version: ownerListVersion([]), owners: [] });
-  }
   try {
     return NextResponse.json(await current());
   } catch (e) {

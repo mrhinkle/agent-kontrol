@@ -1,9 +1,10 @@
 import { currentActor, type Actor } from "./actor";
-import { activityDetail, activityRow, attachReceipt, receiptFromParts, type ActivityRow, type Receipt } from "./activity";
+import { activityRow, attachReceipt, receiptFromParts, type ActivityRow, type Receipt } from "./activity";
 import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } from "./idempotency";
 import { StaleWrite, absentRevision } from "./revision";
 import { writeSessionNote } from "./session-memory";
 import { sql, type SqlTag } from "./db";
+import { insertToolReceipt } from "./tool-receipt";
 import { stampSortAt } from "./list-params";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
 import { asUnknownWriteOutcome } from "./write-outcome";
@@ -1681,21 +1682,15 @@ export async function readMemoryForPreview(key: string): Promise<{ item: MemoryI
 /**
  * One events row for a write that already committed in its own statement.
  * Decision tools use this after the row is stored. The kind is the tool name.
+ * A write that must roll back with its receipt calls `insertToolReceipt` on its own transaction instead.
  */
 export async function recordToolReceipt(input: {
   kind: string;
   title: string;
   extra?: Record<string, unknown>;
 }): Promise<Receipt | null> {
-  const detail = JSON.stringify(activityDetail(input.kind, currentActor(), input.extra ?? {}));
   try {
-    const rows = await sql()`
-      insert into events (agent_id, session_id, kind, title, detail)
-      values (null, null, ${input.kind}, ${input.title}, ${detail}::jsonb)
-      returning id, kind, created_at
-    `;
-    const row = rows[0] as Record<string, unknown> | undefined;
-    return row ? receiptFromParts(row.id, row.kind, row.created_at) : null;
+    return await insertToolReceipt(sql(), input);
   } catch (e) {
     throw new Error(`recordToolReceipt: ${errMsg(e)}`);
   }

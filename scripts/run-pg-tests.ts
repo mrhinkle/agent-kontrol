@@ -17,7 +17,11 @@ import { StaleWrite } from "../src/lib/revision";
 import { readReceipt } from "../src/lib/activity";
 import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview, findAgent, deleteMemory, slugify } from "../src/lib/store";
 import { updateTaskForTool } from "../src/lib/dry-run-actions";
-import { getWatchedRepos, replaceWatchedRepos, setRepoOverride } from "../src/lib/watched-repos";
+import { runWithActor } from "../src/lib/actor";
+import { GET as getRepoSettings, PUT as putRepoSettings } from "../src/app/api/settings/repos/route";
+import { readRepoSettings } from "../src/lib/settings-read";
+import { getSettingsTool, setWatchedReposTool } from "../src/lib/settings-tools";
+import { getWatchedRepos, listVersion, replaceWatchedRepos, setRepoOverride } from "../src/lib/watched-repos";
 import { applyOwnerDiscovery } from "../src/lib/watched-owners";
 import type { RepoConfig } from "../src/lib/progress-config";
 import { getTrace, listTraces, pruneSpans, upsertSpans } from "../src/lib/trace-store";
@@ -189,6 +193,7 @@ async function main() {
   assert.equal(got.repos[1].blockedLabel, "blocked");
   await sql()`delete from watched_repos`;
   assert.equal((await getWatchedRepos(fallback)).source, "file");
+  await testRepoSettingsVersionAndReceipt(tag);
 
   // Traces: upsert merges an open span with its close, lists summarize, prune removes old rows.
   const traceId = randomUUID().replace(/-/g, "");
@@ -2322,6 +2327,234 @@ async function testDecisionWritebackHardening(tag: string) {
     );
   } finally {
     await drop();
+  }
+}
+
+/**
+ * An empty configured database reports the stored-list version, so the first
+ * save that sends it is not stale. The dry run diffs that empty list. A
+ * receipt insert that fails rolls the replace back. A normal write leaves
+ * one receipt and the new list. REST PUT still writes no receipt.
+ */
+async function testRepoSettingsVersionAndReceipt(tag: string): Promise<void> {
+  const digits = tag.replace(/\D/g, "").slice(-8);
+  const shortA = `a${digits}`.slice(0, 12);
+  const shortB = `b${digits}`.slice(0, 12);
+  const repoA = `pgr${digits}/a`;
+  const repoB = `pgr${digits}/b`;
+  const row = (name: string, short: string, label: string) => ({
+    repo: name,
+    label,
+    short,
+    color: "#112233",
+    blockedLabel: null as string | null,
+  });
+  const actor = { actor_type: "agent" as const, actor_id: "mc-token" };
+  const savedPassword = process.env.MC_DASHBOARD_PASSWORD;
+  const savedToken = process.env.MC_TOKEN;
+  delete process.env.MC_DASHBOARD_PASSWORD;
+  delete process.env.MC_TOKEN;
+  const detailOf = (value: unknown): { version?: string; tool?: string; actor_id?: string } => {
+    if (typeof value === "string") return JSON.parse(value) as { version?: string; tool?: string; actor_id?: string };
+    if (value && typeof value === "object") return value as { version?: string; tool?: string; actor_id?: string };
+    return {};
+  };
+  const dropTrigger = async () => {
+    await sql()`drop trigger if exists ak_test_fail_repo_event on events`;
+    await sql()`drop function if exists ak_test_fail_repo_event()`;
+  };
+  const floor = await sql()`select coalesce(max(id), 0)::bigint as id from events`;
+  const floorId = String(floor[0].id);
+  try {
+    const owners = await sql()`select count(*)::int as n from watched_owners`;
+    const repos = await sql()`select count(*)::int as n from watched_repos`;
+    assert.equal(Number(owners[0].n), 0, "version test starts with no owners");
+    assert.equal(Number(repos[0].n), 0, "version test starts with no repos");
+
+    await sql()`
+      insert into watched_repos (repo, label, short, color, blocked_label, position, origin, pinned, hidden, fields_overridden)
+      values ('acme/kept', 'Kept', 'kept', '#abcdef', 'wait', 0, 'auto', true, false, true)
+    `;
+    const fixed = await readRepoSettings();
+    assert.equal(fixed.source, "database");
+    assert.equal(fixed.version, listVersion(fixed.repos));
+    assert.equal(fixed.version, "fc16e23e1910c991", "a populated list keeps the pre-change fingerprint");
+    await sql()`delete from watched_repos where repo = 'acme/kept'`;
+
+    const settings = await readRepoSettings();
+    assert.equal(settings.source, "file");
+    assert.equal(settings.version, listVersion([]));
+    assert.equal(settings.version, "4f53cda18c2baa0c");
+    assert.notEqual(settings.version, listVersion(settings.repos));
+    const toolBody = JSON.parse((await getSettingsTool()).content[0].text) as {
+      repos: { version: string; source: string };
+    };
+    assert.equal(toolBody.repos.version, settings.version);
+    assert.equal(toolBody.repos.source, "file");
+
+    const preview = await setWatchedReposTool({ repos: [row(repoA, shortA, "A")], dry_run: true });
+    assert.equal(preview.isError, undefined, preview.content[0]?.text);
+    const diff = JSON.parse(preview.content[0].text) as {
+      source?: string;
+      added: string[];
+      removed: string[];
+      version: string;
+      would_write: boolean;
+    };
+    assert.equal(diff.source, "file");
+    assert.equal(diff.version, settings.version);
+    assert.deepEqual(diff.added, [repoA]);
+    assert.deepEqual(diff.removed, []);
+    assert.equal(diff.would_write, true);
+
+    const saved = await runWithActor(actor, () => setWatchedReposTool({
+      repos: [row(repoA, shortA, "A")],
+      expected_version: settings.version,
+    }));
+    assert.equal(saved.isError, undefined, saved.content[0]?.text);
+    assert.equal(saved.content[0].text.split("receipt:").length - 1, 1);
+    const after = await readRepoSettings();
+    assert.equal(after.source, "database");
+    assert.deepEqual(after.repos.map((item) => item.repo), [repoA]);
+    const receiptRows = await sql()`
+      select id::text as id, detail
+      from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+      order by id asc
+    `;
+    assert.equal(receiptRows.length, 1, "a normal write leaves exactly one receipt");
+    const detail = detailOf(receiptRows[0].detail);
+    assert.equal(detail.version, after.version);
+    assert.equal(detail.tool, "set_watched_repos");
+    assert.equal(detail.actor_id, "mc-token");
+    await sql()`delete from watched_repos where repo = ${repoA}`;
+    await sql()`delete from events where id = ${String(receiptRows[0].id)}::bigint`;
+
+    const got = await getRepoSettings(new Request("http://localhost/api/settings/repos"));
+    assert.equal(got.status, 200);
+    const gotBody = await got.json() as { source: string; version: string; repos: { repo: string }[] };
+    assert.equal(gotBody.source, "file");
+    assert.equal(gotBody.version, "4f53cda18c2baa0c");
+    assert.ok(gotBody.repos.length > 0);
+    const restPreview = await putRepoSettings(new Request("http://localhost/api/settings/repos", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repos: [row(repoB, shortB, "B")], version: gotBody.version, dry_run: true }),
+    }));
+    assert.equal(restPreview.status, 200);
+    const restDiff = await restPreview.json() as {
+      source?: string;
+      would_write: boolean;
+      changes: { op: string; summary: string }[];
+    };
+    assert.equal(restDiff.source, "file");
+    assert.equal(restDiff.would_write, true);
+    assert.equal(restDiff.changes.some((change) => change.op === "remove"), false);
+    assert.equal(restDiff.changes.some((change) => change.op === "add" && change.summary.includes(repoB)), true);
+    const restPut = await putRepoSettings(new Request("http://localhost/api/settings/repos", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repos: [row(repoB, shortB, "B")], version: gotBody.version }),
+    }));
+    const restText = await restPut.text();
+    assert.equal(restPut.status, 200, restText);
+    const restSaved = JSON.parse(restText) as { source: string; repos: { repo: string }[]; version: string };
+    assert.equal(restSaved.source, "database");
+    assert.deepEqual(restSaved.repos.map((item) => item.repo), [repoB]);
+    assert.notEqual(restSaved.version, gotBody.version);
+    const restEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+    `;
+    assert.equal(Number(restEvents[0].n), 0, "REST PUT writes no receipt");
+    await sql()`delete from watched_repos where repo = ${repoB}`;
+
+    await replaceWatchedRepos([row(repoA, shortA, "Kept")]);
+    const populated = await readRepoSettings();
+    assert.equal(populated.source, "database");
+    assert.equal(populated.version, listVersion(populated.repos));
+    const beforeRows = await sql()`select repo, label from watched_repos where repo = ${repoA}`;
+    const eventsBeforeFail = await sql()`
+      select count(*)::int as n from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+    `;
+    await sql()`
+      create or replace function ak_test_fail_repo_event()
+      returns trigger
+      language plpgsql
+      as $fn$
+      begin
+        if new.kind = 'set_watched_repos' then
+          raise exception 'simulated events insert failure';
+        end if;
+        return new;
+      end;
+      $fn$
+    `;
+    await sql()`drop trigger if exists ak_test_fail_repo_event on events`;
+    await sql()`
+      create trigger ak_test_fail_repo_event
+      before insert on events
+      for each row
+      execute procedure ak_test_fail_repo_event()
+    `;
+    const current = await readRepoSettings();
+    await assert.rejects(
+      () => runWithActor(actor, () => setWatchedReposTool({
+        repos: [row(repoB, shortB, "B")],
+        expected_version: current.version,
+      })),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const afterFail = await sql()`
+      select repo, label from watched_repos
+      where repo = ${repoA} or repo = ${repoB}
+      order by repo
+    `;
+    assert.deepEqual(afterFail.map((item) => String(item.repo)), [repoA]);
+    assert.equal(String(afterFail[0].label), String(beforeRows[0].label));
+    const eventsAfterFail = await sql()`
+      select count(*)::int as n from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+    `;
+    assert.equal(Number(eventsAfterFail[0].n), Number(eventsBeforeFail[0].n), "a failed receipt leaves the list and the event log unchanged");
+
+    await dropTrigger();
+    const retryVersion = (await readRepoSettings()).version;
+    const retried = await runWithActor(actor, () => setWatchedReposTool({
+      repos: [row(repoB, shortB, "B")],
+      expected_version: retryVersion,
+    }));
+    assert.equal(retried.isError, undefined, retried.content[0]?.text);
+    const finalRows = await sql()`select repo from watched_repos where repo = ${repoA} or repo = ${repoB} order by repo`;
+    assert.deepEqual(finalRows.map((item) => String(item.repo)), [repoB]);
+    const finalEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+    `;
+    assert.equal(Number(finalEvents[0].n), Number(eventsBeforeFail[0].n) + 1, "the recovered write leaves exactly one receipt");
+
+    const stale = await replaceWatchedRepos(
+      [row(repoA, shortA, "A")],
+      "not-the-version",
+      { kind: "set_watched_repos", title: "Watched repos replaced" },
+    );
+    assert.equal(stale.ok, false);
+    const staleEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+    `;
+    assert.equal(Number(staleEvents[0].n), Number(eventsBeforeFail[0].n) + 1, "a stale replace inserts no receipt");
+    const stillB = await sql()`select repo from watched_repos where repo = ${repoB}`;
+    assert.equal(stillB.length, 1);
+  } finally {
+    await dropTrigger();
+    await sql()`delete from watched_repos where repo = ${repoA} or repo = ${repoB} or repo = 'acme/kept'`;
+    await sql()`delete from events where kind = 'set_watched_repos' and id > ${floorId}::bigint`;
+    if (savedPassword === undefined) delete process.env.MC_DASHBOARD_PASSWORD;
+    else process.env.MC_DASHBOARD_PASSWORD = savedPassword;
+    if (savedToken === undefined) delete process.env.MC_TOKEN;
+    else process.env.MC_TOKEN = savedToken;
   }
 }
 

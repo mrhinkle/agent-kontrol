@@ -510,6 +510,8 @@ describe("GET /api/brief", { concurrency: false }, () => {
       "requeue_task",
       "delete_note",
       "list_activity",
+      "get_settings",
+      "set_watched_repos",
     ]);
     assert.equal(registered.filter((name) => name === "get_morning_brief").length, 1);
     assert.equal([...src.matchAll(/name: "reply_to_mark"/g)].length, 1);
