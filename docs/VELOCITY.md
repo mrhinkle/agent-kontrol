@@ -197,7 +197,7 @@ and a resolve path, so those come before any page.
 3. `decisions` table + `GET/POST/PATCH /api/decisions` **with GitHub write-back** + collector
    upsert from labels. Resolve ships with the table, as a CLI if the page is not ready.
 4. `/api/brief` + `get_morning_brief` reading the database; scheduler switches to the route.
-   Shipped 2026-10-27: `GET /api/brief` and MCP `get_morning_brief` read Postgres. The cron should `curl` the route. `scripts/morning-brief.sh` stays the fallback and still sweeps GitHub. The API does not. A 72h lead time uses `detail.merged` from the collector, not a live recompute.
+   Shipped 2026-10-27: `GET /api/brief` and MCP `get_morning_brief` read Postgres. The cron should `curl` the route. `scripts/morning-brief.sh` stays the fallback and still sweeps GitHub. The API does not. A 72h lead time uses `detail.merged` from the collector, not a live recompute. A positive 72h merge count with no `detail.merged` prints `SHIPPED: DATA INCOMPLETE` for that repo. A cumulative counter that went backwards is unmeasured (`DATA INCOMPLETE`), not 0. A decisions page that fills the 1000-row read is incomplete. With no database the route does not fill in the progress board's demo numbers.
 5. `/decisions` page; `request_decision` MCP tool.
 6. Owner-based repo discovery (`watched_owners`); Settings becomes the override layer.
 7. Remaining threshold alerts (zero-merge repo, review SLA, 14-day decision), enabled after
