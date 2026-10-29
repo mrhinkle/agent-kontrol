@@ -104,8 +104,10 @@ export interface MorningBrief {
     repos_total: number;
   };
   repos: BriefRepo[];
-  stuck_prs: BriefStuckPr[];
-  decisions: BriefDecision[];
+  /** Null when the total is unmeasured and no row is known: an empty list would read as "none". */
+  stuck_prs: BriefStuckPr[] | null;
+  /** Null when the total is unmeasured and no row is known: an empty list would read as "none". */
+  decisions: BriefDecision[] | null;
 }
 
 export interface CoordinatorEvent {
@@ -551,6 +553,8 @@ export function assembleBrief(input: {
   const decisions = stableByAgeDesc(
     counted.flatMap((repo) => repo.decisions ?? []),
   );
+  const stuckTotal = measuredLen(counted, anyIncomplete, "stuck_prs");
+  const decisionTotal = measuredLen(counted, anyIncomplete, "decisions");
   return {
     generated_at: input.generatedAt,
     window_hours: input.windowHours,
@@ -570,14 +574,14 @@ export function assembleBrief(input: {
       net_backlog: measuredSum(counted, anyIncomplete, "net_backlog"),
       open_issues: measuredSum(counted, anyIncomplete, "open_issues"),
       open_prs: measuredSum(counted, anyIncomplete, "open_prs"),
-      stuck_prs: measuredLen(counted, anyIncomplete, "stuck_prs"),
-      decisions: measuredLen(counted, anyIncomplete, "decisions"),
+      stuck_prs: stuckTotal,
+      decisions: decisionTotal,
       repos_counted: counted.length,
       repos_total: repos.length,
     },
     repos,
-    stuck_prs: stuck,
-    decisions,
+    stuck_prs: stuckTotal === null && stuck.length === 0 ? null : stuck,
+    decisions: decisionTotal === null && decisions.length === 0 ? null : decisions,
   };
 }
 
@@ -672,7 +676,7 @@ export function formatBriefText(
   lines.push(`  stale = open issue untouched ${brief.thresholds.stale_issue_days}d+ \u00b7 stuck = non-draft PR open ${brief.thresholds.stuck_pr_hours}h+ or blocked/dirty \u00b7 lead-med = median hours PR open\u2192merge`);
   lines.push("");
   const writeStuck = () => {
-    for (const pr of brief.stuck_prs) {
+    for (const pr of brief.stuck_prs ?? []) {
       lines.push(`  ${pr.repo} #${pr.number}  ${pr.age_days}d  ${pr.reason}`);
       lines.push(`      ${sliceText(pr.title, 78)}  ${pr.url}`);
     }
@@ -685,12 +689,12 @@ export function formatBriefText(
   } else if (brief.totals.stuck_prs === 0) {
     lines.push("STUCK PRs: none.");
   } else {
-    lines.push(`STUCK PRs (${brief.stuck_prs.length}) \u2014 oldest first`);
+    lines.push(`STUCK PRs (${(brief.stuck_prs ?? []).length}) \u2014 oldest first`);
     writeStuck();
   }
   lines.push("");
   const writeDecisions = () => {
-    for (const row of brief.decisions) {
+    for (const row of brief.decisions ?? []) {
       const kind = row.kind === "pr" ? "PR " : "";
       lines.push(`  ${row.repo_short} ${kind}#${row.number}  ${row.age_days}d  [${row.labels.join(",")}]  ${sliceText(row.title, 70)}`);
       lines.push(`      ${row.url}`);

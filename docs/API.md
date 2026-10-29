@@ -336,7 +336,7 @@ MCP `recall` and `get_task_queue` take the same three parameters. Omitting them 
 With no `DATABASE_URL` set (demo mode):
 
 - The auth gate is open.
-- GET routes return demo data, usually with `demo: true` in the response. `GET /api/decisions` returns `{ "demo": true, "decisions": [] }`. `GET /api/brief` does not. The brief is database-only: with no `DATABASE_URL` every configured repo is incomplete and the text says `DATA INCOMPLETE`. See [Brief](#brief).
+- GET routes return demo data, usually with `demo: true` in the response. `GET /api/decisions` returns `{ "demo": true, "decisions": [] }`. `GET /api/brief` does not. The brief is database-only: with no `DATABASE_URL` every configured repo is incomplete and the text says `DATA INCOMPLETE`. In the JSON, a fleet total that is unmeasured is `null`, and the top-level `stuck_prs` / `decisions` lists are `null` (not `[]`) when that total is unmeasured and no row is known; known rows are still listed when some were measured. See [Brief](#brief).
 - Ingest routes answer `{"ok": true, "demo": true}` and drop the data. `POST /api/decisions` does the same and adds `note`. `PATCH /api/decisions/:id` answers `{ "ok": true, "demo": true }` and does not look the id up.
 - MCP `report_status`, `remember`, `create_task`, `claim_task`, and `update_task` store in memory for this process. `get_fleet_status`, `recall`, and `get_task_queue` read that store. Successful text starts with `[demo — in-memory, cleared when this process restarts]`. The store is cleared when the process restarts. Those rows are not mixed into the sample data on GET routes.
 - REST `POST` and `PATCH` in demo mode still answer `{ "ok": true, "demo": true }` (memory adds `note`) and do not write the in-memory store.

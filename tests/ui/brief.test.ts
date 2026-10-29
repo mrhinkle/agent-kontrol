@@ -266,7 +266,7 @@ describe("GET /api/brief", { concurrency: false }, () => {
       const body = await res.json();
       assert.equal(body.window_hours, 72);
       assert.ok(Array.isArray(body.repos));
-      assert.ok(Array.isArray(body.decisions));
+      assert.ok(body.decisions === null || Array.isArray(body.decisions));
       assert.equal(typeof body.coordinator, "object");
       assert.equal(body.demo, undefined);
     }
@@ -287,8 +287,8 @@ describe("GET /api/brief", { concurrency: false }, () => {
     assert.equal(body.coordinator.agent_id, null);
     assert.ok(Array.isArray(body.repos));
     assert.ok(body.repos.length > 0);
-    assert.deepEqual(body.decisions, []);
-    assert.deepEqual(body.stuck_prs, []);
+    assert.equal(body.decisions, null, "unmeasured with no known rows is null, never []");
+    assert.equal(body.stuck_prs, null, "unmeasured with no known rows is null, never []");
     assert.ok(body.incomplete_repos.length > 0);
     for (const repo of body.repos) {
       assert.equal(repo.incomplete, true);
@@ -477,8 +477,8 @@ describe("GET /api/brief", { concurrency: false }, () => {
       coordinator: { configured: false, agent_id: null },
       repos: joined,
     });
-    assert.deepEqual(brief.decisions.map((row) => row.repo), ["other/app", "acme/app"]);
-    assert.deepEqual(brief.stuck_prs.map((row) => [row.repo, row.number]), [["app", 22], ["app", 11]]);
+    assert.deepEqual((brief.decisions ?? []).map((row) => row.repo), ["other/app", "acme/app"]);
+    assert.deepEqual((brief.stuck_prs ?? []).map((row) => [row.repo, row.number]), [["app", 22], ["app", 11]]);
     const text = formatBriefText(brief, { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] });
     assert.ok(text.indexOf("other only") < text.indexOf("acme only"));
     assert.ok(text.indexOf("Other") < text.indexOf("Acme"));
@@ -633,10 +633,10 @@ describe("GET /api/brief", { concurrency: false }, () => {
     assert.deepEqual(JSON.parse(JSON.stringify(tsBrief.decisions)), jqBrief.decisions);
     assert.deepEqual(JSON.parse(JSON.stringify(tsBrief.stuck_prs)), jqBrief.stuck_prs);
     assert.deepEqual(JSON.parse(JSON.stringify(tsBrief.totals)), jqBrief.totals);
-    assert.deepEqual(tsBrief.decisions.map((row) => row.number), [9, 2, 1]);
-    assert.deepEqual(tsBrief.stuck_prs.map((row) => row.number), [11, 22, 33]);
-    assert.equal(tsBrief.decisions.some((row) => row.number === 99), false);
-    assert.equal(tsBrief.stuck_prs.some((row) => row.number === 99), false);
+    assert.deepEqual((tsBrief.decisions ?? []).map((row) => row.number), [9, 2, 1]);
+    assert.deepEqual((tsBrief.stuck_prs ?? []).map((row) => row.number), [11, 22, 33]);
+    assert.equal((tsBrief.decisions ?? []).some((row) => row.number === 99), false);
+    assert.equal((tsBrief.stuck_prs ?? []).some((row) => row.number === 99), false);
     assert.equal(tsBrief.totals.merged_prs, null);
     assert.equal(tsBrief.totals.stuck_prs, null);
     assert.equal(tsBrief.totals.decisions, null);
@@ -1004,7 +1004,7 @@ describe("GET /api/brief", { concurrency: false }, () => {
       repos: [bare],
     });
     assert.equal(omitted.totals.stuck_prs, null);
-    assert.deepEqual(omitted.stuck_prs, []);
+    assert.equal(omitted.stuck_prs, null);
     const rendered = formatBriefText(omitted, { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] });
     assert.equal(rendered.includes("STUCK PRs: none."), false);
     assert.match(rendered, /STUCK PRs: DATA INCOMPLETE\./);
@@ -1048,7 +1048,7 @@ describe("GET /api/brief", { concurrency: false }, () => {
       ],
     });
     assert.equal(mixed.totals.stuck_prs, null);
-    assert.deepEqual(mixed.stuck_prs.map((row) => row.number), [11]);
+    assert.deepEqual((mixed.stuck_prs ?? []).map((row) => row.number), [11]);
     const mixedText = formatBriefText(mixed, { clock: "Mon 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] });
     assert.equal(mixedText.includes("STUCK PRs: none."), false);
     assert.match(mixedText, /STUCK PRs: DATA INCOMPLETE\./);
@@ -2304,7 +2304,8 @@ describe("GET /api/brief", { concurrency: false }, () => {
     assert.equal(seen.limit, 2);
     assert.equal(full.totals.decisions, null);
     assert.equal(full.totals.merged_prs, 3);
-    assert.deepEqual(full.decisions, []);
+    // Wholly unmeasured: null, never an empty list that reads as none (round-1 review of #108).
+    assert.equal(full.decisions, null);
     assert.equal(full.repos.every((row) => row.decisions === null), true);
     assert.equal(full.repos.every((row) => row.incomplete === false), true);
     assert.equal(full.repos.every((row) => row.errors.includes("decisions incomplete")), true);
@@ -2320,14 +2321,14 @@ describe("GET /api/brief", { concurrency: false }, () => {
     const exact = await loadBrief("24h", now, { decisionLimit: 3 });
     assert.equal(seen.limit, 3);
     assert.equal(exact.totals.decisions, null);
-    assert.deepEqual(exact.decisions, []);
+    assert.equal(exact.decisions, null);
     assert.match(formatBriefText(exact, clock), /DECISIONS FOR YOU: DATA INCOMPLETE\./);
 
     install();
     const under = await loadBrief("24h", now, { decisionLimit: 4 });
     assert.equal(seen.limit, 4);
     assert.equal(under.totals.decisions, 3);
-    assert.deepEqual(under.decisions.map((row) => row.number).sort((a, b) => a - b), [1, 2, 3]);
+    assert.deepEqual((under.decisions ?? []).map((row) => row.number).sort((a, b) => a - b), [1, 2, 3]);
     assert.equal(under.repos.every((row) => Array.isArray(row.decisions)), true);
     assert.equal(under.incomplete_repos.length, 0);
     const underText = formatBriefText(under, clock);
