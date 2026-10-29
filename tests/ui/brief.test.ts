@@ -2247,6 +2247,35 @@ describe("GET /api/brief", { concurrency: false }, () => {
     assert.equal(dayRepo?.errors.includes("cumulative counter decreased"), false);
   });
 
+  it("a 72h window with a baseline but no latest cumulative counter is unmeasured", () => {
+    // Round-2 review of #108: the 24h column must not stand in for a missing latest counter.
+    const now = "2026-10-27T12:00:00Z";
+    const cfg = { repo: "acme/app", label: "Acme", short: "app", blockedLabel: null };
+    const snap = (over: Partial<RepoSnapshot>): RepoSnapshot => ({
+      repo: "acme/app", label: "Acme", collected_at: now, kind: "tick",
+      open_issues: 2, open_prs: 1, blocked_issues: 0,
+      merged_prs_24h: 2, issues_closed_24h: 5, issues_opened_24h: 4,
+      total_issues_created: 20, total_issues_closed: 16, total_prs_merged: 10,
+      review_rounds: null, no_verdict_rate: null, detail: { stuck_prs: [], merged: [] },
+      ...over,
+    });
+    for (const field of ["total_prs_merged", "total_issues_created", "total_issues_closed"] as const) {
+      const section = repoSection({
+        cfg,
+        snap: snap({ [field]: null }),
+        baseline: snap({ collected_at: "2026-10-24T12:00:00Z" }),
+        windowHours: 72,
+        nowIso: now,
+      });
+      assert.equal(section.incomplete, true, field);
+      const key = field === "total_prs_merged" ? "merged_prs" : field === "total_issues_created" ? "issues_opened" : "issues_closed";
+      assert.equal(section[key], null, field);
+    }
+    // A missing baseline (first tick) still falls back to the 24h column.
+    const first = repoSection({ cfg, snap: snap({}), baseline: null, windowHours: 72, nowIso: now });
+    assert.equal(first.merged_prs, 2);
+  });
+
   it("a decisions page at the read limit is incomplete", async () => {
     const now = new Date("2026-10-27T12:00:00Z");
     const clock = { clock: "Tue 2026-10-27 08:00 EDT", decisionLabels: ["needs-owner"] };

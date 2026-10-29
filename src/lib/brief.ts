@@ -222,7 +222,8 @@ function num(value: unknown): number | null {
 /**
  * One window count from a cumulative counter.
  *
- * A missing side falls back to the 24h column: the first tick has no baseline.
+ * A missing baseline falls back to the 24h column: the first tick has no baseline.
+ * A missing latest counter is unmeasured (null).
  * A decrease is a reset or rollback. That delta is null, and the 24h column
  * is not a stand-in for a number the counter no longer supports.
  */
@@ -234,7 +235,10 @@ function windowCount(
 ): { value: number | null; reset: boolean } {
   if (windowHours === 24) return { value: day, reset: false };
   if (latest !== null && baseline !== null && latest < baseline) return { value: null, reset: true };
-  if (latest === null || baseline === null) return { value: day, reset: false };
+  // Only a missing baseline (first tick) may fall back to the 24h column. A missing
+  // latest counter means this tick did not measure it: unmeasured, never a count.
+  if (latest === null) return { value: null, reset: false };
+  if (baseline === null) return { value: day, reset: false };
   return { value: latest - baseline, reset: false };
 }
 
