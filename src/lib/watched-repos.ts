@@ -185,6 +185,15 @@ export function listVersion(repos: WatchedRepo[]): string {
   return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
 }
 
+export type RepoWriteResult =
+  | { ok: true }
+  | { ok: false; reason: "stale" };
+
+/** Same fingerprint GET returns. Owners and `shown` are not part of it. */
+function versionOf(rows: TrackedRepo[]): string {
+  return listVersion(rows.map((row) => toWatchedRepo(row, [], new Date(0))));
+}
+
 /**
  * Replaces the hand-added list in one statement, so a failure part-way or a
  * concurrent read never sees a half-old, half-new list. Auto rows the body
@@ -193,13 +202,20 @@ export function listVersion(repos: WatchedRepo[]): string {
  * Origin, pin, hide, gone, and discovery metadata stay. The short is allocated
  * under the same lock discovery uses. Snapshots of a removed repo stay in
  * `repo_snapshots`; adding it back restores its history.
+ *
+ * `expectedVersion`, when passed, is checked again after that lock so a pin
+ * or hide that committed since the caller's read cannot be overwritten.
  */
-export async function replaceWatchedRepos(repos: RepoInput[]): Promise<void> {
-  await withTransaction(async (q) => {
+export async function replaceWatchedRepos(repos: RepoInput[], expectedVersion?: string): Promise<RepoWriteResult> {
+  return withTransaction(async (q) => {
     await q`select pg_advisory_xact_lock(${DISCOVERY_WRITE_LOCK}::bigint)`;
     const stored = await readTrackedRepos(q);
+    if (expectedVersion !== undefined && expectedVersion !== versionOf(stored)) {
+      return { ok: false, reason: "stale" };
+    }
     const resets = planOverrideResets(stored, repos);
     await writeReplacedRepos(q, repos, resets);
+    return { ok: true };
   });
 }
 
@@ -330,18 +346,27 @@ async function writeReplacedRepos(q: SqlTag, repos: RepoInput[], resets: Tracked
   `;
 }
 
-/** Pin or hide one stored repo. Does not change origin. Returns false when the repo is absent. */
+/**
+ * Pin or hide one stored repo. Does not change origin. Returns false when the
+ * repo is absent. Takes the discovery write lock so a list replace cannot
+ * pass its version check and then drop this flag. Pin and hide are part of
+ * the list version, so a real change makes the next replace with the old
+ * version stale.
+ */
 export async function setRepoOverride(
   repo: string,
   patch: { pinned?: boolean; hidden?: boolean },
 ): Promise<boolean> {
-  const rows = await sql()`
-    update watched_repos set
-      pinned = coalesce(${patch.pinned ?? null}::boolean, pinned),
-      hidden = coalesce(${patch.hidden ?? null}::boolean, hidden),
-      updated_at = now()
-    where repo = ${repo}
-    returning repo
-  `;
-  return rows.length > 0;
+  return withTransaction(async (q) => {
+    await q`select pg_advisory_xact_lock(${DISCOVERY_WRITE_LOCK}::bigint)`;
+    const rows = await q`
+      update watched_repos set
+        pinned = coalesce(${patch.pinned ?? null}::boolean, pinned),
+        hidden = coalesce(${patch.hidden ?? null}::boolean, hidden),
+        updated_at = now()
+      where repo = ${repo}
+      returning repo
+    `;
+    return rows.length > 0;
+  });
 }

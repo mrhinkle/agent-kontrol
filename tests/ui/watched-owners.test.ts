@@ -18,7 +18,7 @@ import { validateOwnerList, validateOwnerName } from "../../src/lib/owner-valida
 import { MAX_REPOS, retainedAutoShortErrors, validateRepoList } from "../../src/lib/repo-validation";
 import { authorizeRoute, scopeForRoute } from "../../src/lib/scopes";
 import { applyOwnerDiscovery, ownerListVersion } from "../../src/lib/watched-owners";
-import { getWatchedRepos, visibleOnBoard } from "../../src/lib/watched-repos";
+import { getWatchedRepos, listVersion, toWatchedRepo, trackedFromRow, visibleOnBoard } from "../../src/lib/watched-repos";
 import { GET as getOwners, PUT as putOwners } from "../../src/app/api/settings/owners/route";
 import { POST as postDiscover } from "../../src/app/api/settings/owners/discover/route";
 import { PATCH as patchRepos, PUT as putRepos } from "../../src/app/api/settings/repos/route";
@@ -1257,8 +1257,26 @@ describe("watched owners discovery", () => {
       }),
     }));
     assert.equal(res.status, 409, JSON.stringify(await res.clone().json()));
-    const body = await res.json() as { code?: string };
+    const body = await res.json() as {
+      code?: string;
+      results?: { owner?: string; ok?: boolean; error?: string; added?: unknown; updated?: unknown; marked_gone?: unknown }[];
+      added?: unknown;
+      updated?: unknown;
+      marked_gone?: unknown;
+    };
     assert.equal(body.code, "conflict");
+    assert.equal(body.results?.[0]?.owner, "acme");
+    assert.equal(body.results?.[0]?.ok, false);
+    assert.equal(body.results?.[0]?.error, "short name conflict");
+    assert.deepEqual(body.results?.[0]?.added, []);
+    assert.deepEqual(body.results?.[0]?.updated, []);
+    assert.deepEqual(body.results?.[0]?.marked_gone, []);
+    assert.deepEqual(body.added, []);
+    assert.deepEqual(body.updated, []);
+    assert.deepEqual(body.marked_gone, []);
+    const route = fs.readFileSync("src/app/api/settings/owners/discover/route.ts", "utf8");
+    assert.equal(route.match(/apiError\("conflict"/g)?.length, 1, "every discovery 409 goes through one helper");
+    assert.equal(route.match(/discoveryConflictResponse\(/g)?.length, 4, "the helper is defined once and used for every 409");
     assert.equal(inserts, 2, "a unique violation replans once, then conflicts");
   });
 
@@ -1863,5 +1881,127 @@ describe("watched owners discovery", () => {
     assert.deepEqual(missingBody.results?.[0]?.added, []);
     assert.deepEqual(missingBody.results?.[0]?.updated, []);
     assert.deepEqual(missingBody.results?.[0]?.marked_gone, []);
+  });
+
+  it("a repo PUT that read version V is stale after a pin PATCH and the pin survives", async () => {
+    env.NODE_ENV = "test";
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+
+    const row = {
+      repo: "acme/app",
+      label: "Custom",
+      short: "custom",
+      color: "#112233",
+      blocked_label: null as string | null,
+      position: 0,
+      origin: "auto",
+      pinned: false,
+      hidden: false,
+      gone: false,
+      is_fork: false,
+      is_archived: false,
+      last_activity_at: null as string | null,
+      fields_overridden: true,
+    };
+    const prePatch = { ...row };
+    const version = listVersion([toWatchedRepo(trackedFromRow(prePatch, 0), [], new Date(0))]);
+    let repoSelects = 0;
+    let phase: "put" | "patch" = "put";
+    const patchLocks: unknown[] = [];
+    const putLocks: unknown[] = [];
+    const writes: string[] = [];
+    let releasePutPark = (): void => {};
+    let failPutPark = (_err: Error): void => {};
+    const putParked = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("repo PUT did not read the list version")), 2000);
+      failPutPark = (err) => {
+        clearTimeout(timer);
+        reject(err);
+      };
+      releasePutPark = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+    let releasePatch = (): void => {};
+    const patchDone = new Promise<void>((resolve) => {
+      releasePatch = resolve;
+    });
+
+    setSqlForTests(async (strings, ...values) => {
+      const text = strings.join(" ").replace(/\s+/g, " ").trim().toLowerCase();
+      if (text === "begin" || text === "commit" || text === "rollback") return [];
+      if (text.includes("pg_advisory_xact_lock")) {
+        (phase === "patch" ? patchLocks : putLocks).push(values[0]);
+        return [];
+      }
+      if (text.includes("update watched_repos")) {
+        if (typeof values[0] === "boolean") row.pinned = values[0];
+        if (typeof values[1] === "boolean") row.hidden = values[1];
+        return [{ repo: row.repo }];
+      }
+      if (text.includes("insert into watched_repos") || text.includes("delete from watched_repos")) {
+        writes.push(text);
+        const pinned = values[6];
+        if (Array.isArray(pinned)) row.pinned = pinned[0] === true;
+        return [];
+      }
+      if (text.includes("from watched_repos")) {
+        repoSelects += 1;
+        if (repoSelects === 2) {
+          releasePutPark();
+          await patchDone;
+          return [{ ...prePatch }];
+        }
+        return [{ ...row }];
+      }
+      return [];
+    });
+
+    const putPromise = putRepos(new Request("http://localhost/api/settings/repos", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        version,
+        repos: [{
+          repo: "acme/app",
+          label: "Custom",
+          short: "custom",
+          color: "#112233",
+          blockedLabel: null,
+          pinned: false,
+          hidden: false,
+        }],
+      }),
+    }));
+    try {
+      await putParked;
+      phase = "patch";
+      const patched = await patchRepos(new Request("http://localhost/api/settings/repos", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repo: "acme/app", pinned: true }),
+      }));
+      assert.equal(patched.status, 200, JSON.stringify(await patched.clone().json()));
+      phase = "put";
+      releasePatch();
+      const saved = await putPromise;
+      assert.equal(saved.status, 409, JSON.stringify(await saved.clone().json()));
+      const body = await saved.json() as { code?: string };
+      assert.equal(body.code, "stale");
+      assert.equal(row.pinned, true, "the pin that landed after the version read must survive");
+      assert.deepEqual(writes, [], "a stale replace must not write");
+      assert.equal(String(patchLocks[0]), "87216667", "pin takes the discovery write lock");
+      assert.equal(String(putLocks[0]), "87216667", "replace takes the same lock");
+    } catch (err) {
+      failPutPark(err instanceof Error ? err : new Error(String(err)));
+      releasePatch();
+      throw err;
+    } finally {
+      releasePatch();
+    }
   });
 });

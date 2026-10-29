@@ -64,21 +64,26 @@ function parseSweptAt(raw: unknown): { ok: true; sweptAt: string } | { ok: false
   return { ok: true, sweptAt: new Date(raw).toISOString() };
 }
 
-function discoveryConflict(parsed: DiscoveryRequest[], error: string) {
+/** Every discovery 409, including a short-name conflict, uses this body. */
+function discoveryConflictResponse(parsed: DiscoveryRequest[], message: string, fix: string, error: string) {
   const empty: string[] = [];
-  return {
-    results: parsed.map((item) => ({
-      owner: item.owner,
-      ok: false as const,
-      error,
+  return apiError("conflict", {
+    message,
+    fix,
+    extra: {
+      results: parsed.map((item) => ({
+        owner: item.owner,
+        ok: false as const,
+        error,
+        added: [...empty],
+        updated: [...empty],
+        marked_gone: [...empty],
+      })),
       added: [...empty],
       updated: [...empty],
       marked_gone: [...empty],
-    })),
-    added: [...empty],
-    updated: [...empty],
-    marked_gone: [...empty],
-  };
+    },
+  });
 }
 
 function parseResult(raw: unknown): { ok: true; request: DiscoveryRequest } | { ok: false; error: string } {
@@ -148,20 +153,22 @@ export async function POST(req: Request) {
     seen.add(item.owner);
   }
   if (!isConfigured()) {
-    return apiError("conflict", {
-      message: "Owner discovery can only be saved when a database is connected.",
-      fix: "Connect a database (DATABASE_URL) and retry the tick.",
-      extra: discoveryConflict(parsed, "no database"),
-    });
+    return discoveryConflictResponse(
+      parsed,
+      "Owner discovery can only be saved when a database is connected.",
+      "Connect a database (DATABASE_URL) and retry the tick.",
+      "no database",
+    );
   }
   try {
     const listed = await listWatchedOwners();
     if (!listed.writable) {
-      return apiError("conflict", {
-        message: "Owner discovery can only be saved after the owner store exists.",
-        fix: "Apply supabase/migrations/20261028_watched_owners.sql, then retry the tick.",
-        extra: discoveryConflict(parsed, "owner store is not writable"),
-      });
+      return discoveryConflictResponse(
+        parsed,
+        "Owner discovery can only be saved after the owner store exists.",
+        "Apply supabase/migrations/20261028_watched_owners.sql, then retry the tick.",
+        "owner store is not writable",
+      );
     }
     const owners = listed.owners;
     let existing = await loadTrackedRepos();
@@ -188,10 +195,12 @@ export async function POST(req: Request) {
     return NextResponse.json({ results: out });
   } catch (e) {
     if (e instanceof DiscoveryShortConflict) {
-      return apiError("conflict", {
-        message: "Discovery could not allocate a unique short name.",
-        fix: "Retry the tick.",
-      });
+      return discoveryConflictResponse(
+        parsed,
+        "Discovery could not allocate a unique short name.",
+        "Retry the tick.",
+        "short name conflict",
+      );
     }
     return publicError("[settings/owners/discover] apply failed", e, "Could not apply discovery.");
   }

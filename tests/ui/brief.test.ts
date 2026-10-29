@@ -2315,6 +2315,8 @@ describe("GET /api/brief", { concurrency: false }, () => {
       setSqlForTests(async (strings, ...values) => {
         const text = strings.join(" ");
         if (text.includes("from watched_repos")) return [];
+        // No saved owners: getWatchedRepos stays on the file list these fixtures use.
+        if (text.includes("from watched_owners")) return [];
         if (text.includes("from decisions")) {
           for (let i = 0; i < strings.length - 1; i++) {
             if (/\blimit\s*$/.test(strings[i])) seen.limit = Number(values[i]);

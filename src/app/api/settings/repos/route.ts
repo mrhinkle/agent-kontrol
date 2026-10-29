@@ -19,13 +19,16 @@ export const dynamic = "force-dynamic";
  *      and adds code, fix, retryable, and fields. 409 when no database is connected.
  *      If `version` (from the GET the caller started from) is sent and the list has
  *      changed since, answers 409 { code: "stale" } instead of overwriting someone
- *      else's change. `dry_run: true` returns that diff and writes nothing.
+ *      else's change. A real save checks that version again under the discovery
+ *      write lock, in the same transaction as the replace. `dry_run: true` returns that diff and writes nothing.
  *      Any other `dry_run` value is 400 and also writes nothing.
  *      Rows with origin "auto" are kept when the body omits them. Omitting one
  *      whose fields were overridden resets label, short, color, and blocked
  *      label to the discovery defaults and clears fields_overridden.
  * PATCH /api/settings/repos  { repo, pinned?, hidden?, dry_run? }
- *      Sets the override flags on one stored repo. Hide wins over pin when
+ *      Sets the override flags on one stored repo. Takes the same advisory
+ *      lock as discovery and repo replacement. Changing a flag changes the
+ *      list version. Hide wins over pin when
  *      both are true: the repo stays collected and is left off the brief.
  *      A repo marked gone stays off the brief even when pinned.
  *
@@ -157,7 +160,10 @@ export async function PUT(req: Request) {
     if (dry.dryRun) {
       return NextResponse.json(diffRepoList(cur.repos, checked.repos, true));
     }
-    await replaceWatchedRepos(checked.repos);
+    // A mismatch above is enough for a dry run. A real save checks again
+    // under the discovery write lock, after a pin or hide may have landed.
+    const saved = await replaceWatchedRepos(checked.repos, typeof sent === "string" ? sent : undefined);
+    if (!saved.ok) return apiError("stale");
     return NextResponse.json(await current());
   } catch (e) {
     if (isUniqueViolation(e)) {
