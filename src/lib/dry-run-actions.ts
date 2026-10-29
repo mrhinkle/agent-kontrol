@@ -16,7 +16,7 @@ import {
 import { demoRememberTool, demoUpdateTaskTool } from "./demo-store";
 import { absentRevision } from "./revision";
 import { currentActor } from "./actor";
-import { readMemoryForPreview, readTaskForPreview, recordSubjectReceipt, remember, report, updateTask } from "./store";
+import { readMemoryForPreview, readTaskForPreview, remember, report, updateTask } from "./store";
 import type { TaskStatus } from "./types";
 
 export async function previewTaskChange(id: number, patch: TaskPatch): Promise<DryRunResult | null> {
@@ -49,16 +49,7 @@ export async function rememberForTool(args: {
   }
   const item = await remember(args);
   const text = `Stored memory #${item.id}${item.key ? ` (key: ${item.key})` : ""}.`;
-  const receipt = await recordSubjectReceipt({
-    kind: "remember",
-    title: text.replace(/\.$/, ""),
-    tool: "remember",
-    matchKey: "memory_id",
-    matchValue: String(item.id),
-    reuse: false,
-    extra: { memory_key: item.key },
-  });
-  return withReceipt(text, receipt);
+  return withReceipt(text, readReceipt(item));
 }
 
 export async function updateTaskForTool(args: {

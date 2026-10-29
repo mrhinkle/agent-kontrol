@@ -92,6 +92,8 @@ interface DemoAgent {
 interface IdemRow {
   hash: string;
   task: Task;
+  /** Kept on the key so event-cap eviction does not drop a replay's receipt. */
+  receipt: Receipt;
   expiresAt: number;
   storedAt: number;
 }
@@ -117,6 +119,8 @@ const idempotency = new Map<string, IdemRow>();
 interface MessageIdemRow {
   hash: string;
   message: Message;
+  /** Kept on the key so event-cap eviction does not drop a replay's receipt. */
+  receipt: Receipt;
   expiresAt: number;
   storedAt: number;
 }
@@ -311,10 +315,6 @@ function actorFields(actor: Actor | null | undefined): { actor_type: Task["actor
 
 function receiptOf(event: Event): Receipt {
   return { id: String(event.id), kind: event.kind, at: event.created_at };
-}
-
-function findActivity(kind: string, key: string, value: string): Event | undefined {
-  return events.find((event) => event.kind === kind && String(event.detail?.[key] ?? "") === value);
 }
 
 /** An audit row that is not a task-status change. No fault hook. */
@@ -700,9 +700,7 @@ function createTaskUnlocked(input: DemoCreateTaskInput): Task {
     const row = idempotency.get(mapKey);
     if (row && row.expiresAt > nowMs) {
       if (row.hash !== hash) throw new IdempotencyConflict(MISMATCH);
-      const replayed = cloneTask(row.task);
-      const prior = findActivity("create_task", "task_id", String(replayed.id));
-      return prior ? attachReceipt(replayed, receiptOf(prior)) : replayed;
+      return attachReceipt(cloneTask(row.task), row.receipt);
     }
   }
 
@@ -732,14 +730,21 @@ function createTaskUnlocked(input: DemoCreateTaskInput): Task {
     completed_at: null,
   };
   tasks.push(task);
+  const saved = cloneTask(task);
+  const receipt = pushActivity("create_task", `Task #${saved.id} queued`, "create_task", {
+    task_id: String(saved.id),
+  });
   if (mapKey && hash) {
-    idempotency.set(mapKey, { hash, task: cloneTask(task), expiresAt: nowMs + IDEMPOTENCY_TTL_MS, storedAt: nowMs });
+    idempotency.set(mapKey, {
+      hash,
+      task: cloneTask(task),
+      receipt: { id: receipt.id, kind: receipt.kind, at: receipt.at },
+      expiresAt: nowMs + IDEMPOTENCY_TTL_MS,
+      storedAt: nowMs,
+    });
     evictIdempotency();
   }
-  const saved = cloneTask(task);
-  return attachReceipt(saved, pushActivity("create_task", `Task #${saved.id} queued`, "create_task", {
-    task_id: String(saved.id),
-  }));
+  return attachReceipt(saved, receipt);
 }
 
 export function demoCreateTask(input: DemoCreateTaskInput): Promise<Task> {
@@ -1138,9 +1143,7 @@ export function demoSendMessage(input: {
       const row = messageIdempotency.get(mapKey);
       if (row && row.expiresAt > nowMs) {
         if (row.hash !== hash) throw new IdempotencyConflict(MISMATCH);
-        const message = cloneMessage(row.message);
-        const prior = findActivity("send_message", "message_id", String(message.id));
-        return { kind: "message", message: prior ? attachReceipt(message, receiptOf(prior)) : message };
+        return { kind: "message", message: attachReceipt(cloneMessage(row.message), row.receipt) };
       }
     }
 
@@ -1171,6 +1174,7 @@ export function demoSendMessage(input: {
       messageIdempotency.set(mapKey, {
         hash,
         message: cloneMessage(message),
+        receipt: { id: receipt.id, kind: receipt.kind, at: receipt.at },
         expiresAt: nowMs + IDEMPOTENCY_TTL_MS,
         storedAt: nowMs,
       });

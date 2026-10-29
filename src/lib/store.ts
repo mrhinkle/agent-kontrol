@@ -1,5 +1,5 @@
 import { currentActor, type Actor } from "./actor";
-import { activityDetail, activityRow, attachReceipt, receiptFromParts, type ActivityRow, type Receipt } from "./activity";
+import { activityRow, attachReceipt, receiptFromParts, type ActivityRow, type Receipt } from "./activity";
 import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } from "./idempotency";
 import { StaleWrite, absentRevision } from "./revision";
 import { writeSessionNote } from "./session-memory";
@@ -309,67 +309,175 @@ export async function remember(input: {
   const agentId = input.agent_id ?? null;
   const updatedAt = new Date().toISOString();
   const expected = input.expected_revision;
+  const actor = currentActor();
+  const actorType = actor?.actor_type ?? null;
+  const actorId = actor?.actor_id ?? null;
 
   try {
     if (expected === undefined) {
       if (key) {
         const rows = await db`
-          insert into memory (key, content, tags, agent_id, updated_at)
-          values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
-          on conflict (key) do update set
-            content = excluded.content,
-            tags = excluded.tags,
-            agent_id = excluded.agent_id,
-            updated_at = excluded.updated_at,
-            source = null,
-            facts_at = null
-          returning *
+          with w as (
+            insert into memory (key, content, tags, agent_id, updated_at)
+            values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
+            on conflict (key) do update set
+              content = excluded.content,
+              tags = excluded.tags,
+              agent_id = excluded.agent_id,
+              updated_at = excluded.updated_at,
+              source = null,
+              facts_at = null
+            returning *
+          ),
+          e as (
+            insert into events (agent_id, session_id, kind, title, detail)
+            select
+              null,
+              null,
+              'remember',
+              'Stored memory #' || w.id::text || case when w.key is not null then ' (key: ' || w.key || ')' else '' end,
+              jsonb_build_object(
+                'memory_id', w.id::text,
+                'memory_key', w.key,
+                'tool', 'remember',
+                'actor_type', ${actorType}::text,
+                'actor_id', ${actorId}::text
+              )
+            from w
+            returning id, kind, created_at
+          )
+          select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+          from w, e
         `;
         if (!rows[0]) throw new Error("memory upsert returned no row");
-        return rows[0] as MemoryItem;
+        return asMemory(rows[0] as Record<string, unknown>);
       }
       const rows = await db`
-        insert into memory (key, content, tags, agent_id, updated_at)
-        values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
-        returning *
+        with w as (
+          insert into memory (key, content, tags, agent_id, updated_at)
+          values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
+          returning *
+        ),
+        e as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            'remember',
+            'Stored memory #' || w.id::text || case when w.key is not null then ' (key: ' || w.key || ')' else '' end,
+            jsonb_build_object(
+              'memory_id', w.id::text,
+              'memory_key', w.key,
+              'tool', 'remember',
+              'actor_type', ${actorType}::text,
+              'actor_id', ${actorId}::text
+            )
+          from w
+          returning id, kind, created_at
+        )
+        select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+        from w, e
       `;
       if (!rows[0]) throw new Error("memory insert returned no row");
-      return rows[0] as MemoryItem;
+      return asMemory(rows[0] as Record<string, unknown>);
     }
 
     if (!key) {
       if (expected !== absentRevision()) throw new StaleWrite(absentRevision());
       const rows = await db`
-        insert into memory (key, content, tags, agent_id, updated_at)
-        values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
-        returning *
+        with w as (
+          insert into memory (key, content, tags, agent_id, updated_at)
+          values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
+          returning *
+        ),
+        e as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            'remember',
+            'Stored memory #' || w.id::text || case when w.key is not null then ' (key: ' || w.key || ')' else '' end,
+            jsonb_build_object(
+              'memory_id', w.id::text,
+              'memory_key', w.key,
+              'tool', 'remember',
+              'actor_type', ${actorType}::text,
+              'actor_id', ${actorId}::text
+            )
+          from w
+          returning id, kind, created_at
+        )
+        select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+        from w, e
       `;
       if (!rows[0]) throw new Error("memory insert returned no row");
-      return rows[0] as MemoryItem;
+      return asMemory(rows[0] as Record<string, unknown>);
     }
 
     if (expected === absentRevision()) {
       const rows = await db`
-        insert into memory (key, content, tags, agent_id, updated_at)
-        values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
-        on conflict (key) do nothing
-        returning *
+        with w as (
+          insert into memory (key, content, tags, agent_id, updated_at)
+          values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
+          on conflict (key) do nothing
+          returning *
+        ),
+        e as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            'remember',
+            'Stored memory #' || w.id::text || case when w.key is not null then ' (key: ' || w.key || ')' else '' end,
+            jsonb_build_object(
+              'memory_id', w.id::text,
+              'memory_key', w.key,
+              'tool', 'remember',
+              'actor_type', ${actorType}::text,
+              'actor_id', ${actorId}::text
+            )
+          from w
+          returning id, kind, created_at
+        )
+        select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+        from w, e
       `;
-      if (rows[0]) return rows[0] as MemoryItem;
+      if (rows[0]) return asMemory(rows[0] as Record<string, unknown>);
     } else {
       const rows = await db`
-        update memory m set
-          content = ${content},
-          tags = ${tags},
-          agent_id = ${agentId},
-          updated_at = ${updatedAt},
-          source = null,
-          facts_at = null
-        where m.key = ${key}
-          and md5(m::text) = ${expected}
-        returning *
+        with w as (
+          update memory m set
+            content = ${content},
+            tags = ${tags},
+            agent_id = ${agentId},
+            updated_at = ${updatedAt},
+            source = null,
+            facts_at = null
+          where m.key = ${key}
+            and md5(m::text) = ${expected}
+          returning *
+        ),
+        e as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            'remember',
+            'Stored memory #' || w.id::text || case when w.key is not null then ' (key: ' || w.key || ')' else '' end,
+            jsonb_build_object(
+              'memory_id', w.id::text,
+              'memory_key', w.key,
+              'tool', 'remember',
+              'actor_type', ${actorType}::text,
+              'actor_id', ${actorId}::text
+            )
+          from w
+          returning id, kind, created_at
+        )
+        select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+        from w, e
       `;
-      if (rows[0]) return rows[0] as MemoryItem;
+      if (rows[0]) return asMemory(rows[0] as Record<string, unknown>);
     }
   } catch (e) {
     if (e instanceof StaleWrite) throw e;
@@ -463,7 +571,7 @@ export async function recall(input: {
 }
 
 function asMessage(row: Record<string, unknown>): Message {
-  return {
+  const message: Message = {
     id: Number(row.id),
     agent_id: String(row.agent_id),
     body: String(row.body),
@@ -478,6 +586,21 @@ function asMessage(row: Record<string, unknown>): Message {
     thread_id: (row.thread_id as string | null) ?? null,
     read_by_dashboard_at: (row.read_by_dashboard_at as string | null) ?? null,
   };
+  const receipt = receiptFromParts(row.receipt_id, row.receipt_kind, row.receipt_at);
+  if (receipt) attachReceipt(message, receipt);
+  return message;
+}
+
+/** Drop the receipt columns the statement joined on, and keep the receipt on the object. */
+function asMemory(row: Record<string, unknown>): MemoryItem {
+  const receipt = receiptFromParts(row.receipt_id, row.receipt_kind, row.receipt_at);
+  const copy: Record<string, unknown> = { ...row };
+  delete copy.receipt_id;
+  delete copy.receipt_kind;
+  delete copy.receipt_at;
+  const item = copy as unknown as MemoryItem;
+  if (receipt) attachReceipt(item, receipt);
+  return item;
 }
 
 function actorFields(actor: Actor | null | undefined): { actor_type: string | null; actor_id: string | null } {
@@ -573,49 +696,97 @@ async function insertMessage(
 async function insertPlainMessage(db: SqlTag, input: MessageWrite): Promise<Record<string, unknown>[]> {
   if (input.threadId == null) {
     return db`
-      insert into messages (
-        id, agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id
+      with w as (
+        insert into messages (
+          id, agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id
+        )
+        overriding system value
+        select
+          allocated.nid,
+          ${input.agentId},
+          ${input.body},
+          ${input.createdBy},
+          ${input.direction},
+          ${input.inReplyTo},
+          allocated.nid::text,
+          ${input.actorType},
+          ${input.actorId}
+        from (
+          select nextval(pg_get_serial_sequence('messages', 'id')) as nid
+        ) allocated
+        returning *
+      ),
+      e as (
+        insert into events (agent_id, session_id, kind, title, detail)
+        select
+          null,
+          null,
+          case when w.direction = 'inbound' then 'send_message' else 'reply_to_operator' end,
+          case
+            when w.direction = 'inbound'
+              then 'Message #' || w.id::text || ' sent to ' || w.agent_id
+            else 'Reply #' || w.id::text || ' delivered'
+          end,
+          jsonb_build_object(
+            'tool', case when w.direction = 'inbound' then 'send_message' else 'reply_to_operator' end,
+            'actor_type', w.actor_type,
+            'actor_id', w.actor_id,
+            'message_id', w.id::text
+          )
+        from w
+        returning id, kind, created_at
       )
-      overriding system value
-      select
-        allocated.nid,
+      select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+      from w, e
+    `;
+  }
+  return db`
+    with w as (
+      insert into messages (
+        agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id
+      )
+      values (
         ${input.agentId},
         ${input.body},
         ${input.createdBy},
         ${input.direction},
         ${input.inReplyTo},
-        allocated.nid::text,
+        ${input.threadId},
         ${input.actorType},
         ${input.actorId}
-      from (
-        select nextval(pg_get_serial_sequence('messages', 'id')) as nid
-      ) allocated
+      )
       returning *
-    `;
-  }
-  return db`
-    insert into messages (
-      agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id
+    ),
+    e as (
+      insert into events (agent_id, session_id, kind, title, detail)
+      select
+        null,
+        null,
+        case when w.direction = 'inbound' then 'send_message' else 'reply_to_operator' end,
+        case
+          when w.direction = 'inbound'
+            then 'Message #' || w.id::text || ' sent to ' || w.agent_id
+          else 'Reply #' || w.id::text || ' delivered'
+        end,
+        jsonb_build_object(
+          'tool', case when w.direction = 'inbound' then 'send_message' else 'reply_to_operator' end,
+          'actor_type', w.actor_type,
+          'actor_id', w.actor_id,
+          'message_id', w.id::text
+        )
+      from w
+      returning id, kind, created_at
     )
-    values (
-      ${input.agentId},
-      ${input.body},
-      ${input.createdBy},
-      ${input.direction},
-      ${input.inReplyTo},
-      ${input.threadId},
-      ${input.actorType},
-      ${input.actorId}
-    )
-    returning *
+    select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+    from w, e
   `;
 }
 
 /**
- * Insert the message and store the claim response in one statement.
- * `gate` locks the claim. The insert's WHERE repeats the token check, so a
- * token that was taken over inserts no row. thread_id is set here, not by a
- * later update.
+ * Insert the message, its activity event, and the claim response in one
+ * statement. `gate` locks the claim. The insert's WHERE repeats the token
+ * check, so a token that was taken over inserts no row. A replay reads the
+ * stored response and does not run this statement. thread_id is set here.
  */
 async function insertClaimedMessage(
   db: SqlTag,
@@ -633,7 +804,7 @@ async function insertClaimedMessage(
           and response is null
         for update
       ),
-      inserted as (
+      w as (
         insert into messages (
           id, agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id
         )
@@ -662,14 +833,42 @@ async function insertClaimedMessage(
         )
         returning *
       ),
+      e as (
+        insert into events (agent_id, session_id, kind, title, detail)
+        select
+          null,
+          null,
+          case when w.direction = 'inbound' then 'send_message' else 'reply_to_operator' end,
+          case
+            when w.direction = 'inbound'
+              then 'Message #' || w.id::text || ' sent to ' || w.agent_id
+            else 'Reply #' || w.id::text || ' delivered'
+          end,
+          jsonb_build_object(
+            'tool', case when w.direction = 'inbound' then 'send_message' else 'reply_to_operator' end,
+            'actor_type', w.actor_type,
+            'actor_id', w.actor_id,
+            'message_id', w.id::text
+          )
+        from w
+        returning id, kind, created_at
+      ),
       stored as (
         update idempotency_keys as k
-        set response = (select to_jsonb(i) from inserted i)
+        set response = (
+          select to_jsonb(w) || jsonb_build_object(
+            'receipt_id', e.id,
+            'receipt_kind', e.kind,
+            'receipt_at', e.created_at
+          )
+          from w, e
+        )
         from gate
         where k.scope = gate.scope
           and k.idempotency_key = gate.idempotency_key
           and k.claim_token = ${claim.token}
-          and exists (select 1 from inserted)
+          and exists (select 1 from w)
+          and exists (select 1 from e)
         returning k.response
       )
       select response from stored
@@ -685,7 +884,7 @@ async function insertClaimedMessage(
         and response is null
       for update
     ),
-    inserted as (
+    w as (
       insert into messages (
         agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id
       )
@@ -709,14 +908,42 @@ async function insertClaimedMessage(
       )
       returning *
     ),
+    e as (
+      insert into events (agent_id, session_id, kind, title, detail)
+      select
+        null,
+        null,
+        case when w.direction = 'inbound' then 'send_message' else 'reply_to_operator' end,
+        case
+          when w.direction = 'inbound'
+            then 'Message #' || w.id::text || ' sent to ' || w.agent_id
+          else 'Reply #' || w.id::text || ' delivered'
+        end,
+        jsonb_build_object(
+          'tool', case when w.direction = 'inbound' then 'send_message' else 'reply_to_operator' end,
+          'actor_type', w.actor_type,
+          'actor_id', w.actor_id,
+          'message_id', w.id::text
+        )
+      from w
+      returning id, kind, created_at
+    ),
     stored as (
       update idempotency_keys as k
-      set response = (select to_jsonb(i) from inserted i)
+      set response = (
+        select to_jsonb(w) || jsonb_build_object(
+          'receipt_id', e.id,
+          'receipt_kind', e.kind,
+          'receipt_at', e.created_at
+        )
+        from w, e
+      )
       from gate
       where k.scope = gate.scope
         and k.idempotency_key = gate.idempotency_key
         and k.claim_token = ${claim.token}
-        and exists (select 1 from inserted)
+        and exists (select 1 from w)
+        and exists (select 1 from e)
       returning k.response
     )
     select response from stored
@@ -953,7 +1180,7 @@ async function insertTask(
               and response is null
             for update
           ),
-          inserted as (
+          w as (
             insert into tasks (
               title, description, project, platform, machine,
               priority, reviewer_platform, created_by, actor_type, actor_id
@@ -980,36 +1207,80 @@ async function insertTask(
             )
             returning *
           ),
+          e as (
+            insert into events (agent_id, session_id, kind, title, detail)
+            select
+              null,
+              null,
+              'create_task',
+              'Task #' || w.id::text || ' queued',
+              jsonb_build_object(
+                'tool', 'create_task',
+                'actor_type', w.actor_type,
+                'actor_id', w.actor_id,
+                'task_id', w.id::text
+              )
+            from w
+            returning id, kind, created_at
+          ),
           stored as (
             update idempotency_keys as k
-            set response = (select to_jsonb(i) from inserted i)
+            set response = (
+              select to_jsonb(w) || jsonb_build_object(
+                'receipt_id', e.id,
+                'receipt_kind', e.kind,
+                'receipt_at', e.created_at
+              )
+              from w, e
+            )
             from gate
             where k.scope = gate.scope
               and k.idempotency_key = gate.idempotency_key
               and k.claim_token = ${claim.token}
-              and exists (select 1 from inserted)
+              and exists (select 1 from w)
+              and exists (select 1 from e)
             returning k.response
           )
           select response from stored
         `
       : await db`
-          insert into tasks (
-            title, description, project, platform, machine,
-            priority, reviewer_platform, created_by, actor_type, actor_id
+          with w as (
+            insert into tasks (
+              title, description, project, platform, machine,
+              priority, reviewer_platform, created_by, actor_type, actor_id
+            )
+            values (
+              ${input.title},
+              ${input.description ?? null},
+              ${input.project ?? null},
+              ${input.platform ?? "any"},
+              ${input.machine ?? null},
+              ${input.priority ?? 2},
+              ${input.reviewer_platform ?? null},
+              ${input.created_by ?? "dashboard"},
+              ${actor.actor_type},
+              ${actor.actor_id}
+            )
+            returning *
+          ),
+          e as (
+            insert into events (agent_id, session_id, kind, title, detail)
+            select
+              null,
+              null,
+              'create_task',
+              'Task #' || w.id::text || ' queued',
+              jsonb_build_object(
+                'tool', 'create_task',
+                'actor_type', w.actor_type,
+                'actor_id', w.actor_id,
+                'task_id', w.id::text
+              )
+            from w
+            returning id, kind, created_at
           )
-          values (
-            ${input.title},
-            ${input.description ?? null},
-            ${input.project ?? null},
-            ${input.platform ?? "any"},
-            ${input.machine ?? null},
-            ${input.priority ?? 2},
-            ${input.reviewer_platform ?? null},
-            ${input.created_by ?? "dashboard"},
-            ${actor.actor_type},
-            ${actor.actor_id}
-          )
-          returning *
+          select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+          from w, e
         `;
     const row = claim ? responseRow(rows as Record<string, unknown>[]) : rows[0] as Record<string, unknown> | undefined;
     if (!row) {
@@ -1443,82 +1714,73 @@ export async function findAgent(agentId: string): Promise<{ id: string } | null>
 export async function deleteMemory(input: { key: string; expected_revision?: string }): Promise<MemoryItem> {
   const db = sql();
   const expected = input.expected_revision;
+  const actor = currentActor();
+  const actorType = actor?.actor_type ?? null;
+  const actorId = actor?.actor_id ?? null;
   let rows: Record<string, unknown>[] = [];
   try {
     if (expected === undefined) {
-      rows = await db`delete from memory where key = ${input.key} returning *`;
+      rows = await db`
+        with w as (
+          delete from memory where key = ${input.key} returning *
+        ),
+        e as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            'delete_note',
+            'Deleted memory key "' || coalesce(w.key, '') || '"',
+            jsonb_build_object(
+              'tool', 'delete_note',
+              'actor_type', ${actorType}::text,
+              'actor_id', ${actorId}::text,
+              'memory_key', w.key,
+              'memory_id', w.id::text
+            )
+          from w
+          returning id, kind, created_at
+        )
+        select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+        from w, e
+      `;
     } else {
       rows = await db`
-        delete from memory m
-        where m.key = ${input.key}
-          and md5(m::text) = ${expected}
-        returning *
+        with w as (
+          delete from memory m
+          where m.key = ${input.key}
+            and md5(m::text) = ${expected}
+          returning *
+        ),
+        e as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            'delete_note',
+            'Deleted memory key "' || coalesce(w.key, '') || '"',
+            jsonb_build_object(
+              'tool', 'delete_note',
+              'actor_type', ${actorType}::text,
+              'actor_id', ${actorId}::text,
+              'memory_key', w.key,
+              'memory_id', w.id::text
+            )
+          from w
+          returning id, kind, created_at
+        )
+        select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+        from w, e
       `;
     }
   } catch (e) {
     rethrowStore(e);
   }
-  if (rows[0]) return rows[0] as unknown as MemoryItem;
+  if (rows[0]) return asMemory(rows[0] as Record<string, unknown>);
   if (expected === undefined) throw new Error("Memory not found");
   const current = await memoryRevisionOf(input.key);
   if (!current) throw new Error("Memory not found");
   throw new StaleWrite(current);
-}
-
-const SUBJECT_KEYS = new Set(["task_id", "message_id", "memory_id", "memory_key"]);
-
-/**
- * An event for a write that is not itself the task-status statement.
- * Idempotent routes pass reuse so a replay returns the original receipt
- * and does not insert a second row. An empty RETURNING yields null: a test
- * double that does not model events must not turn the write into an error.
- */
-export async function recordSubjectReceipt(input: {
-  kind: string;
-  title: string;
-  tool: string;
-  matchKey: "task_id" | "message_id" | "memory_id" | "memory_key";
-  matchValue: string;
-  reuse: boolean;
-  extra?: Record<string, unknown>;
-}): Promise<Receipt | null> {
-  if (!SUBJECT_KEYS.has(input.matchKey)) throw new Error("activity subject key is not allowlisted");
-  const db = sql();
-  const actor = currentActor();
-  try {
-    if (input.reuse) {
-      const found = await db`
-        select id, kind, created_at
-        from events
-        where kind = ${input.kind}
-          and detail->>${input.matchKey} = ${input.matchValue}
-        order by id asc
-        limit 1
-      `;
-      const existing = found[0] as Record<string, unknown> | undefined;
-      const prior = existing ? receiptFromParts(existing.id, existing.kind, existing.created_at) : null;
-      if (prior) return prior;
-    }
-    const detail = activityDetail(input.tool, actor, {
-      [input.matchKey]: input.matchValue,
-      ...(input.extra ?? {}),
-    });
-    const rows = await db`
-      insert into events (agent_id, session_id, kind, title, detail)
-      values (
-        ${null},
-        ${null},
-        ${input.kind},
-        ${input.title},
-        ${JSON.stringify(detail)}::jsonb
-      )
-      returning id, kind, created_at
-    `;
-    const row = rows[0] as Record<string, unknown> | undefined;
-    return row ? receiptFromParts(row.id, row.kind, row.created_at) : null;
-  } catch (e) {
-    rethrowStore(e);
-  }
 }
 
 export interface ActivityListQuery {

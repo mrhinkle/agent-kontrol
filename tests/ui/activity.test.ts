@@ -12,12 +12,14 @@ import { pathToFileURL } from "node:url";
 import { GET as getActivity } from "../../src/app/api/activity/route";
 import { PATCH as patchTask } from "../../src/app/api/tasks/[id]/route";
 import { activityDetail, readReceipt, type Receipt } from "../../src/lib/activity";
+import { openApiDocument } from "../../src/lib/openapi";
 import { type McpToolResult } from "../../src/lib/api-error";
 import { runWithActor, type Actor } from "../../src/lib/actor";
 import { createCredential, resetCredentialsForTests } from "../../src/lib/credentials";
 import { demoTasks } from "../../src/lib/demo-data";
 import {
   DEMO_BANNER,
+  DEMO_CAPS,
   DEMO_EMPTY_CLAIM,
   demoClaimNextTask,
   demoClaimTaskTool,
@@ -37,7 +39,7 @@ import {
   setDemoClockForTests,
 } from "../../src/lib/demo-store";
 import { rememberForTool, updateTaskForTool } from "../../src/lib/dry-run-actions";
-import { encodeCursor, TASK_REST } from "../../src/lib/list-params";
+import { ACTIVITY_LIST, encodeCursor, TASK_REST } from "../../src/lib/list-params";
 import { listActivityResult } from "../../src/lib/list-read";
 import { deleteNoteTool, requeueTaskTool, sendMessageTool } from "../../src/lib/operator-actions";
 import { authorizeTool } from "../../src/lib/scopes";
@@ -710,15 +712,18 @@ describe("activity log", { concurrency: false }, () => {
     setDemoClockForTests(() => Date.parse(T0));
     await runWithActor(ANNA, () => demoRememberTool({ content: "older", key: "older" }));
     setDemoClockForTests(() => Date.parse(T2));
-    await runWithActor(ANN, () => demoReportStatusTool({ agent_id: "ann", title: "later" }));
-
+    const newest = splitReceipt(await runWithActor(ANN, () => demoReportStatusTool({
+      agent_id: "ann",
+      title: "later",
+    })));
     const rest = await restActivity("?limit=1");
     const tool = await walkTool(1);
     assert.deepEqual(await walk(1), tool);
-    assert.equal(String(rest.body.activity[0]?.id), written.receipt.id === rest.body.activity[0]?.id.toString()
-      ? rest.body.activity[0].id.toString()
-      : rest.body.activity[0]?.id.toString());
-    assert.equal(rest.body.activity[0]?.kind, "status");
+    // The newest row is the status report, not the earlier create_task receipt.
+    assert.equal(String(rest.body.activity[0]?.id), newest.receipt.id);
+    assert.equal(rest.body.activity[0]?.kind, newest.receipt.kind);
+    assert.equal(rest.body.activity[0]?.created_at, newest.receipt.at);
+    assert.notEqual(newest.receipt.id, written.receipt.id);
     assert.equal(rest.body.demo, true);
     assert.equal(typeof rest.body.next_cursor, "string");
 
@@ -736,5 +741,55 @@ describe("activity log", { concurrency: false }, () => {
     assert.equal(filtered.body.activity.length, 1);
     assert.match(filteredLines[0] ?? "", new RegExp(`#${filtered.body.activity[0]?.id}\\b`));
     assert.equal(filtered.body.activity[0]?.kind, "remember");
+  });
+
+  it("F8 a replay after event eviction returns the original receipt", async () => {
+    await demoReport({ agent_id: "ada", kind: "status", title: "up" });
+    const created = splitReceipt(await demoCreateTaskTool({
+      title: "survive eviction",
+      platform: "any",
+      idempotency_key: "evict-task",
+    }, null));
+    const sent = splitReceipt(await sendMessageTool({
+      agent_id: "ada",
+      body: "ping",
+      idempotency_key: "evict-msg",
+    }));
+    for (let i = 0; i < DEMO_CAPS.events; i++) {
+      await demoReport({ agent_id: "ada", kind: "heartbeat", title: `pad ${i}` });
+    }
+    assert.equal(demoStoreSize().events, DEMO_CAPS.events);
+    const kept = await walk(200);
+    assert.equal(kept.includes(Number(created.receipt.id)), false, "the create_task receipt was evicted");
+    assert.equal(kept.includes(Number(sent.receipt.id)), false, "the send_message receipt was evicted");
+
+    const before = demoStoreSize().events;
+    const replayedTask = splitReceipt(await demoCreateTaskTool({
+      title: "survive eviction",
+      platform: "any",
+      idempotency_key: "evict-task",
+    }, null));
+    const replayedMessage = splitReceipt(await sendMessageTool({
+      agent_id: "ada",
+      body: "ping",
+      idempotency_key: "evict-msg",
+    }));
+    assert.deepEqual(replayedTask.receipt, created.receipt);
+    assert.deepEqual(replayedMessage.receipt, sent.receipt);
+    assert.equal(demoStoreSize().events, before, "a replay does not insert a receipt");
+  });
+
+  it("F9 OpenAPI activity items list the fields list_activity returns", () => {
+    const doc = openApiDocument() as {
+      paths: Record<string, {
+        get?: {
+          responses?: Record<string, {
+            content?: { "application/json"?: { schema?: { properties?: { activity?: { items?: { properties?: Record<string, unknown> } } } } } };
+          }>;
+        };
+      }>;
+    };
+    const props = doc.paths["/api/activity"]?.get?.responses?.["200"]?.content?.["application/json"]?.schema?.properties?.activity?.items?.properties;
+    assert.deepEqual(Object.keys(props ?? {}).sort(), [...ACTIVITY_LIST.allow].sort());
   });
 });

@@ -10,7 +10,7 @@ import { INGEST_KINDS } from "@/lib/store";
 import { TASK_STATUSES } from "@/lib/types";
 import { USAGE_SOURCES } from "@/lib/usage-types";
 import { USAGE_WINDOWS } from "@/lib/usage-window";
-import { LIST_MAX } from "./list-params";
+import { ACTIVITY_LIST, LIST_MAX } from "./list-params";
 import { RUNTIMES } from "./skills/types";
 
 /**
@@ -29,6 +29,16 @@ import { RUNTIMES } from "./skills/types";
 const ERROR_CODES = [...new Set([...Object.keys(API_ERRORS), "insufficient_scope"])];
 
 type Json = Record<string, unknown>;
+
+/** The nine names list_activity and GET /api/activity return. fields= may omit some. */
+const ACTIVITY_ITEM_PROPERTIES: Json = Object.fromEntries(
+  ACTIVITY_LIST.allow.map((name) => {
+    if (name === "id") return [name, { type: "integer" }];
+    if (name === "created_at") return [name, { type: "string", format: "date-time" }];
+    if (name === "detail") return [name, { type: ["object", "null"], additionalProperties: true }];
+    return [name, { type: ["string", "null"] }];
+  }),
+);
 
 const INGEST_PLATFORMS = [
   "claude-code",
@@ -1381,7 +1391,7 @@ export function openApiDocument(): Json {
               type: "object",
               properties: {
                 demo: { type: "boolean" },
-                activity: { type: "array", items: { type: "object" } },
+                activity: { type: "array", items: { type: "object", properties: ACTIVITY_ITEM_PROPERTIES } },
                 next_cursor: nextCursor,
               },
             }),

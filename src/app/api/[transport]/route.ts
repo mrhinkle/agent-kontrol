@@ -17,7 +17,7 @@ import {
 import { listActivityResult, recallResult, taskQueueResult } from "@/lib/list-read";
 import { evaluateMcpMessages, insufficientScopeBody, principalFromMcpAuth } from "@/lib/scopes";
 import { rememberForTool, updateTaskForTool } from "@/lib/dry-run-actions";
-import { claimNextTask, createTask, fetchMessages, fleet, recordSubjectReceipt, replyFromAgent, report } from "@/lib/store";
+import { claimNextTask, createTask, fetchMessages, fleet, replyFromAgent, report } from "@/lib/store";
 import { progress } from "@/lib/progress-store";
 import { formatDigest } from "@/lib/progress-digest";
 import { morningBriefText } from "@/lib/brief";
@@ -317,15 +317,7 @@ const handler = createMcpHandler(
           });
           const text = `Reply #${msg.id} delivered to Agent Kontrol` +
             (msg.thread_id ? ` (thread ${msg.thread_id}).` : ".");
-          const receipt = await recordSubjectReceipt({
-            kind: "reply_to_operator",
-            title: `Reply #${msg.id} delivered`,
-            tool: "reply_to_operator",
-            matchKey: "message_id",
-            matchValue: String(msg.id),
-            reuse: true,
-          });
-          return withReceipt(text, receipt);
+          return withReceipt(text, readReceipt(msg));
         }),
       );
     }
@@ -368,15 +360,7 @@ const handler = createMcpHandler(
           actor: currentActor(),
         });
         const text = `Task #${task.id} queued for ${task.platform} (priority ${task.priority}).`;
-        const receipt = await recordSubjectReceipt({
-          kind: "create_task",
-          title: `Task #${task.id} queued`,
-          tool: "create_task",
-          matchKey: "task_id",
-          matchValue: String(task.id),
-          reuse: true,
-        });
-        return withReceipt(text, receipt);
+        return withReceipt(text, readReceipt(task));
       }),
     );
 

@@ -18,7 +18,6 @@ import {
   findAgent,
   readMemoryForPreview,
   readTaskForPreview,
-  recordSubjectReceipt,
   updateTask,
 } from "./store";
 
@@ -94,15 +93,7 @@ export async function sendMessageTool(args: {
     idempotency_key: args.idempotency_key,
   });
   const text = `Message #${message.id} sent to ${message.agent_id}.`;
-  const receipt = await recordSubjectReceipt({
-    kind: "send_message",
-    title: text.replace(/\.$/, ""),
-    tool: "send_message",
-    matchKey: "message_id",
-    matchValue: String(message.id),
-    reuse: true,
-  });
-  return withReceipt(text, receipt);
+  return withReceipt(text, readReceipt(message));
 }
 
 export async function requeueTaskTool(args: {
@@ -197,16 +188,7 @@ export async function deleteNoteTool(args: {
   try {
     const removed = await deleteMemory({ key: args.key, expected_revision: revision.revision });
     const text = deletedText(removed.key ?? args.key, actor);
-    const receipt = await recordSubjectReceipt({
-      kind: "delete_note",
-      title: text.replace(/\.$/, ""),
-      tool: "delete_note",
-      matchKey: "memory_key",
-      matchValue: removed.key ?? args.key,
-      reuse: false,
-      extra: { memory_id: String(removed.id) },
-    });
-    return withReceipt(text, receipt);
+    return withReceipt(text, readReceipt(removed));
   } catch (err) {
     const mapped = mapDeleteError(err);
     if (mapped) return mapped;
