@@ -14,6 +14,7 @@
 import type { Actor } from "./actor";
 import { mcpToolError, memoryKeyError, type McpToolResult } from "./api-error";
 import { diffMemoryWrite, diffTaskUpdate, readDryRun, type MemoryWriteInput } from "./dry-run";
+import { requeueBlock } from "./requeue";
 import { StaleWrite, absentRevision, memoryRevision, taskRevision } from "./revision";
 import {
   IDEMPOTENCY_ROUTE,
@@ -24,7 +25,7 @@ import {
   idempotencyScope,
   payloadOf,
 } from "./idempotency";
-import type { Event, FleetAgent, MemoryItem, Session, Task, TaskStatus } from "./types";
+import type { Event, FleetAgent, MemoryItem, Message, Session, Task, TaskStatus } from "./types";
 
 /** Same rule as store.slugify. Kept here so this module does not import the database store. */
 function slugify(input: string): string {
@@ -46,6 +47,7 @@ export const DEMO_BANNER = "[demo — in-memory, cleared when this process resta
 export const DEMO_CAPS = {
   tasks: 200,
   notes: 200,
+  messages: 200,
   agents: 100,
   events: 400,
   idempotency: 200,
@@ -91,13 +93,25 @@ let tail: Promise<void> = Promise.resolve();
 let nextTaskId = 1;
 let nextNoteId = 1;
 let nextEventId = 1;
+let nextMessageId = 1;
 
 const agents = new Map<string, DemoAgent>();
 const sessions = new Map<string, Session>();
 const events: Event[] = [];
 const notes: MemoryItem[] = [];
 const tasks: Task[] = [];
+const messages: Message[] = [];
 const idempotency = new Map<string, IdemRow>();
+
+interface MessageIdemRow {
+  hash: string;
+  message: Message;
+  expiresAt: number;
+  storedAt: number;
+}
+
+/** Separate from task idempotency. Evicting a message must not drop its key. */
+const messageIdempotency = new Map<string, MessageIdemRow>();
 
 /** Tests move the 24 hour idempotency window. Production never calls this. */
 export function setDemoClockForTests(fn: (() => number) | null): void {
@@ -134,10 +148,13 @@ export function resetDemoStoreForTests(): void {
   events.length = 0;
   notes.length = 0;
   tasks.length = 0;
+  messages.length = 0;
   idempotency.clear();
+  messageIdempotency.clear();
   nextTaskId = 1;
   nextNoteId = 1;
   nextEventId = 1;
+  nextMessageId = 1;
 }
 
 function withDemoLabel(text: string): string {
@@ -667,6 +684,8 @@ function updateTaskUnlocked(input: {
   cost_usd?: number;
   session_id?: string;
   assigned_agent?: string;
+  /** Set only when the caller passes an authenticated actor. Omitted leaves the columns. */
+  actor?: Actor | null;
 }): Task {
   touch();
   const task = tasks.find((row) => row.id === input.id);
@@ -683,6 +702,10 @@ function updateTaskUnlocked(input: {
   if (input.cost_usd !== undefined) task.cost_usd = input.cost_usd;
   if (input.session_id !== undefined) task.session_id = input.session_id;
   if (input.assigned_agent !== undefined) task.assigned_agent = input.assigned_agent;
+  if (input.actor) {
+    task.actor_type = input.actor.actor_type;
+    task.actor_id = input.actor.actor_id;
+  }
   return cloneTask(task);
 }
 
@@ -900,4 +923,153 @@ export async function demoUpdateTaskTool(args: {
     });
   }
   return { content: [{ type: "text", text: withDemoLabel(`Task #${task.id} updated (${task.status}).`) }] };
+}
+
+function cloneMessage(message: Message): Message {
+  return { ...message };
+}
+
+function evictMessageIdempotency(): void {
+  while (messageIdempotency.size > DEMO_CAPS.idempotency) {
+    let oldestKey: string | null = null;
+    let oldestAt = Infinity;
+    for (const [key, row] of messageIdempotency) {
+      if (row.storedAt < oldestAt) {
+        oldestAt = row.storedAt;
+        oldestKey = key;
+      }
+    }
+    if (oldestKey == null) return;
+    messageIdempotency.delete(oldestKey);
+  }
+}
+
+/** Messages the demo send_message tool stored. The idempotency map is separate. */
+export function demoMessagesForTests(): Message[] {
+  return messages.map(cloneMessage);
+}
+
+export type DemoSendResult = { kind: "missing" } | { kind: "message"; message: Message };
+
+/**
+ * Inbound message for an agent that already reported. The agent check happens
+ * before the idempotency row is written. A replay returns the original message
+ * and does not insert another row. Dropping the message at the cap leaves the key.
+ */
+export function demoSendMessage(input: {
+  agent_id: string;
+  body: string;
+  created_by?: string;
+  actor?: Actor | null;
+  idempotency_key?: string | null;
+}): Promise<DemoSendResult> {
+  return enqueue(async () => {
+    touch();
+    const slug = slugify(input.agent_id);
+    if (!slug || !agents.has(slug)) return { kind: "missing" };
+
+    const key = normalizeKey(input.idempotency_key);
+    const actor = input.actor ?? null;
+    const scope = key ? idempotencyScope(actor, IDEMPOTENCY_ROUTE.enqueueMessage) : null;
+    const hash = key ? hashPayload(payloadOf(input, ["agent_id", "body", "created_by"])) : null;
+    const mapKey = scope && key ? `${scope}\0${key}` : null;
+    const nowMs = nowFn();
+    if (mapKey && hash) {
+      const row = messageIdempotency.get(mapKey);
+      if (row && row.expiresAt > nowMs) {
+        if (row.hash !== hash) throw new IdempotencyConflict(MISMATCH);
+        return { kind: "message", message: cloneMessage(row.message) };
+      }
+    }
+
+    const recorded = actorFields(actor);
+    const now = iso(nowMs);
+    if (messages.length >= DEMO_CAPS.messages) messages.shift();
+    const id = nextMessageId++;
+    const message: Message = {
+      id,
+      agent_id: slug,
+      body: input.body,
+      created_by: input.created_by ?? "dashboard",
+      actor_type: recorded.actor_type,
+      actor_id: recorded.actor_id,
+      created_at: now,
+      delivered_at: null,
+      acked_at: null,
+      direction: "inbound",
+      in_reply_to: null,
+      thread_id: String(id),
+      read_by_dashboard_at: null,
+    };
+    messages.push(message);
+    if (mapKey && hash) {
+      messageIdempotency.set(mapKey, {
+        hash,
+        message: cloneMessage(message),
+        expiresAt: nowMs + IDEMPOTENCY_TTL_MS,
+        storedAt: nowMs,
+      });
+      evictMessageIdempotency();
+    }
+    return { kind: "message", message: cloneMessage(message) };
+  });
+}
+
+export type DemoRequeueResult =
+  | { kind: "missing" }
+  | { kind: "blocked"; code: "forbidden" | "conflict"; message: string }
+  | { kind: "preview"; task: Task; revision: string }
+  | { kind: "task"; task: Task };
+
+/**
+ * Eligibility, the revision check, and the status write share one turn of the
+ * queue. No await between the check and the write.
+ */
+export function demoRequeueTask(input: {
+  id: number;
+  callerId: string | null;
+  dryRun: boolean;
+  expectedRevision?: string;
+  actor?: Actor | null;
+}): Promise<DemoRequeueResult> {
+  return enqueue(async () => {
+    touch();
+    const task = tasks.find((row) => row.id === input.id);
+    if (!task) return { kind: "missing" };
+    const block = requeueBlock(task, input.callerId);
+    if (!block.ok) return { kind: "blocked", code: block.code, message: block.message };
+    const revision = taskRevision(task);
+    if (input.dryRun) return { kind: "preview", task: cloneTask(task), revision };
+    if (input.expectedRevision !== undefined && revision !== input.expectedRevision) {
+      throw new StaleWrite(revision);
+    }
+    const updated = updateTaskUnlocked({ id: task.id, status: "queued", actor: input.actor });
+    return { kind: "task", task: updated };
+  });
+}
+
+export type DemoDeleteResult =
+  | { kind: "missing" }
+  | { kind: "preview"; item: MemoryItem; revision: string }
+  | { kind: "deleted"; item: MemoryItem };
+
+/** Compare-and-delete. A missing key is not a successful delete, including `absent`. */
+export function demoDeleteMemory(input: {
+  key: string;
+  dryRun: boolean;
+  expectedRevision?: string;
+}): Promise<DemoDeleteResult> {
+  return enqueue(async () => {
+    touch();
+    const index = notes.findIndex((note) => note.key === input.key);
+    if (index < 0) return { kind: "missing" };
+    const item = notes[index];
+    const revision = memoryRevision(item);
+    if (input.dryRun) return { kind: "preview", item: { ...item, tags: [...item.tags] }, revision };
+    if (input.expectedRevision !== undefined && revision !== input.expectedRevision) {
+      throw new StaleWrite(revision);
+    }
+    const [removed] = notes.splice(index, 1);
+    return { kind: "deleted", item: { ...removed, tags: [...removed.tags] } };
+  });
 }
