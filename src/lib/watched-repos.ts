@@ -90,6 +90,12 @@ async function loadOwners(): Promise<StoredOwner[]> {
   }
 }
 
+/** Postgres 42P01 for `watched_repos` only. Other "does not exist" errors stay errors. */
+function missingReposRelation(e: unknown): boolean {
+  const err = e as { code?: string; message?: string };
+  return err.code === "42P01" && (err.message?.includes("watched_repos") ?? false);
+}
+
 /** Reads tracked repos through `q`, so a discovery transaction can reload under its lock. */
 export async function readTrackedRepos(q: SqlTag): Promise<TrackedRepo[]> {
   try {
@@ -125,10 +131,7 @@ export async function getWatchedRepos(fallback: RepoConfig[]): Promise<{ source:
     const now = new Date();
     return { source: "database", repos: rows.map((row) => toWatchedRepo(row, owners, now)) };
   } catch (e) {
-    const err = e as { code?: string; message?: string };
-    if (err.code === "42P01" || (err.message?.includes("watched_repos") && err.message.includes("does not exist"))) {
-      return { source: "file", repos: fallback };
-    }
+    if (missingReposRelation(e)) return { source: "file", repos: fallback };
     throw e;
   }
 }

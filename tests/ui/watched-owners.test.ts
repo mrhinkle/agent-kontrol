@@ -21,6 +21,7 @@ import { applyOwnerDiscovery, ownerListVersion } from "../../src/lib/watched-own
 import { getWatchedRepos, visibleOnBoard } from "../../src/lib/watched-repos";
 import { GET as getOwners, PUT as putOwners } from "../../src/app/api/settings/owners/route";
 import { POST as postDiscover } from "../../src/app/api/settings/owners/discover/route";
+import { PUT as putRepos } from "../../src/app/api/settings/repos/route";
 
 /**
  * Failure cases for watched_owners (#66). Each test tries to make discovery
@@ -135,6 +136,9 @@ describe("watched owners discovery", () => {
           is_archived: row.isArchived,
           last_activity_at: row.lastActivityAt,
         }));
+      }
+      if (/from watched_owners/i.test(text)) {
+        return [{ owner: "acme", activity_days: 30, include_forks: false, include_archived: false, last_discovered_at: null }];
       }
       return [];
     });
@@ -746,6 +750,9 @@ describe("watched owners discovery", () => {
       if (/insert into watched_repos/i.test(text)) {
         throw Object.assign(new Error("repo insert failed"), { code: "53100" });
       }
+      if (/from watched_owners/i.test(text)) {
+        return [{ owner: "acme", activity_days: 30, include_forks: false, include_archived: false, last_discovered_at: null }];
+      }
       return [];
     });
     await assert.rejects(
@@ -1053,7 +1060,16 @@ describe("watched owners discovery", () => {
         }
         return [];
       }
-      if (text.includes("from watched_owners")) return [];
+      if (text.includes("from watched_owners")) {
+        const ownerName = typeof values[0] === "string" ? values[0] : "";
+        return [{
+          owner: ownerName,
+          activity_days: 30,
+          include_forks: false,
+          include_archived: false,
+          last_discovered_at: null,
+        }];
+      }
       if (text.includes("from watched_repos")) {
         if (mode === "different") {
           reads += 1;
@@ -1210,5 +1226,361 @@ describe("watched owners discovery", () => {
       assert.match(text, /unique\s*\(\s*short\s*\)/i);
       assert.match(text, /deferrable/i);
     }
+  });
+
+  /**
+   * Discovery has already read `acme` when the save runs. The save finishes
+   * before discovery writes. A correct apply re-reads the owner under the
+   * shared lock and does not insert repos for a rule it no longer has.
+   */
+  async function discoverAfterOwnerSave(saved: { owner: string; activity_days?: number; include_forks?: boolean; include_archived?: boolean }[]) {
+    env.NODE_ENV = "test";
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+
+    let owners: Row[] = [{
+      owner: "acme",
+      activity_days: 30,
+      include_forks: false,
+      include_archived: false,
+      last_discovered_at: null,
+    }];
+    const inserts: string[] = [];
+    let listed = false;
+    let releaseRead = (): void => {};
+    const readSeen = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    let continueDiscover = (): void => {};
+    const savedDone = new Promise<void>((resolve) => {
+      continueDiscover = resolve;
+    });
+
+    setSqlForTests(async (strings, ...values) => {
+      const text = strings.join(" ").replace(/\s+/g, " ").trim().toLowerCase();
+      if (text === "begin" || text === "commit" || text === "rollback" || text.includes("pg_advisory_xact_lock")) return [];
+      if (text.includes("insert into watched_owners")) {
+        const names = (values[0] as string[]) ?? [];
+        owners = names.map((name, i) => ({
+          owner: name,
+          activity_days: (values[1] as number[])[i],
+          include_forks: (values[2] as boolean[])[i],
+          include_archived: (values[3] as boolean[])[i],
+          last_discovered_at: null,
+        }));
+        return [];
+      }
+      if (text.includes("insert into watched_repos")) {
+        for (const name of (values[0] as string[]) ?? []) inserts.push(name);
+        return [];
+      }
+      if (text.startsWith("select") && text.includes("from watched_owners") && text.includes("where owner =")) {
+        const name = String(values[0] ?? "");
+        return owners.filter((row) => String(row.owner) === name);
+      }
+      if (text.includes("from watched_owners")) {
+        if (!listed) {
+          listed = true;
+          const snapshot = owners.map((row) => ({ ...row }));
+          releaseRead();
+          await savedDone;
+          return snapshot;
+        }
+        return owners.map((row) => ({ ...row }));
+      }
+      return [];
+    });
+
+    const discoverPromise = postDiscover(new Request("http://localhost/api/settings/owners/discover", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        results: [{
+          owner: "acme",
+          ok: true,
+          swept_at: atAge(0),
+          repos: [{ name: "app", pushedAt: atAge(1), isFork: false, isArchived: false }],
+        }],
+      }),
+    }));
+    await readSeen;
+    const putRes = await putOwners(new Request("http://localhost/api/settings/owners", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ owners: saved }),
+    }));
+    continueDiscover();
+    const discoverRes = await discoverPromise;
+    return { putRes, discoverRes, inserts };
+  }
+
+  it("an owner removed between discovery read and write gets no repos", async () => {
+    const { putRes, discoverRes, inserts } = await discoverAfterOwnerSave([]);
+    assert.equal(putRes.status, 200, JSON.stringify(await putRes.clone().json()));
+    assert.equal(discoverRes.status, 200, JSON.stringify(await discoverRes.clone().json()));
+    const body = await discoverRes.json() as { results: { ok?: boolean; skipped?: string; error?: string | null; added?: number }[] };
+    assert.equal(body.results[0]?.skipped, "owner_removed");
+    assert.equal(body.results[0]?.error, "skipped: owner_removed");
+    assert.equal(body.results[0]?.ok, false);
+    assert.equal(body.results[0]?.added, 0);
+    assert.deepEqual(inserts, [], "a removed owner must not gain tracked repos");
+  });
+
+  it("an owner rule changed between discovery read and write gets no repos", async () => {
+    const { putRes, discoverRes, inserts } = await discoverAfterOwnerSave([
+      { owner: "acme", activity_days: 7, include_forks: true, include_archived: true },
+    ]);
+    assert.equal(putRes.status, 200, JSON.stringify(await putRes.clone().json()));
+    assert.equal(discoverRes.status, 200, JSON.stringify(await discoverRes.clone().json()));
+    const body = await discoverRes.json() as { results: { ok?: boolean; skipped?: string; error?: string | null; added?: number }[] };
+    assert.equal(body.results[0]?.skipped, "rule_changed");
+    assert.equal(body.results[0]?.error, "skipped: rule_changed");
+    assert.equal(body.results[0]?.ok, false);
+    assert.equal(body.results[0]?.added, 0);
+    assert.deepEqual(inserts, [], "a sweep planned under the old rule must not write repos");
+  });
+
+  it("an owner save waits on the discovery write lock", async () => {
+    env.NODE_ENV = "test";
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+
+    const owners: Row[] = [{
+      owner: "acme",
+      activity_days: 30,
+      include_forks: false,
+      include_archived: false,
+      last_discovered_at: null,
+    }];
+    const lockKeys: string[] = [];
+    let heldKey: string | null = null;
+    const queue: Array<{ key: string; resume: () => void }> = [];
+    let releaseDiscovery = (): void => {};
+    const discoveryContinue = new Promise<void>((resolve) => {
+      releaseDiscovery = resolve;
+    });
+    let markInside = (): void => {};
+    let failInside = (_err: Error): void => {};
+    const discoveryInside = new Promise<void>((resolve, reject) => {
+      failInside = reject;
+      const timer = setTimeout(() => reject(new Error("discovery did not re-read the owner under the lock")), 2000);
+      markInside = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+    let markPutLock = (): void => {};
+    let failPutLock = (_err: Error): void => {};
+    const putReachedLock = new Promise<void>((resolve, reject) => {
+      failPutLock = reject;
+      const timer = setTimeout(() => reject(new Error("owner save did not reach its lock")), 2000);
+      markPutLock = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+    let parked = false;
+
+    setSqlForTests(async (strings, ...values) => {
+      const text = strings.join(" ").replace(/\s+/g, " ").trim().toLowerCase();
+      if (text === "begin" || text === "rollback") return [];
+      if (text === "commit") {
+        if (queue.length > 0) {
+          const next = queue.shift()!;
+          heldKey = next.key;
+          next.resume();
+        } else {
+          heldKey = null;
+        }
+        return [];
+      }
+      if (text.includes("pg_advisory_xact_lock")) {
+        const key = String(values[0]);
+        lockKeys.push(key);
+        if (heldKey === null) {
+          heldKey = key;
+          return [];
+        }
+        markPutLock();
+        if (heldKey !== key) return [];
+        await new Promise<void>((resolve) => queue.push({ key, resume: resolve }));
+        return [];
+      }
+      if (text.startsWith("select") && text.includes("from watched_owners") && text.includes("where owner =") && !parked) {
+        parked = true;
+        markInside();
+        await discoveryContinue;
+        return owners.map((row) => ({ ...row }));
+      }
+      if (text.includes("insert into watched_owners")) {
+        const names = (values[0] as string[]) ?? [];
+        owners.length = 0;
+        names.forEach((name, i) => {
+          owners.push({
+            owner: name,
+            activity_days: (values[1] as number[])[i],
+            include_forks: (values[2] as boolean[])[i],
+            include_archived: (values[3] as boolean[])[i],
+            last_discovered_at: null,
+          });
+        });
+        return [];
+      }
+      if (text.includes("from watched_owners")) return owners.map((row) => ({ ...row }));
+      return [];
+    });
+
+    const discoveryPromise = applyOwnerDiscovery(
+      owner(),
+      [],
+      { repos: [listed("app", 1)], error: null, truncated: false, sweptAt: atAge(0) },
+      NOW,
+    );
+    const putPromise = (async () => {
+      try {
+        await discoveryInside;
+      } catch (err) {
+        failPutLock(err instanceof Error ? err : new Error(String(err)));
+        throw err;
+      }
+      return putOwners(new Request("http://localhost/api/settings/owners", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ owners: [] }),
+      }));
+    })();
+
+    try {
+      await putReachedLock;
+      // A different lock lets the save continue on the next turn. The same lock leaves it waiting.
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(owners.map((row) => row.owner), ["acme"], "the owner save must not commit while discovery holds the write lock");
+      releaseDiscovery();
+      const [outcome, putRes] = await Promise.all([discoveryPromise, putPromise]);
+      assert.equal(outcome.failure, null, outcome.failure ?? "");
+      assert.equal(outcome.skipped, undefined);
+      assert.equal(putRes.status, 200, JSON.stringify(await putRes.clone().json()));
+      assert.deepEqual(owners.map((row) => row.owner), []);
+      assert.equal(new Set(lockKeys).size, 1, `owner save and discovery must share one lock, saw ${lockKeys.join(", ")}`);
+      assert.equal(lockKeys[0], "87216667");
+    } catch (err) {
+      failInside(err instanceof Error ? err : new Error(String(err)));
+      failPutLock(err instanceof Error ? err : new Error(String(err)));
+      throw err;
+    } finally {
+      releaseDiscovery();
+    }
+  });
+
+  it("a manual short name colliding with a retained auto row is 400", async () => {
+    env.NODE_ENV = "test";
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+    const writes: string[] = [];
+    setSqlForTests(async (strings) => {
+      const text = strings.join(" ").replace(/\s+/g, " ").trim().toLowerCase();
+      if (text.includes("insert into watched_repos") || text.includes("delete from watched_repos")) {
+        writes.push(text);
+        return [];
+      }
+      if (text.includes("from watched_repos")) {
+        return [{
+          repo: "acme/app",
+          label: "App",
+          short: "app",
+          color: "#2563eb",
+          blocked_label: null,
+          position: 0,
+          origin: "auto",
+          pinned: false,
+          hidden: false,
+          gone: false,
+          is_fork: false,
+          is_archived: false,
+          last_activity_at: null,
+        }];
+      }
+      return [];
+    });
+
+    const res = await putRepos(new Request("http://localhost/api/settings/repos", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repos: [{ repo: "acme/manual", label: "Manual", short: "App", color: "#112233", blockedLabel: null }],
+      }),
+    }));
+    assert.equal(res.status, 400, JSON.stringify(await res.clone().json()));
+    const body = await res.json() as {
+      code?: string;
+      errors?: { index: number; field: string; message: string }[];
+      fields?: Record<string, string>;
+    };
+    assert.equal(body.code, "repo_list_invalid");
+    assert.equal(body.errors?.[0]?.index, 0);
+    assert.equal(body.errors?.[0]?.field, "short");
+    assert.equal(body.errors?.[0]?.message, "This short name is already used.");
+    assert.match(body.fields?.["0.short"] ?? "", /already used/);
+    assert.deepEqual(writes, [], "a conflicting short name must not be written");
+  });
+
+  it("a unique violation on repo replace is 409 conflict", async () => {
+    env.NODE_ENV = "test";
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+    setSqlForTests(async (strings) => {
+      const text = strings.join(" ").replace(/\s+/g, " ").trim().toLowerCase();
+      if (text.includes("insert into watched_repos")) {
+        const err = new Error('duplicate key value violates unique constraint "watched_repos_short_key"');
+        (err as { code?: string }).code = "23505";
+        throw err;
+      }
+      return [];
+    });
+
+    const res = await putRepos(new Request("http://localhost/api/settings/repos", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repos: [{ repo: "acme/manual", label: "Manual", short: "hand", color: "#112233", blockedLabel: null }],
+      }),
+    }));
+    assert.equal(res.status, 409, JSON.stringify(await res.clone().json()));
+    const body = await res.json() as { code?: string; error?: string };
+    assert.equal(body.code, "conflict");
+    assert.equal(typeof body.error, "string");
+  });
+
+  it("getWatchedRepos falls back only for a missing watched_repos relation", async () => {
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    const fallback = [{ repo: "acme/file", label: "File", short: "file", color: "#2563eb", blockedLabel: null }];
+    const thrower = (message: string, code?: string) => async () => {
+      const err = new Error(message);
+      if (code) (err as { code?: string }).code = code;
+      throw err;
+    };
+
+    setSqlForTests(thrower('relation "other_table" does not exist', "42P01"));
+    await assert.rejects(() => getWatchedRepos(fallback), /other_table/);
+
+    setSqlForTests(thrower('relation "watched_repos" does not exist'));
+    await assert.rejects(() => getWatchedRepos(fallback), /watched_repos/);
+
+    setSqlForTests(thrower('relation "watched_repos" does not exist', "42703"));
+    await assert.rejects(() => getWatchedRepos(fallback), /watched_repos/);
+
+    setSqlForTests(thrower('relation "watched_repos" does not exist', "42P01"));
+    const missing = await getWatchedRepos(fallback);
+    assert.equal(missing.source, "file");
+    assert.deepEqual(missing.repos, fallback);
   });
 });

@@ -169,6 +169,7 @@ export async function POST(req: Request) {
         owner: item.owner,
         ok: outcome.failure === null,
         error: outcome.failure ?? outcome.warning,
+        ...(outcome.skipped ? { skipped: outcome.skipped } : {}),
         added: outcome.added.length,
         updated: outcome.updated.length,
         marked_gone: outcome.markedGone.length,

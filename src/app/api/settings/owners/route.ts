@@ -131,7 +131,7 @@ export async function PUT(req: Request) {
       return notReady("Apply supabase/migrations/20261028_watched_owners.sql, then retry the save.");
     }
     // A mismatch here is enough for a dry run, which writes nothing. A real
-    // save checks the version again under the owner-list lock.
+    // save checks the version again under the shared discovery write lock.
     if (typeof sent === "string" && sent !== cur.version) {
       return apiError("stale");
     }

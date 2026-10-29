@@ -4,7 +4,7 @@ import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { diffRepoList, readDryRun } from "@/lib/dry-run";
 import { REPOS } from "@/lib/progress-config";
-import { MAX_REPOS, validateRepoList, type RepoError, type RepoInput } from "@/lib/repo-validation";
+import { MAX_REPOS, retainedAutoShortErrors, validateRepoList, type RepoError, type RepoInput } from "@/lib/repo-validation";
 import { getWatchedRepos, listVersion, loadTrackedRepos, replaceWatchedRepos, setRepoOverride } from "@/lib/watched-repos";
 
 export const dynamic = "force-dynamic";
@@ -64,8 +64,30 @@ async function validateForSave(raw: unknown) {
   return validateRepoList(raw);
 }
 
+/** 400 when a submitted short name belongs to an auto row this save will keep. */
+async function rejectRetainedShorts(repos: RepoInput[]): Promise<Response | null> {
+  if (!isConfigured() || repos.length === 0) return null;
+  try {
+    const collisions = retainedAutoShortErrors(repos, await loadTrackedRepos());
+    if (collisions.length === 0) return null;
+    return apiError("repo_list_invalid", {
+      message: collisions[0]?.message ?? "The repo list is invalid.",
+      fields: repoFields(collisions),
+      extra: { errors: collisions },
+    });
+  } catch {
+    // A store error surfaces on the write. A concurrent unique violation is 409.
+    return null;
+  }
+}
+
 function failure(e: unknown, what: string) {
   return publicError(`[settings/repos] ${what}`, e, `Could not ${what}.`);
+}
+
+function isUniqueViolation(e: unknown): boolean {
+  const err = e as { code?: string; cause?: { code?: string } };
+  return err?.code === "23505" || err?.cause?.code === "23505";
 }
 
 export async function GET(req: Request) {
@@ -108,6 +130,8 @@ export async function PUT(req: Request) {
       fields: { dry_run: "Use true to preview, or false to save." },
     });
   }
+  const retained = await rejectRetainedShorts(checked.repos);
+  if (retained) return retained;
   if (!isConfigured()) {
     if (dry.dryRun) {
       try {
@@ -134,6 +158,12 @@ export async function PUT(req: Request) {
     await replaceWatchedRepos(checked.repos);
     return NextResponse.json(await current());
   } catch (e) {
+    if (isUniqueViolation(e)) {
+      return apiError("conflict", {
+        message: "A short name in this list is already used.",
+        fix: "Reload the repo list and choose a short name that is not already taken.",
+      });
+    }
     return failure(e, "save settings");
   }
 }

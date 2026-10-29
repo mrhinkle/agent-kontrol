@@ -75,15 +75,21 @@ export interface WatchedOwnerRead {
   owners: StoredOwner[];
 }
 
-/** Serializes owner-list writers. Empty-table `for update` locks nothing, so this is a transaction lock. */
-const OWNER_LIST_LOCK = 87216666;
-
 /**
- * One lock for every owner's discovery write, so generated short names cannot
- * collide across owners. Held only around read-plan-write, never around `gh`.
- * Distinct from the owner-list lock so a save is not stuck behind discovery.
+ * One lock for owner-list replacement and every discovery write.
+ * Both paths take it so a save cannot remove or retune an owner while
+ * discovery is committing repos for the rule it just read. Discovery holds
+ * it only around read-plan-write, never around `gh`. Short-name allocation
+ * stays serialized because every discovery write takes this same lock.
  */
 const DISCOVERY_WRITE_LOCK = 87216667;
+
+export type DiscoverySkip = "owner_removed" | "rule_changed";
+
+export interface DiscoveryApplyOutcome extends DiscoveryOutcome {
+  /** Set when the locked owner row no longer matches the sweep that was planned. */
+  skipped?: DiscoverySkip;
+}
 
 /** A second writer claimed the short name. The route maps this to 409. */
 export class DiscoveryShortConflict extends Error {
@@ -129,8 +135,10 @@ export type OwnerWriteResult =
 
 /**
  * Replaces the owner list. Does not delete discovered repos. Records the actor.
- * `expectedVersion`, when passed, is checked again after `pg_advisory_xact_lock`
- * so two writers that read the same version cannot both commit.
+ * `expectedVersion`, when passed, is checked again after the shared
+ * discovery write lock so two writers that read the same version cannot
+ * both commit, and a discovery apply cannot pass that lock while this
+ * replacement is in progress.
  */
 export async function replaceWatchedOwners(
   owners: OwnerInput[],
@@ -140,7 +148,7 @@ export async function replaceWatchedOwners(
   const actorType = actor?.actor_type ?? null;
   const actorId = actor?.actor_id ?? null;
   return withTransaction(async (q) => {
-    await q`select pg_advisory_xact_lock(${OWNER_LIST_LOCK}::bigint)`;
+    await q`select pg_advisory_xact_lock(${DISCOVERY_WRITE_LOCK}::bigint)`;
     let rows: Row[];
     try {
       rows = await q`
@@ -224,19 +232,20 @@ function unchanged(existing: TrackedRepo[], failure: string): DiscoveryOutcome {
  * Applies one owner's sweep. A failure records `last_error` and does not
  * insert, update, hide, or delete tracked repos.
  *
- * One global lock is held across the reload, the plan, and the write, so
- * two owners cannot allocate the same short name. `gh` has already finished
- * before this runs. A sweep whose `sweptAt` is not newer than
- * `last_discovered_at` writes nothing, so a delayed older list cannot
- * resurrect a repo. A unique short-name violation replans once, then throws
- * `DiscoveryShortConflict`.
+ * The same lock as owner replacement is held across the reload, the plan,
+ * and the write. Inside it, the owner row is read again. A missing row or a
+ * changed activity window or fork/archive flag skips the sweep and writes
+ * no repos. `gh` has already finished before this runs. A sweep whose
+ * `sweptAt` is not newer than `last_discovered_at` writes nothing, so a
+ * delayed older list cannot resurrect a repo. A unique short-name violation
+ * replans once, then throws `DiscoveryShortConflict`.
  */
 export async function applyOwnerDiscovery(
   rule: OwnerRule,
   existing: TrackedRepo[],
   sweep: DiscoverySweep,
   now: Date,
-): Promise<DiscoveryOutcome> {
+): Promise<DiscoveryApplyOutcome> {
   try {
     return await applyOwnerDiscoveryOnce(rule, existing, sweep, now);
   } catch (e) {
@@ -250,21 +259,34 @@ export async function applyOwnerDiscovery(
   }
 }
 
+function sameDiscoveryRule(rule: OwnerRule, stored: StoredOwner): boolean {
+  return stored.activityDays === rule.activityDays
+    && stored.includeForks === rule.includeForks
+    && stored.includeArchived === rule.includeArchived;
+}
+
+function skippedOutcome(existing: TrackedRepo[], skipped: DiscoverySkip): DiscoveryApplyOutcome {
+  return { ...unchanged(existing, `skipped: ${skipped}`), skipped };
+}
+
 async function applyOwnerDiscoveryOnce(
   rule: OwnerRule,
   existing: TrackedRepo[],
   sweep: DiscoverySweep,
   now: Date,
-): Promise<DiscoveryOutcome> {
+): Promise<DiscoveryApplyOutcome> {
   const sweptAt = sweep.sweptAt ?? null;
   return withTransaction(async (q) => {
     await q`select pg_advisory_xact_lock(${DISCOVERY_WRITE_LOCK}::bigint)`;
     const marker = await q`
-      select last_discovered_at
+      select owner, activity_days, include_forks, include_archived, last_discovered_at
       from watched_owners
       where owner = ${rule.owner}
     `;
-    if (isStaleDiscovery(sweptAt, iso(marker[0]?.last_discovered_at))) {
+    const stored = marker[0] ? ownerFromRow(marker[0]) : null;
+    if (!stored) return skippedOutcome(existing, "owner_removed");
+    if (!sameDiscoveryRule(rule, stored)) return skippedOutcome(existing, "rule_changed");
+    if (isStaleDiscovery(sweptAt, stored.lastDiscoveredAt)) {
       return unchanged(existing, "stale discovery sweep");
     }
     // Failures do not depend on the repo snapshot. A success plans again

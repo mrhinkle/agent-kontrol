@@ -137,3 +137,27 @@ export function validateRepoList(input: unknown): RepoValidation {
 
   return errors.length > 0 ? { ok: false, errors } : { ok: true, repos };
 }
+
+/**
+ * Short names of auto rows that a replace will keep because the body omits
+ * them. A manual row that reuses one of those names is the same field error
+ * as a duplicate inside the submitted list.
+ */
+export function retainedAutoShortErrors(
+  submitted: RepoInput[],
+  stored: { repo: string; short: string; origin?: "manual" | "auto" }[],
+): RepoError[] {
+  const submittedIds = new Set(submitted.map((row) => row.repo.toLowerCase()));
+  const taken = new Set(
+    stored
+      .filter((row) => row.origin === "auto" && !submittedIds.has(row.repo.toLowerCase()))
+      .map((row) => row.short.toLowerCase()),
+  );
+  const errors: RepoError[] = [];
+  submitted.forEach((row, index) => {
+    if (taken.has(row.short.toLowerCase())) {
+      errors.push({ index, field: "short", message: "This short name is already used." });
+    }
+  });
+  return errors;
+}
