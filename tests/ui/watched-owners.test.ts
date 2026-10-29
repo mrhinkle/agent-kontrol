@@ -1883,6 +1883,37 @@ describe("watched owners discovery", () => {
     assert.deepEqual(missingBody.results?.[0]?.marked_gone, []);
   });
 
+  it("a pin PATCH whose row vanished before the locked update returns 404, not 200", async () => {
+    // Round-10 review: the route ignored setRepoOverride's false and reported success.
+    env.NODE_ENV = "test";
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_DB_DRIVER = "pg";
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+    const row = {
+      repo: "acme/app", label: "App", short: "app", color: "#112233", blocked_label: null as string | null,
+      position: 0, origin: "auto", pinned: false, hidden: false, gone: false, is_fork: false,
+      is_archived: false, last_activity_at: null as string | null, fields_overridden: false,
+    };
+    setSqlForTests(async (strings) => {
+      const text = strings.join(" ").replace(/\s+/g, " ").trim().toLowerCase();
+      if (text === "begin" || text === "commit" || text === "rollback") return [];
+      if (text.includes("pg_advisory_xact_lock")) return [];
+      // A concurrent PUT removed the row after the read: the locked update matches nothing.
+      if (text.includes("update watched_repos")) return [];
+      if (text.includes("from watched_repos")) return [{ ...row }];
+      return [];
+    });
+    const res = await patchRepos(new Request("http://localhost/api/settings/repos", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "acme/app", pinned: true }),
+    }));
+    assert.equal(res.status, 404, JSON.stringify(await res.clone().json()));
+    const body = await res.json() as { code?: string };
+    assert.equal(body.code, "not_found");
+  });
+
   it("a repo PUT that read version V is stale after a pin PATCH and the pin survives", async () => {
     env.NODE_ENV = "test";
     env.DATABASE_URL = FIXTURE_URL;

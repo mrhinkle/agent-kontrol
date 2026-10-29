@@ -272,7 +272,8 @@ export async function PATCH(req: Request) {
             : "The repo follows the activity window.",
       });
     }
-    await setRepoOverride(repo, patch);
+    // The row can vanish between the read above and the locked update (a concurrent PUT).
+    if (!(await setRepoOverride(repo, patch))) return repoNotFound();
     return NextResponse.json(await current());
   } catch (e) {
     return failure(e, "save settings");
