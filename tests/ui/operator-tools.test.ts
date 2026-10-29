@@ -268,6 +268,22 @@ describe("operator MCP tools", () => {
     assert.equal(demoMessagesForTests()[1]?.actor_id, "cred-other");
   });
 
+  it("database requeue always writes conditionally on the revision it read", () => {
+    // Without a caller revision, the unconditional update could requeue a task another agent claimed
+    // between the read and the write (Codex review of #106, round 1).
+    const src = fs.readFileSync("src/lib/operator-actions.ts", "utf8");
+    const dbPath = src.slice(src.indexOf("const loaded = await readTaskForPreview(args.id);"));
+    assert.match(dbPath, /expected_revision: revision\.revision \?\? loaded\.revision,/);
+    assert.doesNotMatch(dbPath.slice(0, dbPath.indexOf("export async function deleteNoteTool")), /expected_revision: revision\.revision,/);
+  });
+
+  it("REST messages rejects a non-string body before the length cap", () => {
+    const route = fs.readFileSync("src/app/api/messages/route.ts", "utf8");
+    const typeCheck = route.indexOf('typeof body.body !== "string"');
+    assert.ok(typeCheck > 0, "messages route must type-check body");
+    assert.ok(typeCheck < route.indexOf("body.body.length > MESSAGE_BODY_MAX"), "type check must precede the length cap");
+  });
+
   it("F8 demo mode matches the live preview shape and still drops REST sends", async () => {
     await demoReport({ agent_id: "lane", kind: "status", title: "up" });
     await demoRemember({ key: "note-1", content: "keep", agent_id: "lane" });

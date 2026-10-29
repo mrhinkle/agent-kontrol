@@ -130,10 +130,12 @@ export async function requeueTaskTool(args: {
       content: [{ type: "text", text: JSON.stringify(diffTaskRequeue(loaded.task, loaded.revision, actor)) }],
     };
   }
+  // Always guard on a revision: with none from the caller, use the one read above, so a task
+  // claimed by another agent between the read and this write is refused, not requeued.
   const task = await updateTask({
     id: args.id,
     status: "queued",
-    expected_revision: revision.revision,
+    expected_revision: revision.revision ?? loaded.revision,
     actor,
   });
   return { content: [{ type: "text", text: requeuedText(task.id, actor) }] };
