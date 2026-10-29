@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { PALETTE, fromRepos, groupErrors, isDirty, moveRow, newRow, splitWatchedRepos, toPayload } from "../../src/lib/repo-settings-helpers";
+import fs from "node:fs";
+import { PALETTE, fromRepos, groupErrors, isDirty, moveRow, newRow, preserveDirtyRows, splitWatchedRepos, toPayload } from "../../src/lib/repo-settings-helpers";
 import type { RepoInput } from "../../src/lib/repo-validation";
 
 const repo = (n: number): RepoInput => ({ repo: `acme/r${n}`, label: `R${n}`, short: `r${n}`, color: "#2563eb", blockedLabel: null });
@@ -72,5 +73,35 @@ describe("repo settings helpers", () => {
     assert.deepEqual(g.rows[0], { repo: "first", color: "bad color" });
     assert.deepEqual(g.rows[2], { short: "dup" });
     assert.equal(g.rows[1], undefined);
+  });
+
+  it("keeps a dirty hand-added draft when the server refresh changes pin", () => {
+    const saved = fromRepos([
+      { ...repo(1), label: "Saved", pinned: false, hidden: false, origin: "manual" },
+      { repo: "acme/new", label: "New", short: "new", color: "#112233", blockedLabel: null },
+    ]);
+    const draft = saved.map((row, index) => index === 0 ? { ...row, label: "Edited", short: "edited" } : row);
+    const server = [
+      { ...repo(1), repo: "Acme/R1", label: "Saved", short: "r1", color: "#2563eb", blockedLabel: null, pinned: true, hidden: false, origin: "manual" as const },
+    ];
+    const kept = preserveDirtyRows(draft, server);
+    assert.equal(kept.length, 2);
+    assert.equal(kept[0]?.id, draft[0]?.id);
+    assert.equal(kept[0]?.label, "Edited");
+    assert.equal(kept[0]?.short, "edited");
+    assert.equal(kept[0]?.repo, "acme/r1");
+    assert.equal(kept[0]?.pinned, true);
+    assert.equal(kept[1]?.repo, "acme/new");
+    assert.equal(kept[1]?.label, "New");
+  });
+
+  it("the settings page preserves the draft inside setOverride instead of reloading the form", () => {
+    const source = fs.readFileSync("src/components/RepoSettings.tsx", "utf8");
+    const start = source.indexOf("async function setOverride");
+    const end = source.indexOf("if (loadError)");
+    assert.ok(start > 0 && end > start);
+    const fn = source.slice(start, end);
+    assert.match(fn, /preserveDirtyRows/);
+    assert.doesNotMatch(fn, /\bapply\(/);
   });
 });

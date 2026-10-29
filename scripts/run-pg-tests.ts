@@ -17,7 +17,8 @@ import { StaleWrite } from "../src/lib/revision";
 import { readReceipt } from "../src/lib/activity";
 import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview, findAgent, deleteMemory, slugify } from "../src/lib/store";
 import { updateTaskForTool } from "../src/lib/dry-run-actions";
-import { getWatchedRepos, replaceWatchedRepos } from "../src/lib/watched-repos";
+import { getWatchedRepos, replaceWatchedRepos, setRepoOverride } from "../src/lib/watched-repos";
+import { applyOwnerDiscovery } from "../src/lib/watched-owners";
 import type { RepoConfig } from "../src/lib/progress-config";
 import { getTrace, listTraces, pruneSpans, upsertSpans } from "../src/lib/trace-store";
 import { pruneAutomaticNotes, upsertAutomaticNote } from "../src/lib/session-memory";
@@ -355,6 +356,7 @@ async function main() {
   await testWatchBeats(tag);
   await testListCursors(tag);
   await testBriefAlerts(tag);
+  await testRepoCaseIdentity(tag);
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
 }
@@ -1781,6 +1783,58 @@ async function testBriefAlerts(tag: string): Promise<void> {
     setBeforeClaimForTests(null);
     setBriefSettingsForTests(null);
     await cleanup();
+  }
+}
+
+/** Case-insensitive repo identity and a swept_at activity cutoff, on real SQL. */
+async function testRepoCaseIdentity(tag: string): Promise<void> {
+  const slug = tag.replace(/\D/g, "").slice(-10);
+  const owner = `pgc${slug}`;
+  const stored = `${owner}/app`;
+  const short = `s${slug}`.slice(0, 12);
+  const brand = `Bn${slug}`;
+  try {
+    await sql()`insert into watched_owners (owner, activity_days) values (${owner}, 30)`;
+    await sql()`
+      insert into watched_repos (repo, label, short, color, position, origin)
+      values (${stored}, 'App', ${short}, '#2563eb', 0, 'manual')
+    `;
+    const outcome = await applyOwnerDiscovery(
+      { owner, activityDays: 30, includeForks: false, includeArchived: false },
+      [],
+      {
+        repos: [
+          { name: "App", pushedAt: "2026-01-15T00:00:00.000Z", isFork: false, isArchived: false },
+          { name: brand, pushedAt: "2026-01-01T00:00:00.000Z", isFork: false, isArchived: false },
+          { name: `Old${slug}`, pushedAt: "2025-12-31T23:59:59.999Z", isFork: false, isArchived: false },
+        ],
+        error: null,
+        sweptAt: "2026-01-31T00:00:00.000Z",
+      },
+      new Date("2026-10-29T00:00:00.000Z"),
+    );
+    assert.equal(outcome.failure, null, outcome.failure ?? "");
+    const rows = await sql()`
+      select repo, pinned
+      from watched_repos
+      where lower(repo) like ${`${owner.toLowerCase()}/%`}
+      order by repo
+    `;
+    const names = rows.map((row) => String(row.repo));
+    assert.deepEqual(names.filter((name) => name.toLowerCase() === stored.toLowerCase()), [stored]);
+    assert.ok(names.includes(`${owner}/${brand}`), `expected GitHub casing, saw ${names.join(", ")}`);
+    assert.equal(names.some((name) => name.toLowerCase().includes("old")), false);
+    const pinned = await setRepoOverride(stored.toUpperCase(), { pinned: true });
+    assert.equal(pinned, true);
+    const after = await sql()`
+      select repo, pinned from watched_repos where lower(repo) = lower(${stored})
+    `;
+    assert.equal(after.length, 1);
+    assert.equal(after[0]?.repo, stored);
+    assert.equal(after[0]?.pinned, true);
+  } finally {
+    await sql()`delete from watched_repos where lower(repo) like ${`${owner.toLowerCase()}/%`}`;
+    await sql()`delete from watched_owners where owner = ${owner}`;
   }
 }
 

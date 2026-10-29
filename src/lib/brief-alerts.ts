@@ -9,6 +9,10 @@
  * `brief.alerts.enabled` defaults to false. While it is off, evaluate still
  * computes every condition and sends nothing, including no clear and no re-arm.
  * Unknown (a failed or incomplete read) never sends and never clears.
+ * A zero-merge latch whose repo is no longer in the visible set is cleared
+ * on the enabled live path, after the watched-repo read and the latch read
+ * both succeeded, using the same clear statement and its compute-instant
+ * guard. A failed watched-repo read clears nothing. `readAlerts` does not clear.
  *
  * The claim is one INSERT ... ON CONFLICT statement. It carries the compute
  * instant. Episode and repeat claims re-arm a cleared latch only when
@@ -298,13 +302,22 @@ function covers(intervals: Array<[number, number]>, start: number, end: number):
   return cursor >= end;
 }
 
-async function readMerges(settings: BriefSettings, now: Date): Promise<Draft[]> {
+interface MergeRead {
+  drafts: Draft[];
+  /** False only when the watched-repo read threw. A later snapshot failure is still true. */
+  reposRead: boolean;
+}
+
+async function readMerges(settings: BriefSettings, now: Date): Promise<MergeRead> {
   let repos: RepoConfig[];
   try {
     // Same repo set as the brief: a hidden, gone, or out-of-window repo does not alert.
     repos = (await getWatchedRepos(REPOS)).repos.filter(visibleOnBoard);
   } catch {
-    return [unknownDraft("zero-merge", "zero_merge", "Watched repos could not be read.")];
+    return {
+      drafts: [unknownDraft("zero-merge", "zero_merge", "Watched repos could not be read.")],
+      reposRead: false,
+    };
   }
   const nowIso = toSecondIso(now);
   const since = new Date(now.getTime() - hourMs(settings.alerts.zeroMergeLookbackDays * 24 + settings.alerts.zeroMergeHours));
@@ -319,11 +332,14 @@ async function readMerges(settings: BriefSettings, now: Date): Promise<Draft[]> 
       order by repo, collected_at desc
     `;
   } catch {
-    return repos.map((repo) => unknownDraft(
-      `zero-merge:${repo.repo}`,
-      "zero_merge",
-      `${repo.label} merges could not be read.`,
-    ));
+    return {
+      drafts: repos.map((repo) => unknownDraft(
+        `zero-merge:${repo.repo}`,
+        "zero_merge",
+        `${repo.label} merges could not be read.`,
+      )),
+      reposRead: true,
+    };
   }
   const byRepo = new Map<string, MergeSnap[]>();
   for (const row of rows) {
@@ -338,7 +354,9 @@ async function readMerges(settings: BriefSettings, now: Date): Promise<Draft[]> 
     list.push({ repo: name, collectedAt, merged });
     byRepo.set(name, list);
   }
-  return repos.map((repo) => {
+  return {
+    reposRead: true,
+    drafts: repos.map((repo) => {
     const key = `zero-merge:${repo.repo}`;
     const snaps = byRepo.get(repo.repo) ?? [];
     const condition = classifyZeroMerge(snaps, now.getTime(), settings.alerts);
@@ -359,7 +377,8 @@ async function readMerges(settings: BriefSettings, now: Date): Promise<Draft[]> 
       condition,
       summary: `${repo.label} is not in a zero-merge stretch.`,
     };
-  });
+  }),
+  };
 }
 
 async function readDecisions(settings: BriefSettings, now: Date): Promise<Draft[]> {
@@ -407,13 +426,49 @@ async function readDecisions(settings: BriefSettings, now: Date): Promise<Draft[
   return drafts;
 }
 
-async function compute(settings: BriefSettings, now: Date): Promise<Draft[]> {
+async function compute(settings: BriefSettings, now: Date): Promise<{ drafts: Draft[]; zeroMergeReposRead: boolean }> {
   const [coordinator, merges, decisions] = await Promise.all([
     readCoordinator(settings, now),
     readMerges(settings, now),
     readDecisions(settings, now),
   ]);
-  return [...coordinator, ...merges, ...decisions].sort((a, b) => a.key.localeCompare(b.key));
+  return {
+    zeroMergeReposRead: merges.reposRead,
+    drafts: [...coordinator, ...merges.drafts, ...decisions].sort((a, b) => a.key.localeCompare(b.key)),
+  };
+}
+
+/**
+ * Clears uncleared zero-merge latches whose repo was not evaluated.
+ * Uses `clearLatch`, so a latch sent at this same instant stays.
+ */
+async function clearAbsentZeroMergeLatches(drafts: Draft[], nowIso: string): Promise<AlertFailure[]> {
+  const evaluated = new Set(
+    drafts.filter((draft) => draft.key.startsWith("zero-merge:")).map((draft) => draft.key),
+  );
+  let rows: Record<string, unknown>[];
+  try {
+    rows = await sql()`
+      select key, cleared_at
+      from brief_alerts
+      where key like 'zero-merge:%'
+        and cleared_at is null
+    `;
+  } catch {
+    return [{ step: "clear" }];
+  }
+  const failures: AlertFailure[] = [];
+  for (const row of rows) {
+    const key = String(row.key);
+    if (!key.startsWith("zero-merge:") || evaluated.has(key)) continue;
+    if (row.cleared_at != null) continue;
+    try {
+      await clearLatch(key, nowIso);
+    } catch {
+      failures.push({ step: "clear", key });
+    }
+  }
+  return failures;
 }
 
 interface Latch {
@@ -726,9 +781,9 @@ export async function readAlerts(input: { now?: Date; settings?: BriefSettings }
       return unmeasured(settings, fallbackNow, "read", "The database clock could not be read.");
     }
   }
-  const drafts = await compute(settings, now);
-  const latches = await readLatches(drafts.map((draft) => draft.key));
-  return pack(settings, now, "read", drafts, latches, 0, undefined, "Read only. This route does not send.");
+  const computed = await compute(settings, now);
+  const latches = await readLatches(computed.drafts.map((draft) => draft.key));
+  return pack(settings, now, "read", computed.drafts, latches, 0, undefined, "Read only. This route does not send.");
 }
 
 export async function evaluateAlerts(input: {
@@ -754,7 +809,8 @@ export async function evaluateAlerts(input: {
       return unmeasured(settings, fallbackNow, settings.alerts.enabled ? "live" : "disabled", "The database clock could not be read.");
     }
   }
-  const drafts = await compute(settings, now);
+  const computed = await compute(settings, now);
+  const drafts = computed.drafts;
   if (!settings.alerts.enabled) {
     const latches = await readLatches(drafts.map((draft) => draft.key));
     return pack(
@@ -774,6 +830,10 @@ export async function evaluateAlerts(input: {
     return pack(settings, now, "live", drafts, null, 0, undefined, "Latch state could not be read, so nothing was sent or cleared.");
   }
   const delivery = await deliver(drafts, settings, now, input.actor ?? null);
+  const absent = computed.zeroMergeReposRead
+    ? await clearAbsentZeroMergeLatches(drafts, toSecondIso(now))
+    : [];
+  const failures = absent.length > 0 ? [...delivery.failures, ...absent] : delivery.failures;
   const latches = await readLatches(drafts.map((draft) => draft.key));
-  return pack(settings, now, "live", drafts, latches, delivery.sent, delivery.failures);
+  return pack(settings, now, "live", drafts, latches, delivery.sent, failures);
 }

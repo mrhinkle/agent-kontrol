@@ -308,8 +308,14 @@ describe("OpenAPI document", () => {
     assert.ok(requiredSets.some((fields) => fields.includes("pinned")));
     assert.ok(requiredSets.some((fields) => fields.includes("hidden")));
     const discovery = schemaOf(doc, "OwnerDiscovery");
-    const item = (discovery.properties?.results as { items?: { required?: string[] } }).items;
+    const item = (discovery.properties?.results as { items?: { required?: string[]; oneOf?: { $ref?: string }[]; properties?: { repos?: { items?: { properties?: { pushedAt?: { format?: string } } } } } } }).items;
     assert.ok(item?.required?.includes("swept_at"));
+    assert.ok(item?.oneOf?.some((entry) => entry.$ref?.endsWith("OwnerDiscoveryOk")));
+    const okSchema = schemaOf(doc, "OwnerDiscoveryOk");
+    assert.ok(okSchema.required?.includes("repos"));
+    assert.equal((okSchema.properties?.ok as { const?: boolean } | undefined)?.const, true);
+    const listed = (okSchema.properties?.repos as { items?: { properties?: { pushedAt?: { format?: string } } } } | undefined)?.items;
+    assert.equal(listed?.properties?.pushedAt?.format, "date-time");
   });
 
   it("covers the decisions routes, decisions:write, and the api-error codes", () => {

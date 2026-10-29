@@ -1,9 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DryRunResult } from "@/lib/dry-run";
 import { MAX_REPOS, validateRepoList, type RepoError, type RepoInput } from "@/lib/repo-validation";
-import { fromRepos, groupErrors, isDirty, moveRow, newRow, splitWatchedRepos, toPayload, type Row } from "@/lib/repo-settings-helpers";
+import { fromRepos, groupErrors, isDirty, moveRow, newRow, preserveDirtyRows, splitWatchedRepos, toPayload, type Row } from "@/lib/repo-settings-helpers";
 import { PreviewDialog } from "@/components/PreviewDialog";
 
 interface ListedRepo extends RepoInput {
@@ -67,6 +67,8 @@ export function RepoSettings() {
     void load();
   }, [load]);
 
+  const draftRef = useRef<Row[]>(rows);
+  draftRef.current = rows;
   const dirty = useMemo(() => isDirty(initial, rows), [initial, rows]);
 
   useEffect(() => {
@@ -200,7 +202,20 @@ export function RepoSettings() {
       });
       const body = (await res.json().catch(() => ({}))) as SaveBody;
       if (res.ok && body.dry_run !== true) {
-        apply(body as Loaded);
+        const data = body as Loaded;
+        const split = splitWatchedRepos(data.repos);
+        const dirtyNow = isDirty(initial, draftRef.current);
+        setLoaded(data);
+        setAutoRepos(split.discovered);
+        setInitial(split.editable);
+        setRows((current) => (
+          isDirty(initial, current) ? preserveDirtyRows(current, split.editable) : fromRepos(split.editable)
+        ));
+        if (!dirtyNow) {
+          setAttempted(false);
+          setServerErrors([]);
+          setStale(false);
+        }
         return;
       }
       explainSave(res, body);

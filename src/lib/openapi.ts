@@ -173,6 +173,17 @@ const staleWrite: Json = jsonResponse(
   },
 );
 
+const discoveryListedRepo: Json = {
+  type: "object",
+  required: ["name", "isArchived", "isFork"],
+  properties: {
+    name: { type: "string" },
+    pushedAt: { type: ["string", "null"], format: "date-time" },
+    isArchived: { type: "boolean" },
+    isFork: { type: "boolean" },
+  },
+};
+
 const flatErrors: Json = {
   "400": jsonResponse("The body is not JSON, a required field is missing, or a field failed validation.", ref("Error")),
   "401": jsonResponse("The credential is missing or not valid.", ref("Error")),
@@ -364,6 +375,28 @@ export function openApiDocument(): Json {
             owners: { type: "array", maxItems: MAX_OWNERS, items: ref("WatchedOwnerInput") },
           },
         },
+        OwnerDiscoveryOk: {
+          type: "object",
+          required: ["owner", "ok", "swept_at", "repos"],
+          properties: {
+            owner: { type: "string" },
+            ok: { const: true },
+            error: { type: ["string", "null"] },
+            truncated: { type: "boolean" },
+            swept_at: { type: "string", format: "date-time" },
+            repos: { type: "array", items: discoveryListedRepo },
+          },
+        },
+        OwnerDiscoveryFailed: {
+          type: "object",
+          required: ["owner", "ok", "swept_at"],
+          properties: {
+            owner: { type: "string" },
+            ok: { const: false },
+            error: { type: ["string", "null"] },
+            swept_at: { type: "string", format: "date-time" },
+          },
+        },
         OwnerDiscovery: {
           type: "object",
           required: ["results"],
@@ -373,24 +406,24 @@ export function openApiDocument(): Json {
               items: {
                 type: "object",
                 required: ["owner", "ok", "swept_at"],
+                discriminator: {
+                  propertyName: "ok",
+                  mapping: {
+                    true: "#/components/schemas/OwnerDiscoveryOk",
+                    false: "#/components/schemas/OwnerDiscoveryFailed",
+                  },
+                },
+                oneOf: [ref("OwnerDiscoveryOk"), ref("OwnerDiscoveryFailed")],
                 properties: {
                   owner: { type: "string" },
                   ok: { type: "boolean" },
                   error: { type: ["string", "null"] },
                   truncated: { type: "boolean", description: "True when gh repo list hit the 1000-repo cap. Seen repos are updated. Others are not marked gone." },
-                  swept_at: { type: "string", format: "date-time", description: "Required. Collector time just before gh repo list. A sweep that is not newer than last_discovered_at is ignored." },
+                  swept_at: { type: "string", format: "date-time", description: "Required RFC 3339 collector time just before gh repo list. More than 5 minutes in the future is 400. A sweep that is not newer than last_discovered_at is skipped." },
                   repos: {
                     type: "array",
-                    items: {
-                      type: "object",
-                      required: ["name", "isArchived", "isFork"],
-                      properties: {
-                        name: { type: "string" },
-                        pushedAt: { type: ["string", "null"], format: "date-time" },
-                        isArchived: { type: "boolean" },
-                        isFork: { type: "boolean" },
-                      },
-                    },
+                    description: "Required when ok is true.",
+                    items: discoveryListedRepo,
                   },
                 },
               },
@@ -1617,7 +1650,7 @@ export function openApiDocument(): Json {
           tags: ["settings"],
           summary: "Apply one collector tick of gh repo list results.",
           description:
-            "Auth matches PUT /api/settings/repos. A result with ok false, a rate-limit error, or zero repos records last_error and does not change tracked repos. A truncated list updates the repos it saw, does not mark the others gone, and stores a warning on last_error while still setting last_discovered_at. An unknown owner is an error on that result and does not fail the batch. A duplicate owner in one request is 400 and writes nothing. A missing swept_at is 400. A repo name that is not safe to store fails that owner's sweep and writes no repo changes. One owner's metadata update and repo changes commit together, under one global advisory lock shared by every owner, after reloading tracked repos. The lock is not held during gh repo list. swept_at orders overlapping ticks: a sweep that is not newer than last_discovered_at writes nothing. A short-name unique violation replans once and then is 409 with results plus added, updated, and marked_gone as empty arrays on the response and on each result. Discovery does not change pin, hide, label, short, color, origin, fieldsOverridden, or the actor who saved the owner. No database, or a missing watched_owners table, is 409 and includes results plus added, updated, and marked_gone as empty arrays on the response and on each result.",
+            "Auth matches PUT /api/settings/repos. A result with ok false, a rate-limit error, or zero repos records last_error and does not change tracked repos. A truncated list updates the repos it saw, does not mark the others gone, and stores a warning on last_error while still setting last_discovered_at. An unknown owner is an error on that result and does not fail the batch. A duplicate owner in one request is 400 and writes nothing. A missing swept_at, a swept_at that is not RFC 3339, or a swept_at more than 5 minutes in the future is 400. pushedAt must be RFC 3339 or null; anything else is 400. Repo names that differ only by case in one result are 400. A repo name that is not safe to store fails that owner's sweep and writes no repo changes. New-repo activity uses swept_at, not the server clock. One owner's metadata update and repo changes commit together, under one global advisory lock shared by every owner, after reloading tracked repos. The lock is not held during gh repo list. swept_at orders overlapping ticks: a sweep that is not newer than last_discovered_at returns ok true with skipped stale and writes nothing. A short-name unique violation replans once and then is 409 with results plus added, updated, and marked_gone as empty arrays on the response and on each result. Discovery does not change pin, hide, label, short, color, origin, fieldsOverridden, or the actor who saved the owner. An existing repo is matched case-insensitively and keeps its stored casing. No database, or a missing watched_owners table, is 409 and includes results plus added, updated, and marked_gone as empty arrays on the response and on each result.",
           security: cookieOrBearer,
           requestBody: body(ref("OwnerDiscovery")),
           responses: {
@@ -1634,6 +1667,7 @@ export function openApiDocument(): Json {
                       owner: { type: "string" },
                       ok: { type: "boolean" },
                       error: { type: ["string", "null"] },
+                      skipped: { type: "string", enum: ["stale", "owner_removed", "rule_changed"], description: "stale is HTTP 200 with ok true and writes nothing. owner_removed and rule_changed stay ok false." },
                       added: { type: "integer" },
                       updated: { type: "integer" },
                       marked_gone: { type: "integer" },

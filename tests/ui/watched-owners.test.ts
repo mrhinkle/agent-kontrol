@@ -962,12 +962,13 @@ describe("watched owners discovery", () => {
 
     assert.equal(newerRes.status, 200, JSON.stringify(await newerRes.clone().json()));
     assert.equal(olderRes.status, 200, JSON.stringify(await olderRes.clone().json()));
-    const newerBody = await newerRes.json() as { results: { ok: boolean; error: string | null; marked_gone: number }[] };
-    const olderBody = await olderRes.json() as { results: { ok: boolean; error: string | null; marked_gone: number }[] };
+    const newerBody = await newerRes.json() as { results: { ok: boolean; error: string | null; marked_gone: number; skipped?: string }[] };
+    const olderBody = await olderRes.json() as { results: { ok: boolean; error: string | null; marked_gone: number; skipped?: string }[] };
     assert.equal(newerBody.results[0]?.ok, true, JSON.stringify(newerBody));
     assert.ok((newerBody.results[0]?.marked_gone ?? 0) >= 1);
-    assert.equal(olderBody.results[0]?.ok, false, JSON.stringify(olderBody));
-    assert.match(olderBody.results[0]?.error ?? "", /stale/);
+    assert.equal(olderBody.results[0]?.ok, true, JSON.stringify(olderBody));
+    assert.equal(olderBody.results[0]?.skipped, "stale");
+    assert.equal(olderBody.results[0]?.error, null);
     const old = state.repos.find((row) => row.repo === "acme/old");
     assert.equal(old?.gone, true);
     assert.equal(old?.pinned, true);
@@ -986,6 +987,7 @@ describe("watched owners discovery", () => {
     assert.ok(unwritable > 0, "writable:false must not use the empty-list log line");
     assert.ok(none > unwritable, "none configured remains the message for an empty owner list");
     assert.match(fn, /swept_at/);
+    assert.match(fn, /discovery skipped stale sweep/);
   });
 
   it("the collector sweeps nothing when the dashboard's database repo list is empty", () => {

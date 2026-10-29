@@ -62,6 +62,7 @@ Hide wins over pin. A repo marked gone is not shown, including when it is pinned
 - **New repos need history.** The collector only records the present. Run `collect-progress.sh --backfill 90` once to fill in the past.
 - **Access.** The collector's `gh` login must be able to read each repo, including private ones.
 - **The collector trusts the dashboard.** Whenever it can reach the dashboard it uses the dashboard's list, whether that is one you saved or the default, so a reinstalled collector never sweeps stale example repos. **If the dashboard is unreachable,** it keeps using its local config file. Set `MC_REPOS_FROM_DASHBOARD=0` to make it ignore the dashboard list entirely.
+- **Duplicate short names.** `watched_repos.short` is unique, case-sensitively, but only after a deploy can add `watched_repos_short_key`. If duplicates already exist, `supabase/schema.sql` skips that constraint and warns. It does not rename or delete rows. Run `DATABASE_URL=... node scripts/report-duplicate-shorts.mjs` to print the groups. The script is read-only: it runs one `select` and prints suggested `update` statements as comments. Rename the shorts by hand, then redeploy so the constraint can be added. Comparison is case-insensitive (`App` and `app` are one group).
 
 ## See also
 
