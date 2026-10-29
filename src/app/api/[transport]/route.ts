@@ -1,6 +1,7 @@
 import { createMcpHandler, withMcpAuth } from "mcp-handler";
 import { z } from "zod";
 import { actorFromPrincipal, currentActor, runWithActor } from "@/lib/actor";
+import { activityDetail, readReceipt, withReceipt } from "@/lib/activity";
 import { apiError, memoryKeyError, toolResultFromCaught, type McpToolResult } from "@/lib/api-error";
 import { secretsMatch, verifyAccessToken } from "@/lib/authcrypto";
 import { resolveAgentCredential } from "@/lib/credentials";
@@ -13,7 +14,7 @@ import {
   demoReportStatusTool,
   demoTaskQueueTool,
 } from "@/lib/demo-store";
-import { recallResult, taskQueueResult } from "@/lib/list-read";
+import { listActivityResult, recallResult, taskQueueResult } from "@/lib/list-read";
 import { evaluateMcpMessages, insufficientScopeBody, principalFromMcpAuth } from "@/lib/scopes";
 import { rememberForTool, updateTaskForTool } from "@/lib/dry-run-actions";
 import { claimNextTask, createTask, fetchMessages, fleet, replyFromAgent, report } from "@/lib/store";
@@ -24,18 +25,19 @@ import { OPERATOR } from "@/lib/operator";
 import { demoProgress } from "@/lib/demo-progress";
 import { listDecisionsTool, requestDecisionTool, resolveDecisionTool } from "@/lib/decision-resolve";
 import { getSkillTool, listSkillsTool, runSkillTool } from "@/lib/skills/mcp";
+import { deleteNoteTool, requeueTaskTool, sendMessageTool } from "@/lib/operator-actions";
 
 export const maxDuration = 60;
 
 /**
  * MCP tool annotations. Every tool declares all four hints explicitly so hosts can
  * warn before invoking. Agent Kontrol is a closed system (its own database), so
- * openWorldHint is false everywhere, and nothing here deletes data.
+ * openWorldHint is false everywhere. delete_note is the tool that removes a row.
  */
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
 const WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false } as const;
 const WRITE_IDEMPOTENT = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
-/** Overwrites existing state (a keyed note, a task's status and result) and appends an event, so not idempotent. */
+/** Overwrites existing state, or deletes a note, so not idempotent. */
 const WRITE_DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false } as const;
 
 /** Caught tool failures become an isError result. The text is the JSON error body, never the exception. */
@@ -80,7 +82,8 @@ const handler = createMcpHandler(
       },
       async (args) => guardTool("report_status", async () => {
         if (!isConfigured()) return demoReportStatusTool(args);
-        await report({
+        const actor = currentActor();
+        const receipt = await report({
           agent_id: args.agent_id,
           platform: args.platform,
           machine: args.machine,
@@ -91,8 +94,9 @@ const handler = createMcpHandler(
           title: args.title,
           project: args.project,
           summary: args.summary ?? args.title,
+          detail: activityDetail("report_status", actor, {}),
         });
-        return { content: [{ type: "text", text: "Status reported to Agent Kontrol." }] };
+        return withReceipt("Status reported to Agent Kontrol.", receipt);
       }),
     );
 
@@ -312,15 +316,9 @@ const handler = createMcpHandler(
             actor: currentActor(),
             idempotency_key: args.idempotency_key,
           });
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Reply #${msg.id} delivered to Agent Kontrol` +
-                  (msg.thread_id ? ` (thread ${msg.thread_id}).` : "."),
-              },
-            ],
-          };
+          const text = `Reply #${msg.id} delivered to Agent Kontrol` +
+            (msg.thread_id ? ` (thread ${msg.thread_id}).` : ".");
+          return withReceipt(text, readReceipt(msg));
         }),
       );
     }
@@ -362,11 +360,8 @@ const handler = createMcpHandler(
           idempotency_key: args.idempotency_key,
           actor: currentActor(),
         });
-        return {
-          content: [
-            { type: "text", text: `Task #${task.id} queued for ${task.platform} (priority ${task.priority}).` },
-          ],
-        };
+        const text = `Task #${task.id} queued for ${task.platform} (priority ${task.priority}).`;
+        return withReceipt(text, readReceipt(task));
       }),
     );
 
@@ -413,19 +408,13 @@ const handler = createMcpHandler(
         if (!task) {
           return { content: [{ type: "text", text: "No queued tasks for your platform." }] };
         }
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `Claimed task #${task.id}: ${task.title}\n` +
-                (task.project ? `Project: ${task.project}\n` : "") +
-                (task.reviewer_platform ? `Review by: ${task.reviewer_platform} when done\n` : "") +
-                `Instructions:\n${task.description ?? task.title}\n\n` +
-                `When finished, call update_task (id: ${task.id}) with status 'done' or 'failed' and a result summary.`,
-            },
-          ],
-        };
+        const text =
+          `Claimed task #${task.id}: ${task.title}\n` +
+          (task.project ? `Project: ${task.project}\n` : "") +
+          (task.reviewer_platform ? `Review by: ${task.reviewer_platform} when done\n` : "") +
+          `Instructions:\n${task.description ?? task.title}\n\n` +
+          `When finished, call update_task (id: ${task.id}) with status 'done' or 'failed' and a result summary.`;
+        return withReceipt(text, readReceipt(task));
       }),
     );
 
@@ -459,7 +448,7 @@ const handler = createMcpHandler(
         description:
           "List skills whose trigger is not off, whose scope admits the lane, and which are compatible with runtime when runtime is passed. With no runtime, incompatible skills are not hidden. With no lane, selected-lane skills are hidden. Trigger off is omitted. category is an exact case-insensitive match. Pass uncategorized for skills with no category. Each line includes category and tags.",
         inputSchema: {
-          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional().describe("Caller runtime. Omit to skip the runtime filter."),
+          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini", "nemoclaw"]).optional().describe("Caller runtime. Omit to skip the runtime filter."),
           lane: z.string().optional().describe("Lane name. Required to see skills limited to selected lanes."),
           query: z.string().optional().describe("Case-insensitive match on id and description."),
           category: z.string().optional().describe("Exact category, case-insensitive. Pass uncategorized to list skills with no category."),
@@ -478,7 +467,7 @@ const handler = createMcpHandler(
         inputSchema: {
           id: z.string().describe("Skill id."),
           path: z.string().optional().describe("Reference path relative to the skill directory. Omit for SKILL.md."),
-          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional(),
+          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini", "nemoclaw"]).optional(),
           lane: z.string().optional(),
         },
       },
@@ -495,7 +484,7 @@ const handler = createMcpHandler(
         inputSchema: {
           id: z.string().optional().describe("Skill id. Required on start. Omit it on completion. If you pass it then, it must match the skill on the run."),
           agent_id: z.string().optional().describe("Omit to use the authenticated caller. An agent credential or OAuth client may pass only that same id."),
-          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini"]).optional().describe("Required on start. Caller hint for the rendered instructions, not an identity."),
+          runtime: z.enum(["claude", "codex", "grok", "hermes", "mini", "nemoclaw"]).optional().describe("Required on start. Caller hint for the rendered instructions, not an identity."),
           lane: z.string().optional().describe("Caller hint. Required when the skill's scope is selected. Not an identity."),
           run_id: z.string().optional().describe("Set with complete true to finish the run you started."),
           complete: z.boolean().optional().describe("True finishes the run. Requires run_id."),
@@ -583,6 +572,88 @@ const handler = createMcpHandler(
         expected_updated_at: args.expected_updated_at,
         expected_revision: args.expected_revision,
       })),
+    );
+
+    server.registerTool(
+      "send_message",
+      {
+        title: "Send message",
+        annotations: WRITE,
+        description:
+          "Send an inbound message to an agent that has already reported. Requires messages:write. The recipient is slugified and must match an existing agent. body is at most 8000 characters and is stored as given. created_by is a label and does not set actor_type or actor_id. The server records the authenticated credential. idempotency_key matches create_task: the same key, actor, and arguments return the original message for 24 hours.",
+        inputSchema: {
+          agent_id: z.string().describe("Agent to receive the message. Slugified. Must already exist."),
+          body: z.string().describe("Message text, 1 to 8000 characters. Not trimmed."),
+          created_by: z.string().optional().describe("Free-text label. It does not set actor_type or actor_id."),
+          idempotency_key: z
+            .string()
+            .optional()
+            .describe("Optional. Scoped by actor and the enqueue_message route. The same key and the same arguments return the original message for 24 hours."),
+        },
+      },
+      async (args) => guardTool("send_message", () => sendMessageTool(args)),
+    );
+
+    server.registerTool(
+      "requeue_task",
+      {
+        title: "Requeue task",
+        annotations: WRITE,
+        description:
+          "Put a done, failed, or cancelled task back to queued. Requires tasks:write. A running, claimed, or review task is refused. A running task held by another agent is forbidden. assigned_agent and completed_at are left as they are. dry_run true returns the diff and expected_revision and writes nothing. Send that expected_revision to make the confirm conditional. A mismatch is stale_write and writes nothing. The server records the authenticated actor on the task.",
+        inputSchema: {
+          id: z.number().int().describe("Task id."),
+          agent_id: z
+            .string()
+            .optional()
+            .describe("Caller compared with assigned_agent. Omit to use the authenticated actor id. This does not clear or set assigned_agent."),
+          dry_run: z.boolean().optional().describe("True returns the preview and writes nothing."),
+          expected_revision: z
+            .string()
+            .optional()
+            .describe("Revision from the preview. Omit for an unconditional confirm. Ignored when dry_run is true, except that a bad token is still rejected."),
+        },
+      },
+      async (args) => guardTool("requeue_task", () => requeueTaskTool(args)),
+    );
+
+    server.registerTool(
+      "delete_note",
+      {
+        title: "Delete note",
+        annotations: WRITE_DESTRUCTIVE,
+        description:
+          "Delete one shared memory note by key. Requires memory:write. A missing key is not_found and deletes nothing. dry_run true returns the diff and expected_revision and writes nothing. Send that expected_revision to make the confirm conditional. A mismatch is stale_write and writes nothing. The authenticated actor is named in the result. The memory table has no actor columns.",
+        inputSchema: {
+          key: z.string().describe("Memory key, 1 to 200 characters, no control characters."),
+          dry_run: z.boolean().optional().describe("True returns the preview and writes nothing."),
+          expected_revision: z
+            .string()
+            .optional()
+            .describe("Revision from the preview. Omit for an unconditional confirm. Ignored when dry_run is true, except that a bad token is still rejected."),
+        },
+      },
+      async (args) => guardTool("delete_note", () => deleteNoteTool(args)),
+    );
+
+    server.registerTool(
+      "list_activity",
+      {
+        title: "List activity",
+        annotations: READ_ONLY,
+        description:
+          "List write receipts and other events, newest first. Filter by actor (the authenticated actor id), kind, since, and until. since and until are inclusive ISO timestamps. limit, cursor, and fields match the other lists: limit is 1 to 200, cursor is the opaque next_cursor, and fields is a comma-separated allowlist. Operator only, the same boundary as traces. An agent credential is denied, including one with fleet:read. MC_TOKEN and an OAuth access token can call it. With no database, this reads the in-memory demo log.",
+        inputSchema: {
+          actor: z.string().optional().describe("Exact actor_id. Omit to include every actor."),
+          kind: z.string().optional().describe("Exact event kind, such as task_updated or status."),
+          since: z.string().optional().describe("Inclusive ISO timestamp. Rows at or after this instant."),
+          until: z.string().optional().describe("Inclusive ISO timestamp. Rows in this millisecond and earlier."),
+          limit: z.number().optional().describe("Maximum rows, from 1 to 200. Defaults to 50. Passing limit or cursor adds a next_cursor line."),
+          cursor: z.string().optional().describe("Opaque cursor from a previous next_cursor line."),
+          fields: z.string().optional().describe("Comma-separated allowlisted fields. id is always included. One JSON object per line."),
+        },
+      },
+      async (args) => guardTool("list_activity", () => listActivityResult(args, isConfigured())),
     );
   },
   {},

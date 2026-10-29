@@ -78,7 +78,7 @@ export function formatDigest(data: ProgressResponse): string {
     for (const row of skills.triggers_by_skill) lines.push(`  ${row.id}  ${row.count}`);
     const runtimes = skills.triggers_by_runtime;
     lines.push(
-      `  Runtimes: claude ${runtimes.claude} · codex ${runtimes.codex} · grok ${runtimes.grok} · hermes ${runtimes.hermes} · mini ${runtimes.mini}`,
+      `  Runtimes: claude ${runtimes.claude} · codex ${runtimes.codex} · grok ${runtimes.grok} · hermes ${runtimes.hermes} · mini ${runtimes.mini} · nemoclaw ${runtimes.nemoclaw}`,
     );
     if (skills.stalled.length === 0) lines.push("  Stalled runs: none.");
     else lines.push(`  Stalled runs: ${skills.stalled.map((run) => `${run.skill_id} (${run.agent})`).join(", ")}`);

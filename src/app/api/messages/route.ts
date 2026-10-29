@@ -11,6 +11,7 @@ import {
   markConversationRead,
 } from "@/lib/store";
 import { isMessagesSetupError, MESSAGES_SETUP_MESSAGE } from "@/lib/message-errors";
+import { MESSAGE_BODY_MAX } from "@/lib/message-body";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -79,6 +80,16 @@ export async function POST(req: Request) {
     if (!body.agent_id) fields.agent_id = "agent_id is required";
     if (!body.body) fields.body = "body is required";
     return apiError("missing_field", { message: "agent_id and body are required", fields });
+  }
+  if (typeof body.agent_id !== "string" || typeof body.body !== "string") {
+    const fields: Record<string, string> = {};
+    if (typeof body.agent_id !== "string") fields.agent_id = "agent_id must be a string";
+    if (typeof body.body !== "string") fields.body = "body must be a string";
+    return apiError("validation_failed", { message: "agent_id and body must be strings", fields });
+  }
+  if (body.body.length > MESSAGE_BODY_MAX) {
+    const message = `body must be at most ${MESSAGE_BODY_MAX} characters.`;
+    return apiError("validation_failed", { message, fields: { body: message } });
   }
   try {
     const msg = await enqueueMessage({

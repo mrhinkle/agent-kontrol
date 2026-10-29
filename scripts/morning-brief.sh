@@ -141,7 +141,7 @@ elif [[ "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_TOKEN:-}" ]]; the
   # response falls back to the local file.
   if body="$(curl -fsS -m 20 -H "Authorization: Bearer $MC_TOKEN" "${MC_URL%/}/api/settings/repos" 2>/dev/null)" \
      && echo "$body" | jq -e '.repos|type=="array"' >/dev/null 2>&1; then
-    REPOS_JSON="$(echo "$body" | jq -c '[.repos[] | {repo, label, short, blockedLabel}]')"
+    REPOS_JSON="$(echo "$body" | jq -c '[.repos[] | select(.shown != false) | {repo, label, short, blockedLabel}]')"
     REPO_SOURCE="dashboard"
   fi
 fi
@@ -484,6 +484,24 @@ if [[ "$n_known_dec" -gt 0 ]]; then
 fi
 echo
 
-jq -r '.repos[] | select(.merged_prs > 0) | "SHIPPED — \(.label):", (.merged_list[] | "  #\(.number)  \(.title[0:80])  (\(.author), \(.lead_hours*10|floor/10)h)")' <<<"$brief"
+# A positive merge count with no measured list is not an empty heading.
+# null (or any non-array) is unmeasured. An empty array prints nothing.
+# BEGIN shipped_lines
+shipped_lines() {
+  jq -r '
+    .repos[]
+    | select(.merged_prs > 0)
+    | if (.merged_list | type) != "array" then
+        "SHIPPED: DATA INCOMPLETE — \(.label)"
+      elif (.merged_list | length) == 0 then
+        empty
+      else
+        "SHIPPED — \(.label):",
+        (.merged_list[] | "  #\(.number)  \(.title[0:80])  (\(.author), \(.lead_hours*10|floor/10)h)")
+      end
+  '
+}
+# END shipped_lines
+shipped_lines <<<"$brief"
 
 [[ "$n_incomplete" -eq 0 ]] && exit 0 || exit 2

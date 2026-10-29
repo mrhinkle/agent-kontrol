@@ -4,13 +4,15 @@ import { LABEL_MAX } from "@/lib/credentials";
 import { DECISION_STATUSES, LIST_SHAPES, LIST_STATUSES } from "@/lib/decisions";
 import { PROGRESS_INGEST_KINDS } from "@/lib/progress-store";
 import { WINDOWS } from "@/lib/progress-config";
+import { MAX_OWNERS } from "@/lib/owner-validation";
 import { MAX_REPOS } from "@/lib/repo-validation";
 import { SCOPES } from "@/lib/scopes";
 import { INGEST_KINDS } from "@/lib/store";
 import { TASK_STATUSES } from "@/lib/types";
 import { USAGE_SOURCES } from "@/lib/usage-types";
 import { USAGE_WINDOWS } from "@/lib/usage-window";
-import { LIST_MAX } from "./list-params";
+import { ACTIVITY_LIST, LIST_MAX } from "./list-params";
+import { RUNTIMES } from "./skills/types";
 
 /**
  * OpenAPI 3.1 for the documented REST routes.
@@ -28,6 +30,16 @@ import { LIST_MAX } from "./list-params";
 const ERROR_CODES = [...new Set([...Object.keys(API_ERRORS), "insufficient_scope"])];
 
 type Json = Record<string, unknown>;
+
+/** The nine names list_activity and GET /api/activity return. fields= may omit some. */
+const ACTIVITY_ITEM_PROPERTIES: Json = Object.fromEntries(
+  ACTIVITY_LIST.allow.map((name) => {
+    if (name === "id") return [name, { type: "integer" }];
+    if (name === "created_at") return [name, { type: "string", format: "date-time" }];
+    if (name === "detail") return [name, { type: ["object", "null"], additionalProperties: true }];
+    return [name, { type: ["string", "null"] }];
+  }),
+);
 
 const INGEST_PLATFORMS = [
   "claude-code",
@@ -112,6 +124,8 @@ function body(schema: Json): Json {
 const cookieOrBearer = [{ cookieAuth: [] }, { bearerAuth: [] }];
 const bearerOnly = [{ bearerAuth: [] }];
 const sessionOnly = [{ cookieAuth: [] }];
+/** Dashboard session or MC_TOKEN. Not the generic bearer that accepts an agent credential. */
+const operatorSessionOrMcToken = [{ cookieAuth: [] }, { mcToken: [] }];
 
 /** Server-set. A request body cannot write these. */
 const actorType: Json = {
@@ -191,6 +205,7 @@ export function openApiDocument(): Json {
       { name: "settings" },
       { name: "usage" },
       { name: "traces" },
+      { name: "activity" },
       { name: "skills" },
       { name: "auth" },
       { name: "mcp" },
@@ -202,6 +217,12 @@ export function openApiDocument(): Json {
           type: "http",
           scheme: "bearer",
           description: "MC_TOKEN, an akc_ agent credential, or an OAuth access token on the MCP transport.",
+        },
+        mcToken: {
+          type: "http",
+          scheme: "bearer",
+          bearerFormat: "MC_TOKEN",
+          description: "Operator MC_TOKEN. An agent credential and an OAuth access token are not accepted on operations that use this scheme.",
         },
       },
       schemas: {
@@ -225,6 +246,45 @@ export function openApiDocument(): Json {
           type: "object",
           required: ["error"],
           properties: { error: { type: "string" } },
+        },
+        BriefAlert: {
+          type: "object",
+          required: ["key", "kind", "condition", "sent", "last_sent_at", "summary"],
+          properties: {
+            key: { type: "string" },
+            kind: { type: "string", enum: ["coordinator_silent", "zero_merge", "decision_age"] },
+            condition: { type: "string", enum: ["firing", "clear", "unknown"] },
+            sent: {
+              type: ["boolean", "null"],
+              description: "True when a latch is active. False when the table was read and this key is not latched. Null when the latch table could not be read.",
+            },
+            last_sent_at: { type: ["string", "null"], format: "date-time" },
+            summary: { type: "string" },
+          },
+        },
+        BriefAlerts: {
+          type: "object",
+          required: ["enabled", "delivery", "generated_at", "sent_count", "alerts"],
+          properties: {
+            enabled: { type: "boolean" },
+            delivery: { type: "string", enum: ["read", "disabled", "live"] },
+            generated_at: { type: "string", format: "date-time" },
+            sent_count: { type: "integer" },
+            alerts: { type: "array", items: ref("BriefAlert") },
+            latches: { type: "string", enum: ["ok", "unknown"] },
+            failures: {
+              type: "array",
+              items: {
+                type: "object",
+                required: ["step"],
+                properties: {
+                  step: { type: "string", enum: ["latches", "claim", "clear", "message", "restore"] },
+                  key: { type: "string" },
+                },
+              },
+            },
+            note: { type: "string" },
+          },
         },
         ReportInput: {
           type: "object",
@@ -252,6 +312,103 @@ export function openApiDocument(): Json {
             short: { type: "string" },
             color: { type: "string", pattern: "^#[0-9a-fA-F]{6}$" },
             blockedLabel: { type: ["string", "null"] },
+            pinned: { type: "boolean", description: "Always show on the brief, including after the activity window. Hide wins over pin." },
+            hidden: { type: "boolean", description: "Collected, but omitted from the brief and the board. Hide wins over pin." },
+            origin: { type: "string", enum: ["manual", "auto"], description: "manual is hand-added. auto is discovered and is kept when a save omits it." },
+          },
+        },
+        WatchedOwnerInput: {
+          type: "object",
+          required: ["owner"],
+          properties: {
+            owner: { type: "string", maxLength: 39, description: "GitHub user or organization login. Stored lowercase." },
+            activity_days: { type: "integer", minimum: 1, maximum: 3650, description: "Repos with a push older than this drop off the brief. Default 30. The boundary day is still shown." },
+            activityDays: { type: "integer", minimum: 1, maximum: 3650, description: "Same as activity_days. Sending both is 400." },
+            include_forks: { type: "boolean", description: "Default false. Forks stay out of the brief unless this is true." },
+            includeForks: { type: "boolean" },
+            include_archived: { type: "boolean", description: "Default false." },
+            includeArchived: { type: "boolean" },
+          },
+        },
+        WatchedOwner: {
+          type: "object",
+          required: ["owner", "activity_days", "include_forks", "include_archived"],
+          properties: {
+            owner: { type: "string" },
+            activity_days: { type: "integer" },
+            include_forks: { type: "boolean" },
+            include_archived: { type: "boolean" },
+            last_error: { type: ["string", "null"], description: "Set when gh repo list failed, was rate-limited, or returned no repos. A truncated list stores a warning here and still sets last_discovered_at." },
+            last_error_at: { type: ["string", "null"], format: "date-time" },
+            last_discovered_at: { type: ["string", "null"], format: "date-time" },
+            actor_type: { type: ["string", "null"], enum: ["human", "agent", null] },
+            actor_id: { type: ["string", "null"] },
+          },
+        },
+        WatchedOwners: {
+          type: "object",
+          required: ["writable", "max", "version", "owners"],
+          properties: {
+            writable: { type: "boolean" },
+            max: { type: "integer", const: MAX_OWNERS },
+            version: { type: "string" },
+            owners: { type: "array", items: ref("WatchedOwner") },
+          },
+        },
+        OwnerList: {
+          type: "object",
+          required: ["owners"],
+          properties: {
+            version: { type: "string", description: "Version from the last GET. A mismatch is 409 stale and writes nothing." },
+            dry_run: dryRunFlag,
+            owners: { type: "array", maxItems: MAX_OWNERS, items: ref("WatchedOwnerInput") },
+          },
+        },
+        OwnerDiscovery: {
+          type: "object",
+          required: ["results"],
+          properties: {
+            results: {
+              type: "array",
+              items: {
+                type: "object",
+                required: ["owner", "ok", "swept_at"],
+                properties: {
+                  owner: { type: "string" },
+                  ok: { type: "boolean" },
+                  error: { type: ["string", "null"] },
+                  truncated: { type: "boolean", description: "True when gh repo list hit the 1000-repo cap. Seen repos are updated. Others are not marked gone." },
+                  swept_at: { type: "string", format: "date-time", description: "Required. Collector time just before gh repo list. A sweep that is not newer than last_discovered_at is ignored." },
+                  repos: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      required: ["name", "isArchived", "isFork"],
+                      properties: {
+                        name: { type: "string" },
+                        pushedAt: { type: ["string", "null"], format: "date-time" },
+                        isArchived: { type: "boolean" },
+                        isFork: { type: "boolean" },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        RepoOverride: {
+          type: "object",
+          required: ["repo"],
+          anyOf: [
+            { required: ["pinned"] },
+            { required: ["hidden"] },
+          ],
+          properties: {
+            repo: { type: "string", description: "owner/name" },
+            pinned: { type: "boolean" },
+            hidden: { type: "boolean", description: "Hide wins over pin. The repo stays collected and drops off the brief." },
+            dry_run: dryRunFlag,
           },
         },
         RepoList: {
@@ -268,6 +425,29 @@ export function openApiDocument(): Json {
             },
           },
         },
+        WatchedRepo: {
+          type: "object",
+          required: ["repo", "label", "short", "color", "blockedLabel"],
+          properties: {
+            repo: { type: "string", description: "owner/name" },
+            label: { type: "string" },
+            short: { type: "string" },
+            color: { type: "string" },
+            blockedLabel: { type: ["string", "null"] },
+            origin: { type: "string", enum: ["manual", "auto"] },
+            pinned: { type: "boolean", description: "Always show on the brief, including after the activity window. Hide wins over pin." },
+            hidden: { type: "boolean", description: "Collected, but omitted from the brief and the board. Hide wins over pin." },
+            gone: { type: "boolean", description: "True when the repo left the last successful non-truncated gh repo list. The row is kept. A gone repo is not shown, including when it is pinned." },
+            shown: { type: "boolean", description: "False drops the repo off the brief and the board. Omitted means show." },
+            isFork: { type: "boolean", description: "True when the repo is a fork." },
+            isArchived: { type: "boolean", description: "True when the repo is archived." },
+            lastActivityAt: { type: ["string", "null"], format: "date-time", description: "Last push time from gh. The activity window uses this." },
+            fieldsOverridden: {
+              type: ["boolean", "null"],
+              description: "True after a hand-added save overrode label, short, color, or blocked label on an auto row. False after a later save cleared that override. Null means discovery owns those fields. Omitting the field is the same as null.",
+            },
+          },
+        },
         WatchedRepos: {
           type: "object",
           required: ["source", "writable", "max", "version", "repos"],
@@ -276,7 +456,7 @@ export function openApiDocument(): Json {
             writable: { type: "boolean" },
             max: { type: "integer", const: MAX_REPOS },
             version: { type: "string" },
-            repos: { type: "array", items: ref("RepoInput") },
+            repos: { type: "array", items: ref("WatchedRepo") },
           },
         },
         UsageFact: {
@@ -533,7 +713,7 @@ export function openApiDocument(): Json {
             would_write: { type: "boolean" },
             action: {
               type: "string",
-              enum: ["replace_repos", "cancel_task", "update_task", "overwrite_memory", "insert_memory"],
+              enum: ["replace_repos", "replace_owners", "cancel_task", "update_task", "overwrite_memory", "insert_memory"],
             },
             changes: { type: "array", items: ref("DryRunChange") },
             affected: { type: "array", items: { type: "object", additionalProperties: true } },
@@ -871,7 +1051,7 @@ export function openApiDocument(): Json {
           tags: ["messages"],
           summary: "Operator enqueues an inbound message.",
           description:
-            "The server sets actor_type and actor_id from the authenticated credential. created_by is a label and does not set those fields. When MC_DASHBOARD_PASSWORD is unset and the request presents no credential, both actor fields are null. Optional header Idempotency-Key.",
+            "The server sets actor_type and actor_id from the authenticated credential. created_by is a label and does not set those fields. When MC_DASHBOARD_PASSWORD is unset and the request presents no credential, both actor fields are null. body is at most 8000 characters. A longer body is 400 validation_failed and stores nothing. Optional header Idempotency-Key.",
           security: cookieOrBearer,
           parameters: [idempotencyHeader],
           requestBody: body({
@@ -879,7 +1059,7 @@ export function openApiDocument(): Json {
             required: ["agent_id", "body"],
             properties: {
               agent_id: { type: "string" },
-              body: { type: "string" },
+              body: { type: "string", maxLength: 8000 },
               created_by: { type: "string" },
             },
           }),
@@ -1302,6 +1482,34 @@ export function openApiDocument(): Json {
           },
         }),
       },
+      "/api/brief/alerts": {
+        get: operation({
+          operationId: "getBriefAlerts",
+          tags: ["progress"],
+          summary: "Threshold alert conditions. Does not send.",
+          description:
+            "Auth matches GET /api/brief: session cookie, MC_TOKEN, or an agent credential with progress:read. Returns the coordinator-silence, zero-merge, and decision-age conditions. condition is firing, clear, or unknown. unknown means that source could not be read or the merge history does not cover the window; it is not a clear. sent is true only when a brief_alerts latch exists and cleared_at is null, false when that table was read and the key is not latched, and null when the table could not be read. latches is unknown in that case. This route never inserts a message. With no database every condition is unknown.",
+          security: cookieOrBearer,
+          responses: {
+            "200": jsonResponse("Current conditions and latch state.", ref("BriefAlerts")),
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/brief/alerts/evaluate": {
+        post: operation({
+          operationId: "evaluateBriefAlerts",
+          tags: ["progress"],
+          summary: "Evaluate threshold alerts and send newly claimed ones.",
+          description:
+            "Auth matches POST /api/progress/ingest: Authorization Bearer MC_TOKEN. An agent credential is 403, including one with progress:read. The body is ignored. When brief.alerts.enabled is false the conditions are still computed, sent_count is 0, delivery is disabled, and no brief_alerts row is claimed or cleared. When enabled, one operator message is inserted per alert whose claim statement returns a row. The claim stores a claim_token and the evaluation's compute instant. Episode and repeat claims re-arm a cleared latch only when cleared_at is null or older than that instant. A clear writes cleared_at only when last_sent_at is older than the clear's instant. A decision claim inserts only while that decision is still open and still old enough. An event between compute and claim with no concurrent evaluation can still send once; the next evaluation clears it. A failed message insert restores the previous row only while that token still matches and cleared_at is still null. Coordinator silence re-claims after coordinatorRepeatHours. A zero-merge alert re-arms only after it clears. A decision alerts once per row. Unknown conditions are not claimed and do not clear an existing latch. failures names a latch read, claim, clear, message, or restore that threw.",
+          security: bearerOnly,
+          responses: {
+            "200": jsonResponse("Conditions, plus sent_count for this call.", ref("BriefAlerts")),
+            ...flatErrors,
+          },
+        }),
+      },
       "/api/progress/ingest": {
         post: operation({
           operationId: "ingestProgress",
@@ -1331,7 +1539,7 @@ export function openApiDocument(): Json {
           tags: ["settings"],
           summary: "Replace the watched-repo list, or preview that replace.",
           description:
-            "dry_run true returns the diff against the list GET would show (adds, removes, updates, reorders) and writes nothing. A stale version is still 409. With no database, a dry run returns that diff with would_write false instead of 409. A non-boolean dry_run is 400 and writes nothing.",
+            "dry_run true returns the diff against the list GET would show (adds, removes, updates, reorders) and writes nothing. An omitted auto row is not a remove. When that row has fieldsOverridden true, the diff reports an update that resets label, short, color, and blocked label to the discovery defaults. A stale version is still 409. The version is checked again under the discovery write lock in the same transaction as the replace. A pin or hide that changed the list is 409 stale and is kept. With no database, a dry run returns that diff with would_write false instead of 409. A non-boolean dry_run is 400 and writes nothing.",
           security: cookieOrBearer,
           requestBody: body(ref("RepoList")),
           responses: {
@@ -1344,6 +1552,100 @@ export function openApiDocument(): Json {
             "401": flatErrors["401"],
             "403": flatErrors["403"],
             "409": jsonResponse("No database, or version does not match the stored list.", ref("Error")),
+            "500": flatErrors["500"],
+          },
+        }),
+        patch: operation({
+          operationId: "patchWatchedRepo",
+          tags: ["settings"],
+          summary: "Pin or hide one watched repo.",
+          description:
+            "Sets pinned and hidden on one stored row. Takes the same advisory lock as discovery and repo replacement. Changing a flag changes the list version. Send at least one flag. Hide wins over pin: the repo stays collected and is left off the brief. A repo marked gone is not shown, including when it is pinned. Does not change origin. dry_run true returns before and after and writes nothing. With no database, the preview resolves the repo against the file fallback, returns before and after, and sets would_write false. An unknown repo is 404 in both modes.",
+          security: cookieOrBearer,
+          requestBody: body(ref("RepoOverride")),
+          responses: {
+            "200": jsonResponse("The stored list, or a preview that writes nothing.", {
+              oneOf: [ref("WatchedRepos"), ref("DryRunResult")],
+            }),
+            "400": flatErrors["400"],
+            "401": flatErrors["401"],
+            "403": flatErrors["403"],
+            "404": jsonResponse("That repo is not in the watched list.", ref("Error")),
+            "409": jsonResponse("No database is connected.", ref("Error")),
+            "500": flatErrors["500"],
+          },
+        }),
+      },
+      "/api/settings/owners": {
+        get: operation({
+          operationId: "getWatchedOwners",
+          tags: ["settings"],
+          summary: "GitHub owners whose repos are discovered.",
+          description:
+            "With no database, returns writable false and an empty owners list. A missing table is writable false and the same empty list, not a 500.",
+          security: cookieOrBearer,
+          responses: {
+            "200": jsonResponse("The current owner list and its version.", ref("WatchedOwners")),
+            ...flatErrors,
+          },
+        }),
+        put: operation({
+          operationId: "putWatchedOwners",
+          tags: ["settings"],
+          summary: "Replace the watched-owner list, or preview that replace.",
+          description:
+            "Auth matches PUT /api/settings/repos. An agent credential is 403 insufficient_scope. The actor is the principal, never a body field. dev-open stores null actor fields. Removing an owner does not delete repos already tracked. An empty owners list is allowed. dry_run true returns the diff and writes nothing. A stale version is 409. The version is checked again under a lock in the same transaction as the replace. With no database, or before the table exists, a dry run returns that diff with would_write false instead of 409, and a save is 409 conflict.",
+          security: cookieOrBearer,
+          requestBody: body(ref("OwnerList")),
+          responses: {
+            "200": jsonResponse("The stored list, or a preview that writes nothing.", {
+              oneOf: [ref("WatchedOwners"), ref("DryRunResult")],
+            }),
+            "400": jsonResponse("The list failed validation.", {
+              allOf: [ref("Error"), { type: "object", properties: { errors: { type: "array" } } }],
+            }),
+            "401": flatErrors["401"],
+            "403": flatErrors["403"],
+            "409": jsonResponse("No database, or version does not match the stored list.", ref("Error")),
+            "500": flatErrors["500"],
+          },
+        }),
+      },
+      "/api/settings/owners/discover": {
+        post: operation({
+          operationId: "discoverWatchedOwners",
+          tags: ["settings"],
+          summary: "Apply one collector tick of gh repo list results.",
+          description:
+            "Auth matches PUT /api/settings/repos. A result with ok false, a rate-limit error, or zero repos records last_error and does not change tracked repos. A truncated list updates the repos it saw, does not mark the others gone, and stores a warning on last_error while still setting last_discovered_at. An unknown owner is an error on that result and does not fail the batch. A duplicate owner in one request is 400 and writes nothing. A missing swept_at is 400. A repo name that is not safe to store fails that owner's sweep and writes no repo changes. One owner's metadata update and repo changes commit together, under one global advisory lock shared by every owner, after reloading tracked repos. The lock is not held during gh repo list. swept_at orders overlapping ticks: a sweep that is not newer than last_discovered_at writes nothing. A short-name unique violation replans once and then is 409 with results plus added, updated, and marked_gone as empty arrays on the response and on each result. Discovery does not change pin, hide, label, short, color, origin, fieldsOverridden, or the actor who saved the owner. No database, or a missing watched_owners table, is 409 and includes results plus added, updated, and marked_gone as empty arrays on the response and on each result.",
+          security: cookieOrBearer,
+          requestBody: body(ref("OwnerDiscovery")),
+          responses: {
+            "200": jsonResponse("One outcome per owner.", {
+              type: "object",
+              required: ["results"],
+              properties: {
+                results: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    required: ["owner", "ok", "added", "updated", "marked_gone"],
+                    properties: {
+                      owner: { type: "string" },
+                      ok: { type: "boolean" },
+                      error: { type: ["string", "null"] },
+                      added: { type: "integer" },
+                      updated: { type: "integer" },
+                      marked_gone: { type: "integer" },
+                    },
+                  },
+                },
+              },
+            }),
+            "400": flatErrors["400"],
+            "401": flatErrors["401"],
+            "403": flatErrors["403"],
+            "409": jsonResponse("No database is connected, or watched_owners does not exist yet.", ref("Error")),
             "500": flatErrors["500"],
           },
         }),
@@ -1424,6 +1726,36 @@ export function openApiDocument(): Json {
           },
         }),
       },
+      "/api/activity": {
+        get: operation({
+          operationId: "listActivity",
+          tags: ["activity"],
+          summary: "Write receipts and other events, newest first.",
+          description:
+            "Operator only. Authenticate with a dashboard session or MC_TOKEN. An agent credential is denied, including one with fleet:read. Same boundary as GET /api/traces. actor is an exact actor_id. kind is an exact event kind. since and until are inclusive ISO timestamps; a since later than until is 400 validation_failed. With no database the body is the in-memory demo event log (demo true), not a static sample, and the filters still apply. next_cursor is absent unless limit or cursor was passed.",
+          security: operatorSessionOrMcToken,
+          parameters: [
+            query("actor", { type: "string" }, "Exact actor_id. Empty means no filter. Longer than 200 characters is 400."),
+            query("kind", { type: "string" }, "Exact event kind. Empty means no filter. Anything other than 1 to 64 letters, digits, or _ . : - is 400."),
+            query("since", { type: "string", format: "date-time" }, "Inclusive start. A value that is not an ISO timestamp is 400."),
+            query("until", { type: "string", format: "date-time" }, "Inclusive end, through that millisecond. A value that is not an ISO timestamp, or a value before since, is 400."),
+            listLimitParam(50),
+            listCursor,
+            listFields,
+          ],
+          responses: {
+            "200": jsonResponse("demo and activity. next_cursor is absent unless limit or cursor was passed.", {
+              type: "object",
+              properties: {
+                demo: { type: "boolean" },
+                activity: { type: "array", items: { type: "object", properties: ACTIVITY_ITEM_PROPERTIES } },
+                next_cursor: nextCursor,
+              },
+            }),
+            ...flatErrors,
+          },
+        }),
+      },
       "/api/traces": {
         get: operation({
           operationId: "listTraces",
@@ -1494,7 +1826,7 @@ export function openApiDocument(): Json {
             "Agent credentials need skills:read. runtime filters to skills compatible with that runtime. An unknown runtime is 400 validation_failed. q matches name and description, case-insensitive. category is an exact case-insensitive match on the stored category. The value uncategorized matches a null category. The taxonomy is not enforced. Each skill includes category (string or null) and tags (string array), plus lastScheduledAt and nextDueAt (ISO strings or null). Removed skills are omitted. With no database the body is demo true and a fixture list.",
           security: cookieOrBearer,
           parameters: [
-            query("runtime", { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] }, "Compatible runtime. Omit to return every skill."),
+            query("runtime", { type: "string", enum: [...RUNTIMES] }, "Compatible runtime. Omit to return every skill."),
             query("q", { type: "string" }, "Case-insensitive match on name and description."),
             query("category", { type: "string" }, "Exact category, case-insensitive. uncategorized matches a null category."),
           ],
@@ -1514,7 +1846,7 @@ export function openApiDocument(): Json {
           security: cookieOrBearer,
           parameters: [
             query("lane", { type: "string" }, "Lane name. Selected-scope skills match only an exact lane.", { required: true }),
-            query("runtime", { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] }, "Runtime that will read the file.", { required: true }),
+            query("runtime", { type: "string", enum: [...RUNTIMES] }, "Runtime that will read the file.", { required: true }),
             query("format", { type: "string", enum: ["json", "text"] }, "json (default) or text."),
           ],
           responses: {
@@ -1537,12 +1869,35 @@ export function openApiDocument(): Json {
             required: ["lane", "runtime"],
             properties: {
               lane: { type: "string" },
-              runtime: { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] },
+              runtime: { type: "string", enum: [...RUNTIMES] },
               agents_md: { type: ["string", "null"] },
             },
           }),
           responses: {
             "200": jsonResponse("demo, lane, runtime, empty, changed, and content (string or null).", { type: "object" }),
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/skill-bundles": {
+        get: operation({
+          operationId: "exportSkills",
+          tags: ["skills"],
+          summary: "Download a skill tree for one runtime.",
+          description:
+            "Operator only. Authenticate with a dashboard session or MC_TOKEN. An agent credential is denied, including one with skills:read or skills:write. runtime is required and is claude, codex, grok, hermes, mini, or nemoclaw. lane is optional. Visibility is the list_skills check. Trigger off is omitted. A trigger other than off, on_request, auto_inject, or scheduled is treated as off and listed with reason invalid trigger. A selected scope is omitted unless lane is set and admits it. category and q match list_skills. The body is a gzip-compressed tar. Paths are relative. The directory is the skill id, which is the upstream directory slug. The frontmatter name is a display string and may differ. The folder is the id. Category is a Hermes folder only. Claude, Codex, Grok, mini, and NemoClaw leave category out of the path, so a category value does not omit the skill for those runtimes. NemoClaw uses .agents/skills/<id>/SKILL.md. Its frontmatter is name and description, plus license, user_invocable, and metadata.author or metadata.tags only when the stored file already has them. A Hermes category or a skill id that does not already match ^[a-z0-9][a-z0-9-_]*$ is omitted and listed. The stored text is left as it is. When two skills would write one archive path, every one of those skills is omitted and listed. A reference that is unsafe, that collides case-insensitively, or that does not fit a ustar name and prefix is omitted and listed with its path, and the skill is still exported. A skill whose SKILL.md cannot be written is omitted as a whole. Each omission is {skill, path?, reason}. When the list is not empty, manifest.json at the archive root contains every entry. The x-ak-skipped header carries count, the first 20 entries, and the text see manifest.json. The header is at most 4 KB. The archive contains each path once. A skill with no category is under uncategorized/ in the Hermes layout. hermes uses <category>/<id>/SKILL.md. With no database the archive is the demo fixture under the same rules. A repeated runtime, lane, category, or q is 400 validation_failed.",
+          security: operatorSessionOrMcToken,
+          parameters: [
+            query("runtime", { type: "string", enum: [...RUNTIMES] }, "Runtime the tree is rendered for.", { required: true }),
+            query("lane", { type: "string" }, "When omitted, skills whose scope is selected are omitted."),
+            query("category", { type: "string" }, "Exact category, case-insensitive. uncategorized matches a null category."),
+            query("q", { type: "string" }, "Case-insensitive match on the skill id and the description."),
+          ],
+          responses: {
+            "200": {
+              description: "gzip-compressed tar of the rendered tree. x-ak-demo is true when no database is configured.",
+              content: { "application/gzip": { schema: { type: "string", contentEncoding: "gzip" } } },
+            },
             ...flatErrors,
           },
         }),

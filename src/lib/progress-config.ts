@@ -178,7 +178,34 @@ export interface BriefSettings {
      */
     workKinds: string[];
   };
+  /**
+   * Between-brief pushes. `enabled` defaults off: VELOCITY keeps alerts
+   * quiet until the owner has cleared the decision backlog once.
+   */
+  alerts: BriefAlertSettings;
 }
+
+/** Thresholds for `GET /api/brief/alerts`. Missing keys keep these defaults. */
+export interface BriefAlertSettings {
+  /** False sends nothing. Only a boolean true turns delivery on. */
+  enabled: boolean;
+  /** Coordinator silence re-sends after this many hours while it still holds. */
+  coordinatorRepeatHours: number;
+  /** Quiet stretch that fires a zero-merge alert. */
+  zeroMergeHours: number;
+  /** The repo must have merged at least once inside this many days. */
+  zeroMergeLookbackDays: number;
+  /** An open decision older than this many days fires once. */
+  decisionAgeDays: number;
+}
+
+export const DEFAULT_BRIEF_ALERTS: BriefAlertSettings = {
+  enabled: false,
+  coordinatorRepeatHours: 12,
+  zeroMergeHours: 72,
+  zeroMergeLookbackDays: 7,
+  decisionAgeDays: 14,
+};
 
 const DEFAULT_WORK_KINDS = ["session_end", "milestone", "status"];
 
@@ -197,6 +224,22 @@ export function resolveWorkKinds(kinds: readonly string[]): string[] {
 
 function finiteNumber(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function positiveNumber(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/** A missing block, or any `enabled` other than boolean true, stays off. */
+export function readBriefAlerts(raw: unknown): BriefAlertSettings {
+  const row = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  return {
+    enabled: row.enabled === true,
+    coordinatorRepeatHours: positiveNumber(row.coordinatorRepeatHours, DEFAULT_BRIEF_ALERTS.coordinatorRepeatHours),
+    zeroMergeHours: positiveNumber(row.zeroMergeHours, DEFAULT_BRIEF_ALERTS.zeroMergeHours),
+    zeroMergeLookbackDays: positiveNumber(row.zeroMergeLookbackDays, DEFAULT_BRIEF_ALERTS.zeroMergeLookbackDays),
+    decisionAgeDays: positiveNumber(row.decisionAgeDays, DEFAULT_BRIEF_ALERTS.decisionAgeDays),
+  };
 }
 
 /** Reads `brief` from the resolved progress config. A missing block keeps the script's defaults. */
@@ -227,6 +270,7 @@ export function readBriefSettings(raw: unknown): BriefSettings {
       maxSilenceHours: finiteNumber(coord.maxSilenceHours, 3),
       workKinds,
     },
+    alerts: readBriefAlerts(brief.alerts),
   };
 }
 

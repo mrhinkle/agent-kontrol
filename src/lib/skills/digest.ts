@@ -19,7 +19,7 @@ export async function skillsDigest(window: TimeWindow): Promise<SkillsDigest> {
   const [runs, skills, settings] = await Promise.all([digestRuns(since), listSkillRows(), listSettings()]);
   const inWindow = runs.filter((run) => run.started_at >= since);
   const counts = new Map<string, number>();
-  const byRuntime: SkillsDigest["triggers_by_runtime"] = { claude: 0, codex: 0, grok: 0, hermes: 0, mini: 0 };
+  const byRuntime: SkillsDigest["triggers_by_runtime"] = { claude: 0, codex: 0, grok: 0, hermes: 0, mini: 0, nemoclaw: 0 };
   for (const run of inWindow) {
     counts.set(run.skill_id, (counts.get(run.skill_id) ?? 0) + 1);
     if ((RUNTIMES as readonly string[]).includes(run.runtime)) {
