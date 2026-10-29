@@ -106,6 +106,7 @@ export function renderHermesDocument(skill: FormatSkill): string | null {
 export function renderHermesTree(skill: FormatSkill): RenderTree {
   const folder = categoryFolder(skill.category);
   if (!folder.ok) return { ok: false, reason: folder.reason };
+  // Directory is the skill id (the upstream slug). `skill.name` is display text.
   const name = skillFolder(skill.id);
   if (!name) return { ok: false, reason: "unsafe skill name" };
   const dir = `${folder.folder}/${name}`;

@@ -19,8 +19,9 @@ export function isSafeArchivePath(value: string): boolean {
 }
 
 /**
- * One path segment restricted to [a-z0-9-_], or [a-z0-9._-] when `allowDot`
- * is set so a reference can keep its extension. `..` is still rejected.
+ * One reference-file segment. This rewrites case and punctuation so a
+ * reference can keep a readable path. Do not use it for a category or a
+ * skill directory: those must already match `exactFolderSegment`.
  * Returns null when the segment is empty, too long, or a traversal.
  */
 export function safeSegment(raw: string, allowDot: boolean): string | null {
@@ -40,18 +41,40 @@ export function safeSegment(raw: string, allowDot: boolean): string | null {
   return slug;
 }
 
-/** Category or skill folder. A blank value is "no category", not a traversal. */
+/**
+ * A category or skill directory that is already safe.
+ * The pattern is the whole string: no lowercasing, no punctuation rewrite.
+ * A value outside the set is omitted from the archive.
+ */
+const EXACT_FOLDER = /^[a-z0-9][a-z0-9-_]*$/;
+
+export function exactFolderSegment(raw: string): string | null {
+  if (typeof raw !== "string") return null;
+  if (raw.length === 0 || raw.length > SEGMENT_MAX) return null;
+  if (!EXACT_FOLDER.test(raw)) return null;
+  return raw;
+}
+
+/**
+ * Category folder. Null or blank is "uncategorized".
+ * Any other value is kept only when it already matches the safe set.
+ */
 export function categoryFolder(category: string | null | undefined): { ok: true; folder: string } | { ok: false; reason: string } {
   if (category == null) return { ok: true, folder: "uncategorized" };
-  const trimmed = category.trim();
-  if (!trimmed) return { ok: true, folder: "uncategorized" };
-  const folder = safeSegment(trimmed, false);
+  if (category.trim() === "") return { ok: true, folder: "uncategorized" };
+  const folder = exactFolderSegment(category);
   if (!folder) return { ok: false, reason: "unsafe category" };
   return { ok: true, folder };
 }
 
+/**
+ * Skill directory segment.
+ * The store id is that name: assemble.ts copies it from the upstream
+ * directory slug, and the frontmatter `name` is only the display string.
+ * Those fields may differ. The archive uses `id`, unchanged.
+ */
 export function skillFolder(id: string): string | null {
-  return safeSegment(id, false);
+  return exactFolderSegment(id);
 }
 
 /**

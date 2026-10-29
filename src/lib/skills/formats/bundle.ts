@@ -33,10 +33,15 @@ export interface BundleSkill {
   runtimes: RuntimeFlags;
 }
 
+export interface SkippedSkill {
+  id: string;
+  reason: string;
+}
+
 export interface BuiltBundle {
   files: RenderedFile[];
-  /** Skill ids left out because the folder or the name was not a safe path. */
-  rejectedSkills: string[];
+  /** Skills left out of the archive, in input order, with the reason. */
+  skipped: SkippedSkill[];
   /** Reference paths left out of an otherwise exported skill. */
   rejectedReferences: string[];
 }
@@ -59,14 +64,19 @@ export function visibleForExport(skills: BundleSkill[], filter: ExportFilter): B
   });
 }
 
+interface RenderedSkill {
+  id: string;
+  files: RenderedFile[];
+  rejected: string[];
+}
+
 export function buildBundle(skills: BundleSkill[], filter: ExportFilter): BuiltBundle {
-  const files: RenderedFile[] = [];
-  const rejectedSkills: string[] = [];
-  const rejectedReferences: string[] = [];
+  const skipped: SkippedSkill[] = [];
+  const renderedSkills: RenderedSkill[] = [];
   for (const row of visibleForExport(skills, filter)) {
     const rendered = renderSkillTree(filter.runtime, row.skill);
     if (!rendered.ok) {
-      rejectedSkills.push(row.skill.id);
+      skipped.push({ id: row.skill.id, reason: rendered.reason });
       continue;
     }
     const safeFiles: RenderedFile[] = [];
@@ -81,17 +91,67 @@ export function buildBundle(skills: BundleSkill[], filter: ExportFilter): BuiltB
     // A single unsafe path drops the whole skill. Leaving SKILL.md in while
     // rejecting a sibling would still ship a tree the path check refused.
     if (unsafe) {
-      rejectedSkills.push(row.skill.id);
+      skipped.push({ id: row.skill.id, reason: "unsafe skill path" });
       continue;
     }
-    files.push(...safeFiles);
-    rejectedReferences.push(...rendered.rejected);
+    renderedSkills.push({ id: row.skill.id, files: safeFiles, rejected: rendered.rejected });
   }
-  return { files, rejectedSkills, rejectedReferences };
+  const colliding = duplicateSkillIndexes(renderedSkills);
+  const files: RenderedFile[] = [];
+  const rejectedReferences: string[] = [];
+  renderedSkills.forEach((row, index) => {
+    if (colliding.has(index)) {
+      skipped.push({ id: row.id, reason: "duplicate archive path" });
+      return;
+    }
+    files.push(...row.files);
+    rejectedReferences.push(...row.rejected);
+  });
+  return { files: uniqueArchiveFiles(files), skipped, rejectedReferences };
+}
+
+/** Skills that share any archive path. Every one of them is omitted. */
+function duplicateSkillIndexes(rows: RenderedSkill[]): Set<number> {
+  const owners = new Map<string, number[]>();
+  rows.forEach((row, index) => {
+    const seen = new Set<string>();
+    for (const file of row.files) {
+      if (seen.has(file.path)) continue;
+      seen.add(file.path);
+      const list = owners.get(file.path) ?? [];
+      list.push(index);
+      owners.set(file.path, list);
+    }
+  });
+  const colliding = new Set<number>();
+  for (const list of owners.values()) {
+    if (list.length < 2) continue;
+    for (const index of list) colliding.add(index);
+  }
+  return colliding;
+}
+
+/** Drop every file whose path appears more than once. The archive keeps one path once. */
+function uniqueArchiveFiles(files: RenderedFile[]): RenderedFile[] {
+  const counts = new Map<string, number>();
+  for (const file of files) counts.set(file.path, (counts.get(file.path) ?? 0) + 1);
+  return files.filter((file) => counts.get(file.path) === 1);
+}
+
+const MANIFEST_PATH = "manifest.json";
+
+/** Tar entries. A non-empty skip list is also written to manifest.json. */
+export function archiveFiles(built: BuiltBundle): RenderedFile[] {
+  if (built.skipped.length === 0) return built.files;
+  if (built.files.some((file) => file.path === MANIFEST_PATH)) return built.files;
+  return [
+    ...built.files,
+    { path: MANIFEST_PATH, content: `${JSON.stringify({ skipped: built.skipped })}\n` },
+  ];
 }
 
 export function bundleGzip(skills: BundleSkill[], filter: ExportFilter): Buffer {
-  return tarGzip(buildBundle(skills, filter).files);
+  return tarGzip(archiveFiles(buildBundle(skills, filter)));
 }
 
 export function parseExportQuery(url: string): { ok: true; filter: ExportFilter } | { ok: false; message: string; field: string } {

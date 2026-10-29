@@ -4,12 +4,13 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { runWithActor } from "../../src/lib/actor";
 import { createCredential, resetCredentialsForTests } from "../../src/lib/credentials";
 import { setSqlForTests } from "../../src/lib/db";
 import { setSkillNowForTests } from "../../src/lib/skills/clock";
 import { buildBundle, bundleGzip, visibleForExport, type BundleSkill } from "../../src/lib/skills/formats/bundle";
-import { renderAgentSkillsDocument } from "../../src/lib/skills/formats/agentskills";
+import { renderAgentSkillsDocument, renderAgentSkillsTree } from "../../src/lib/skills/formats/agentskills";
 import { renderClaudeTree } from "../../src/lib/skills/formats/claude";
 import { hermesKnown, renderHermesTree, storedFromHermesMarkdown } from "../../src/lib/skills/formats/hermes";
 import { categoryFolder, isSafeArchivePath, safeReferencePath, safeSegment } from "../../src/lib/skills/formats/paths";
@@ -77,6 +78,32 @@ function bundleSkill(partial: Partial<BundleSkill["skill"]> & Pick<BundleSkill["
     scope: partial.scope ?? { mode: "all", lanes: [] },
     runtimes: partial.runtimes ?? { claude: true, codex: true, grok: true, hermes: true, mini: true },
   };
+}
+
+function archiveNames(bytes: Buffer): string[] {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ak-skills-"));
+  try {
+    const file = path.join(dir, "bundle.tar.gz");
+    fs.writeFileSync(file, bytes);
+    const listing = execFileSync("tar", ["-tzf", file], { encoding: "utf8" });
+    return listing.split("\n").map((line) => line.trim()).filter(Boolean);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Next serves a concrete segment ahead of `[id]`. Calling the handler that
+ * wins for this URL is what an operator's GET /api/skills/:id actually hits.
+ */
+async function dispatchSkillsGet(id: string, url: string): Promise<Response> {
+  const staticFile = path.join("src/app/api/skills", id, "route.ts");
+  if (fs.existsSync(staticFile)) {
+    const loaded = await import(pathToFileURL(path.resolve(staticFile)).href) as { GET: (req: Request) => Promise<Response> };
+    return loaded.GET(new Request(url));
+  }
+  const dynamic = await import("../../src/app/api/skills/[id]/route");
+  return dynamic.GET(new Request(url), { params: Promise.resolve({ id }) });
 }
 
 function readArchive(bytes: Buffer): Map<string, string> {
@@ -287,15 +314,18 @@ describe("Hermes format adapters", () => {
     assert.equal(tree.files[0]?.path, "uncategorized/bare-skill/SKILL.md");
     assert.equal(tree.files[0]?.path.startsWith("/"), false);
     const spaced = renderHermesTree(bundleSkill({ id: "labeled", category: "Engineering Tools" }).skill);
-    assert.equal(spaced.ok, true);
-    if (!spaced.ok) return;
-    assert.equal(spaced.files[0]?.path, "engineering-tools/labeled/SKILL.md");
+    assert.equal(spaced.ok, false);
+    if (!spaced.ok) assert.match(spaced.reason, /unsafe category/);
+    const exactCategory = renderHermesTree(bundleSkill({ id: "labeled", category: "engineering-tools" }).skill);
+    assert.equal(exactCategory.ok, true);
+    if (!exactCategory.ok) return;
+    assert.equal(exactCategory.files[0]?.path, "engineering-tools/labeled/SKILL.md");
   });
 
   it("F7 bundles references beside SKILL.md and sanitizes their paths", () => {
     const tree = renderHermesTree(bundleSkill({
       id: "apple-notes",
-      category: "Apple",
+      category: "apple",
       references: [
         { path: "Notes/Guide.MD", content: "guide body" },
         { path: "checks.sh", content: "echo ok\n" },
@@ -491,8 +521,8 @@ describe("skill export route", { concurrency: false }, () => {
       { skill_id: "bad-trigger", trigger: "nope" as "off", scope: { mode: "all", lanes: [] }, schedule: null, updated_by: null, updated_at: NOW },
     );
 
-    const { GET } = await import("../../src/app/api/skills/export/route");
-    const open = await GET(new Request("http://localhost/api/skills/export?runtime=hermes", {
+    const { GET } = await import("../../src/app/api/skill-bundles/route");
+    const open = await GET(new Request("http://localhost/api/skill-bundles?runtime=hermes", {
       headers: { authorization: "Bearer test-mc-token" },
     }));
     assert.equal(open.status, 200);
@@ -508,7 +538,7 @@ describe("skill export route", { concurrency: false }, () => {
     assert.equal([...openFiles.values()].join("\n").includes("disabled body"), false);
     assert.equal([...openFiles.values()].join("\n").includes("bad trigger body"), false);
 
-    const lane = await GET(new Request("http://localhost/api/skills/export?runtime=hermes&lane=conference-os", {
+    const lane = await GET(new Request("http://localhost/api/skill-bundles?runtime=hermes&lane=conference-os", {
       headers: { authorization: "Bearer test-mc-token" },
     }));
     const laneFiles = readArchive(Buffer.from(await lane.arrayBuffer()));
@@ -516,24 +546,24 @@ describe("skill export route", { concurrency: false }, () => {
     assert.equal(laneFiles.has("apple/other-lane/SKILL.md"), false);
     assert.match(laneFiles.get("apple/shown/SKILL.md") ?? "", /shown body/);
 
-    const wrongCase = await GET(new Request("http://localhost/api/skills/export?runtime=hermes&lane=Conference-OS", {
+    const wrongCase = await GET(new Request("http://localhost/api/skill-bundles?runtime=hermes&lane=Conference-OS", {
       headers: { authorization: "Bearer test-mc-token" },
     }));
     const wrongFiles = readArchive(Buffer.from(await wrongCase.arrayBuffer()));
     assert.equal(wrongFiles.has("apple/picked/SKILL.md"), false);
 
-    const query = await GET(new Request("http://localhost/api/skills/export?runtime=hermes&q=target", {
+    const query = await GET(new Request("http://localhost/api/skill-bundles?runtime=hermes&q=target", {
       headers: { authorization: "Bearer test-mc-token" },
     }));
     const queryFiles = readArchive(Buffer.from(await query.arrayBuffer()));
     assert.equal(queryFiles.size, 0);
 
-    const missing = await GET(new Request("http://localhost/api/skills/export"));
+    const missing = await GET(new Request("http://localhost/api/skill-bundles"));
     assert.equal(missing.status, 400);
     assert.equal((await missing.json()).code, "validation_failed");
-    const repeated = await GET(new Request("http://localhost/api/skills/export?runtime=hermes&runtime=claude"));
+    const repeated = await GET(new Request("http://localhost/api/skill-bundles?runtime=hermes&runtime=claude"));
     assert.equal(repeated.status, 400);
-    const nemoclaw = await GET(new Request("http://localhost/api/skills/export?runtime=nemoclaw"));
+    const nemoclaw = await GET(new Request("http://localhost/api/skill-bundles?runtime=nemoclaw"));
     assert.equal(nemoclaw.status, 400);
 
     const pure = visibleForExport([
@@ -551,14 +581,16 @@ describe("skill export route", { concurrency: false }, () => {
     assert.equal(reader.ok && writer.ok && both.ok, true);
     if (!reader.ok || !writer.ok || !both.ok) return;
 
-    assert.equal(scopeForRoute("GET", "/api/skills/export"), null);
-    assert.equal(authorizeRoute({ kind: "agent", id: "cred", scopes: ["skills:read", "skills:write"] }, "GET", "/api/skills/export").ok, false);
-    assert.equal(authorizeRoute({ kind: "legacy" }, "GET", "/api/skills/export").ok, true);
+    assert.equal(scopeForRoute("GET", "/api/skill-bundles"), null);
+    assert.equal(authorizeRoute({ kind: "agent", id: "cred", scopes: ["skills:read", "skills:write"] }, "GET", "/api/skill-bundles").ok, false);
+    assert.equal(authorizeRoute({ kind: "legacy" }, "GET", "/api/skill-bundles").ok, true);
+    assert.equal(scopeForRoute("GET", "/api/skills/export"), "skills:read");
+    assert.equal(authorizeRoute({ kind: "agent", id: "cred", scopes: ["skills:read"] }, "GET", "/api/skills/export").ok, true);
     assert.equal(authorizeRoute({ kind: "agent", id: "cred", scopes: ["skills:read"] }, "GET", "/api/skills/verify-gibson").ok, true);
 
-    const { GET } = await import("../../src/app/api/skills/export/route");
+    const { GET } = await import("../../src/app/api/skill-bundles/route");
     for (const token of [reader.token, writer.token, both.token]) {
-      const denied = await GET(new Request("http://localhost/api/skills/export?runtime=hermes", {
+      const denied = await GET(new Request("http://localhost/api/skill-bundles?runtime=hermes", {
         headers: { authorization: `Bearer ${token}` },
       }));
       assert.equal(denied.status, 403);
@@ -566,7 +598,7 @@ describe("skill export route", { concurrency: false }, () => {
     }
 
     env.MC_TOKEN = "test-mc-token";
-    const allowed = await GET(new Request("http://localhost/api/skills/export?runtime=hermes", {
+    const allowed = await GET(new Request("http://localhost/api/skill-bundles?runtime=hermes", {
       headers: { authorization: "Bearer test-mc-token" },
     }));
     assert.equal(allowed.status, 200);
@@ -577,13 +609,139 @@ describe("skill export route", { concurrency: false }, () => {
     assert.equal([...files.keys()].some((name) => name.includes("operator-voice")), false);
   });
 
+  it("GET /api/skills/export returns the skill whose id is export", async () => {
+    installSkillsSql();
+    env.DATABASE_URL = "postgres://skills:skills@127.0.0.1:9/skills_test";
+    skillsMemory.skills.push(skill({
+      id: "export",
+      name: "export",
+      body: "the export skill",
+      description: "detail for the export id",
+    }));
+    for (const url of [
+      "http://localhost/api/skills/export",
+      "http://localhost/api/skills/export?runtime=hermes",
+    ]) {
+      const response = await dispatchSkillsGet("export", url);
+      assert.equal(response.status, 200, url);
+      assert.match(response.headers.get("content-type") ?? "", /application\/json/, url);
+      const body = await response.json() as { id: string; body: string };
+      assert.equal(body.id, "export", url);
+      assert.equal(body.body, "the export skill", url);
+    }
+  });
+
   it("documents the route in OpenAPI and API.md", () => {
     const api = fs.readFileSync("docs/API.md", "utf8");
-    assert.match(api, /\/api\/skills\/export/);
+    const mcp = fs.readFileSync("docs/MCP.md", "utf8");
+    assert.match(api, /\/api\/skill-bundles/);
+    assert.equal(api.includes("/api/skills/export"), false);
+    assert.equal(mcp.includes("/api/skills/export"), false);
     const { openApiDocument } = require("../../src/lib/openapi") as typeof import("../../src/lib/openapi");
-    const doc = openApiDocument() as { paths: Record<string, { get?: { parameters?: { name: string; required?: boolean }[] } }> };
-    const get = doc.paths["/api/skills/export"]?.get;
+    const doc = openApiDocument() as {
+      paths: Record<string, { get?: { description?: string; security?: { cookieAuth?: unknown[]; bearerAuth?: unknown[]; mcToken?: unknown[] }[]; parameters?: { name: string; required?: boolean }[] } }>;
+    };
+    assert.equal(doc.paths["/api/skills/export"], undefined);
+    const get = doc.paths["/api/skill-bundles"]?.get;
     assert.ok(get);
     assert.equal(get.parameters?.find((item) => item.name === "runtime")?.required, true);
+    assert.deepEqual(get.security, [{ cookieAuth: [] }, { mcToken: [] }]);
+    assert.equal(JSON.stringify(get.security).includes("bearerAuth"), false);
+    assert.match(get.description ?? "", /dashboard session/i);
+    assert.match(get.description ?? "", /MC_TOKEN/);
+    assert.match(get.description ?? "", /agent credential/i);
+  });
+});
+
+describe("archive path collisions", () => {
+  const filter = { runtime: "hermes" as const, lane: null, category: null, query: null };
+
+  it("keeps foo-bar and skips foo bar instead of writing one path twice", () => {
+    const rows = [
+      bundleSkill({ id: "foo bar", category: "notes", body: "spaced body" }),
+      bundleSkill({ id: "foo-bar", category: "notes", body: "dashed body" }),
+    ];
+    const names = archiveNames(bundleGzip(rows, filter));
+    const counts = new Map<string, number>();
+    for (const name of names) counts.set(name, (counts.get(name) ?? 0) + 1);
+    for (const [name, count] of counts) assert.equal(count, 1, name);
+    assert.equal(names.includes("notes/foo-bar/SKILL.md"), true);
+    assert.equal(names.some((name) => name.includes("foo bar")), false);
+    const built = buildBundle(rows, filter);
+    const skipped = built.skipped ?? [];
+    assert.equal(skipped.some((entry) => entry.id === "foo bar" && entry.reason.length > 0), true);
+    assert.equal(skipped.some((entry) => entry.id === "foo-bar"), false);
+    const archived = readArchive(bundleGzip(rows, filter));
+    assert.equal(archived.get("notes/foo-bar/SKILL.md")?.includes("dashed body"), true);
+    assert.equal([...archived.values()].some((text) => text.includes("spaced body")), false);
+  });
+
+  it("skips a category or name that is not already a safe folder and reports it", () => {
+    const rows = [
+      bundleSkill({ id: "safe-name", category: "Bad Category", body: "bad category body" }),
+      bundleSkill({ id: "Bad Name", category: "notes", body: "bad name body" }),
+      bundleSkill({ id: "kept", category: "notes", body: "kept body" }),
+    ];
+    const built = buildBundle(rows, filter);
+    const paths = built.files.map((file) => file.path);
+    assert.equal(paths.includes("bad-category/safe-name/SKILL.md"), false);
+    assert.equal(paths.includes("notes/bad-name/SKILL.md"), false);
+    assert.equal(paths.includes("notes/Bad Name/SKILL.md"), false);
+    assert.equal(paths.includes("notes/kept/SKILL.md"), true);
+    const skipped = built.skipped ?? [];
+    assert.equal(skipped.some((entry) => entry.id === "safe-name" && /category/i.test(entry.reason)), true);
+    assert.equal(skipped.some((entry) => entry.id === "Bad Name" && /name/i.test(entry.reason)), true);
+    assert.equal(skipped.some((entry) => entry.id === "kept"), false);
+    const names = archiveNames(bundleGzip(rows, filter));
+    assert.equal(new Set(names).size, names.length);
+    assert.equal([...readArchive(bundleGzip(rows, filter)).values()].some((text) => text.includes("bad category body") || text.includes("bad name body")), false);
+  });
+
+  it("omits every skill that would share an archive path", () => {
+    const rows = [
+      bundleSkill({ id: "same", category: "notes", body: "first body" }),
+      bundleSkill({ id: "same", category: "notes", body: "second body" }),
+    ];
+    const built = buildBundle(rows, filter);
+    assert.equal(built.files.some((file) => file.path === "notes/same/SKILL.md"), false);
+    const skipped = (built.skipped ?? []).filter((entry) => entry.id === "same" && /duplicate/i.test(entry.reason));
+    assert.equal(skipped.length, 2);
+    const names = archiveNames(bundleGzip(rows, filter));
+    assert.equal(names.includes("notes/same/SKILL.md"), false);
+    assert.equal(new Set(names).size, names.length);
+    const text = [...readArchive(bundleGzip(rows, filter)).values()].join("\n");
+    assert.equal(text.includes("first body"), false);
+    assert.equal(text.includes("second body"), false);
+
+    const uncategorized = [
+      bundleSkill({ id: "notes", category: null, body: "from null" }),
+      bundleSkill({ id: "notes", category: "uncategorized", body: "from folder" }),
+    ];
+    const folded = buildBundle(uncategorized, filter);
+    assert.equal(folded.files.some((file) => file.path === "uncategorized/notes/SKILL.md"), false);
+    assert.equal((folded.skipped ?? []).filter((entry) => entry.id === "notes" && /duplicate/i.test(entry.reason)).length, 2);
+  });
+
+  it("uses the skill id as the directory when the display name differs", () => {
+    const row = bundleSkill({
+      id: "apple-notes",
+      name: "Apple Notes",
+      category: "apple",
+      description: "Manage notes.",
+      body: "body",
+    }).skill;
+    const hermes = renderHermesTree(row);
+    assert.equal(hermes.ok, true);
+    if (!hermes.ok) return;
+    assert.equal(hermes.files[0]?.path, "apple/apple-notes/SKILL.md");
+    assert.match(hermes.files[0]?.content ?? "", /name: Apple Notes/);
+    const claude = renderClaudeTree(row);
+    assert.equal(claude.ok, true);
+    if (!claude.ok) return;
+    assert.equal(claude.files[0]?.path, "skills/apple-notes/SKILL.md");
+    const agents = renderAgentSkillsTree(row);
+    assert.equal(agents.ok, true);
+    if (!agents.ok) return;
+    assert.equal(agents.files[0]?.path, ".agents/skills/apple-notes/SKILL.md");
   });
 });

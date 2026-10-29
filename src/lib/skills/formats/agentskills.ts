@@ -33,6 +33,7 @@ export function renderAgentSkillsDocument(skill: FormatSkill): string | null {
 }
 
 export function renderAgentSkillsTree(skill: FormatSkill): RenderTree {
+  // Directory is the skill id. `skill.name` is the display string.
   const name = skillFolder(skill.id);
   if (!name) return { ok: false, reason: "unsafe skill name" };
   const dir = `.agents/skills/${name}`;

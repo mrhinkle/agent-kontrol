@@ -7,6 +7,10 @@
  */
 
 export interface FormatSkill {
+  /**
+   * Canonical directory name. This is the upstream directory slug.
+   * `name` is the frontmatter display string and may differ.
+   */
   id: string;
   name: string;
   description: string;

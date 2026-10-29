@@ -112,6 +112,8 @@ function body(schema: Json): Json {
 const cookieOrBearer = [{ cookieAuth: [] }, { bearerAuth: [] }];
 const bearerOnly = [{ bearerAuth: [] }];
 const sessionOnly = [{ cookieAuth: [] }];
+/** Dashboard session or MC_TOKEN. Not the generic bearer that accepts an agent credential. */
+const operatorSessionOrMcToken = [{ cookieAuth: [] }, { mcToken: [] }];
 
 /** Server-set. A request body cannot write these. */
 const actorType: Json = {
@@ -202,6 +204,12 @@ export function openApiDocument(): Json {
           type: "http",
           scheme: "bearer",
           description: "MC_TOKEN, an akc_ agent credential, or an OAuth access token on the MCP transport.",
+        },
+        mcToken: {
+          type: "http",
+          scheme: "bearer",
+          bearerFormat: "MC_TOKEN",
+          description: "Operator MC_TOKEN. An agent credential and an OAuth access token are not accepted on operations that use this scheme.",
         },
       },
       schemas: {
@@ -1472,14 +1480,14 @@ export function openApiDocument(): Json {
           },
         }),
       },
-      "/api/skills/export": {
+      "/api/skill-bundles": {
         get: operation({
           operationId: "exportSkills",
           tags: ["skills"],
           summary: "Download a skill tree for one runtime.",
           description:
-            "Operator route. An agent credential is denied, including one with skills:read or skills:write. Dashboard session or MC_TOKEN. runtime is required and is claude, codex, grok, hermes, or mini. lane is optional. Trigger off is omitted. A selected scope is omitted unless lane is set and admits it. category and q match list_skills. The body is a gzip-compressed tar. Paths are relative. A category or skill name that is not a safe folder is left out. A skill with no category is under uncategorized/. hermes uses <category>/<name>/SKILL.md. With no database the archive is the demo fixture under the same rules. A repeated runtime, lane, category, or q is 400 validation_failed.",
-          security: cookieOrBearer,
+            "Operator only. Authenticate with a dashboard session or MC_TOKEN. An agent credential is denied, including one with skills:read or skills:write. runtime is required and is claude, codex, grok, hermes, or mini. lane is optional. Trigger off is omitted. A selected scope is omitted unless lane is set and admits it. category and q match list_skills. The body is a gzip-compressed tar. Paths are relative. The directory is the skill id, which is the upstream directory slug. The frontmatter name is a display string and may differ. A category or skill id that does not already match ^[a-z0-9][a-z0-9-_]*$ is omitted and listed in x-ak-skipped and in manifest.json. It is not rewritten. When two skills would write one archive path, every one of those skills is omitted and listed the same way. The archive contains each path once. A skill with no category is under uncategorized/. hermes uses <category>/<id>/SKILL.md. With no database the archive is the demo fixture under the same rules. A repeated runtime, lane, category, or q is 400 validation_failed.",
+          security: operatorSessionOrMcToken,
           parameters: [
             query("runtime", { type: "string", enum: ["claude", "codex", "grok", "hermes", "mini"] }, "Runtime the tree is rendered for.", { required: true }),
             query("lane", { type: "string" }, "When omitted, skills whose scope is selected are omitted."),
