@@ -118,6 +118,33 @@ describe("skill sync", { concurrency: false }, () => {
     assert.equal(failed.upstream.sha, "a".repeat(40));
   });
 
+  it("handles an indented non-list runtimes value exactly like the one-line form", async () => {
+    const run = (sha: string, extra: string) =>
+      syncSkills({
+        trigger: "manual",
+        fetcher: fetcher({ "master-skills": { commit_sha: sha.repeat(40), files: [md("skills/typed", "body", extra)] } }),
+      });
+    const outcome = async (extra: string) => {
+      installSkillsSql();
+      await run("a", "runtimes: [codex]\n");
+      assert.equal(skillsMemory.skills[0]?.runtimes?.codex, true);
+      const result = await run("b", extra);
+      const row = skillsMemory.skills.find((item) => item.id === "typed");
+      return { status: result.status, errors: result.errors.map((item) => item.message), runtimes: row?.runtimes };
+    };
+    for (const value of ["false", "true", "123"]) {
+      const oneLine = await outcome(`runtimes: ${value}\n`);
+      const indented = await outcome(`runtimes:\n  ${value}\n`);
+      assert.equal(oneLine.status, "failed", value);
+      assert.deepEqual(indented, oneLine, value);
+      assert.match(indented.errors.join(" "), /runtimes is not a list/, value);
+      assert.doesNotMatch(indented.errors.join(" "), /unknown runtimes/, value);
+    }
+    for (const value of ["null", "~"]) {
+      assert.deepEqual(await outcome(`runtimes:\n  ${value}\n`), await outcome(`runtimes: ${value}\n`), value);
+    }
+  });
+
   it("does not let a later source take an id owned by a source that failed", async () => {
     await syncSkills({
       trigger: "manual",

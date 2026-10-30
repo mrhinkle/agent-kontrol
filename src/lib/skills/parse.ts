@@ -243,7 +243,7 @@ function parseYamlMap(text: string): { ok: true; data: Record<string, unknown> }
       if (!MAPPING_INDICATOR.test(nextTrim) && isPlainStart(nextTrim)) {
         const plain = readPlainContinuation(lines, i + 1, indent);
         if (!plain.ok) return plain;
-        map[key] = foldPlain([], plain.lines);
+        map[key] = plainValue(foldPlain([], plain.lines));
         i = plain.next;
         continue;
       }
@@ -271,7 +271,7 @@ function parseYamlMap(text: string): { ok: true; data: Record<string, unknown> }
       if (!isPlainStart(rest)) return { ok: false, error: "multiline value does not start as plain text" };
       if (/\s#/.test(rest)) return { ok: false, error: "comment inside a multiline value is not supported" };
       if (MAPPING_INDICATOR.test(rest.trim())) return { ok: false, error: "mapping value inside a multiline value is not supported" };
-      map[key] = foldPlain([rest.trim()], continuation.lines);
+      map[key] = plainValue(foldPlain([rest.trim()], continuation.lines));
       i = continuation.next;
       continue;
     }
@@ -407,10 +407,14 @@ function parseScalar(text: string): { ok: true; value: unknown } | { ok: false; 
     return { ok: true, value: trimmed.slice(1, -1) };
   }
   if (trimmed.startsWith('"') || trimmed.startsWith("'")) return { ok: false, error: "unclosed quote in frontmatter" };
-  const unquoted = trimmed.replace(/[ \t]+#[ \t].*$/, "");
-  if (unquoted === "null" || unquoted === "~") return { ok: true, value: null };
-  if (unquoted === "true") return { ok: true, value: true };
-  if (unquoted === "false") return { ok: true, value: false };
-  if (/^-?[0-9]+$/.test(unquoted)) return { ok: true, value: Number(unquoted) };
-  return { ok: true, value: unquoted };
+  return { ok: true, value: plainValue(trimmed.replace(/[ \t]+#[ \t].*$/, "")) };
+}
+
+/** The type of an unquoted scalar, the same whether it was written on one line or folded from several. */
+function plainValue(text: string): unknown {
+  if (text === "null" || text === "~") return null;
+  if (text === "true") return true;
+  if (text === "false") return false;
+  if (/^-?[0-9]+$/.test(text)) return Number(text);
+  return text;
 }

@@ -282,6 +282,28 @@ describe("skill frontmatter and runtimes", () => {
     assert.equal(decision.flags.claude, false);
   });
 
+  it("gives an indented plain scalar the same type as the one-line form", () => {
+    for (const [text, value] of [["false", false], ["true", true], ["null", null], ["~", null], ["123", 123], ["-7", -7]] as const) {
+      const oneLine = parseSkillMarkdown(`---\nruntimes: ${text}\n---\nNeutral body.\n`, "typed");
+      const indented = parseSkillMarkdown(`---\nruntimes:\n  ${text}\n---\nNeutral body.\n`, "typed");
+      assert.equal(oneLine.parseProblem, null);
+      assert.equal(indented.parseProblem, null);
+      assert.deepEqual(indented.frontmatter, oneLine.frontmatter);
+      assert.equal(indented.frontmatter.runtimes, value);
+      const one = resolveRuntimes({ frontmatter: oneLine.frontmatter, body: oneLine.body, sibling: null, siblingProblem: null, parseProblem: null });
+      const two = resolveRuntimes({ frontmatter: indented.frontmatter, body: indented.body, sibling: null, siblingProblem: null, parseProblem: null });
+      assert.deepEqual(two, one);
+    }
+    const prose = parseSkillMarkdown(
+      "---\ndescription:\n  false\n  alarms are rare\nnote: 123\n  more\nruntimes:\n  codex grok\n---\nBody\n",
+      "prose",
+    );
+    assert.equal(prose.parseProblem, null);
+    assert.equal(prose.description, "false alarms are rare");
+    assert.equal(prose.frontmatter.note, "123 more");
+    assert.equal(prose.frontmatter.runtimes, "codex grok");
+  });
+
   it("keeps adjacent nested maps, both sequence styles, and block scalars in their shapes", () => {
     const parsed = parseSkillMarkdown(
       [
