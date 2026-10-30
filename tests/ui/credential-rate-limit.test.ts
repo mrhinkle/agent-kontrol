@@ -5,7 +5,9 @@ import { authCookieValue, signAccessToken } from "../../src/lib/authcrypto";
 import {
   createCredential,
   listCredentials,
+  plantCredentialForTests,
   resetCredentialsForTests,
+  resolveAgentCredential,
   revokeCredential,
   setCredentialClockForTests,
   validateLimitsInput,
@@ -88,6 +90,17 @@ describe("limits: defaults and validation", { concurrency: false }, () => {
     const listed = await listCredentials();
     assert.equal(listed[0]?.rate_limit_per_minute, 60);
     assert.equal(listed[0]?.rate_limit_per_day, 10_000);
+  });
+
+  it("gives a planted test credential the default limits, so it is charged and not 503", async () => {
+    plantCredentialForTests({ token: "akc_planted-quota-not-a-secret", scopes: ["fleet:read"] });
+    const resolved = await resolveAgentCredential("akc_planted-quota-not-a-secret");
+    assert.equal(resolved.status, "ok");
+    if (resolved.status !== "ok") return;
+    assert.equal(resolved.credential.rate_limit_per_minute, 60);
+    assert.equal(resolved.credential.rate_limit_per_day, 10_000);
+    const charged = await chargeCredentialRequest(fleetReq("akc_planted-quota-not-a-secret"), resolved.credential.id);
+    assert.equal(charged.status, "ok");
   });
 
   it("rejects a limit that is not a whole number from 1 to 1,000,000, and has no unlimited value", async () => {
