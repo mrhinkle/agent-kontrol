@@ -270,6 +270,7 @@ function parseYamlMap(text: string): { ok: true; data: Record<string, unknown> }
       if (rest.startsWith('"') || rest.startsWith("'")) return { ok: false, error: "multiline quoted value is not supported" };
       if (!isPlainStart(rest)) return { ok: false, error: "multiline value does not start as plain text" };
       if (/\s#/.test(rest)) return { ok: false, error: "comment inside a multiline value is not supported" };
+      if (MAPPING_INDICATOR.test(rest.trim())) return { ok: false, error: "mapping value inside a multiline value is not supported" };
       map[key] = foldPlain([rest.trim()], continuation.lines);
       i = continuation.next;
       continue;
