@@ -376,6 +376,14 @@ export async function testSweeper(tag: string, applyCanonicalSchema: () => Promi
       assert.equal(verdictOf(run, "resume-uncited", jobKey), "clear");
       assert.equal((await inbox("resume-uncited", jobKey)).map((r) => r.event).join(","), "resume-uncited,resume-uncited-cleared");
 
+      // A refresh that omits stale_after_minutes keeps the stored window.
+      const windowJob = `${tag}-window`.toLowerCase();
+      await observe("sweep.scheduler_job", { source: "mini", job_id: windowJob, state: "paused", transition: 1, observed_at: new Date().toISOString(), stale_after_minutes: 5 });
+      assert.equal((await observe("sweep.scheduler_job", { source: "mini", job_id: windowJob, state: "paused", transition: 1, observed_at: new Date().toISOString() })).outcome, "refreshed");
+      assert.equal(Number((await sql()`select stale_after_minutes from scheduler_jobs where job_id = ${windowJob}`)[0].stale_after_minutes), 5);
+      advance(6 * MIN);
+      assert.equal(verdictOf(await runSweep(), "pause-unexplained", `job:mini/${windowJob}`), "unknown", "the five-minute window still applies");
+
       // A first active observation proves no resume.
       const lone = `${tag}-lone`.toLowerCase();
       await observe("sweep.scheduler_job", { source: "mini", job_id: lone, state: "active", transition: 5, observed_at: new Date().toISOString() });

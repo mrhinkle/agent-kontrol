@@ -141,7 +141,7 @@ Three reserved kinds carry trusted evidence for the absence sweeper (see [VELOCI
 
 | `kind` | `observation` |
 | --- | --- |
-| `sweep.scheduler_job` | `source`, `job_id`, `state` (`active` or `paused`), `transition` (the source's monotonic transition id for the job), `observed_at`, and for a pause `paused_at`, `paused_reason` (500 max), `until`; `decision` is the citation for this transition. Optional `stale_after_minutes` (5 to 1440, default 30). |
+| `sweep.scheduler_job` | `source`, `job_id`, `state` (`active` or `paused`), `transition` (the source's monotonic transition id for the job), `observed_at`, and for a pause `paused_at`, `paused_reason` (500 max), `until`; `decision` is the citation for this transition. Optional `stale_after_minutes` (5 to 1440): default 30 on a new transition; omitted on a refresh of the same transition, the stored window is kept. |
 | `sweep.queue` | `source`, `queue` (stored lowercase), `classification` (`issue_dispatch` or `pr_review`), `repo`, `seq`, `observed_at`, `complete`, `error`, `ready {count, refs}`, `raw {count, refs}` (50 refs max). A complete observation needs both counts. |
 | `sweep.pr_snapshot` | `source`, `repo`, `seq`, `observed_at`, `complete`, `error`, and `prs`: every open PR (200 max) with `number`, `draft`, `opened_at`, `mergeable` (`mergeable`, `conflicting`, `unknown`), `head_sha`, `required_checks {state, head_sha}`, `review {started, head_sha}`, and optional `title`, `url`. |
 

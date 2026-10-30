@@ -287,7 +287,8 @@ export interface SchedulerObservation {
   until: string | null;
   decision: string | null;
   observed_at: string;
-  stale_after_minutes: number;
+  /** Null when omitted: a new transition uses the default, a refresh keeps the stored window. */
+  stale_after_minutes: number | null;
 }
 
 const SCHEDULER_FIELDS = ["source", "job_id", "state", "transition", "paused_at", "paused_reason", "until", "decision", "observed_at", "stale_after_minutes"];
@@ -312,7 +313,7 @@ export function checkSchedulerObservation(body: unknown): Checked<SchedulerObser
     until: r.timestamp("until"),
     decision: r.citation("decision"),
     observed_at: r.timestamp("observed_at", { required: true }) ?? "",
-    stale_after_minutes: r.staleAfter("stale_after_minutes"),
+    stale_after_minutes: r.has("stale_after_minutes") && r.raw("stale_after_minutes") !== null ? r.staleAfter("stale_after_minutes") : null,
   };
   if (state === "active") {
     for (const key of ["paused_at", "paused_reason", "until"] as const) {
@@ -658,7 +659,7 @@ export async function writeSchedulerObservation(obs: SchedulerObservation, prove
         ) values (
           ${obs.source}, ${obs.job_id}, ${obs.state}, ${obs.transition}, ${obs.paused_at}::timestamptz,
           ${obs.paused_reason}, ${obs.until}::timestamptz, ${obs.decision},
-          null, null, null, false, ${obs.observed_at}::timestamptz, ${obs.stale_after_minutes},
+          null, null, null, false, ${obs.observed_at}::timestamptz, ${obs.stale_after_minutes ?? DEFAULT_STALE_MINUTES},
           ${now}::timestamptz, ${now}::timestamptz, ${id}::bigint, 1
         )
         on conflict (source, job_id) do update set
@@ -688,7 +689,7 @@ export async function writeSchedulerObservation(obs: SchedulerObservation, prove
           until = coalesce(${obs.until}::timestamptz, until),
           decision = coalesce(${obs.decision}::text, decision),
           observed_at = greatest(observed_at, ${obs.observed_at}::timestamptz),
-          stale_after_minutes = ${obs.stale_after_minutes},
+          stale_after_minutes = coalesce(${obs.stale_after_minutes}::integer, stale_after_minutes),
           last_received_at = greatest(last_received_at, ${now}::timestamptz),
           last_observation_id = ${id}::bigint,
           version = version + 1
