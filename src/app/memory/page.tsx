@@ -45,7 +45,7 @@ export default function MemoryPage() {
     };
   }, [query, reload]);
 
-  async function postNote(dryRun: boolean) {
+  async function postNote(dryRun: boolean, expectedRevision?: string) {
     if (!draft) return null;
     const res = await fetch("/api/memory", {
       method: "POST",
@@ -56,9 +56,13 @@ export default function MemoryPage() {
         tags: draft.tags,
         agent_id: draft.agent_id,
         ...(dryRun ? { dry_run: true } : {}),
+        ...(!dryRun && expectedRevision ? { expected_revision: expectedRevision } : {}),
       }),
     });
-    const body = (await res.json().catch(() => ({}))) as Partial<DryRunResult> & { error?: string };
+    const body = (await res.json().catch(() => ({}))) as Partial<DryRunResult> & {
+      error?: string;
+      code?: string;
+    };
     return { res, body };
   }
 
@@ -85,8 +89,19 @@ export default function MemoryPage() {
     setBusy(true);
     setFormError(null);
     try {
-      const sent = await postNote(false);
+      const sent = await postNote(false, preview?.expected_revision);
       if (!sent) return;
+      if (sent.res.status === 409 && sent.body.error === "stale_write") {
+        const fresh = await postNote(true);
+        if (fresh && fresh.res.ok && fresh.body.dry_run === true && Array.isArray(fresh.body.changes)) {
+          setPreview(fresh.body as DryRunResult);
+          setFormError("This note changed since the preview. Review the new preview before overwriting.");
+          return;
+        }
+        setFormError(fresh?.body.error ?? "This note changed. Preview it again before overwriting.");
+        setPreview(null);
+        return;
+      }
       if (!sent.res.ok) {
         setFormError(sent.body.error ?? `Overwrite failed (${sent.res.status}).`);
         setPreview(null);

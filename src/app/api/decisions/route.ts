@@ -101,6 +101,12 @@ export async function POST(req: Request) {
   if (!isConfigured()) return NextResponse.json({ ok: true, demo: true, note: DEMO_NOTE });
   try {
     const result = await upsertDecision(parsed.value);
+    if (result.writeback_in_progress) {
+      return apiError("writeback_in_progress", {
+        message: "A write-back is in progress for this decision.",
+        fields: { force: "Wait for the write-back to finish before reopening." },
+      });
+    }
     return NextResponse.json({ ok: true, decision: result.decision, status_held: result.status_held });
   } catch (e) {
     return publicError("[decisions] upsert failed", e);

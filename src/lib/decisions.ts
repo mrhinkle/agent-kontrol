@@ -1,4 +1,4 @@
-import { sql } from "./db";
+import { isConfigured, sql } from "./db";
 
 /**
  * The decisions queue.
@@ -19,6 +19,75 @@ import { sql } from "./db";
  */
 
 export const DECISION_STATUSES = ["open", "decided", "deferred", "withdrawn"] as const;
+
+/**
+ * How long a write-back may hold `writeback_lock`. Neon HTTP cannot keep a
+ * session advisory lock across queries, so the claim is one UPDATE and the
+ * lease is how a crashed writer gives the row back.
+ *
+ * The lease is longer than every caller. MCP `resolve_decision` runs on
+ * `/api/mcp` with `maxDuration` 60s, and each GitHub fetch aborts after 15s.
+ * 180s keeps a reopen from winning while that writer can still post.
+ */
+export const WRITEBACK_LOCK_LEASE_SECONDS = 180;
+
+/**
+ * True while `lock` is set and its timestamp is inside the lease.
+ * A missing timestamp is still held: the row cannot prove the claim expired.
+ * This is the same predicate as the SQL reopen and claim guards.
+ */
+export function writebackLockUnexpired(lock: unknown, lockAt: unknown, nowMs = Date.now()): boolean {
+  if (lock == null || lock === "") return false;
+  const at = lockAt instanceof Date ? lockAt.getTime() : Date.parse(String(lockAt ?? ""));
+  if (Number.isNaN(at)) return true;
+  return nowMs - at < WRITEBACK_LOCK_LEASE_SECONDS * 1000;
+}
+
+/** Milliseconds of a timestamp, or null when the value is missing or not a time. */
+function timeMs(value: unknown): number | null {
+  if (value == null || value === "") return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (value instanceof Date) {
+    const at = value.getTime();
+    return Number.isFinite(at) ? at : null;
+  }
+  const at = Date.parse(String(value));
+  return Number.isFinite(at) ? at : null;
+}
+
+/**
+ * Strictly older than the claim lease. Equal to the lease is still inside.
+ * One timestamp. The retry population uses `nullWritebackRetryDue`.
+ */
+export function nullWritebackPastLease(at: unknown, nowMs = Date.now()): boolean {
+  const ms = timeMs(at);
+  if (ms == null) return false;
+  return nowMs - ms > WRITEBACK_LOCK_LEASE_SECONDS * 1000;
+}
+
+/**
+ * A decided row with a null write-back stamp joins `writeback=not_written`
+ * on this predicate, the same one as the list SQL:
+ * the claim is absent or `writeback_lock_at` is strictly older than the
+ * lease, and coalesce(`writeback_lock_at`, `decided_at`, `updated_at`) is too.
+ * A collector upsert refreshes `updated_at` and leaves the other two columns
+ * alone, so `updated_at` by itself is not the age clock.
+ */
+export function nullWritebackRetryDue(
+  row: {
+    writeback_lock?: unknown;
+    writeback_lock_at?: unknown;
+    decided_at?: unknown;
+    updated_at?: unknown;
+  },
+  nowMs = Date.now(),
+): boolean {
+  const lockAbsent = row.writeback_lock == null;
+  if (!lockAbsent && !nullWritebackPastLease(row.writeback_lock_at, nowMs)) return false;
+  const clock = timeMs(row.writeback_lock_at) ?? timeMs(row.decided_at) ?? timeMs(row.updated_at);
+  return nullWritebackPastLease(clock, nowMs);
+}
+
 export type DecisionStatus = (typeof DECISION_STATUSES)[number];
 
 export const LIST_STATUSES = [...DECISION_STATUSES, "all"] as const;
@@ -55,8 +124,19 @@ export interface Decision {
   last_seen_at: string;
   created_at: string;
   updated_at: string;
+  /**
+   * Optimistic concurrency token. Increments on patch, upsert, claim, and
+   * write-back stamp. Not a timestamp: `updated_at` is not compared for equality.
+   */
+  revision: number;
   /** Whole days from opened_at (else first_seen_at) to now. Same floor as morning-brief.sh. */
   age_days: number;
+  /** Null when the caller was dev-open, or when the column was never written. */
+  actor_type: "human" | "agent" | null;
+  actor_id: string | null;
+  chosen_option: string | null;
+  /** `written` or `not_written` after a decide. Null when there is no GitHub target, or before a decide. */
+  writeback: "written" | "not_written" | null;
 }
 
 /** One element of `morning-brief.sh --json .decisions`. */
@@ -116,6 +196,70 @@ export interface PatchInput {
   setDecidedBy: boolean;
   defer_until?: string | null;
   setDefer: boolean;
+  /** When true, store actor_type and actor_id, including null for dev-open. */
+  setActor?: boolean;
+  actor_type?: "human" | "agent" | null;
+  actor_id?: string | null;
+  setChosen?: boolean;
+  chosen_option?: string | null;
+  /**
+   * Accepted for older clients. Not the concurrency token.
+   * A mismatch does not reject the write.
+   */
+  expectedUpdatedAt?: string | null;
+  /** When set, the update matches only a row still at this integer revision. */
+  expectedRevision?: number | null;
+  /**
+   * When true, a decided or withdrawn row is not updated unless status is
+   * open (the explicit reopen). Deferred is not terminal. Resolve sets this
+   * on every mutation so omitting status cannot change the answer text.
+   */
+  guardTerminal?: boolean;
+}
+
+export interface DecisionStore {
+  get(id: number): Promise<Record<string, unknown> | null>;
+  list(query: {
+    status: ListStatus;
+    repo: string | null;
+    source: string | null;
+    limit: number;
+    shape?: ListShape;
+    writeback?: "written" | "not_written" | null;
+  }): Promise<Record<string, unknown>[]>;
+  upsert(input: UpsertInput): Promise<{ row: Record<string, unknown>; previous_status: string | null; writeback_in_progress?: boolean }>;
+  patch(id: number, input: PatchInput): Promise<Record<string, unknown> | null>;
+  /**
+   * Stamp writeback only when the row is still `decided` at `revision`.
+   * A token requires that claim as well and clears the lock.
+   * A null token is the give-up stamp when no live claim holds the row.
+   * A lock still inside the lease refuses the stamp so the writer is not fenced.
+   */
+  setWriteback(id: number, writeback: "written" | "not_written", revision: number, token: string | null): Promise<Record<string, unknown> | null>;
+  /**
+   * Claim this decided revision. Returns the new revision after the increment.
+   * Null when the row changed or an unexpired lock is held.
+   */
+  claimWriteback(id: number, revision: number): Promise<{ token: string; revision: number } | null>;
+  releaseWriteback(id: number, token: string): Promise<void>;
+  writebackClaimHeld(id: number, token: string, revision: number): Promise<boolean>;
+}
+
+let testStore: DecisionStore | null = null;
+
+/** Route tests substitute the queue so they do not parse SQL. */
+export function setDecisionStoreForTests(store: DecisionStore | null): void {
+  testStore = store;
+}
+
+/** True when a database or a test store will keep the row. */
+export function decisionPersistenceOn(): boolean {
+  return isConfigured() || testStore !== null;
+}
+
+/** True when route tests substituted the queue. Callers must not hit SQL then. */
+export function usingDecisionTestStore(): boolean {
+  return testStore !== null;
 }
 
 export interface ReconcileInput {
@@ -203,6 +347,15 @@ function asId(value: unknown): number {
   return Number.isSafeInteger(n) ? n : 0;
 }
 
+function asRevision(value: unknown): number {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return value;
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    const n = Number(value);
+    if (Number.isSafeInteger(n)) return n;
+  }
+  return 0;
+}
+
 export function presentDecision(row: Record<string, unknown>, nowIso: string): Decision {
   const opened = iso(row.opened_at) ?? iso(row.first_seen_at) ?? nowIso;
   const kind = row.kind === "pr" || row.kind === "issue" ? row.kind : null;
@@ -233,7 +386,12 @@ export function presentDecision(row: Record<string, unknown>, nowIso: string): D
     last_seen_at: iso(row.last_seen_at) ?? nowIso,
     created_at: iso(row.created_at) ?? nowIso,
     updated_at: iso(row.updated_at) ?? nowIso,
+    revision: asRevision(row.revision),
     age_days: ageDays(opened, nowIso),
+    actor_type: row.actor_type === "human" || row.actor_type === "agent" ? row.actor_type : null,
+    actor_id: row.actor_id == null ? null : String(row.actor_id),
+    chosen_option: row.chosen_option == null ? null : String(row.chosen_option),
+    writeback: row.writeback === "written" || row.writeback === "not_written" ? row.writeback : null,
   };
 }
 
@@ -560,7 +718,7 @@ export function parseDecisionId(raw: string): number | null {
   return Number.isSafeInteger(id) ? id : null;
 }
 
-export function parseListQuery(params: URLSearchParams): { ok: true; status: ListStatus; repo: string | null; source: string | null; limit: number; shape: ListShape } | ParseFail {
+export function parseListQuery(params: URLSearchParams): { ok: true; status: ListStatus; repo: string | null; source: string | null; limit: number; shape: ListShape; writeback: "written" | "not_written" | null } | ParseFail {
   const shapeRaw = params.get("shape") ?? "row";
   if (!(LIST_SHAPES as readonly string[]).includes(shapeRaw)) {
     return fail("validation_failed", { shape: "shape must be row or brief." });
@@ -585,6 +743,14 @@ export function parseListQuery(params: URLSearchParams): { ok: true; status: Lis
     }
     limit = Number(limitRaw);
   }
+  const writebackRaw = params.get("writeback");
+  let writeback: "written" | "not_written" | null = null;
+  if (writebackRaw != null && writebackRaw !== "") {
+    if (writebackRaw !== "written" && writebackRaw !== "not_written") {
+      return fail("validation_failed", { writeback: "writeback must be written or not_written." });
+    }
+    writeback = writebackRaw;
+  }
   return {
     ok: true,
     status: statusRaw as ListStatus,
@@ -592,6 +758,7 @@ export function parseListQuery(params: URLSearchParams): { ok: true; status: Lis
     source: sourceRaw,
     limit,
     shape: shapeRaw as ListShape,
+    writeback,
   };
 }
 
@@ -599,16 +766,158 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+export async function getDecision(id: number): Promise<Decision | null> {
+  const now = nowIso();
+  if (testStore) {
+    const row = await testStore.get(id);
+    return row ? presentDecision(row, now) : null;
+  }
+  if (!isConfigured()) return null;
+  const db = sql();
+  const rows = await db`select * from decisions where id = ${id}`;
+  return rows[0] ? presentDecision(rows[0], now) : null;
+}
+
+/**
+ * Claim the decided revision write-back is about to publish. The claim is
+ * the fence: an explicit reopen matches zero rows while it is held, and a
+ * writer whose revision is no longer current does not contact GitHub.
+ * The returned revision is the row after this increment. Stamp and the
+ * pre-mutation check use that value, plus the token.
+ * Returns null when the row changed or another unexpired claim is live.
+ */
+export async function claimDecisionWriteback(id: number, revision: number): Promise<{ token: string; revision: number } | null> {
+  if (!Number.isSafeInteger(revision) || revision < 0) return null;
+  if (testStore) return testStore.claimWriteback(id, revision);
+  const db = sql();
+  const token = crypto.randomUUID();
+  const rows = await db`
+    update decisions
+    set writeback_lock = ${token},
+        writeback_lock_at = now(),
+        revision = revision + 1,
+        updated_at = now()
+    where id = ${id}
+      and status = 'decided'
+      and revision = ${revision}
+      and (
+        writeback_lock is null
+        or writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+      )
+    returning revision
+  `;
+  const next = asRevision(rows[0]?.revision);
+  if (!rows[0] || next <= revision) return null;
+  return { token, revision: next };
+}
+
+export async function releaseDecisionWriteback(id: number, token: string): Promise<void> {
+  if (testStore) {
+    await testStore.releaseWriteback(id, token);
+    return;
+  }
+  const db = sql();
+  await db`
+    update decisions
+    set writeback_lock = null, writeback_lock_at = null
+    where id = ${id} and writeback_lock = ${token}
+  `;
+}
+
+/**
+ * True while this token still owns that decided revision.
+ * An expired lease does not drop the holder. It only lets someone else claim.
+ * A new claim, a stamp, or a reopen changes the token or the revision.
+ */
+export async function decisionWritebackClaimHeld(id: number, token: string, revision: number): Promise<boolean> {
+  if (!Number.isSafeInteger(revision) || revision < 0) return false;
+  if (testStore) return testStore.writebackClaimHeld(id, token, revision);
+  const db = sql();
+  const rows = await db`
+    select id from decisions
+    where id = ${id}
+      and writeback_lock = ${token}
+      and status = 'decided'
+      and revision = ${revision}
+  `;
+  return Boolean(rows[0]);
+}
+
+/**
+ * True when an unexpired write-back claim still owns this row.
+ * Callers use it to answer 409 writeback_in_progress instead of a generic conflict.
+ */
+export async function decisionWritebackLocked(id: number): Promise<boolean> {
+  if (testStore) {
+    const row = await testStore.get(id);
+    return row != null && writebackLockUnexpired(row.writeback_lock, row.writeback_lock_at);
+  }
+  if (!isConfigured()) return false;
+  const db = sql();
+  const rows = await db`select writeback_lock, writeback_lock_at from decisions where id = ${id}`;
+  const row = rows[0];
+  return row != null && writebackLockUnexpired(row.writeback_lock, row.writeback_lock_at);
+}
+
+export async function setDecisionWriteback(
+  id: number,
+  writeback: "written" | "not_written",
+  revision: number,
+  token: string | null,
+): Promise<Decision | null> {
+  if (!Number.isSafeInteger(revision) || revision < 0) return null;
+  const now = nowIso();
+  if (testStore) {
+    const row = await testStore.setWriteback(id, writeback, revision, token);
+    return row ? presentDecision(row, now) : null;
+  }
+  const db = sql();
+  const rows = token
+    ? await db`
+        update decisions
+        set writeback = ${writeback},
+            revision = revision + 1,
+            writeback_lock = null,
+            writeback_lock_at = null,
+            updated_at = now()
+        where id = ${id}
+          and status = 'decided'
+          and revision = ${revision}
+          and writeback_lock = ${token}
+        returning *
+      `
+    : await db`
+        update decisions
+        set writeback = ${writeback},
+            revision = revision + 1,
+            updated_at = now()
+        where id = ${id}
+          and status = 'decided'
+          and revision = ${revision}
+          and (
+            writeback_lock is null
+            or writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+          )
+        returning *
+      `;
+  return rows[0] ? presentDecision(rows[0], now) : null;
+}
+
 export async function listDecisions(query: {
   status: ListStatus;
   repo: string | null;
   source: string | null;
   limit: number;
-  /** `brief` selects the morning-brief population and ignores status and source. */
+  /** `brief` selects the morning-brief population and ignores status, source, and writeback. */
   shape?: ListShape;
+  writeback?: "written" | "not_written" | null;
 }): Promise<Decision[]> {
-  const db = sql();
   const now = nowIso();
+  if (testStore) {
+    const rows = await testStore.list(query);
+    return rows.map((row) => presentDecision(row, now));
+  }
+  const db = sql();
   const brief = query.shape === "brief";
   const rows = await db`
     select * from decisions
@@ -633,6 +942,21 @@ export async function listDecisions(query: {
         else (${query.source}::text is null or source = ${query.source})
       end
     )
+    and (
+      ${brief} is true
+      or ${query.writeback ?? null}::text is null
+      or writeback = ${query.writeback ?? null}
+      or (
+        ${query.writeback ?? null}::text = 'not_written'
+        and status = 'decided'
+        and writeback is null
+        and (
+          writeback_lock is null
+          or writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+        )
+        and coalesce(writeback_lock_at, decided_at, updated_at) < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+      )
+    )
     order by first_seen_at asc, id asc
     limit ${query.limit}
   `;
@@ -643,11 +967,25 @@ export interface UpsertResult {
   decision: Decision;
   /** True when a decided or deferred row kept its status because force was not set. */
   status_held: boolean;
+  /** True when force reopen was refused because an unexpired write-back claim holds the row. */
+  writeback_in_progress?: boolean;
 }
 
 export async function upsertDecision(input: UpsertInput): Promise<UpsertResult> {
-  const db = sql();
   const now = nowIso();
+  if (testStore) {
+    const stored = await testStore.upsert(input);
+    const decision = presentDecision(stored.row, now);
+    if (stored.writeback_in_progress) {
+      return { decision, status_held: false, writeback_in_progress: true };
+    }
+    const previous = stored.previous_status;
+    const held =
+      (previous === "decided" && decision.status === "decided") ||
+      (previous === "deferred" && decision.status === "deferred");
+    return { decision, status_held: held };
+  }
+  const db = sql();
   const optionsJson = input.options == null ? null : JSON.stringify(input.options);
   const labelsJson = input.labels == null ? null : JSON.stringify(input.labels);
   const rows = await db`
@@ -710,7 +1048,47 @@ export async function upsertDecision(input: UpsertInput): Promise<UpsertResult> 
           when ${input.force} is true and decisions.status = 'deferred' then null
           when decisions.status = 'withdrawn' then null
           else decisions.defer_until
-        end
+        end,
+        actor_type = case
+          when ${input.force} is true and decisions.status in ('decided', 'deferred') then null
+          when decisions.status = 'withdrawn' then null
+          else decisions.actor_type
+        end,
+        actor_id = case
+          when ${input.force} is true and decisions.status in ('decided', 'deferred') then null
+          when decisions.status = 'withdrawn' then null
+          else decisions.actor_id
+        end,
+        chosen_option = case
+          when ${input.force} is true and decisions.status in ('decided', 'deferred') then null
+          when decisions.status = 'withdrawn' then null
+          else decisions.chosen_option
+        end,
+        writeback = case
+          when ${input.force} is true and decisions.status in ('decided', 'deferred') then null
+          when decisions.status = 'withdrawn' then null
+          else decisions.writeback
+        end,
+        writeback_lock = case
+          when ${input.force} is true and decisions.status in ('decided', 'deferred') then null
+          when decisions.status = 'withdrawn' then null
+          else decisions.writeback_lock
+        end,
+        writeback_lock_at = case
+          when ${input.force} is true and decisions.status in ('decided', 'deferred') then null
+          when decisions.status = 'withdrawn' then null
+          else decisions.writeback_lock_at
+        end,
+        revision = decisions.revision + 1
+      where not (
+        ${input.force} is true
+        and decisions.status in ('decided', 'deferred')
+        and decisions.writeback_lock is not null
+        and (
+          decisions.writeback_lock_at is null
+          or decisions.writeback_lock_at >= now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+        )
+      )
       returning *
     )
     select upserted.*, prior.status as previous_status
@@ -718,7 +1096,19 @@ export async function upsertDecision(input: UpsertInput): Promise<UpsertResult> 
     left join prior on true
   `;
   const row = rows[0];
-  if (!row) throw new Error("decision upsert returned no row");
+  if (!row) {
+    const existing = await db`select * from decisions where key = ${input.key}`;
+    const blocked = existing[0];
+    if (
+      blocked
+      && input.force
+      && (blocked.status === "decided" || blocked.status === "deferred")
+      && writebackLockUnexpired(blocked.writeback_lock, blocked.writeback_lock_at)
+    ) {
+      return { decision: presentDecision(blocked, now), status_held: false, writeback_in_progress: true };
+    }
+    throw new Error("decision upsert returned no row");
+  }
   const previous = typeof row.previous_status === "string" ? row.previous_status : null;
   const decision = presentDecision(row, now);
   const held =
@@ -746,6 +1136,7 @@ export async function reconcileDecisions(input: ReconcileInput): Promise<Reconci
     set
       github_present = false,
       updated_at = now(),
+      revision = revision + 1,
       status = case when status in ('open', 'deferred', 'decided') then 'withdrawn' else status end,
       defer_until = case when status in ('open', 'deferred') then null else defer_until end
     where source = ${input.source}
@@ -761,9 +1152,17 @@ export async function reconcileDecisions(input: ReconcileInput): Promise<Reconci
 }
 
 export async function patchDecision(id: number, input: PatchInput): Promise<Decision | null> {
-  const db = sql();
   const now = nowIso();
+  if (testStore) {
+    const row = await testStore.patch(id, input);
+    return row ? presentDecision(row, now) : null;
+  }
+  const db = sql();
   const status = input.status ?? null;
+  const setActor = input.setActor === true;
+  const setChosen = input.setChosen === true;
+  const guardTerminal = input.guardTerminal === true;
+  const expectedRevision = input.expectedRevision ?? null;
   const rows = await db`
     update decisions
     set
@@ -793,8 +1192,50 @@ export async function patchDecision(id: number, input: PatchInput): Promise<Deci
         when ${status} = 'withdrawn' then false
         else github_present
       end,
+      actor_type = case
+        when ${status} = 'open' then null
+        when ${setActor} then ${input.actor_type ?? null}
+        else actor_type
+      end,
+      actor_id = case
+        when ${status} = 'open' then null
+        when ${setActor} then ${input.actor_id ?? null}
+        else actor_id
+      end,
+      chosen_option = case
+        when ${status} = 'open' then null
+        when ${setChosen} then ${input.chosen_option ?? null}
+        else chosen_option
+      end,
+      writeback = case
+        when ${status} in ('open', 'decided', 'deferred', 'withdrawn') then null
+        else writeback
+      end,
+      writeback_lock = case
+        when ${status} = 'open' then null
+        else writeback_lock
+      end,
+      writeback_lock_at = case
+        when ${status} = 'open' then null
+        else writeback_lock_at
+      end,
+      revision = revision + 1,
       updated_at = now()
     where id = ${id}
+      and (
+        ${expectedRevision}::int is null
+        or revision = ${expectedRevision}
+      )
+      and (
+        ${guardTerminal} is not true
+        or ${status} = 'open'
+        or status not in ('decided', 'withdrawn')
+      )
+      and (
+        ${status} is distinct from 'open'
+        or writeback_lock is null
+        or writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+      )
     returning *
   `;
   const row = rows[0];

@@ -1,5 +1,6 @@
 import { stallMinutes } from "./clock";
-import type { RunRecord, SkillTriggerView } from "./types";
+import { renderSkillDocument, type FormatSkill } from "./formats";
+import type { RunRecord, Runtime, SkillTriggerView } from "./types";
 
 /** Milliseconds. A bad AK_SKILL_STALL_MINUTES falls back to 60 so stalls stay visible. */
 export function skillStallMs(env: NodeJS.ProcessEnv = process.env): number {
@@ -25,4 +26,18 @@ export function presentRun(run: RunRecord, now: Date, stallMs: number = skillSta
 export function isStalled(run: Pick<RunRecord, "ended_at" | "started_at">, now: Date, stallMs: number): boolean {
   if (run.ended_at != null) return false;
   return now.getTime() - Date.parse(run.started_at) > stallMs;
+}
+
+/**
+ * The skill text get_skill and run_skill put under the preamble.
+ * hermes gets Hermes frontmatter. codex and grok get an Agent Skills document.
+ * nemoclaw gets the NemoClaw frontmatter subset in the Agent Skills directory.
+ * claude, mini, and a call with no runtime keep the stored body.
+ */
+export function presentSkillDocument(skill: FormatSkill, runtime: Runtime | null): string {
+  try {
+    return renderSkillDocument(runtime, skill).trimEnd();
+  } catch {
+    return skill.body.trimEnd();
+  }
 }

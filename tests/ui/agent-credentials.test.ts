@@ -91,10 +91,12 @@ describe("scope table", { concurrency: false }, () => {
       ...Array.from(src.matchAll(/registerTool\(\s*"([^"]+)"/g), (m) => m[1]),
       ...Array.from(src.matchAll(/name:\s*"([^"]+)"/g), (m) => m[1]),
     ]);
+    const operatorOnly = new Set(["list_activity", "get_settings", "set_watched_repos"]);
     for (const name of [
       "report_status",
       "get_fleet_status",
       "get_progress_digest",
+      "get_morning_brief",
       "remember",
       "recall",
       "check_inbox",
@@ -107,8 +109,26 @@ describe("scope table", { concurrency: false }, () => {
       "list_skills",
       "get_skill",
       "run_skill",
+      "request_decision",
+      "list_decisions",
+      "resolve_decision",
+      "send_message",
+      "requeue_task",
+      "delete_note",
+      "list_activity",
+      "get_settings",
+      "set_watched_repos",
     ]) {
       assert.ok(names.has(name), `route source is missing ${name}`);
+      if (operatorOnly.has(name)) {
+        assert.equal(TOOL_SCOPES[name], undefined, `${name} is operator-only`);
+        const denied = authorizeTool(agent([...SCOPES]), name);
+        assert.equal(denied.ok, false, name);
+        if (!denied.ok) assert.equal(denied.body.fix, "This route is not granted by any agent scope.");
+        assert.equal(authorizeTool({ kind: "legacy" }, name).ok, true, name);
+        assert.equal(authorizeTool({ kind: "oauth", id: "oauth-client" }, name).ok, true, name);
+        continue;
+      }
       assert.ok(TOOL_SCOPES[name], `${name} is not in the scope table`);
     }
     const legacy = authorizeTool({ kind: "legacy" }, "not_a_real_tool");

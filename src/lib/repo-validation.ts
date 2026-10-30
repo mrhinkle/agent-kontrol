@@ -14,9 +14,15 @@ export interface RepoInput {
   color: string;
   /** the label this repo uses for blocked work, or null if it does not track any */
   blockedLabel: string | null;
+  /** Always show on the brief, including after the activity window. Hide wins. */
+  pinned?: boolean;
+  /** Collected, but omitted from the brief and the board. Wins over pin. */
+  hidden?: boolean;
+  /** manual rows are hand-added. auto rows are discovered and are not deleted by a save that omits them. */
+  origin?: "manual" | "auto";
 }
 
-export type RepoField = "repo" | "label" | "short" | "color" | "blockedLabel" | "repos";
+export type RepoField = "repo" | "label" | "short" | "color" | "blockedLabel" | "pinned" | "hidden" | "repos";
 
 export interface RepoError {
   /** row index, or -1 for an error about the whole list */
@@ -112,8 +118,50 @@ export function validateRepoList(input: unknown): RepoValidation {
       }
     }
 
-    repos.push({ repo, label, short, color: color.toLowerCase(), blockedLabel });
+    const flag = (value: unknown, field: "pinned" | "hidden"): boolean | undefined => {
+      if (value === undefined) return undefined;
+      if (typeof value !== "boolean") {
+        errors.push({ index, field, message: `${field} must be true or false.` });
+        return undefined;
+      }
+      return value;
+    };
+    const pinned = flag(e.pinned, "pinned");
+    const hidden = flag(e.hidden, "hidden");
+    const row: RepoInput = { repo, label, short, color: color.toLowerCase(), blockedLabel };
+    if (pinned !== undefined) row.pinned = pinned;
+    if (hidden !== undefined) row.hidden = hidden;
+    if (e.origin === "auto" || e.origin === "manual") row.origin = e.origin;
+    repos.push(row);
   });
 
   return errors.length > 0 ? { ok: false, errors } : { ok: true, repos };
+}
+
+/**
+ * Short names of auto rows that a replace will keep because the body omits
+ * them. A manual row that reuses one of those names is the same field error
+ * as a duplicate inside the submitted list.
+ */
+export function retainedAutoShortErrors(
+  submitted: RepoInput[],
+  stored: { repo: string; short: string; origin?: "manual" | "auto"; fieldsOverridden?: boolean | null }[],
+): RepoError[] {
+  const submittedIds = new Set(submitted.map((row) => row.repo.toLowerCase()));
+  const taken = new Set(
+    stored
+      .filter((row) => (
+        row.origin === "auto"
+        && row.fieldsOverridden !== true
+        && !submittedIds.has(row.repo.toLowerCase())
+      ))
+      .map((row) => row.short.toLowerCase()),
+  );
+  const errors: RepoError[] = [];
+  submitted.forEach((row, index) => {
+    if (taken.has(row.short.toLowerCase())) {
+      errors.push({ index, field: "short", message: "This short name is already used." });
+    }
+  });
+  return errors;
 }

@@ -11,6 +11,10 @@
 
 One dashboard for the AI coding agents you run: Claude Code, Codex, Grok, Hermes and anything that speaks MCP. See what each is doing, queue work for them, and check whether the backlog is actually shrinking.
 
+[90-second demo video](docs/demo/agent-kontrol-demo.mp4) — link to the file committed in this repository (`docs/demo/agent-kontrol-demo.mp4`). This page does not embed a player.
+
+*90-second demo with AI narration. Captions: [agent-kontrol-demo.srt](docs/demo/agent-kontrol-demo.srt).*
+
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fmrhinkle%2Fagent-kontrol&project-name=agent-kontrol&repository-name=agent-kontrol&env=MC_TOKEN%2CMC_DASHBOARD_PASSWORD&envDescription=MC_TOKEN%20is%20the%20shared%20secret%20agents%20use.%20MC_DASHBOARD_PASSWORD%20protects%20the%20dashboard.%20Generate%20each%20with%20openssl%20rand%20-hex%2024.&envLink=https%3A%2F%2Fgithub.com%2Fmrhinkle%2Fagent-kontrol%2Fblob%2Fmain%2Fdocs%2FDEPLOY.md&stores=%5B%7B%22type%22%3A%22integration%22%2C%22integrationSlug%22%3A%22neon%22%2C%22productSlug%22%3A%22neon%22%2C%22protocol%22%3A%22storage%22%7D%5D)
 
 ```bash
@@ -67,7 +71,7 @@ Agent Kontrol is in **1.0 beta** ([release notes](https://github.com/mrhinkle/ag
 | --- | --- |
 | [Deploy](docs/DEPLOY.md) | One-line install, targets, environment variables, operations |
 | [Agents](docs/AGENTS.md) | Adapters and what each can do |
-| [MCP](docs/MCP.md) | The 14 tools and how to connect |
+| [MCP](docs/MCP.md) | The 24 tools and how to connect |
 | [API](docs/API.md) | REST routes and authentication |
 | [Database](docs/DATABASE.md) | Neon or any Postgres, driver selection |
 | [Architecture](docs/ARCHITECTURE.md) | Data flow, tables, code map |
@@ -95,8 +99,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Changes are listed in [CHANGELOG.md](CHA
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE). Copyright 2026 Mark Hinkle.
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Copyright 2026 Mark Hinkle and The AIE Network.
 
 ## Trademarks
 
-Agent Kontrol™ and The AIE Network™ are trademarks of Peripety Labs LLC. The Apache License covers the code and, under its section 6, does not grant permission to use these names or the logo. You may use the name factually, for example to say your deployment runs Agent Kontrol. If you fork or sell a modified version, please give it your own name and logo.
+Agent Kontrol™ is a trademark of Mark Hinkle. The AIE Network™ is a trademark of Peripety Labs LLC. The Apache License covers the code and, under its section 6, does not grant permission to use these names or the logo. You may use the name factually, for example to say your deployment runs Agent Kontrol. If you fork or sell a modified version, please give it your own name and logo.

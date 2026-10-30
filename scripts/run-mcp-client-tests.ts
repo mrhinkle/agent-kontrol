@@ -1,6 +1,8 @@
 /**
  * Boots Agent Kontrol in demo mode (no DATABASE_URL) and drives /api/mcp
  * with the official MCP client. Assertions live in tests/mcp/client.test.ts.
+ * The five write tools store in memory for this process; the client test
+ * round-trips that store. A restart clears it.
  *
  * Prior art: scripts/run-pg-tests.ts (a tsx script that owns process
  * lifecycle and fails closed) and tests/ui/mcp-tools.test.ts (the static

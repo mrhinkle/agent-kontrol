@@ -5,29 +5,58 @@
  */
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Client } from "pg";
+import { evaluateAlerts, setBeforeClaimForTests, setBriefSettingsForTests } from "../src/lib/brief-alerts";
+import type { BriefSettings } from "../src/lib/progress-config";
 import { sql, sqlTransaction } from "../src/lib/db";
 import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
-import { report, remember, recall, createTask, claimNextTask, listTasks } from "../src/lib/store";
-import { getWatchedRepos, replaceWatchedRepos } from "../src/lib/watched-repos";
+import { StaleWrite } from "../src/lib/revision";
+import { readReceipt } from "../src/lib/activity";
+import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview, findAgent, deleteMemory, slugify } from "../src/lib/store";
+import { updateTaskForTool } from "../src/lib/dry-run-actions";
+import { runWithActor } from "../src/lib/actor";
+import { GET as getRepoSettings, PUT as putRepoSettings } from "../src/app/api/settings/repos/route";
+import { readRepoSettings } from "../src/lib/settings-read";
+import { getSettingsTool, setWatchedReposTool } from "../src/lib/settings-tools";
+import { getWatchedRepos, listVersion, replaceWatchedRepos, setRepoOverride } from "../src/lib/watched-repos";
+import { applyOwnerDiscovery } from "../src/lib/watched-owners";
 import type { RepoConfig } from "../src/lib/progress-config";
 import { getTrace, listTraces, pruneSpans, upsertSpans } from "../src/lib/trace-store";
 import { pruneAutomaticNotes, upsertAutomaticNote } from "../src/lib/session-memory";
 import type { SpanInput } from "../src/lib/traces";
 import {
   ageDays,
+  claimDecisionWriteback,
+  getDecision,
   listDecisions,
   patchDecision,
   reconcileDecisions,
   partitionBrief,
+  setDecisionWriteback,
   toBriefDecisions,
   upsertDecision,
+  WRITEBACK_LOCK_LEASE_SECONDS,
   type UpsertInput,
 } from "../src/lib/decisions";
 import { finishSyncRun, markSkillRemoved, SyncLeaseLost, upsertSettings, upsertSkill } from "../src/lib/skills/store";
 import { runScheduleTick, type TickResult } from "../src/lib/skills/schedule";
 import { listLastScheduledTasks, listOpenScheduledTasks } from "../src/lib/skills/schedule-store";
 import type { SkillRecord } from "../src/lib/skills/types";
+import { readBeats, upsertBeat, WATCH_STATUSES, type WatchBeat } from "../src/lib/watch";
+import {
+  MEMORY_REST,
+  TASK_REST,
+  TRACE_LIST,
+  decodeCursor,
+  memoryKeyset,
+  parseToolList,
+  splitPage,
+  taskKeyset,
+  traceKeyset,
+} from "../src/lib/list-params";
 
 async function main() {
   if (!process.env.DATABASE_URL) {
@@ -63,6 +92,70 @@ async function main() {
   assert.equal(hits.length, 1, "case-insensitive search plus tag overlap");
   assert.ok(Array.isArray(hits[0].tags), "text[] comes back as an array");
 
+  // A microsecond timestamp stays in the row. The preview token is md5(row),
+  // computed in SQL, so the confirm matches that same value.
+  const memoryKey = `${tag}/k1`;
+  await sql()`update memory set updated_at = timestamptz '2026-10-28 12:00:00.123456+00' where key = ${memoryKey}`;
+  const micros = await sql()`select to_char(updated_at, 'US') as us from memory where key = ${memoryKey}`;
+  assert.equal(String(micros[0].us), "123456");
+  const memoryPreview = await readMemoryForPreview(memoryKey);
+  assert.ok(memoryPreview);
+  assert.match(memoryPreview.revision, /^[0-9a-f]{32}$/);
+  const confirmed = await remember({ content: `confirmed ${tag}`, key: memoryKey, expected_revision: memoryPreview.revision });
+  assert.equal(confirmed.content, `confirmed ${tag}`);
+  await assert.rejects(
+    () => remember({ content: `too late ${tag}`, key: memoryKey, expected_revision: memoryPreview.revision }),
+    (err: unknown) => err instanceof StaleWrite && err.currentRevision !== memoryPreview.revision,
+  );
+
+  const knownAgent = await findAgent(`${tag}-agent`);
+  assert.equal(knownAgent?.id, `${tag}-agent`);
+  assert.equal(await findAgent(`${tag}-missing`), null);
+  assert.equal(await findAgent("***"), null);
+  const deleteKey = `${tag}/delete-me`;
+  await assert.rejects(
+    () => deleteMemory({ key: deleteKey }),
+    (err: unknown) => err instanceof Error && err.message === "Memory not found",
+  );
+  await remember({ content: "one", key: deleteKey, agent_id: `${tag}-agent` });
+  const beforeDelete = await readMemoryForPreview(deleteKey);
+  assert.ok(beforeDelete);
+  await remember({ content: "two", key: deleteKey, agent_id: `${tag}-agent` });
+  await assert.rejects(
+    () => deleteMemory({ key: deleteKey, expected_revision: beforeDelete.revision }),
+    (err: unknown) => err instanceof StaleWrite && err.currentRevision !== beforeDelete.revision,
+  );
+  const kept = await readMemoryForPreview(deleteKey);
+  assert.ok(kept);
+  assert.equal(kept.item.content, "two");
+  const removed = await deleteMemory({ key: deleteKey, expected_revision: kept.revision });
+  assert.equal(removed.content, "two");
+  assert.equal(await readMemoryForPreview(deleteKey), null);
+  const actorTask = await createTask({ title: `${tag} actor requeue`, platform: "any" });
+  const stamped = await updateTask({
+    id: actorTask.id,
+    status: "failed",
+    actor: { actor_type: "agent", actor_id: `${tag}-actor` },
+  });
+  assert.equal(stamped.actor_type, "agent");
+  assert.equal(stamped.actor_id, `${tag}-actor`);
+  const untouched = await updateTask({ id: actorTask.id, result: "still mine" });
+  assert.equal(untouched.actor_id, `${tag}-actor`);
+  assert.equal(untouched.result, "still mine");
+
+  const absentKey = `${tag}/absent`;
+  const raced = await Promise.allSettled([
+    remember({ content: `race-a ${tag}`, key: absentKey, expected_revision: "absent" }),
+    remember({ content: `race-b ${tag}`, key: absentKey, expected_revision: "absent" }),
+  ]);
+  assert.equal(raced.filter((item) => item.status === "fulfilled").length, 1);
+  const lost = raced.find((item) => item.status === "rejected");
+  assert.ok(lost && lost.status === "rejected");
+  assert.equal(lost.reason instanceof StaleWrite, true);
+  const absentCount = await sql()`select count(*)::int as n from memory where key = ${absentKey}`;
+  assert.equal(Number(absentCount[0].n), 1);
+  await sql()`delete from memory where key = ${absentKey}`;
+
   const task = await createTask({ title: `smoke ${tag}`, platform: `pgtest-${tag}`, priority: 2 } as never);
   const claimed = await claimNextTask({ platform: `pgtest-${tag}`, machine: "m1", agent_id: `${tag}-agent` });
   const again = await claimNextTask({ platform: `pgtest-${tag}`, machine: "m1", agent_id: `${tag}-agent` });
@@ -71,12 +164,22 @@ async function main() {
   const all = await listTasks({ status: "claimed" });
   assert.ok(all.some((t) => t.id === task.id));
 
+  await sql()`update tasks set updated_at = timestamptz '2026-10-28 12:00:00.123456+00' where id = ${task.id}`;
+  const taskMicros = await sql()`select to_char(updated_at, 'US') as us from tasks where id = ${task.id}`;
+  assert.equal(String(taskMicros[0].us), "123456");
+  const taskPreview = await readTaskForPreview(Number(task.id));
+  assert.ok(taskPreview);
+  assert.match(taskPreview.revision, /^[0-9a-f]{32}$/);
+  const cancelled = await updateTask({ id: Number(task.id), status: "cancelled", expected_revision: taskPreview.revision });
+  assert.equal(cancelled.status, "cancelled");
+
 
   // Watched repos: fallback, ordered replace, removal, restoring order.
   const fallback: RepoConfig[] = [{ repo: "example-org/fallback", label: "Fallback", short: "fb", color: "#000000", blockedLabel: null }];
+  await sql()`delete from watched_owners`;
   await sql()`delete from watched_repos`;
   const empty = await getWatchedRepos(fallback);
-  assert.equal(empty.source, "file", "an empty table falls back to the file list");
+  assert.equal(empty.source, "file", "no owners and no repos falls back to the file list");
   assert.deepEqual(empty.repos, fallback);
   const a = { repo: `${tag}/a`, label: "A", short: `${tag}-a`, color: "#111111", blockedLabel: null };
   const b = { repo: `${tag}/b`, label: "B", short: `${tag}-b`, color: "#222222", blockedLabel: "blocked" };
@@ -103,6 +206,7 @@ async function main() {
   assert.equal(got.repos[1].blockedLabel, "blocked");
   await sql()`delete from watched_repos`;
   assert.equal((await getWatchedRepos(fallback)).source, "file");
+  await testRepoSettingsVersionAndReceipt(tag);
 
   // Traces: upsert merges an open span with its close, lists summarize, prune removes old rows.
   const traceId = randomUUID().replace(/-/g, "");
@@ -255,17 +359,330 @@ async function main() {
       idempotency_key: idemKey,
     });
     assert.notEqual(String(afterExpiry.id), String(first.id), "an expired key can create a new task");
+    await sql()`
+      delete from events
+      where kind = 'create_task'
+        and detail->>'task_id' in (select id::text from tasks where platform = ${idemPlatform})
+    `;
     await sql()`delete from tasks where platform = ${idemPlatform}`;
     await sql()`delete from idempotency_keys where idempotency_key = ${idemKey}`;
   } finally {
     setIdempotencyClockForTests(null);
   }
 
+  await testActivityReceiptAtomic(tag);
+  await testReportStatusAtomic(tag);
   await testDecisions(tag);
   await testSkillLeaseFence(tag);
   await testSkillSchedule(tag);
+  await testWatchBeats(tag);
+  await testWatchBeatRoute(tag);
+  await testListCursors(tag);
+  await testBriefAlerts(tag);
+  await testZeroMergeCaseFold(tag);
+  await testDecisionWritebackHardening(tag);
+  await testRepoCaseIdentity(tag);
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
+}
+
+/**
+ * One idempotent create_task is one task, one event, and one receipt.
+ * A forced events-insert failure rolls the write back with it.
+ */
+async function testActivityReceiptAtomic(tag: string) {
+  const platform = `pgtest-act-${tag}`;
+  const key = `act-${tag}`;
+  const failPlatform = `pgtest-act-fail-${tag}`;
+  const memoryKey = `${tag}/act-keep`;
+  const freshKey = `${tag}/act-fresh`;
+  const deleteKey = `${tag}/act-del`;
+  const failIdem = `act-fail-${tag}`;
+  try {
+    const settled = await Promise.allSettled([
+      createTask({ title: `race ${tag}`, platform, priority: 1, idempotency_key: key }),
+      createTask({ title: `race ${tag}`, platform, priority: 1, idempotency_key: key }),
+    ]);
+    for (const item of settled) {
+      if (item.status === "rejected" && !(item.reason instanceof IdempotencyConflict)) throw item.reason;
+    }
+    const won = settled.filter((item) => item.status === "fulfilled");
+    assert.ok(won.length >= 1, "at least one concurrent create_task completed");
+    const taskIds = new Set(won.map((item) => String(item.value.id)));
+    assert.equal(taskIds.size, 1, "concurrent same-key creates share one task");
+    const receiptIds = new Set(won.map((item) => readReceipt(item.value)?.id).filter((id): id is string => Boolean(id)));
+    assert.equal(receiptIds.size, 1, "concurrent same-key creates share one receipt");
+    const taskId = [...taskIds][0];
+    const receiptId = [...receiptIds][0];
+    const tasks = await sql()`select count(*)::int as n from tasks where platform = ${platform}`;
+    assert.equal(Number(tasks[0].n), 1, "two concurrent calls insert one task");
+    const events = await sql()`
+      select id::text as id
+      from events
+      where kind = 'create_task' and detail->>'task_id' = ${taskId}
+    `;
+    assert.equal(events.length, 1, "two concurrent calls insert one activity event");
+    assert.equal(String(events[0].id), receiptId);
+
+    const replay = await createTask({ title: `race ${tag}`, platform, priority: 1, idempotency_key: key });
+    assert.equal(String(replay.id), taskId);
+    assert.equal(readReceipt(replay)?.id, receiptId, "a replay returns the stored receipt");
+    const afterReplay = await sql()`
+      select count(*)::int as n from events
+      where kind = 'create_task' and detail->>'task_id' = ${taskId}
+    `;
+    assert.equal(Number(afterReplay[0].n), 1, "a replay does not insert a second event");
+
+    await remember({ content: "before", key: memoryKey, agent_id: `${tag}-agent` });
+    await remember({ content: "stay", key: deleteKey, agent_id: `${tag}-agent` });
+
+    await sql()`
+      create or replace function ak_test_fail_event()
+      returns trigger
+      language plpgsql
+      as $fn$
+      begin
+        if new.kind in ('create_task', 'remember', 'delete_note', 'send_message', 'reply_to_operator') then
+          raise exception 'simulated events insert failure';
+        end if;
+        return new;
+      end;
+      $fn$
+    `;
+    await sql()`drop trigger if exists ak_test_fail_event on events`;
+    await sql()`
+      create trigger ak_test_fail_event
+      before insert on events
+      for each row
+      execute procedure ak_test_fail_event()
+    `;
+
+    const orphansBefore = await sql()`
+      select count(*)::int as n
+      from events e
+      where e.kind = 'create_task'
+        and not exists (
+          select 1 from tasks t where t.id::text = e.detail->>'task_id'
+        )
+    `;
+    await assert.rejects(
+      () => createTask({ title: `fail ${tag}`, platform: failPlatform }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const failedTasks = await sql()`select count(*)::int as n from tasks where platform = ${failPlatform}`;
+    assert.equal(Number(failedTasks[0].n), 0, "a failed event insert leaves no task");
+    const orphans = await sql()`
+      select count(*)::int as n
+      from events e
+      where e.kind = 'create_task'
+        and not exists (
+          select 1 from tasks t where t.id::text = e.detail->>'task_id'
+        )
+    `;
+    assert.equal(
+      Number(orphans[0].n),
+      Number(orphansBefore[0].n),
+      "a failed event insert leaves no receipt row",
+    );
+
+    await assert.rejects(
+      () => remember({ content: "after", key: memoryKey, agent_id: `${tag}-agent` }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const kept = await sql()`select content from memory where key = ${memoryKey}`;
+    assert.equal(String(kept[0]?.content), "before", "a failed event insert leaves the previous note");
+
+    await assert.rejects(
+      () => remember({ content: "nope", key: freshKey, agent_id: `${tag}-agent` }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const fresh = await sql()`select count(*)::int as n from memory where key = ${freshKey}`;
+    assert.equal(Number(fresh[0].n), 0, "a failed event insert leaves no new note");
+
+    await assert.rejects(
+      () => deleteMemory({ key: deleteKey }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const stillThere = await sql()`select content from memory where key = ${deleteKey}`;
+    assert.equal(String(stillThere[0]?.content), "stay", "a failed event insert does not delete the note");
+
+    await assert.rejects(
+      () => createTask({ title: `fail idem ${tag}`, platform: failPlatform, idempotency_key: failIdem }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    await sql()`drop trigger if exists ak_test_fail_event on events`;
+    const recovered = await createTask({
+      title: `fail idem ${tag}`,
+      platform: failPlatform,
+      idempotency_key: failIdem,
+    });
+    assert.equal(readReceipt(recovered)?.kind, "create_task");
+    const recoveredTasks = await sql()`select count(*)::int as n from tasks where platform = ${failPlatform}`;
+    assert.equal(Number(recoveredTasks[0].n), 1, "a failed claim is released so the same key can write once");
+    const recoveredEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'create_task' and detail->>'task_id' = ${String(recovered.id)}
+    `;
+    assert.equal(Number(recoveredEvents[0].n), 1);
+  } finally {
+    await sql()`drop trigger if exists ak_test_fail_event on events`;
+    await sql()`drop function if exists ak_test_fail_event()`;
+    await sql()`
+      delete from events e
+      where e.kind in ('create_task', 'remember', 'delete_note')
+        and (
+          e.detail->>'memory_key' like ${`%${tag}%`}
+          or e.detail->>'task_id' in (
+            select id::text from tasks where platform like ${`pgtest-act-%${tag}`}
+          )
+        )
+    `;
+    await sql()`delete from tasks where platform like ${`pgtest-act-%${tag}`}`;
+    await sql()`delete from memory where key like ${`%${tag}%`}`;
+    await sql()`delete from idempotency_keys where idempotency_key like ${`%${tag}%`}`;
+  }
+}
+
+/**
+ * report() writes the agent, the session, and the event in one statement.
+ * A rejecting events insert leaves both rows as they were. updateTaskForTool
+ * still returns the task receipt when the later status report fails.
+ */
+async function testReportStatusAtomic(tag: string) {
+  const agentId = slugify(`${tag}-rpt`);
+  // main() already stores a writeback session at `${tag}-sess`. A colliding id
+  // would make the rollback count look like a leftover insert.
+  const sessionId = `${tag}-rpt-sess`;
+  const laneId = slugify(`${tag}-lane`);
+  const platform = `pgtest-rpt-${tag}`;
+  const install = async () => {
+    await sql()`
+      create or replace function ak_test_fail_status_event()
+      returns trigger
+      language plpgsql
+      as $fn$
+      begin
+        if new.kind = 'status' then
+          raise exception 'simulated events insert failure';
+        end if;
+        return new;
+      end;
+      $fn$
+    `;
+    await sql()`drop trigger if exists ak_test_fail_status_event on events`;
+    await sql()`
+      create trigger ak_test_fail_status_event
+      before insert on events
+      for each row
+      execute procedure ak_test_fail_status_event()
+    `;
+  };
+  const drop = async () => {
+    await sql()`drop trigger if exists ak_test_fail_status_event on events`;
+    await sql()`drop function if exists ak_test_fail_status_event()`;
+  };
+  try {
+    await install();
+    await assert.rejects(
+      () => report({
+        agent_id: agentId,
+        platform: "codex",
+        machine: "m1",
+        display_name: "Should Not Stick",
+        session_id: sessionId,
+        kind: "status",
+        title: "ghost",
+        project: "p",
+        summary: "ghost summary",
+      }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const newAgents = await sql()`select count(*)::int as n from agents where id = ${agentId}`;
+    const newSessions = await sql()`select count(*)::int as n from sessions where id = ${sessionId}`;
+    const ghosts = await sql()`select count(*)::int as n from events where kind = 'status' and title = 'ghost'`;
+    assert.equal(Number(newAgents[0].n), 0, "a failed event insert leaves no new agent");
+    assert.equal(Number(newSessions[0].n), 0, "a failed event insert leaves no new session");
+    assert.equal(Number(ghosts[0].n), 0, "a failed event insert leaves no status event");
+
+    await drop();
+    const seeded = await report({
+      agent_id: agentId,
+      platform: "codex",
+      display_name: "Kept",
+      session_id: sessionId,
+      kind: "session_start",
+      title: "hello",
+      project: "p",
+      summary: "kept",
+    });
+    assert.equal(seeded?.kind, "session_start");
+    const beforeAgent = await sql()`select platform, display_name, last_seen_at from agents where id = ${agentId}`;
+    const beforeSession = await sql()`select status, summary, project, ended_at from sessions where id = ${sessionId}`;
+    assert.equal(beforeAgent.length, 1);
+    assert.equal(beforeSession.length, 1);
+    await install();
+    await assert.rejects(
+      () => report({
+        agent_id: agentId,
+        platform: "hermes",
+        display_name: "Changed",
+        session_id: sessionId,
+        kind: "status",
+        status: "failed",
+        title: "ghost-update",
+        summary: "changed",
+      }),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const afterAgent = await sql()`select platform, display_name, last_seen_at from agents where id = ${agentId}`;
+    const afterSession = await sql()`select status, summary, project, ended_at from sessions where id = ${sessionId}`;
+    assert.equal(String(afterAgent[0].platform), String(beforeAgent[0].platform));
+    assert.equal(String(afterAgent[0].display_name), String(beforeAgent[0].display_name));
+    assert.equal(new Date(afterAgent[0].last_seen_at as string | Date).toISOString(), new Date(beforeAgent[0].last_seen_at as string | Date).toISOString());
+    assert.equal(String(afterSession[0].status), String(beforeSession[0].status));
+    assert.equal(String(afterSession[0].summary), String(beforeSession[0].summary));
+    assert.equal(String(afterSession[0].project), String(beforeSession[0].project));
+    const endedBefore = beforeSession[0].ended_at == null ? null : new Date(beforeSession[0].ended_at as string | Date).toISOString();
+    const endedAfter = afterSession[0].ended_at == null ? null : new Date(afterSession[0].ended_at as string | Date).toISOString();
+    assert.equal(endedAfter, endedBefore);
+    const updates = await sql()`select count(*)::int as n from events where kind = 'status' and title = 'ghost-update'`;
+    assert.equal(Number(updates[0].n), 0, "a failed event insert leaves no status event on an existing session");
+
+    const task = await createTask({ title: `secondary ${tag}`, platform });
+    const result = await updateTaskForTool({ id: task.id, status: "done", agent_id: `${tag}-lane` });
+    assert.equal(result.isError, undefined);
+    const text = result.content[0]?.text ?? "";
+    assert.match(text, new RegExp(`^Task #${task.id} updated \\(done\\)\\.`));
+    assert.match(text, /note: the status event was not recorded/);
+    const receiptLine = text.split("\n").at(-1) ?? "";
+    assert.match(receiptLine, /^receipt: \{/);
+    const receipt = JSON.parse(receiptLine.slice("receipt: ".length)) as { id: string; kind: string };
+    assert.equal(receipt.kind, "task_updated");
+    const structured = result.structuredContent as { receipt?: { id: string; kind: string } } | undefined;
+    assert.equal(structured?.receipt?.id, receipt.id);
+    assert.equal(structured?.receipt?.kind, "task_updated");
+    const stored = await sql()`select status from tasks where id = ${task.id}`;
+    assert.equal(String(stored[0].status), "done");
+    const lane = await sql()`select count(*)::int as n from agents where id = ${laneId}`;
+    assert.equal(Number(lane[0].n), 0, "a failed secondary report writes no agent");
+    const statusEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'status' and detail->>'task_id' = ${String(task.id)}
+    `;
+    assert.equal(Number(statusEvents[0].n), 0, "a failed secondary report writes no status event");
+    const taskEvents = await sql()`
+      select id::text as id from events
+      where kind = 'task_updated' and detail->>'task_id' = ${String(task.id)}
+    `;
+    assert.equal(taskEvents.length, 1);
+    assert.equal(String(taskEvents[0].id), receipt.id);
+  } finally {
+    await drop();
+    await sql()`delete from tasks where platform = ${platform}`;
+    await sql()`delete from events where agent_id in (${agentId}, ${laneId}) or session_id = ${sessionId}`;
+    await sql()`delete from sessions where id = ${sessionId}`;
+    await sql()`delete from agents where id in (${agentId}, ${laneId})`;
+  }
 }
 
 async function testDecisions(tag: string) {
@@ -717,7 +1134,7 @@ function skillRecord(id: string, body: string): SkillRecord {
     commit_sha: "b".repeat(40),
     body,
     references: [],
-    runtimes: { claude: true, codex: false, grok: false, hermes: false, mini: false },
+    runtimes: { claude: true, codex: false, grok: false, hermes: false, mini: false, nemoclaw: false },
     category: null,
     tags: [],
     frontmatter: {},
@@ -774,6 +1191,1383 @@ async function holdExpiredLease<T>(holder: Client, runId: string, marker: string
     await holder.query("rollback").catch(() => undefined);
     if (pending) await pending.catch(() => undefined);
     throw err;
+  }
+}
+
+function pgCode(err: unknown): string | undefined {
+  if (!err || typeof err !== "object" || !("code" in err)) return undefined;
+  const code = (err as { code: unknown }).code;
+  return typeof code === "string" ? code : undefined;
+}
+
+async function applyCanonicalSchema(): Promise<void> {
+  const schemaPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "supabase", "schema.sql");
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    await client.query(fs.readFileSync(schemaPath, "utf8"));
+  } finally {
+    await client.end();
+  }
+}
+
+async function restoreWatchBeatsName(): Promise<void> {
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    await client.query(`
+      do $$ begin
+        if to_regclass('public.watch_beats_hidden') is not null
+           and to_regclass('public.watch_beats') is null then
+          alter table watch_beats_hidden rename to watch_beats;
+        end if;
+      end $$
+    `);
+  } finally {
+    await client.end();
+  }
+}
+
+function beatFor(rows: WatchBeat[], source: string): WatchBeat {
+  const found = rows.find((row) => row.source === source);
+  assert.ok(found, `missing beat ${source}`);
+  return found;
+}
+
+/**
+ * Failure cases for watch_beats: constraint rejects, clock skew, a second
+ * write refreshing received_at, concurrent same-source upserts, a failed
+ * read, a missing DATABASE_URL, and a second schema apply that must not
+ * rewrite a stored beat.
+ */
+async function testWatchBeats(tag: string): Promise<void> {
+  await sql()`delete from watch_beats`;
+  const previousUrl = process.env.DATABASE_URL;
+  try {
+    const encoding = await sql()`show server_encoding`;
+    assert.equal(String(encoding[0].server_encoding).toUpperCase(), "UTF8");
+
+    const cols = await sql()`
+      select column_name, data_type, is_nullable
+      from information_schema.columns
+      where table_schema = 'public' and table_name = 'watch_beats'
+      order by ordinal_position
+    `;
+    assert.deepEqual(
+      cols.map((col) => [col.column_name, col.data_type, col.is_nullable]),
+      [
+        ["source", "text", "NO"],
+        ["status", "text", "NO"],
+        ["detail", "text", "NO"],
+        ["beat_at", "timestamp with time zone", "NO"],
+        ["received_at", "timestamp with time zone", "NO"],
+      ],
+    );
+
+    assert.deepEqual(await readBeats(), [], "an empty table is not a fabricated healthy beat");
+
+    const behind = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+    const ahead = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString();
+    const skew = `${tag}-skew`;
+    await upsertBeat(skew, "ok", "sender behind", behind);
+    let row = beatFor(await readBeats(), skew);
+    assert.equal(row.beat_at, behind);
+    assert.match(row.beat_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    assert.match(row.received_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    assert.equal(Number.isInteger(row.age_s), true);
+    assert.ok(row.age_s >= 0 && row.age_s < 30, `age follows received_at, got ${row.age_s}`);
+    assert.deepEqual(Object.keys(row), ["source", "status", "detail", "beat_at", "received_at", "age_s"]);
+
+    await upsertBeat(skew, "failing", "sender ahead", ahead);
+    row = beatFor(await readBeats(), skew);
+    assert.equal(row.status, "failing", "a future beat_at is still accepted");
+    assert.equal(row.detail, "sender ahead");
+    assert.equal(row.beat_at, ahead);
+    assert.ok(row.age_s < 30, `a future beat_at must not zero the age by itself, got ${row.age_s}`);
+
+    // An older sender instant still overwrites. beat_at is not a version.
+    await upsertBeat(skew, "paused", "older sender wins", behind);
+    row = beatFor(await readBeats(), skew);
+    assert.equal(row.status, "paused");
+    assert.equal(row.detail, "older sender wins");
+    assert.equal(row.beat_at, behind);
+
+    await sql()`update watch_beats set received_at = clock_timestamp() - interval '2 days' where source = ${skew}`;
+    const rewound = beatFor(await readBeats(), skew);
+    assert.ok(rewound.age_s >= 2 * 86400 - 5, `rewound age should be about two days, got ${rewound.age_s}`);
+    await upsertBeat(skew, "held", "refreshed", behind);
+    row = beatFor(await readBeats(), skew);
+    assert.equal(row.status, "held");
+    assert.equal(row.detail, "refreshed");
+    assert.ok(row.age_s < 30, `the conflict update must stamp received_at again, got ${row.age_s}`);
+
+    await sql()`update watch_beats set received_at = clock_timestamp() + interval '2 days' where source = ${skew}`;
+    assert.equal(beatFor(await readBeats(), skew).age_s, 0, "age_s floors at zero when received_at is ahead of the database clock");
+
+    const micros = `${tag}-micros`;
+    await upsertBeat(micros, "unknown", "", "2026-10-26T12:00:00.123456Z");
+    const storedUs = await sql()`
+      select to_char(beat_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as beat
+      from watch_beats where source = ${micros}
+    `;
+    assert.equal(String(storedUs[0].beat), "2026-10-26T12:00:00.123456Z");
+    const offset = `${tag}-offset`;
+    await upsertBeat(offset, "ok", "", "2026-10-26T12:00:00-05:00");
+    assert.equal(beatFor(await readBeats(), offset).beat_at, "2026-10-26T17:00:00.000Z");
+
+    const emoji = "😀".repeat(500);
+    const wide = `${tag}-wide`;
+    await upsertBeat(wide, "stale", emoji, "2026-10-28T00:00:00Z");
+    assert.equal(beatFor(await readBeats(), wide).detail, emoji);
+    await upsertBeat(`${tag}-empty-detail`, "ok", "", "2026-10-28T00:00:00Z");
+
+    const hostile = `${tag}-'); drop table watch_beats; --`;
+    await upsertBeat(hostile, "ok", "still here", "2026-10-28T00:00:00Z");
+    assert.equal(beatFor(await readBeats(), hostile).detail, "still here");
+    const stillThere = await sql()`select to_regclass('public.watch_beats') as rel`;
+    assert.equal(stillThere[0].rel, "watch_beats");
+
+    const sources = [`${tag}-c`, `${tag}-a`, `${tag}-b`];
+    for (const source of sources) await upsertBeat(source, "ok", source, "2026-10-28T00:00:00Z");
+    const ordered = (await readBeats()).map((item) => item.source).filter((source) => sources.includes(source));
+    assert.deepEqual(ordered, [...sources].sort(), "readBeats orders by source");
+    const distinct = await sql()`select count(*)::int as n from watch_beats where source like ${`${tag}-%`}`;
+    assert.ok(Number(distinct[0].n) >= sources.length);
+
+    const race = `${tag}-race`;
+    await Promise.all(Array.from({ length: 12 }, (_, i) => upsertBeat(
+      race,
+      WATCH_STATUSES[i % WATCH_STATUSES.length],
+      `n${i}`,
+      new Date(Date.now() - i * 1000).toISOString(),
+    )));
+    const raceCount = await sql()`select count(*)::int as n from watch_beats where source = ${race}`;
+    assert.equal(Number(raceCount[0].n), 1, "concurrent same-source writes leave one row");
+
+    const same = `${tag}-same`;
+    await upsertBeat(same, "ok", "one", "2026-10-28T00:00:00Z");
+    await upsertBeat(same, "unknown", "two", "2026-10-28T00:00:01Z");
+    const sameCount = await sql()`select count(*)::int as n, max(detail) as detail from watch_beats where source = ${same}`;
+    assert.equal(Number(sameCount[0].n), 1);
+    assert.equal(String(sameCount[0].detail), "two");
+    await upsertBeat(`${tag}-other`, "held", "separate", "2026-10-28T00:00:00Z");
+    const pair = await sql()`select count(*)::int as n from watch_beats where source in (${same}, ${`${tag}-other`})`;
+    assert.equal(Number(pair[0].n), 2, "different sources stay separate");
+
+    const kept = `${tag}-kept`;
+    await upsertBeat(kept, "ok", "do not touch", "2026-10-27T01:02:03Z");
+    const before = await sql()`
+      select status, detail,
+             extract(epoch from beat_at) as beat_epoch,
+             extract(epoch from received_at) as received_epoch
+      from watch_beats where source = ${kept}
+    `;
+    await applyCanonicalSchema();
+    await applyCanonicalSchema();
+    const after = await sql()`
+      select status, detail,
+             extract(epoch from beat_at) as beat_epoch,
+             extract(epoch from received_at) as received_epoch
+      from watch_beats where source = ${kept}
+    `;
+    assert.deepEqual(after, before, "applying the canonical schema twice leaves the beat unchanged");
+
+    const badSource = `${tag}-bad`;
+    await assert.rejects(
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values ('', 'ok', '', now(), now())`,
+      (err: unknown) => pgCode(err) === "23514",
+      "empty source",
+    );
+    await assert.rejects(
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'nope', '', now(), now())`,
+      (err: unknown) => pgCode(err) === "23514",
+      "invalid status",
+    );
+    await assert.rejects(
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'OK', '', now(), now())`,
+      (err: unknown) => pgCode(err) === "23514",
+      "status is case-sensitive",
+    );
+    await assert.rejects(
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'ok', ${"a".repeat(501)}, now(), now())`,
+      (err: unknown) => pgCode(err) === "23514",
+      "501 code points",
+    );
+    await assert.rejects(
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'ok', ${"😀".repeat(501)}, now(), now())`,
+      (err: unknown) => pgCode(err) === "23514",
+      "501 emoji code points",
+    );
+    const nullWrites = [
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (null, 'ok', '', now(), now())`,
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, null, '', now(), now())`,
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'ok', null, now(), now())`,
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'ok', '', null, now())`,
+      () => sql()`insert into watch_beats (source, status, detail, beat_at, received_at) values (${badSource}, 'ok', '', now(), null)`,
+    ];
+    for (const write of nullWrites) {
+      await assert.rejects(write, (err: unknown) => pgCode(err) === "23502");
+    }
+    const badLeft = await sql()`select count(*)::int as n from watch_beats where source = ${badSource} or source = ''`;
+    assert.equal(Number(badLeft[0].n), 0, "rejected rows are not stored");
+
+    const admin = new Client({ connectionString: process.env.DATABASE_URL });
+    await admin.connect();
+    try {
+      await admin.query("alter table watch_beats rename to watch_beats_hidden");
+      await assert.rejects(readBeats, (err: unknown) => pgCode(err) === "42P01");
+      await assert.rejects(
+        () => upsertBeat("missing-table", "ok", "", "2026-10-28T00:00:00Z"),
+        (err: unknown) => pgCode(err) === "42P01",
+      );
+    } finally {
+      await admin.query("alter table if exists watch_beats_hidden rename to watch_beats");
+      await admin.end();
+    }
+
+    delete process.env.DATABASE_URL;
+    try {
+      await assert.rejects(readBeats, /DATABASE_URL is not set/);
+      await assert.rejects(
+        () => upsertBeat("unconfigured", "ok", "", new Date()),
+        /DATABASE_URL is not set/,
+      );
+    } finally {
+      process.env.DATABASE_URL = previousUrl;
+    }
+  } finally {
+    if (process.env.DATABASE_URL !== previousUrl) process.env.DATABASE_URL = previousUrl;
+    await restoreWatchBeatsName();
+    await sql()`delete from watch_beats`;
+  }
+}
+
+/**
+ * Persisted round trip through the watch routes. Rejected writes leave the
+ * stored row unchanged. age_s follows received_at, not an old or future beat_at.
+ */
+async function testWatchBeatRoute(tag: string): Promise<void> {
+  const { POST } = await import("../src/app/api/watch/beat/route");
+  const { GET } = await import("../src/app/api/watch/beats/route");
+  const { createCredential } = await import("../src/lib/credentials");
+  const savedBinding = process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON;
+  const ids: string[] = [];
+
+  async function stored(source: string) {
+    const rows = await sql()`
+      select status, detail, beat_at::text as beat_at, received_at::text as received_at
+      from watch_beats where source = ${source}
+    `;
+    return rows[0] ?? null;
+  }
+
+  try {
+    await sql()`delete from watch_beats where source in ('mini', 'macbook', 'watcher')`;
+    const mini = await createCredential({ label: `${tag} mini`, scopes: ["watch:write", "watch:read"] });
+    const mac = await createCredential({ label: `${tag} mac`, scopes: ["watch:write"] });
+    assert.equal(mini.ok, true);
+    assert.equal(mac.ok, true);
+    if (!mini.ok || !mac.ok) return;
+    ids.push(mini.credential.id, mac.credential.id);
+    process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON = JSON.stringify({
+      mini: [mini.credential.id],
+      macbook: [mac.credential.id],
+    });
+
+    const oldBeat = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString();
+    const futureBeat = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    const post = (token: string, body: unknown, extra: Record<string, string> = {}) => POST(new Request("http://localhost/api/watch/beat", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json", ...extra },
+      body: JSON.stringify(body),
+    }));
+
+    const wrote = await post(mini.token, {
+      source: "mini",
+      status: "ok",
+      detail: "scheduler healthy",
+      beat_at: oldBeat,
+    });
+    assert.equal(wrote.status, 200);
+    assert.deepEqual(await wrote.json(), { ok: true });
+
+    const listed = await GET(new Request("http://localhost/api/watch/beats", {
+      headers: { authorization: `Bearer ${mini.token}` },
+    }));
+    assert.equal(listed.status, 200);
+    assert.equal(listed.headers.get("cache-control"), "no-store");
+    const body = await listed.json() as { beats: { source: string; beat_at: string; received_at: string; age_s: number; detail: string }[] };
+    const row = body.beats.find((beat) => beat.source === "mini");
+    assert.ok(row);
+    assert.equal(Date.parse(row.beat_at), Date.parse(oldBeat));
+    assert.equal(row.detail, "scheduler healthy");
+    assert.equal(typeof row.age_s, "number");
+    assert.ok(row.age_s >= 0 && row.age_s < 60);
+    assert.ok(Math.abs(Date.now() - Date.parse(row.received_at)) < 60_000);
+
+    const before = await stored("mini");
+    const rejected: unknown[] = [
+      { source: "macbook", status: "failing", detail: "wrong host", beat_at: futureBeat },
+      { source: "watcher", status: "failing", detail: "wrong host", beat_at: futureBeat },
+      { source: "mini", status: "ok", detail: "bad clock", beat_at: "2026-10-27T12:00:00" },
+      { source: "mini", status: "ok", detail: "client clock", beat_at: oldBeat, received_at: oldBeat },
+      { source: "mini", status: "ok", detail: "client age", beat_at: oldBeat, age_s: 1 },
+    ];
+    for (const payload of rejected) {
+      const res = await post(mini.token, payload);
+      assert.ok(res.status === 400 || res.status === 403, `expected 400 or 403, got ${res.status}`);
+      assert.deepEqual(await stored("mini"), before);
+    }
+
+    const bound = process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON;
+    for (const raw of ["{}", JSON.stringify({ mini: [] }), JSON.stringify({ mini: [], macbook: [] })]) {
+      process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON = raw;
+      const res = await post(mini.token, {
+        source: "mini",
+        status: "failing",
+        detail: "empty binding must not land",
+        beat_at: futureBeat,
+      });
+      assert.equal(res.status, 503, raw);
+      assert.deepEqual(await stored("mini"), before);
+    }
+    for (const contentType of [
+      "application/json, text/plain",
+      "application/json+x",
+      "application/jsonx",
+      "text/json",
+      "",
+    ]) {
+      const res = await post(mini.token, {
+        source: "mini",
+        status: "failing",
+        detail: "bad content type must not land",
+        beat_at: futureBeat,
+      }, { "content-type": contentType });
+      assert.equal(res.status, 415, JSON.stringify(contentType));
+      assert.deepEqual(await stored("mini"), before);
+    }
+    const missingType = await POST(new Request("http://localhost/api/watch/beat", {
+      method: "POST",
+      headers: { authorization: `Bearer ${mini.token}` },
+      body: JSON.stringify({
+        source: "mini",
+        status: "failing",
+        detail: "missing content type must not land",
+        beat_at: futureBeat,
+      }),
+    }));
+    assert.equal(missingType.status, 415);
+    assert.deepEqual(await stored("mini"), before);
+    process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON = bound;
+
+    const ahead = await post(mini.token, {
+      source: "mini",
+      status: "held",
+      detail: "sender ahead",
+      beat_at: futureBeat,
+    });
+    assert.equal(ahead.status, 200);
+    const again = await GET(new Request("http://localhost/api/watch/beats", {
+      headers: { authorization: `Bearer ${mini.token}` },
+    }));
+    const fresh = (await again.json() as { beats: { source: string; beat_at: string; age_s: number; status: string }[] })
+      .beats.find((beat) => beat.source === "mini");
+    assert.ok(fresh);
+    assert.equal(fresh.status, "held");
+    assert.equal(Date.parse(fresh.beat_at), Date.parse(futureBeat));
+    assert.ok(fresh.age_s >= 0 && fresh.age_s < 60);
+  } finally {
+    if (savedBinding === undefined) delete process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON;
+    else process.env.WATCH_SOURCE_CREDENTIAL_IDS_JSON = savedBinding;
+    if (ids.length > 0) {
+      await sql()`delete from agent_credentials where id in (${ids[0]}, ${ids[1] ?? ids[0]})`;
+    }
+    await sql()`delete from watch_beats where source in ('mini', 'macbook', 'watcher')`;
+  }
+}
+
+/**
+ * Keyset pages on Postgres. An insert ahead of the cursor must not repeat or
+ * skip a row, and two timestamps that differ only after the millisecond still
+ * page in id order.
+ */
+async function testListCursors(tag: string): Promise<void> {
+  const probe = `${tag}-cursor`;
+  const agent = `${tag}-cursor`;
+  await sql()`delete from tasks where status = 'cursorprobe' and title like ${probe + "%"}`;
+  await sql()`delete from memory where key like ${probe + "%"}`;
+  await sql()`delete from spans where agent_id = ${agent}`;
+  try {
+    const taskId = async (name: string, at: string) => {
+      const rows = await sql()`
+        insert into tasks (title, status, priority, platform, updated_at)
+        values (${`${probe}-${name}`}, 'cursorprobe', 2, 'any', ${at}::timestamptz)
+        returning id::text as id
+      `;
+      return String(rows[0].id);
+    };
+    const a = await taskId("a", "2026-10-28 12:00:00.200000+00");
+    const b = await taskId("b", "2026-10-28 12:00:00.123456+00");
+    const c = await taskId("c", "2026-10-28 12:00:00.123789+00");
+    const d = await taskId("d", "2026-10-28 12:00:00.100000+00");
+    const seen: string[] = [];
+    let cursor: ReturnType<typeof taskKeyset> | null = null;
+    let planted = false;
+    let tie: string | null = null;
+    for (let n = 0; n < 8; n++) {
+      const batch = await listTasks({ status: "cursorprobe", limit: 2, keyset: true, cursor });
+      for (const row of batch) assert.equal("list_sort_at" in row, false);
+      const page = splitPage(batch as never, parseToolList(TASK_REST, { limit: 1 }));
+      assert.equal(page.rows.length > 0, true, "a cursorprobe page must not be empty before the end");
+      seen.push(String(page.rows[0].id));
+      if (tie === null && n === 1) tie = page.next_cursor;
+      if (!page.next_cursor) break;
+      if (!planted) {
+        await taskId("e", "2026-10-28 12:00:00.900000+00");
+        planted = true;
+      } else if (tie && page.next_cursor) {
+        const firstTie = decodeCursor(TASK_REST, tie);
+        const nextTie = decodeCursor(TASK_REST, page.next_cursor);
+        if (String(firstTie.k[2]) === String(nextTie.k[2])) {
+          assert.equal(String(nextTie.k[2]).endsWith(".123Z"), true, "microseconds collapse to the same millisecond");
+        }
+      }
+      cursor = taskKeyset(decodeCursor(TASK_REST, page.next_cursor));
+    }
+    assert.deepEqual(seen, [a, b, c, d], "keyset returns each original task once after a newer insert");
+    const bCursor = decodeCursor(TASK_REST, tie as string);
+    assert.equal(String(bCursor.k[2]), "2026-10-28T12:00:00.123Z");
+
+    const noteId = async (name: string, at: string) => {
+      const rows = await sql()`
+        insert into memory (key, content, tags, updated_at)
+        values (${`${probe}-${name}`}, ${name}, ${[probe]}::text[], ${at}::timestamptz)
+        returning id::text as id
+      `;
+      return String(rows[0].id);
+    };
+    const newer = await noteId("newer", "2026-10-28 13:00:00.500000+00");
+    const low = await noteId("low", "2026-10-28 13:00:00.123111+00");
+    const high = await noteId("high", "2026-10-28 13:00:00.123999+00");
+    const notes: string[] = [];
+    let memoryCursor: ReturnType<typeof memoryKeyset> | null = null;
+    let memoryPlanted = false;
+    let memoryTie: string | null = null;
+    for (let n = 0; n < 8; n++) {
+      const batch = await recall({ tags: [probe], limit: 2, keyset: true, cursor: memoryCursor });
+      for (const row of batch) assert.equal("list_sort_at" in row, false);
+      const page = splitPage(batch as never, parseToolList(MEMORY_REST, { limit: 1 }));
+      if (page.rows.length === 0) break;
+      notes.push(String(page.rows[0].id));
+      if (n === 1) memoryTie = page.next_cursor;
+      if (!page.next_cursor) break;
+      if (!memoryPlanted) {
+        await noteId("front", "2026-10-28 13:00:01.000000+00");
+        memoryPlanted = true;
+      }
+      memoryCursor = memoryKeyset(decodeCursor(MEMORY_REST, page.next_cursor));
+    }
+    assert.deepEqual(notes, [newer, low, high], "keyset returns each original note once");
+    assert.equal(String(decodeCursor(MEMORY_REST, memoryTie as string).k[0]), "2026-10-28T13:00:00.123Z");
+
+    const hex = (ch: string) => ch.repeat(32);
+    const span = (trace: string, at: string): SpanInput => ({
+      trace_id: trace,
+      span_id: "0000000000000001",
+      parent_span_id: null,
+      agent_id: agent,
+      session_id: null,
+      name: "session",
+      kind: "session",
+      status: "ok",
+      status_message: null,
+      started_at: at,
+      ended_at: at,
+      attributes: {},
+      model: null,
+      input_tokens: null,
+      output_tokens: null,
+      cost_usd: null,
+    });
+    const traceC = hex("c");
+    const traceA = hex("a");
+    const traceB = hex("b");
+    await upsertSpans([span(traceC, "2026-10-28T16:00:00.000000Z")]);
+    await upsertSpans([span(traceA, "2026-10-28T15:00:00.123456Z")]);
+    await upsertSpans([span(traceB, "2026-10-28T15:00:00.123999Z")]);
+    const traces: string[] = [];
+    let traceCursor: ReturnType<typeof traceKeyset> | null = null;
+    let tracePlanted = false;
+    let traceTie: string | null = null;
+    for (let n = 0; n < 8; n++) {
+      const batch = await listTraces({ agent, limit: 2, keyset: true, cursor: traceCursor });
+      const page = splitPage(batch as never, parseToolList(TRACE_LIST, { limit: 1 }));
+      if (page.rows.length === 0) break;
+      traces.push(String(page.rows[0].trace_id));
+      assert.equal("list_sort_at" in page.rows[0], false);
+      if (n === 1) traceTie = page.next_cursor;
+      if (!page.next_cursor) break;
+      if (!tracePlanted) {
+        await upsertSpans([span(hex("d"), "2026-10-28T17:00:00.000000Z")]);
+        tracePlanted = true;
+      }
+      traceCursor = traceKeyset(decodeCursor(TRACE_LIST, page.next_cursor));
+    }
+    assert.deepEqual(traces, [traceC, traceA, traceB], "keyset returns each original trace once, trace_id ascending on a tie");
+    assert.equal(String(decodeCursor(TRACE_LIST, traceTie as string).k[0]), "2026-10-28T15:00:00.123Z");
+  } finally {
+    await sql()`delete from tasks where status = 'cursorprobe' and title like ${probe + "%"}`;
+    await sql()`delete from memory where key like ${probe + "%"}`;
+    await sql()`delete from spans where agent_id = ${agent}`;
+  }
+}
+
+/** Real claim SQL: one message per alert, a 12h repeat, and a migration that applies twice. */
+async function testBriefAlerts(tag: string): Promise<void> {
+  const slug = tag.replace(/\W/g, "").slice(-18);
+  const agentId = `alerta${slug}`;
+  const repo = `pgtest/z${slug}`;
+  const now = new Date("2026-10-28T12:00:00.000Z");
+  const hour = 3_600_000;
+  const minute = 60_000;
+  const day = 24 * hour;
+  const iso = (delta: number) => new Date(now.getTime() + delta).toISOString();
+  const settings: BriefSettings = {
+    decisionLabels: ["needs-owner"],
+    stuckPrHours: 48,
+    staleIssueDays: 21,
+    coordinator: { agentId, maxSilenceHours: 3, workKinds: ["session_end", "milestone", "status"] },
+    alerts: {
+      enabled: true,
+      coordinatorRepeatHours: 12,
+      zeroMergeHours: 72,
+      zeroMergeLookbackDays: 7,
+      decisionAgeDays: 14,
+    },
+  };
+  const coordKey = `coordinator-silent:${agentId}`;
+  const mergeKey = `zero-merge:${repo}`;
+  const cleanup = async () => {
+    await sql()`delete from messages where created_by = 'brief-alerts' and body like ${"%" + slug + "%"}`;
+    await sql()`delete from brief_alerts where key like ${"%" + slug + "%"}`;
+    await sql()`delete from events where agent_id = ${agentId}`;
+    await sql()`delete from agents where id = ${agentId}`;
+    await sql()`delete from repo_snapshots where repo = ${repo}`;
+    await sql()`delete from watched_repos where repo = ${repo}`;
+    await sql()`delete from decisions where repo = ${repo}`;
+  };
+
+  const migration = fs.readFileSync("supabase/migrations/20261028_brief_alerts.sql", "utf8");
+  const statements = migration
+    .split(";")
+    .map((part) => part.split("\n").filter((line) => !line.trim().startsWith("--")).join("\n").trim())
+    .filter(Boolean);
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  await client.connect();
+  try {
+    for (let pass = 0; pass < 2; pass += 1) {
+      for (const statement of statements) await client.query(statement);
+    }
+  } finally {
+    await client.end();
+  }
+  const cols = await sql()`
+    select column_name, is_nullable
+    from information_schema.columns
+    where table_schema = 'public' and table_name = 'brief_alerts'
+  `;
+  const nullable = new Map(cols.map((row) => [String(row.column_name), String(row.is_nullable)]));
+  assert.equal(nullable.get("key"), "NO");
+  assert.equal(nullable.get("first_sent_at"), "NO");
+  assert.equal(nullable.get("last_sent_at"), "NO");
+  assert.equal(nullable.get("cleared_at"), "YES");
+  assert.equal(nullable.get("claim_token"), "YES");
+
+  await cleanup();
+  try {
+    await sql()`insert into agents (id, platform) values (${agentId}, 'other')`;
+    await sql()`
+      insert into events (agent_id, kind, title, created_at)
+      values
+        (${agentId}, 'session_end', 'work', ${iso(-4 * hour)}::timestamptz),
+        (${agentId}, 'heartbeat', 'beat', ${iso(-minute)}::timestamptz),
+        (${agentId}, 'telemetry', 'tick', ${iso(-minute)}::timestamptz),
+        (${agentId}, 'turn_start', 'turn', ${iso(-minute)}::timestamptz),
+        (${agentId}, 'status_update', 'status', ${iso(-minute)}::timestamptz),
+        (${agentId}, 'error', 'boom', ${iso(-minute)}::timestamptz)
+    `;
+    await sql()`
+      insert into watched_repos (repo, label, short, color, position)
+      values (${repo}, 'Alert', ${slug.slice(0, 12)}, '#000000', 0)
+      on conflict (repo) do nothing
+    `;
+    await sql()`
+      insert into repo_snapshots (repo, collected_at, detail)
+      values (
+        ${repo},
+        ${iso(0)}::timestamptz,
+        ${JSON.stringify({ merged: [{ merged_at: iso(-72 * hour) }] })}::jsonb
+      )
+    `;
+    const oldDecision = await sql()`
+      insert into decisions (key, source, repo, number, title, status, opened_at, first_seen_at)
+      values (
+        ${`github:${repo}#1`}, 'github-label', ${repo}, 1, ${`old ${slug}`}, 'open',
+        ${iso(-14 * day - minute)}::timestamptz, ${iso(-14 * day - minute)}::timestamptz
+      )
+      returning id
+    `;
+    const youngDecision = await sql()`
+      insert into decisions (key, source, repo, number, title, status, opened_at, first_seen_at)
+      values (
+        ${`github:${repo}#2`}, 'github-label', ${repo}, 2, ${`young ${slug}`}, 'open',
+        ${iso(-14 * day + minute)}::timestamptz, ${iso(-14 * day + minute)}::timestamptz
+      )
+      returning id
+    `;
+    await sql()`
+      insert into decisions (key, source, repo, number, title, status, opened_at, first_seen_at)
+      values (
+        ${`github:${repo}#3`}, 'github-label', ${repo}, 3, ${`done ${slug}`}, 'decided',
+        ${iso(-40 * day)}::timestamptz, ${iso(-40 * day)}::timestamptz
+      )
+    `;
+    const oldId = Number(oldDecision[0].id);
+    const youngId = Number(youngDecision[0].id);
+    const count = async (needle: string) => {
+      const rows = await sql()`
+        select count(*)::int as n from messages
+        where created_by = 'brief-alerts' and position(${needle} in body) > 0
+      `;
+      return Number(rows[0].n);
+    };
+    const bodyKey = (key: string) => `brief-alert ${key}\n`;
+
+    const raced = await Promise.all([
+      evaluateAlerts({ now, settings }),
+      evaluateAlerts({ now, settings }),
+    ]);
+    assert.equal(raced.reduce((sum, report) => sum + report.sent_count, 0) >= 3, true);
+    assert.equal(await count(bodyKey(coordKey)), 1, "a recent heartbeat does not stop the silence alert");
+    assert.equal(await count(bodyKey(mergeKey)), 1, "a merge exactly 72h ago fires once");
+    assert.equal(await count(bodyKey(`decision:${oldId}`)), 1);
+    assert.equal(await count(bodyKey(`decision:${youngId}`)), 0, "14d minus one minute does not alert");
+    assert.equal(await count(`github:${repo}#3`), 0, "a decided row does not alert");
+
+    const hourLater = new Date(now.getTime() + hour);
+    const held = await evaluateAlerts({ now: hourLater, settings });
+    assert.equal(held.alerts.find((alert) => alert.key === coordKey)?.condition, "firing");
+    assert.equal(await count(bodyKey(coordKey)), 1, "one hour later does not repeat");
+
+    const halfDay = new Date(now.getTime() + 12 * hour);
+    const repeated = await evaluateAlerts({ now: halfDay, settings });
+    assert.equal(repeated.alerts.find((alert) => alert.key === coordKey)?.condition, "firing");
+    assert.equal(await count(bodyKey(coordKey)), 2, "exactly 12h repeats the coordinator alert");
+    assert.equal(await count(bodyKey(mergeKey)), 1, "a zero-merge episode does not repeat at 12h");
+    assert.equal(await count(bodyKey(`decision:${oldId}`)), 1, "a decision does not alert twice");
+
+    await sql()`
+      insert into events (agent_id, kind, title, created_at)
+      values (${agentId}, 'milestone', 'back', ${iso(12 * hour)}::timestamptz)
+    `;
+    const clearAt = new Date(halfDay.getTime() + minute);
+    const cleared = await evaluateAlerts({ now: clearAt, settings });
+    assert.equal(cleared.alerts.find((alert) => alert.key === coordKey)?.condition, "clear");
+    assert.equal(await count(bodyKey(coordKey)), 2, "a work event clears without another message");
+    const latch = await sql()`select cleared_at from brief_alerts where key = ${coordKey}`;
+    assert.ok(latch[0]?.cleared_at, "the coordinator latch is cleared");
+    const decisionLatch = await sql()`select cleared_at from brief_alerts where key = ${`decision:${oldId}`}`;
+    assert.equal(decisionLatch[0]?.cleared_at ?? null, null, "a decision latch is never cleared");
+
+    const instant = (value: unknown) => value instanceof Date ? value.getTime() : Date.parse(String(value));
+
+    // 1. A clear that observed a later instant rejects the stale claim.
+    const tClaim = new Date(now.getTime() + 30_000);
+    const tClear = new Date(now.getTime() + 90_000);
+    await sql()`delete from events where agent_id = ${agentId} and kind = 'milestone'`;
+    await sql()`
+      update brief_alerts
+      set cleared_at = null, last_sent_at = ${tClaim.toISOString()}::timestamptz
+      where key = ${coordKey}
+    `;
+    const beforeStale = await count(bodyKey(coordKey));
+    const seen: { report: Awaited<ReturnType<typeof evaluateAlerts>> | null } = { report: null };
+    setBeforeClaimForTests(async (key) => {
+      if (key !== coordKey) return;
+      setBeforeClaimForTests(null);
+      await sql()`
+        insert into events (agent_id, kind, title, created_at)
+        values (${agentId}, 'milestone', 'later-clear', ${tClear.toISOString()}::timestamptz)
+      `;
+      seen.report = await evaluateAlerts({ now: tClear, settings });
+    });
+    const stale = await evaluateAlerts({ now: tClaim, settings });
+    setBeforeClaimForTests(null);
+    const concurrentClear = seen.report;
+    if (!concurrentClear) throw new Error("the later clear ran before the stale claim");
+    assert.equal(concurrentClear.alerts.find((alert) => alert.key === coordKey)?.condition, "clear");
+    assert.equal(stale.failures, undefined, "the stale claim statement ran");
+    assert.equal(await count(bodyKey(coordKey)), beforeStale, "a later clear rejects the stale claim");
+    assert.equal(stale.sent_count, 0);
+    const staleLatch = await sql()`select cleared_at, last_sent_at from brief_alerts where key = ${coordKey}`;
+    assert.equal(instant(staleLatch[0]?.cleared_at), tClear.getTime(), "the later clear stays cleared");
+    assert.equal(instant(staleLatch[0]?.last_sent_at), tClaim.getTime(), "the stale claim does not rewrite last_sent_at");
+
+    // 2. A delayed clear with an earlier compute instant leaves the newer claim.
+    const tNewer = new Date(now.getTime() + 30 * hour);
+    const tOlder = new Date(now.getTime() + 29 * hour);
+    await sql()`delete from events where agent_id = ${agentId} and kind = 'milestone'`;
+    const newerClaim = await evaluateAlerts({ now: tNewer, settings });
+    assert.equal(newerClaim.alerts.find((alert) => alert.key === coordKey)?.condition, "firing");
+    const afterNewer = await count(bodyKey(coordKey));
+    assert.equal(afterNewer, beforeStale + 1, "silence after the clear arms a fresh claim");
+    await sql()`
+      insert into events (agent_id, kind, title, created_at)
+      values (${agentId}, 'milestone', 'already-claimed', ${tNewer.toISOString()}::timestamptz)
+    `;
+    const delayed = await evaluateAlerts({ now: tOlder, settings });
+    assert.equal(delayed.alerts.find((alert) => alert.key === coordKey)?.condition, "clear");
+    assert.equal(await count(bodyKey(coordKey)), afterNewer, "a delayed clear sends nothing");
+    const kept = await sql()`select cleared_at from brief_alerts where key = ${coordKey}`;
+    assert.equal(kept[0]?.cleared_at ?? null, null, "a delayed clear does not erase the newer claim");
+
+    // 3. A decision resolved between compute and claim inserts nothing.
+    const dKey = `decision:${oldId}`;
+    await sql()`delete from messages where created_by = 'brief-alerts' and position(${bodyKey(dKey)} in body) > 0`;
+    await sql()`delete from brief_alerts where key = ${dKey}`;
+    assert.equal(await count(bodyKey(dKey)), 0);
+    setBeforeClaimForTests(async (key) => {
+      if (key !== dKey) return;
+      setBeforeClaimForTests(null);
+      await sql()`update decisions set status = 'decided' where id = ${oldId}`;
+    });
+    const resolvedLate = await evaluateAlerts({ now, settings });
+    setBeforeClaimForTests(null);
+    assert.equal(resolvedLate.alerts.find((alert) => alert.key === dKey)?.condition, "firing");
+    assert.equal(resolvedLate.alerts.find((alert) => alert.key === dKey)?.sent, false);
+    assert.equal(await count(bodyKey(dKey)), 0, "a decision resolved before the claim sends nothing");
+    const gone = await sql()`select key from brief_alerts where key = ${dKey}`;
+    assert.equal(gone.length, 0, "a resolved decision does not leave a latch");
+  } finally {
+    setBeforeClaimForTests(null);
+    setBriefSettingsForTests(null);
+    await cleanup();
+  }
+}
+
+/**
+ * Snapshot rows stored as `PgCase/A…` count for the watched row `pgcase/a…`.
+ * One quiet window sends one lowercase latch. A second evaluate sends nothing.
+ * A sent latch under the stored casing is not cleared as absent.
+ */
+async function testZeroMergeCaseFold(tag: string): Promise<void> {
+  const slug = tag.replace(/\W/g, "").slice(-12);
+  const watched = `pgcase/a${slug}`;
+  const stored = `PgCase/A${slug}`;
+  const key = `zero-merge:${watched}`;
+  const oldKey = `zero-merge:${stored}`;
+  const now = new Date("2026-10-28T12:00:00.000Z");
+  const hour = 3_600_000;
+  const minute = 60_000;
+  const iso = (delta: number) => new Date(now.getTime() + delta).toISOString();
+  const settings: BriefSettings = {
+    decisionLabels: ["needs-owner"],
+    stuckPrHours: 48,
+    staleIssueDays: 21,
+    coordinator: { agentId: null, maxSilenceHours: 3, workKinds: ["session_end"] },
+    alerts: {
+      enabled: true,
+      coordinatorRepeatHours: 12,
+      zeroMergeHours: 72,
+      zeroMergeLookbackDays: 7,
+      decisionAgeDays: 14,
+    },
+  };
+  const cleanup = async () => {
+    await sql()`delete from messages where created_by = 'brief-alerts' and body like ${"%" + slug + "%"}`;
+    await sql()`delete from brief_alerts where key = ${key} or key = ${oldKey}`;
+    await sql()`delete from repo_snapshots where lower(repo) = lower(${watched})`;
+    await sql()`delete from watched_repos where lower(repo) = lower(${watched})`;
+  };
+  await cleanup();
+  try {
+    await sql()`
+      insert into watched_repos (repo, label, short, color, position)
+      values (${watched}, 'Case', ${`c${slug}`.slice(0, 12)}, '#000000', 0)
+    `;
+    await sql()`
+      insert into repo_snapshots (repo, collected_at, detail)
+      values (
+        ${stored},
+        ${iso(0)}::timestamptz,
+        ${JSON.stringify({ merged: [{ merged_at: iso(-72 * hour) }] })}::jsonb
+      )
+    `;
+    const count = async () => {
+      const rows = await sql()`
+        select count(*)::int as n from messages
+        where created_by = 'brief-alerts' and position(${`brief-alert ${key}\n`} in body) > 0
+      `;
+      return Number(rows[0].n);
+    };
+    const first = await evaluateAlerts({ now, settings });
+    assert.equal(first.alerts.find((alert) => alert.key === key)?.condition, "firing");
+    assert.equal(first.alerts.some((alert) => alert.key === oldKey), false);
+    assert.equal(await count(), 1, "quiet history under another casing sends one lowercase alert");
+
+    const second = await evaluateAlerts({ now: new Date(now.getTime() + minute), settings });
+    assert.equal(second.alerts.find((alert) => alert.key === key)?.condition, "firing");
+    assert.equal(await count(), 1, "a second evaluate sends nothing more");
+
+    await sql()`
+      insert into brief_alerts (key, first_sent_at, last_sent_at)
+      values (${oldKey}, ${iso(-hour)}::timestamptz, ${iso(-hour)}::timestamptz)
+    `;
+    const later = new Date(now.getTime() + 2 * minute);
+    await evaluateAlerts({ now: later, settings });
+    const kept = await sql()`select cleared_at from brief_alerts where key = ${oldKey}`;
+    assert.equal(kept.length, 1);
+    assert.equal(kept[0]?.cleared_at ?? null, null, "a case-variant latch of a visible repo is not cleared");
+  } finally {
+    setBriefSettingsForTests(null);
+    await cleanup();
+  }
+}
+
+/** Case-insensitive repo identity and a swept_at activity cutoff, on real SQL. */
+async function testRepoCaseIdentity(tag: string): Promise<void> {
+  const slug = tag.replace(/\D/g, "").slice(-10);
+  const owner = `pgc${slug}`;
+  const stored = `${owner}/app`;
+  const short = `s${slug}`.slice(0, 12);
+  const brand = `Bn${slug}`;
+  try {
+    await sql()`insert into watched_owners (owner, activity_days) values (${owner}, 30)`;
+    await sql()`
+      insert into watched_repos (repo, label, short, color, position, origin)
+      values (${stored}, 'App', ${short}, '#2563eb', 0, 'manual')
+    `;
+    const outcome = await applyOwnerDiscovery(
+      { owner, activityDays: 30, includeForks: false, includeArchived: false },
+      [],
+      {
+        repos: [
+          { name: "App", pushedAt: "2026-01-15T00:00:00.000Z", isFork: false, isArchived: false },
+          { name: brand, pushedAt: "2026-01-01T00:00:00.000Z", isFork: false, isArchived: false },
+          { name: `Old${slug}`, pushedAt: "2025-12-31T23:59:59.999Z", isFork: false, isArchived: false },
+        ],
+        error: null,
+        sweptAt: "2026-01-31T00:00:00.000Z",
+      },
+      new Date("2026-10-29T00:00:00.000Z"),
+    );
+    assert.equal(outcome.failure, null, outcome.failure ?? "");
+    const rows = await sql()`
+      select repo, pinned
+      from watched_repos
+      where lower(repo) like ${`${owner.toLowerCase()}/%`}
+      order by repo
+    `;
+    const names = rows.map((row) => String(row.repo));
+    assert.deepEqual(names.filter((name) => name.toLowerCase() === stored.toLowerCase()), [stored]);
+    assert.ok(names.includes(`${owner}/${brand}`), `expected GitHub casing, saw ${names.join(", ")}`);
+    assert.equal(names.some((name) => name.toLowerCase().includes("old")), false);
+    const pinned = await setRepoOverride(stored.toUpperCase(), { pinned: true });
+    assert.equal(pinned, true);
+    const after = await sql()`
+      select repo, pinned from watched_repos where lower(repo) = lower(${stored})
+    `;
+    assert.equal(after.length, 1);
+    assert.equal(after[0]?.repo, stored);
+    assert.equal(after[0]?.pinned, true);
+  } finally {
+    await sql()`delete from watched_repos where lower(repo) like ${`${owner.toLowerCase()}/%`}`;
+    await sql()`delete from watched_owners where owner = ${owner}`;
+  }
+}
+
+/**
+ * Claim, stamp, and reopen predicates, plus the crash-window retry population.
+ * Tagged by repo so the delete cannot touch another test's rows.
+ */
+async function testDecisionWritebackHardening(tag: string) {
+  const repo = `pgtest/h${tag.replace(/\W/g, "")}`;
+  const key = (n: number) => `github:${repo}#${n}`;
+  const drop = () => sql()`delete from decisions where repo = ${repo}`;
+  const body = (n: number): UpsertInput => ({
+    key: key(n),
+    source: "github-label",
+    repo,
+    repo_short: "app",
+    number: n,
+    url: null,
+    title: `harden ${n}`,
+    why: null,
+    options: null,
+    recommended: null,
+    requested_by: "owner",
+    kind: "issue",
+    labels: ["needs-owner"],
+    opened_at: "2026-07-21T12:00:00.000Z",
+    first_seen_at: "2026-07-21T12:00:00.000Z",
+    github_present: true,
+    force: false,
+  });
+  const decide = async (id: number, revision: number) => {
+    const row = await patchDecision(id, {
+      status: "decided",
+      decision: "ship",
+      setDecision: true,
+      decided_by: "mark",
+      setDecidedBy: true,
+      defer_until: null,
+      setDefer: false,
+      guardTerminal: true,
+      expectedRevision: revision,
+    });
+    assert.ok(row);
+    assert.equal(row.status, "decided");
+    return row;
+  };
+
+  await drop();
+  try {
+    const seeded = await upsertDecision(body(1));
+    const decided = await decide(seeded.decision.id, seeded.decision.revision);
+    const claim = await claimDecisionWriteback(decided.id, decided.revision);
+    assert.ok(claim);
+    assert.equal(claim.revision, decided.revision + 1);
+    const locked = await sql()`
+      select writeback_lock, writeback, revision, status from decisions where id = ${decided.id}
+    `;
+    assert.equal(locked[0].writeback_lock, claim.token);
+    assert.equal(locked[0].writeback, null);
+    assert.equal(Number(locked[0].revision), claim.revision);
+
+    assert.equal(await claimDecisionWriteback(decided.id, decided.revision), null);
+    assert.equal(await claimDecisionWriteback(decided.id, claim.revision), null);
+    assert.equal(await setDecisionWriteback(decided.id, "written", claim.revision, "wrong-token"), null);
+    assert.equal(await setDecisionWriteback(decided.id, "not_written", claim.revision, null), null);
+    const fenced = await sql()`
+      select writeback_lock, writeback, revision from decisions where id = ${decided.id}
+    `;
+    assert.equal(fenced[0].writeback_lock, claim.token);
+    assert.equal(fenced[0].writeback, null);
+    assert.equal(Number(fenced[0].revision), claim.revision);
+
+    const reopened = await patchDecision(decided.id, {
+      status: "open",
+      setDecision: false,
+      setDecidedBy: false,
+      defer_until: null,
+      setDefer: false,
+      guardTerminal: true,
+      expectedRevision: claim.revision,
+    });
+    assert.equal(reopened, null);
+    assert.equal((await getDecision(decided.id))?.status, "decided");
+
+    const stamped = await setDecisionWriteback(decided.id, "written", claim.revision, claim.token);
+    assert.equal(stamped?.writeback, "written");
+    assert.equal(stamped?.revision, claim.revision + 1);
+    const cleared = await sql()`select writeback_lock from decisions where id = ${decided.id}`;
+    assert.equal(cleared[0].writeback_lock, null);
+
+    const takeoverSeed = await upsertDecision(body(2));
+    const takeoverDecided = await decide(takeoverSeed.decision.id, takeoverSeed.decision.revision);
+    const firstClaim = await claimDecisionWriteback(takeoverDecided.id, takeoverDecided.revision);
+    assert.ok(firstClaim);
+    await sql()`
+      update decisions
+      set writeback_lock_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 1})
+      where id = ${takeoverDecided.id}
+    `;
+    const took = await claimDecisionWriteback(takeoverDecided.id, firstClaim.revision);
+    assert.ok(took);
+    assert.notEqual(took.token, firstClaim.token);
+    assert.equal(took.revision, firstClaim.revision + 1);
+
+    const reopenSeed = await upsertDecision(body(3));
+    const reopenDecided = await decide(reopenSeed.decision.id, reopenSeed.decision.revision);
+    const reopenClaim = await claimDecisionWriteback(reopenDecided.id, reopenDecided.revision);
+    assert.ok(reopenClaim);
+    await sql()`
+      update decisions
+      set writeback_lock_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 1})
+      where id = ${reopenDecided.id}
+    `;
+    const opened = await patchDecision(reopenDecided.id, {
+      status: "open",
+      setDecision: false,
+      setDecidedBy: false,
+      defer_until: null,
+      setDefer: false,
+      guardTerminal: true,
+      expectedRevision: reopenClaim.revision,
+    });
+    assert.equal(opened?.status, "open");
+    const openedLock = await sql()`select writeback_lock, status from decisions where id = ${reopenDecided.id}`;
+    assert.equal(openedLock[0].writeback_lock, null);
+    assert.equal(openedLock[0].status, "open");
+
+    const insideSeed = await upsertDecision(body(4));
+    const outsideSeed = await upsertDecision(body(5));
+    const stampedSeed = await upsertDecision(body(6));
+    const writtenSeed = await upsertDecision(body(7));
+    const inside = await decide(insideSeed.decision.id, insideSeed.decision.revision);
+    const outside = await decide(outsideSeed.decision.id, outsideSeed.decision.revision);
+    const freshStamp = await decide(stampedSeed.decision.id, stampedSeed.decision.revision);
+    const written = await decide(writtenSeed.decision.id, writtenSeed.decision.revision);
+    await sql()`
+      update decisions
+      set writeback = null,
+          writeback_lock = null,
+          writeback_lock_at = null,
+          decided_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS - 30}),
+          updated_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS - 30})
+      where id = ${inside.id}
+    `;
+    await sql()`
+      update decisions
+      set writeback = null,
+          writeback_lock = null,
+          writeback_lock_at = null,
+          decided_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30}),
+          updated_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30})
+      where id = ${outside.id}
+    `;
+    await sql()`
+      update decisions set writeback = 'not_written', updated_at = now() where id = ${freshStamp.id}
+    `;
+    await sql()`
+      update decisions
+      set writeback = 'written',
+          updated_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30})
+      where id = ${written.id}
+    `;
+
+    // A claimed row whose process died before the stamp. The collector
+    // upserts the still-labeled row and refreshes updated_at. The lock
+    // timestamp and decided_at stay, so an expired claim is still due.
+    const expiredSeed = await upsertDecision(body(8));
+    const expiredDecided = await decide(expiredSeed.decision.id, expiredSeed.decision.revision);
+    const expiredClaim = await claimDecisionWriteback(expiredDecided.id, expiredDecided.revision);
+    assert.ok(expiredClaim);
+    await sql()`
+      update decisions
+      set writeback_lock_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30}),
+          decided_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30})
+      where id = ${expiredDecided.id}
+    `;
+    const expiredAgain = await upsertDecision(body(8));
+    assert.equal(expiredAgain.decision.id, expiredDecided.id);
+    assert.equal(expiredAgain.status_held, true);
+    assert.equal(expiredAgain.decision.writeback, null);
+    const expiredRow = await sql()`
+      select writeback_lock, writeback,
+        writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as lock_old,
+        decided_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as decided_old,
+        updated_at >= now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as updated_fresh
+      from decisions where id = ${expiredDecided.id}
+    `;
+    assert.equal(expiredRow[0].writeback_lock, expiredClaim.token);
+    assert.equal(expiredRow[0].writeback, null);
+    assert.equal(expiredRow[0].lock_old === true || expiredRow[0].lock_old === "t", true);
+    assert.equal(expiredRow[0].decided_old === true || expiredRow[0].decided_old === "t", true);
+    assert.equal(expiredRow[0].updated_fresh === true || expiredRow[0].updated_fresh === "t", true);
+
+    // Same crash, but the claim is still inside its lease. The collector
+    // refresh must not put that row in the retry population.
+    const liveSeed = await upsertDecision(body(9));
+    const liveDecided = await decide(liveSeed.decision.id, liveSeed.decision.revision);
+    const liveClaim = await claimDecisionWriteback(liveDecided.id, liveDecided.revision);
+    assert.ok(liveClaim);
+    await sql()`
+      update decisions
+      set writeback_lock_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS - 30}),
+          decided_at = now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS + 30})
+      where id = ${liveDecided.id}
+    `;
+    const liveAgain = await upsertDecision(body(9));
+    assert.equal(liveAgain.decision.id, liveDecided.id);
+    assert.equal(liveAgain.decision.writeback, null);
+    const liveRow = await sql()`
+      select writeback_lock,
+        writeback_lock_at >= now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as lock_live,
+        updated_at >= now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS}) as updated_fresh
+      from decisions where id = ${liveDecided.id}
+    `;
+    assert.equal(liveRow[0].writeback_lock, liveClaim.token);
+    assert.equal(liveRow[0].lock_live === true || liveRow[0].lock_live === "t", true);
+    assert.equal(liveRow[0].updated_fresh === true || liveRow[0].updated_fresh === "t", true);
+
+    const flags = await sql()`
+      select id,
+        (
+          writeback = 'not_written'
+          or (
+            status = 'decided'
+            and writeback is null
+            and (
+              writeback_lock is null
+              or writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+            )
+            and coalesce(writeback_lock_at, decided_at, updated_at) < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
+          )
+        ) as due
+      from decisions
+      where repo = ${repo} and status = 'decided'
+    `;
+    const due = new Map(flags.map((row) => [Number(row.id), row.due === true || row.due === "t"]));
+    assert.equal(due.get(inside.id), false, "a null writeback inside the lease is not due");
+    assert.equal(due.get(outside.id), true, "a null writeback older than the lease is due");
+    assert.equal(due.get(freshStamp.id), true, "not_written stays due at any age");
+    assert.equal(due.get(written.id), false, "written is not a retry");
+    assert.equal(due.get(expiredDecided.id), true, "an expired claim stays due after a collector upsert refreshes updated_at");
+    assert.equal(due.get(liveDecided.id), false, "a live claim stays out of the retry population after a collector upsert");
+    const listed = await listDecisions({
+      status: "decided",
+      repo,
+      source: null,
+      limit: 100,
+      shape: "row",
+      writeback: "not_written",
+    });
+    assert.deepEqual(
+      listed.map((row) => row.id).sort((a, b) => a - b),
+      [...due.entries()].filter(([, isDue]) => isDue).map(([id]) => id).sort((a, b) => a - b),
+    );
+  } finally {
+    await drop();
+  }
+}
+
+/**
+ * An empty configured database reports the stored-list version, so the first
+ * save that sends it is not stale. The dry run diffs that empty list. A
+ * receipt insert that fails rolls the replace back. A normal write leaves
+ * one receipt and the new list. REST PUT still writes no receipt.
+ */
+async function testRepoSettingsVersionAndReceipt(tag: string): Promise<void> {
+  const digits = tag.replace(/\D/g, "").slice(-8);
+  const shortA = `a${digits}`.slice(0, 12);
+  const shortB = `b${digits}`.slice(0, 12);
+  const repoA = `pgr${digits}/a`;
+  const repoB = `pgr${digits}/b`;
+  const row = (name: string, short: string, label: string) => ({
+    repo: name,
+    label,
+    short,
+    color: "#112233",
+    blockedLabel: null as string | null,
+  });
+  const actor = { actor_type: "agent" as const, actor_id: "mc-token" };
+  const savedPassword = process.env.MC_DASHBOARD_PASSWORD;
+  const savedToken = process.env.MC_TOKEN;
+  delete process.env.MC_DASHBOARD_PASSWORD;
+  delete process.env.MC_TOKEN;
+  const detailOf = (value: unknown): { version?: string; tool?: string; actor_id?: string } => {
+    if (typeof value === "string") return JSON.parse(value) as { version?: string; tool?: string; actor_id?: string };
+    if (value && typeof value === "object") return value as { version?: string; tool?: string; actor_id?: string };
+    return {};
+  };
+  const dropTrigger = async () => {
+    await sql()`drop trigger if exists ak_test_fail_repo_event on events`;
+    await sql()`drop function if exists ak_test_fail_repo_event()`;
+  };
+  const floor = await sql()`select coalesce(max(id), 0)::bigint as id from events`;
+  const floorId = String(floor[0].id);
+  try {
+    const owners = await sql()`select count(*)::int as n from watched_owners`;
+    const repos = await sql()`select count(*)::int as n from watched_repos`;
+    assert.equal(Number(owners[0].n), 0, "version test starts with no owners");
+    assert.equal(Number(repos[0].n), 0, "version test starts with no repos");
+
+    await sql()`
+      insert into watched_repos (repo, label, short, color, blocked_label, position, origin, pinned, hidden, fields_overridden)
+      values ('acme/kept', 'Kept', 'kept', '#abcdef', 'wait', 0, 'auto', true, false, true)
+    `;
+    const fixed = await readRepoSettings();
+    assert.equal(fixed.source, "database");
+    assert.equal(fixed.version, listVersion(fixed.repos));
+    assert.equal(fixed.version, "fc16e23e1910c991", "a populated list keeps the pre-change fingerprint");
+    await sql()`delete from watched_repos where repo = 'acme/kept'`;
+
+    const settings = await readRepoSettings();
+    assert.equal(settings.source, "file");
+    assert.equal(settings.version, listVersion([]));
+    assert.equal(settings.version, "4f53cda18c2baa0c");
+    assert.notEqual(settings.version, listVersion(settings.repos));
+    const toolBody = JSON.parse((await getSettingsTool()).content[0].text) as {
+      repos: { version: string; source: string };
+    };
+    assert.equal(toolBody.repos.version, settings.version);
+    assert.equal(toolBody.repos.source, "file");
+
+    const preview = await setWatchedReposTool({ repos: [row(repoA, shortA, "A")], dry_run: true });
+    assert.equal(preview.isError, undefined, preview.content[0]?.text);
+    const diff = JSON.parse(preview.content[0].text) as {
+      source?: string;
+      added: string[];
+      removed: string[];
+      version: string;
+      would_write: boolean;
+    };
+    assert.equal(diff.source, "file");
+    assert.equal(diff.version, settings.version);
+    assert.deepEqual(diff.added, [repoA]);
+    assert.deepEqual(diff.removed, []);
+    assert.equal(diff.would_write, true);
+
+    const saved = await runWithActor(actor, () => setWatchedReposTool({
+      repos: [row(repoA, shortA, "A")],
+      expected_version: settings.version,
+    }));
+    assert.equal(saved.isError, undefined, saved.content[0]?.text);
+    assert.equal(saved.content[0].text.split("receipt:").length - 1, 1);
+    const after = await readRepoSettings();
+    assert.equal(after.source, "database");
+    assert.deepEqual(after.repos.map((item) => item.repo), [repoA]);
+    const receiptRows = await sql()`
+      select id::text as id, detail
+      from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+      order by id asc
+    `;
+    assert.equal(receiptRows.length, 1, "a normal write leaves exactly one receipt");
+    const detail = detailOf(receiptRows[0].detail);
+    assert.equal(detail.version, after.version);
+    assert.equal(detail.tool, "set_watched_repos");
+    assert.equal(detail.actor_id, "mc-token");
+    await sql()`delete from watched_repos where repo = ${repoA}`;
+    await sql()`delete from events where id = ${String(receiptRows[0].id)}::bigint`;
+
+    const got = await getRepoSettings(new Request("http://localhost/api/settings/repos"));
+    assert.equal(got.status, 200);
+    const gotBody = await got.json() as { source: string; version: string; repos: { repo: string }[] };
+    assert.equal(gotBody.source, "file");
+    assert.equal(gotBody.version, "4f53cda18c2baa0c");
+    assert.ok(gotBody.repos.length > 0);
+    const restPreview = await putRepoSettings(new Request("http://localhost/api/settings/repos", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repos: [row(repoB, shortB, "B")], version: gotBody.version, dry_run: true }),
+    }));
+    assert.equal(restPreview.status, 200);
+    const restDiff = await restPreview.json() as {
+      source?: string;
+      would_write: boolean;
+      changes: { op: string; summary: string }[];
+    };
+    assert.equal(restDiff.source, "file");
+    assert.equal(restDiff.would_write, true);
+    assert.equal(restDiff.changes.some((change) => change.op === "remove"), false);
+    assert.equal(restDiff.changes.some((change) => change.op === "add" && change.summary.includes(repoB)), true);
+    const restPut = await putRepoSettings(new Request("http://localhost/api/settings/repos", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repos: [row(repoB, shortB, "B")], version: gotBody.version }),
+    }));
+    const restText = await restPut.text();
+    assert.equal(restPut.status, 200, restText);
+    const restSaved = JSON.parse(restText) as { source: string; repos: { repo: string }[]; version: string };
+    assert.equal(restSaved.source, "database");
+    assert.deepEqual(restSaved.repos.map((item) => item.repo), [repoB]);
+    assert.notEqual(restSaved.version, gotBody.version);
+    const restEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+    `;
+    assert.equal(Number(restEvents[0].n), 0, "REST PUT writes no receipt");
+    await sql()`delete from watched_repos where repo = ${repoB}`;
+
+    await replaceWatchedRepos([row(repoA, shortA, "Kept")]);
+    const populated = await readRepoSettings();
+    assert.equal(populated.source, "database");
+    assert.equal(populated.version, listVersion(populated.repos));
+    const beforeRows = await sql()`select repo, label from watched_repos where repo = ${repoA}`;
+    const eventsBeforeFail = await sql()`
+      select count(*)::int as n from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+    `;
+    await sql()`
+      create or replace function ak_test_fail_repo_event()
+      returns trigger
+      language plpgsql
+      as $fn$
+      begin
+        if new.kind = 'set_watched_repos' then
+          raise exception 'simulated events insert failure';
+        end if;
+        return new;
+      end;
+      $fn$
+    `;
+    await sql()`drop trigger if exists ak_test_fail_repo_event on events`;
+    await sql()`
+      create trigger ak_test_fail_repo_event
+      before insert on events
+      for each row
+      execute procedure ak_test_fail_repo_event()
+    `;
+    const current = await readRepoSettings();
+    await assert.rejects(
+      () => runWithActor(actor, () => setWatchedReposTool({
+        repos: [row(repoB, shortB, "B")],
+        expected_version: current.version,
+      })),
+      (err: unknown) => err instanceof Error && /simulated events insert failure/.test(err.message),
+    );
+    const afterFail = await sql()`
+      select repo, label from watched_repos
+      where repo = ${repoA} or repo = ${repoB}
+      order by repo
+    `;
+    assert.deepEqual(afterFail.map((item) => String(item.repo)), [repoA]);
+    assert.equal(String(afterFail[0].label), String(beforeRows[0].label));
+    const eventsAfterFail = await sql()`
+      select count(*)::int as n from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+    `;
+    assert.equal(Number(eventsAfterFail[0].n), Number(eventsBeforeFail[0].n), "a failed receipt leaves the list and the event log unchanged");
+
+    await dropTrigger();
+    const retryVersion = (await readRepoSettings()).version;
+    const retried = await runWithActor(actor, () => setWatchedReposTool({
+      repos: [row(repoB, shortB, "B")],
+      expected_version: retryVersion,
+    }));
+    assert.equal(retried.isError, undefined, retried.content[0]?.text);
+    const finalRows = await sql()`select repo from watched_repos where repo = ${repoA} or repo = ${repoB} order by repo`;
+    assert.deepEqual(finalRows.map((item) => String(item.repo)), [repoB]);
+    const finalEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+    `;
+    assert.equal(Number(finalEvents[0].n), Number(eventsBeforeFail[0].n) + 1, "the recovered write leaves exactly one receipt");
+
+    const stale = await replaceWatchedRepos(
+      [row(repoA, shortA, "A")],
+      "not-the-version",
+      { kind: "set_watched_repos", title: "Watched repos replaced" },
+    );
+    assert.equal(stale.ok, false);
+    const staleEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+    `;
+    assert.equal(Number(staleEvents[0].n), Number(eventsBeforeFail[0].n) + 1, "a stale replace inserts no receipt");
+    const stillB = await sql()`select repo from watched_repos where repo = ${repoB}`;
+    assert.equal(stillB.length, 1);
+  } finally {
+    await dropTrigger();
+    await sql()`delete from watched_repos where repo = ${repoA} or repo = ${repoB} or repo = 'acme/kept'`;
+    await sql()`delete from events where kind = 'set_watched_repos' and id > ${floorId}::bigint`;
+    if (savedPassword === undefined) delete process.env.MC_DASHBOARD_PASSWORD;
+    else process.env.MC_DASHBOARD_PASSWORD = savedPassword;
+    if (savedToken === undefined) delete process.env.MC_TOKEN;
+    else process.env.MC_TOKEN = savedToken;
   }
 }
 

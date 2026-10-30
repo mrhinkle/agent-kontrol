@@ -143,7 +143,7 @@ describe("skill frontmatter and runtimes", () => {
     assert.match(decision.problem ?? "", /not valid JSON/);
   });
 
-  it("defaults to all five runtimes when nothing says otherwise", () => {
+  it("defaults to every current runtime when nothing says otherwise", () => {
     const decision = resolveRuntimes({
       frontmatter: { name: "verify-gibson" },
       body: "Run the checks.",
@@ -456,7 +456,7 @@ describe("skill scopes, alerts, and the digest", () => {
     const text = formatDigest(demoProgress("7d"));
     assert.match(text, /Only triggers routed through Agent Kontrol are counted/);
     const openapi = fs.readFileSync("src/lib/openapi.ts", "utf8");
-    for (const path of ["/api/skills\"", "/api/skills/sync", "/api/skills/drift", "/api/skills/{id}"]) {
+    for (const path of ["/api/skills\"", "/api/skills/sync", "/api/skills/drift", "/api/skill-bundles", "/api/skills/{id}"]) {
       assert.ok(openapi.includes(path), path);
     }
   });

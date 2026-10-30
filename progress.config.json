@@ -37,6 +37,13 @@
     "coordinator": {
       "agentId": null,
       "maxSilenceHours": 3
+    },
+    "alerts": {
+      "enabled": false,
+      "coordinatorRepeatHours": 12,
+      "zeroMergeHours": 72,
+      "zeroMergeLookbackDays": 7,
+      "decisionAgeDays": 14
     }
   }
 }

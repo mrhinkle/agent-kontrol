@@ -126,10 +126,10 @@ class DispatcherTests(unittest.TestCase):
                review=False, extra=None, fail_ingest=False):
         if stdout is None:
             stdout = json.dumps(claude())
-        proc = subprocess.CompletedProcess(["synthetic-cli"], returncode, stdout, "synthetic stderr" if returncode else "")
+        proc = (returncode, stdout, "synthetic stderr" if returncode else "")
         now = datetime(2026, 1, 1, tzinfo=timezone.utc)
         with patch.dict(os.environ, extra or {}, clear=True), \
-             patch.object(dispatcher.subprocess, "run", side_effect=error, return_value=proc) as run, \
+             patch.object(dispatcher, "run_contained", side_effect=error, return_value=proc) as run, \
              patch.object(dispatcher.time, "monotonic", side_effect=[10.0, 11.25]), \
              patch.object(dispatcher, "datetime") as clock, \
              patch.object(dispatcher, "ingest", side_effect=RuntimeError("private report failure") if fail_ingest else None) as ingest, \
@@ -218,14 +218,18 @@ class DispatcherTests(unittest.TestCase):
         self.assertFalse(result[0])
         self.assertEqual(detail["error_class"], "process_error")
 
-    def test_worker_and_review_receive_task_id(self):
-        task = {"id": 8, "title": "synthetic", "reviewer_platform": "grok"}
-        with patch.object(Path, "is_dir", return_value=True), patch.object(dispatcher, "api"), \
-             patch.object(dispatcher, "ingest"), patch.object(dispatcher.shutil, "which", return_value="synthetic"), \
-             patch.object(dispatcher, "run_cli", side_effect=[(True, "done", None), (True, "VERDICT: APPROVE", None)]) as run:
-            dispatcher.run_task(task, "claude-code", unittest.mock.Mock())
-        self.assertEqual(run.call_args_list[0].kwargs, {"task_id": 8})
-        self.assertEqual(run.call_args_list[1].kwargs, {"review": True, "task_id": 8})
+    def test_containment_failure_still_reports_and_propagates(self):
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(dispatcher, "run_contained", side_effect=dispatcher.ContainmentError("synthetic private group")), \
+             patch.object(dispatcher, "ingest") as ingest:
+            with self.assertRaises(dispatcher.ContainmentError):
+                dispatcher.run_cli("claude-code", "synthetic private prompt", Path("/synthetic/private/repo"), task_id=7)
+        detail = ingest.call_args.args[4]
+        self.assertEqual((detail["outcome"], detail["error_class"]), ("failed", "process_error"))
+        self.assertNotIn("private", json.dumps(detail))
+
+    # Worker and reviewer task_id through run_task: test_dispatcher_skills.TestTelemetry,
+    # which has the real worktree, lock, and pointer preparation run_task now requires.
 
 
 if __name__ == "__main__":

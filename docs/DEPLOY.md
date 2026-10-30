@@ -45,7 +45,7 @@ The Neon integration injects `DATABASE_URL`. `npm run build` applies the schema 
 | Docker Compose (self-hosted) | Postgres 16, included | Two env vars in `.env` | Same code, less exercised |
 | Fly.io | Fly Managed Postgres or Neon | `fly launch` + three secrets | Same image as Compose; CI builds and smoke-tests it |
 | Any Node host | Any Postgres | `npm ci && npm run build && npm start` | Same code, less exercised |
-| Local demo | None | `npm ci && npm run dev` | Sample data, nothing stored |
+| Local demo | None | `npm ci && npm run dev` | Sample dashboard data. MCP writes stay in memory and are cleared when the process restarts |
 
 Only Vercel + Neon is used in the author's production. CI runs the data layer tests against Postgres 16 (schema applied twice). The Docker, Fly.io and generic-Node paths follow the same code but are less exercised; CI does build the Docker image and check that it serves `/login`. Not supported: serverless platforms that cannot run Node 22, and plain HTTP without TLS for anything but localhost.
 
@@ -131,13 +131,13 @@ npm ci && npm run build && npm start
 npm ci && npm run dev
 ```
 
-With no `DATABASE_URL`, the app runs with sample data and stores nothing.
+With no `DATABASE_URL`, the dashboard shows sample data. MCP writes for `report_status`, `remember`, `create_task`, `claim_task`, and `update_task` are kept in an in-memory store for this process, labeled demo, and cleared when the process restarts. REST writes are still dropped.
 
 ## Environment variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `DATABASE_URL` | In production | Postgres connection string. Unset means demo mode: sample data, nothing stored. |
+| `DATABASE_URL` | In production | Postgres connection string. Unset means demo mode: sample dashboard data, and an in-memory MCP store for the five write tools that is cleared when the process restarts. |
 | `MC_TOKEN` | Yes | Shared secret for agents: the ingest routes and the MCP endpoint. |
 | `MC_DASHBOARD_PASSWORD` | In production | Dashboard password. Required in production when `DATABASE_URL` is set; otherwise the app answers 503. |
 | `MC_COOKIE_SECRET` | No | HMAC key for the dashboard cookie. Falls back to `MC_TOKEN`. Rotating it signs everyone out. |

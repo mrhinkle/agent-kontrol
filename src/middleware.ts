@@ -7,8 +7,9 @@ import { authCookieValue, secretsMatch } from "@/lib/authcrypto";
  *
  * - MC_DASHBOARD_PASSWORD unset -> no gate in local dev and database-less demo
  *   deploys; a production build with DATABASE_URL set refuses to serve (503).
- * - Agent endpoints (/api/ingest and the MCP transport routes) are excluded
- *   here; they enforce their own bearer auth (legacy MC_TOKEN or an agent credential).
+ * - Agent endpoints (/api/ingest, the watch beat routes, and the MCP transport
+ *   routes) are excluded here. Ingest and MCP accept MC_TOKEN or an agent
+ *   credential. The watch routes accept only a verified akc_ credential.
  * - Data endpoints (/api/fleet, /api/memory) accept either the session
  *   cookie or the MC_TOKEN bearer header.
  */
@@ -17,6 +18,8 @@ const PUBLIC_PATHS: RegExp[] = [
   /^\/login$/,
   /^\/api\/login$/,
   /^\/api\/ingest$/,
+  /^\/api\/watch\/beat$/, // akc_ watch:write, enforced in the route
+  /^\/api\/watch\/beats$/, // akc_ watch:read, enforced in the route
   /^\/api\/messages\/reply$/, // agent replies (token-authed in route)
   /^\/api\/progress\/ingest$/, // collector cron (token-authed in route)
   /^\/api\/usage\/ingest$/, // usage collector (token-authed in route)

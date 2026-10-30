@@ -42,10 +42,11 @@ depends on a file on an operator's laptop or on an agent remembering to report:
   own channel.
 - **Liveness is a work event, never a heartbeat.** A heartbeat proves the daemon that posts
   heartbeats is up. The brief calls a coordinator "working" only if a `session_end`,
-  `milestone` or `status` event arrived within `maxSilenceHours`. `turn_start` and `error`
+  `milestone` or `status` event arrived within `maxSilenceHours`. The read is that work event, not the newest 200 other events, so a burst of `turn_start` cannot hide it. `turn_start` and `error`
   do not count: a coordinator that starts turns and errors every hour is not working, it is
   failing, and the brief says *failing* for that case. Telemetry-only is reported as exactly
-  that.
+  that. Configuring `workKinds` as `heartbeat`, `telemetry`, `turn_start`, `status_update`, or `error`
+  does not make those events count. An error-only list falls back to the three work kinds.
 - **The watcher has a watcher.** The brief runs on a scheduler that can itself go silent (the
   coordinator's did). A dead-man's check on a second channel reports when no brief arrived by
   the expected time plus fifteen minutes. Without it the brief inherits the failure it was
@@ -104,8 +105,11 @@ Existing tables carry most of it. Additions:
   upserted by `key` (`github:<owner/repo>#<n>` for label-sourced rows, `agent:<id>:<slug>` for
   MCP-filed ones). `status` is `open | decided | deferred | withdrawn`; `decision`,
   `decided_by`, `decided_at` record the answer; `defer_until` lets a row disappear and come back.
-- **`watched_owners`** (planned): the GitHub owners whose repos are auto-discovered, with a
-  per-owner activity window. `watched_repos` stays as the override layer.
+- **`watched_owners`** (shipped, `supabase/migrations/20261028_watched_owners.sql`): the GitHub
+  owners whose repos are auto-discovered, with a per-owner activity window. `watched_repos`
+  stays as the override layer: pin and hide for discovered repos; label, short, color and blocked label for hand-added repos. Hide wins over pin. A repo
+  marked gone is not shown, including when it is pinned. A failed or empty `gh repo list`
+  records `last_error` and does not delete or hide tracked repos.
 
 ## API and MCP surface (planned)
 
@@ -129,23 +133,47 @@ open PR list with check rollups (one GraphQL call), the open issue list with lab
 `updatedAt` (one call), and the merged list with timestamps. It writes `detail` on the snapshot
 and upserts label-sourced `decisions`. Repo discovery runs once per tick per owner.
 
-Until the collector change lands, `scripts/morning-brief.sh` is the whole feature: it reads
-GitHub directly, reads the coordinator from `/api/fleet` when `MC_URL`/`MC_TOKEN` are set, and
-prints the brief. Install it on a scheduler (Hermes cron in `--no-agent` mode, launchd, cron)
-delivering to chat at the hour the owner starts work.
+`scripts/collect-progress.sh` writes those `detail` keys on each tick (stuck PRs, median lead
+time, stale issues, drafts, and merged PRs with timestamps covering 72h). A GitHub failure in
+that extra sweep logs and still posts the tick. `scripts/morning-brief.sh` remains the fallback
+when `GET /api/brief` is down: it reads GitHub directly, reads the coordinator from `/api/fleet`
+when `MC_URL`/`MC_TOKEN` are set, and prints the brief. The scheduler (Hermes cron in
+`--no-agent` mode) should `curl` the route and keep the script for the outage.
 
 ## Delivery
 
 One message a day, same time, same shape, to wherever the owner already reads (Slack DM,
 Telegram, email). A second message only when something crosses a threshold during the day:
-coordinator silent past the limit, a repo with zero merges for 72h that had merges before, a
-review SLA breach, or a decision older than 14 days. No other pushes. A dashboard you have to
+coordinator silent past the limit, a repo with zero merges for 72h that had merges before, or
+a decision older than 14 days. No other pushes. A review-SLA breach is listed in the brief and
+is not a push. A dashboard you have to
 open tells you about a stall three days late; a chat that pings on every event trains you to
 ignore it.
 
+Those three pushes are `brief.alerts` in `progress.config.json`. `enabled` defaults to
+**false**. `POST /api/brief/alerts/evaluate` computes the conditions either way and inserts a
+message only when `enabled` is boolean true. `GET /api/brief/alerts` reports the same
+conditions and never sends. The progress collector does not evaluate alerts. The scheduler
+that curls `GET /api/brief` is what POSTs the evaluate route, on that same cadence, not on
+every collector tick. Nothing else inserts an alert message.
+
 Threshold alerts are **off until the owner has cleared the decision backlog once.** Importing
 two dozen stale decisions and alerting on every one of them on day one teaches the owner to
-ignore the channel; the first week is collection only.
+ignore the channel; the first week is collection only. The enable switch is that gate: leave
+`brief.alerts.enabled` false until that first clear, then set it to true. Defaults besides
+the switch: coordinator re-send 12h, zero-merge 72h after a merge in the prior 7 days,
+decision age 14 days. An unmeasured source is `unknown`. Unknown does not send and does not
+clear a latch.
+
+Each claim carries the evaluation's compute instant, the database clock used to judge the
+condition. A cleared latch is re-armed only when `cleared_at` is null or older than that
+instant, and a clear writes `cleared_at` only when the latch is still active and
+`last_sent_at` is older than the clear's own instant. A clear that saw newer evidence beats
+a stale claim, and a delayed clear cannot erase a newer claim. A decision alert is inserted
+only while that decision is still `open` and its `opened_at` (or `first_seen_at` when
+`opened_at` is null) is still at least `decisionAgeDays` old at the compute instant. One
+residual window remains: an event that lands between compute and claim, with no concurrent
+evaluation to clear the latch, can still produce one alert. The next evaluation clears it.
 
 The decision list is ordered by tier, then age. Strict age order lets a three-month-old
 naming question sit ahead of a consent decision.
@@ -180,6 +208,39 @@ Implementer; rework, not first drafts, is where tokens go.
 - Deciding for the owner. The queue shows age, cost of delay and the requester's recommended
   option; the answer is typed by a person.
 
+## Host watcher
+
+The brief's coordinator check is a work event (`session_end`, `milestone`, or `status`). The host watcher is a different measurement. It reads `GET /api/watch/beats` and judges whether the Mini and MacBook dead-man observations were received, using the server's `age_s`. It does not prove the coordinator did any work, and it does not replace the threshold alerts. `scripts/watch.config.json` lists the expected sources. The check walks that list, not only the rows that came back.
+
+For each enabled source:
+
+- Missing from a successful read: `source-missing`.
+- `status` of `stale`, `failing`, `paused`, or `unknown`: `unhealthy:<status>`, at any age.
+- `status` of `ok` or `held` with `age_s` greater than that source's `max_age_s`: `stale`. `age_s` equal to the limit is within the limit. `held` is the producer's own hold. This check does not decide whether the hold was authorized.
+- Any other returned source is ignored. `watcher` is this monitor's own beat, so it is left out of the host loop.
+
+Mini is enabled at 2700 seconds. MacBook is listed at 93600 seconds and left disabled until that producer is installed. Mark sets `enabled` to true when the producer is in place. The limits are config, not secrets. `beat_at` is stored as the sender sent it, including a clock two days behind or two days ahead. `age_s` is the only age.
+
+A successful read is a JSON object whose `beats` field is an array. Each row has string `source`, `status`, `detail`, `beat_at`, and `received_at`, and a finite, non-negative numeric `age_s`. A non-2xx response, a 10 second timeout, malformed JSON, a non-object body, a `beats` value that is not an array, a bad field type, or two rows for the same source fails the whole read. The check tries once more after 30 seconds. A retry that succeeds is evaluated as a normal read and can still alert. Two failures raise only `api-unreachable`. They do not invent a per-host failure and they do not clear a latch.
+
+Slack and Telegram are independent. Each attempt times out at 10 seconds. Slack succeeds on HTTP 2xx, and only when the webhook starts with `https://hooks.slack.com/services/`. Telegram succeeds on HTTP 2xx and a JSON body with `ok` set to true. The bot token and chat id must match the shapes the script checks, or that channel fails closed and no request is sent. A timeout, a non-2xx status, a body that is not that JSON, or `ok: false` is a failed delivery on that channel only. Logs drop webhook URLs, bot tokens, authorization headers, and raw provider bodies.
+
+The alert key is `<destination>|<source>|<condition>` with condition `source-missing`, `stale`, or `unhealthy:<status>`. A failed read uses `<destination>|api-unreachable` and no host key. A new condition is a new key. A failed send stays pending on the original key and is tried on the next run. A successful send suppresses that key for 12 hours while the condition holds. The boundary is inclusive at the end: a run at `lastDeliveredAt + 12h` sends again, and a run one millisecond earlier does not. When a later successful read shows that source healthy, each destination that received the alert gets one recovery, and that recovery closes only its key. A destination that never received it gets no recovery. A failed read does not clear those keys. A failed store of this monitor's own beat uses `<destination>|beat-post-failed` the same way.
+
+The process exits nonzero when any expected source is unhealthy, the read failed, a delivery failed, or the watcher beat did not store. Suppression drops the repeat message. The exit status stays nonzero.
+
+There is no detection SLA. The schedule is `7,17,27,37,47,57 * * * *` UTC. That asks GitHub for a run every ten minutes. GitHub can delay a run, skip a run, or turn schedules off on a public repository after 60 days without a person pushing or dispatching the workflow. Six runs an hour is about 4,320 runs in 30 days before a retry. Hosted minutes are free on a public repository and come out of the included quota on a private one. Mark accepts that cost before activation.
+
+Dedup state is a small JSON document of keys and delivery timestamps. It holds no credentials and no raw API or provider payloads. The Actions cache is best effort. On a live run the workflow restores with the prefix `watch-state-v1-` and saves a new immutable key `watch-state-v1-<run_id>-<run_attempt>`, including after a nonzero evaluation, then the job exits with that evaluation's code. A dry-run or disabled run does not restore or save, so it never creates a cache entry. A missing, evicted, or corrupt cache is unknown history: current faults alert again, and no recovery is invented. A crash after a successful send and before the save can deliver the same message once more. Cache quota can drop the entry. Those are the limits.
+
+After evaluation the run POSTs `/api/watch/beat` as source `watcher`. The credential is a dedicated `akc_` key with `watch:read` and `watch:write`, bound only to `watcher`, passed from the `WATCH_AK_KEY` secret into the live step. It is not written to the log. `beat_at` is this run's clock. `status` is this monitor's own read and delivery health (`ok` or `failing`), which is separate from the Mini and the MacBook. A failed store fails the run and is reported on the configured channels.
+
+Reverse watch is the other half of the pair, and this repo only states the contract. A Mini integration tracked outside this repo reads `age_s` for source `watcher` and alerts when that beat is missing or older than 3600 seconds. It says one thing when the API could not be read and a different thing when the API answered and the watcher was silent. Nothing here shows that the Mini side is installed. Until that is demonstrated, the two checks are not coverage for each other.
+
+Activation is Mark's. Merging the workflow leaves it dark. The live step receives notification secrets and `WATCH_AK_KEY` only when `github.ref` is `refs/heads/<default branch>` and the repository variable `WATCH_ENABLED` is `true`. `github.ref` includes the `refs/heads/` prefix, so the comparison uses that full ref. Any other `workflow_dispatch`, and every run while `WATCH_ENABLED` is unset, takes the dry-run step: `node scripts/watch-check.mjs --dry-run` with no fixture. That step receives no secret context. Workflow permissions are exactly `contents: read`. Cache restore and save use the runner's scoped cache token. The job token cannot push. Both cache steps carry the same live gate, so a dry-run or disabled run never restores or saves a cache entry. `--dry-run` performs no network I/O to Agent Kontrol, Slack, or Telegram. `--fixture <path>` reads a beats document from a path under the working directory or the system temp directory, evaluates it, and prints the decisions. It sends nothing, posts no beat, and writes no state. A path outside those directories is rejected and left unopened. With no `--fixture`, the process prints `dry-run: no fixture, nothing evaluated` and exits 0.
+
+Rollback is: set `WATCH_ENABLED` to `false`, disable the workflow, let an in-flight run finish, then revoke the watcher credential. Tell the Mini reverse-watch the shutdown was intentional. Leave the existing dead-man in place.
+
 ## Rollout order
 
 Reordered 2026-10-25 after cross-vendor review (GLM 5.3, Kimi K3): the failure that motivated
@@ -194,7 +255,13 @@ and a resolve path, so those come before any page.
 3. `decisions` table + `GET/POST/PATCH /api/decisions` **with GitHub write-back** + collector
    upsert from labels. Resolve ships with the table, as a CLI if the page is not ready.
 4. `/api/brief` + `get_morning_brief` reading the database; scheduler switches to the route.
+   Shipped 2026-10-27: `GET /api/brief` and MCP `get_morning_brief` read Postgres. The cron should `curl` the route. `scripts/morning-brief.sh` stays the fallback and still sweeps GitHub. The API does not. A 72h lead time uses `detail.merged` from the collector, not a live recompute. A positive 72h merge count with no `detail.merged` prints `SHIPPED: DATA INCOMPLETE` for that repo. A cumulative counter that went backwards is unmeasured (`DATA INCOMPLETE`), not 0. A decisions page that fills the 1000-row read is incomplete. With no database the route does not fill in the progress board's demo numbers.
 5. `/decisions` page; `request_decision` MCP tool.
-6. Owner-based repo discovery (`watched_owners`); Settings becomes the override layer.
-7. Remaining threshold alerts (zero-merge repo, review SLA, 14-day decision), enabled after
-   the owner's first backlog clear.
+6. Owner-based repo discovery (`watched_owners`); Settings becomes the override layer. Shipped:
+   `GET`/`PUT /api/settings/owners`, `POST /api/settings/owners/discover`, `PATCH /api/settings/repos`,
+   and `discover_watched_owners` in `scripts/collect-progress.sh`. The morning brief drops a repo
+   only when `shown` is false. The collector still sweeps hidden and quiet repos and skips `gone`.
+7. Remaining threshold alerts (zero-merge repo, 14-day decision), plus the coordinator-silence
+   re-send, behind `brief.alerts.enabled` (default false) until the owner's first backlog clear.
+   Shipped as `GET /api/brief/alerts` and `POST /api/brief/alerts/evaluate`. Review-SLA alerts
+   are not sent. No other pushes.
