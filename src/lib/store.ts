@@ -3,9 +3,11 @@ import { activityRow, attachReceipt, receiptFromParts, type ActivityRow, type Re
 import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } from "./idempotency";
 import { StaleWrite, absentRevision } from "./revision";
 import { writeSessionNote } from "./session-memory";
-import { sql, type SqlTag } from "./db";
+import { sql, withTransaction, type SqlTag } from "./db";
 import { insertToolReceipt } from "./tool-receipt";
 import { stampSortAt } from "./list-params";
+import { queueLangfuseEvent } from "./langfuse-report";
+import { parseRunTelemetry } from "./run-telemetry";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
 import { asUnknownWriteOutcome } from "./write-outcome";
 
@@ -71,6 +73,8 @@ function rethrowStore(e: unknown): never {
 }
 
 export async function report(input: ReportInput): Promise<Receipt | null> {
+  const run = input.kind === "run_complete" ? parseRunTelemetry(input.detail) : null;
+  if (input.kind === "run_complete" && !run) throw new Error("invalid run telemetry");
   const db = sql();
   const now = new Date().toISOString();
   const agentId = slugify(input.agent_id);
@@ -79,6 +83,7 @@ export async function report(input: ReportInput): Promise<Receipt | null> {
   // never clobbers platform/machine/display_name set by hooks (or vice versa).
   // COALESCE on conflict keeps existing values when the new side is null.
   const platform = input.platform ?? null;
+  let storedPlatform = platform;
   const machine = input.machine ?? null;
   const displayName = input.display_name ?? null;
   const sessionId = input.session_id ? input.session_id : null;
@@ -95,8 +100,11 @@ export async function report(input: ReportInput): Promise<Receipt | null> {
   // One statement. The event insert depends on the agent and session
   // writes, so a rejecting events trigger rolls all of them back.
   let receipt: Receipt | null = null;
+  let persistedEvent: { id: number; created_at: string | Date } | undefined;
   try {
-    const rows = await db`
+    // A completed run is stored once per (agent, run_id): its sanitized detail
+    // replaces the raw one, and an advisory lock serializes concurrent deliveries.
+    const write = (q: SqlTag) => q`
       with agent_row as (
         insert into agents (id, platform, machine, display_name, last_seen_at)
         values (
@@ -111,7 +119,7 @@ export async function report(input: ReportInput): Promise<Receipt | null> {
           platform = coalesce(${platform}::text, agents.platform),
           machine = coalesce(${machine}::text, agents.machine),
           display_name = coalesce(${displayName}::text, agents.display_name)
-        returning id
+        returning id, platform
       ),
       prior_session as (
         select id, status
@@ -163,17 +171,32 @@ export async function report(input: ReportInput): Promise<Receipt | null> {
           agent_row.id,
           ${sessionId}::text,
           ${input.kind},
-          ${title}::text,
-          ${detail}::jsonb
+          ${run ? "CLI run completed" : title}::text,
+          ${run ? JSON.stringify(run) : detail}::jsonb
         from agent_row
         where (select count(*) from session_insert) >= 0
           and (select count(*) from session_update) >= 0
+          and (${run?.run_id ?? null}::text is null or not exists (
+            select 1 from events
+            where agent_id = agent_row.id and kind = 'run_complete' and detail->>'run_id' = ${run?.run_id ?? null}::text
+          ))
         returning id, kind, created_at
       )
-      select id, kind, created_at from event_row
+      select event_row.id, event_row.kind, event_row.created_at, agent_row.platform
+      from event_row cross join agent_row
     `;
+    const rows = run
+      ? await withTransaction(async (tx) => {
+          await tx`select pg_advisory_xact_lock(hashtextextended(${JSON.stringify([agentId, run.run_id])}, 0))`;
+          return write(tx);
+        })
+      : await write(db);
     const row = rows[0] as Record<string, unknown> | undefined;
-    receipt = row ? receiptFromParts(row.id, row.kind, row.created_at) : null;
+    if (row) {
+      receipt = receiptFromParts(row.id, row.kind, row.created_at);
+      persistedEvent = { id: Number(row.id), created_at: row.created_at as string | Date };
+      if (typeof row.platform === "string") storedPlatform = row.platform;
+    }
   } catch (e) {
     throw new Error(`report: ${errMsg(e)}`);
   }
@@ -187,6 +210,17 @@ export async function report(input: ReportInput): Promise<Receipt | null> {
     await Promise.race([work, new Promise<void>((resolve) => (timer = setTimeout(resolve, 2500)))]);
     clearTimeout(timer);
   }
+  // Only a newly stored event is exported; a duplicate run delivery is not.
+  if (persistedEvent) queueLangfuseEvent({
+    id: persistedEvent.id,
+    created_at: persistedEvent.created_at,
+    agent_id: agentId,
+    session_id: input.session_id,
+    platform: storedPlatform,
+    kind: input.kind,
+    status: input.status,
+    ...(run ? { run } : {}),
+  });
   return receipt;
 }
 

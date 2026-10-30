@@ -17,6 +17,10 @@ MC_URL=https://your-deploy.vercel.app MC_TOKEN=secret \
 It auto-detects which CLIs are installed. Override with
 `MC_PLATFORMS=claude-code,codex`.
 
+`mc_dispatcher.py` imports `ak_pointers.py` and `run_telemetry.py` from its own
+folder. Deploy all three files together; the dispatcher does not start without
+either of them.
+
 ## Usage change: one linked worktree per task
 
 Every task must name `project`, and `MC_WORKDIR/<project>` must be the top
@@ -94,8 +98,8 @@ worktree, you merge or delete it.
    bookkeeping, not a sandbox.
    - `claude -p "<prompt>" --output-format json --permission-mode acceptEdits`
      (cost captured from `total_cost_usd`)
-   - `codex exec --full-auto "<prompt>"`
-   - `grok -p "<prompt>"`
+   - `codex exec --sandbox workspace-write --json "<prompt>"`
+   - `grok -p "<prompt>" --output-format json`
 4. Clean up, whatever the worker did (success, failure, timeout, crash), once
    its process group is stopped: the
    injected block comes out and the managed region goes back to what it held
@@ -122,6 +126,29 @@ worktree, you merge or delete it.
    step 4. Not addressed here: a reviewer of the same vendor as the worker is
    still accepted.
 6. Report: `PATCH /api/tasks/<id>` with status, result summary, and cost.
+
+Each worker and review invocation also sends one best-effort `run_complete`
+event with `detail.schema: "mc.run.v2"`, after the CLI's process group is
+stopped and before step 4's cleanup. It contains a new run UUID, role,
+start/end timestamps, measured subprocess wall time, sanitized outcome/error
+class, task ID, and available finalized per-model token counts. Reporting
+failure cannot change the task result. Prompts, task titles, responses,
+commands, paths, credentials, free-text errors, and costs are excluded from
+this additional event.
+
+`duration_ms` is run duration, including tools and waits; it is not model
+inference latency. Claude and Grok per-model usage is preferred over their
+aggregate usage, so subagent totals are counted once. Input tokens include
+cache reads and writes; Codex input already includes its cache reads.
+Unavailable counts stay absent, and Grok's incomplete-usage flag is retained.
+Resume/continue arguments suppress token export and mark the usage scope
+`session_cumulative`, because those totals cannot safely be assigned to this
+invocation. Interactive sessions outside this dispatcher are not instrumented.
+
+Codex worker runs use the supported `--sandbox workspace-write`; Codex review
+runs use `-s read-only`. Correct any explicit per-machine override that still
+contains the retired `--full-auto` flag during approved activation. This
+source change does not install or enable telemetry on any machine.
 
 ## launchd (run at login on macOS)
 
@@ -160,7 +187,7 @@ the plist. Importing `mc_dispatcher` reads no file; only `main()` does.
   group is stopped on timeout and on every other exit, so its children cannot
   keep writing after cleanup or into the next task. Children that detach into
   their own session or group are not covered (see step 3).
-- Autonomy flags are conservative defaults (`acceptEdits`, `--full-auto`
+- Autonomy flags are conservative defaults (`acceptEdits`, `--sandbox workspace-write`
   sandboxed). Raise them per-machine via `MC_CLAUDE_ARGS` / `MC_CODEX_ARGS`
   only if you accept the blast radius.
 - Anything requiring judgment or credentials beyond the repo should be an

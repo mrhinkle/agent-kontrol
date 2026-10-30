@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import { evaluateAlerts, setBeforeClaimForTests, setBriefSettingsForTests } from "../src/lib/brief-alerts";
 import type { BriefSettings } from "../src/lib/progress-config";
-import { sql } from "../src/lib/db";
+import { sql, sqlTransaction } from "../src/lib/db";
 import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
 import { StaleWrite } from "../src/lib/revision";
 import { readReceipt } from "../src/lib/activity";
@@ -69,6 +69,19 @@ async function main() {
 
   const tag = `pgtest-${Date.now()}`;
   await report({ agent_id: `${tag}-agent`, platform: "codex", machine: "m1", kind: "session_start", title: "hello", project: "p" } as never);
+
+  const run = { schema: "mc.run.v2", run_id: "11111111-1111-4111-8111-111111111111", role: "worker", started_at: new Date().toISOString(), ended_at: new Date().toISOString(), duration_ms: 0, outcome: "completed", error_class: null, usage_scope: "unavailable", usage_complete: false, model_usage: [] };
+  const input = { agent_id: `${tag}-agent`, platform: "codex", kind: "run_complete", detail: run };
+  await Promise.all([report(input), report(input)]);
+  await report(input);
+  const saved = await sql()`select count(*)::int as n from events where agent_id = ${input.agent_id} and kind = 'run_complete'`;
+  assert.equal(saved[0].n, 1, "concurrent and retried run delivery stores one event");
+  await assert.rejects(sqlTransaction([
+    { text: "insert into events (agent_id, kind, title) values ($1, 'rollback_probe', 'test')", params: [input.agent_id] },
+    { text: "select 1/0", params: [] },
+  ]));
+  const rolledBack = await sql()`select count(*)::int as n from events where agent_id = ${input.agent_id} and kind = 'rollback_probe'`;
+  assert.equal(rolledBack[0].n, 0, "a failed transaction leaves no partial run writes");
 
   const first = await remember({ content: `alpha ${tag}`, key: `${tag}/k1`, tags: [tag, "b"], agent_id: `${tag}-agent` });
   const second = await remember({ content: `alpha ${tag} v2`, key: `${tag}/k1`, tags: [tag], agent_id: `${tag}-agent` });

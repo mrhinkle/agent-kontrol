@@ -6,7 +6,9 @@ import { setSkillNowForTests } from "../../src/lib/skills/clock";
 import { syncSkills } from "../../src/lib/skills/sync";
 import type { SkillSnapshot, SkillSnapshotFetcher } from "../../src/lib/skills/source";
 import type { SkillSourceRow } from "../../src/lib/skills/types";
+import { skillSha } from "../../src/lib/skills/sha";
 import { callsOf, installSkillsSql, skillsMemory } from "./skills-memory";
+import { compositionPatterns, reactNative } from "./skills-upstream-frontmatter";
 
 const NOW = "2026-10-27T12:00:00.000Z";
 
@@ -543,5 +545,78 @@ describe("skill sync", { concurrency: false }, () => {
     });
     assert.deepEqual(back.added.map((row) => row.id), ["alpha"]);
     assert.equal(skillsMemory.skills[0]?.removed_at, null);
+  });
+
+  // Fetcher skips (over 256 KB, not UTF-8) and the 1 MB reference total, all on one valid skill.
+  function referenceWarnings(dir: string): { files: { path: string; content: string }[]; skipped: { path: string; reason: string }[] } {
+    const quarter = "r".repeat(250 * 1024);
+    return {
+      files: [
+        { path: `${dir}/references/a.md`, content: quarter },
+        { path: `${dir}/references/b.md`, content: quarter },
+        { path: `${dir}/references/c.md`, content: quarter },
+        { path: `${dir}/references/d.md`, content: quarter },
+        { path: `${dir}/references/e.md`, content: quarter },
+      ],
+      skipped: [
+        { path: `${dir}/assets/model.bin`, reason: "not utf-8 text" },
+        { path: `${dir}/data/large.json`, reason: "over 256 KB" },
+      ],
+    };
+  }
+
+  it("keeps a sync ok when only references are skipped, and lists every skipped path", async () => {
+    const refs = referenceWarnings("skills/alpha");
+    const result = await syncSkills({
+      trigger: "manual",
+      fetcher: fetcher({
+        "master-skills": { commit_sha: "a".repeat(40), files: [md("skills/alpha", "one"), ...refs.files], skipped: refs.skipped },
+      }),
+    });
+    assert.equal(result.status, "ok");
+    assert.deepEqual(result.added.map((row) => row.id), ["alpha"]);
+    const messages = result.errors.map((item) => item.message);
+    assert.equal(messages.length, 3);
+    assert.ok(messages.includes("skills/alpha/assets/model.bin skipped (not utf-8 text)"));
+    assert.ok(messages.includes("skills/alpha/data/large.json skipped (over 256 KB)"));
+    assert.ok(messages.includes("skills/alpha/SKILL.md: skipped reference references/e.md: over 1 MB total"));
+    const row = skillsMemory.skills.find((item) => item.id === "alpha");
+    assert.deepEqual(row?.references.map((item) => item.path), ["references/a.md", "references/b.md", "references/c.md", "references/d.md"]);
+    assert.equal(skillsMemory.syncRuns.at(-1)?.status, "ok");
+  });
+
+  it("adds both pinned upstream skills with reference warnings, and an identical replay writes nothing", async () => {
+    const refs = referenceWarnings(compositionPatterns.dir);
+    const snapshot = {
+      commit_sha: "9b6af03fc38f7dd70dc74d089d931f667a141047",
+      files: [
+        md("skills/alpha", "one"),
+        { path: `${compositionPatterns.dir}/SKILL.md`, content: compositionPatterns.raw },
+        { path: `${reactNative.dir}/SKILL.md`, content: reactNative.raw },
+        ...refs.files,
+      ],
+      skipped: refs.skipped,
+    };
+    const first = await syncSkills({ trigger: "manual", fetcher: fetcher({ "master-skills": snapshot }) });
+    assert.equal(first.status, "ok");
+    assert.deepEqual(first.added.map((row) => row.id).sort(), ["alpha", "vercel-composition-patterns", "vercel-react-native-skills"]);
+    assert.equal(first.errors.length, 3);
+    assert.doesNotMatch(first.errors.map((item) => item.message).join("\n"), /cannot parse/);
+    for (const fixture of [compositionPatterns, reactNative]) {
+      const row = skillsMemory.skills.find((item) => item.path === `${fixture.dir}/SKILL.md`);
+      assert.equal(row?.description, fixture.description);
+      assert.equal(row?.version, "1.0.0");
+      assert.equal(row?.sha, skillSha(fixture.raw));
+    }
+
+    const upserts = callsOf("sk:upsert-skill");
+    const replay = await syncSkills({ trigger: "manual", fetcher: fetcher({ "master-skills": snapshot }) });
+    assert.equal(replay.status, "ok");
+    assert.deepEqual(replay.added, []);
+    assert.deepEqual(replay.changed, []);
+    assert.deepEqual(replay.removed, []);
+    assert.equal(replay.errors.length, 3);
+    assert.equal(callsOf("sk:upsert-skill"), upserts);
+    assert.equal(callsOf("sk:remove-skill"), 0);
   });
 });

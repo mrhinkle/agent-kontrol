@@ -165,6 +165,7 @@ class Harness(unittest.TestCase):
         self.pointer_error = None
         self.calls = []
         self.cli_calls = []
+        self.cli_task_ids = []
         self.worker = None
         self.reviewer = None
         patches = [
@@ -201,8 +202,9 @@ class Harness(unittest.TestCase):
 
     block = BLOCK
 
-    def fake_cli(self, platform, prompt, cwd, review=False):
+    def fake_cli(self, platform, prompt, cwd, review=False, task_id=None):
         self.cli_calls.append((platform, review, prompt, cwd))
+        self.cli_task_ids.append(task_id)
         fn = self.reviewer if review else self.worker
         if fn:
             return fn(cwd)
@@ -922,7 +924,7 @@ REAL_RUN_CLI = md.run_cli
 
 # A fake `codex` CLI. It reads the injected AGENTS.md, starts a background child
 # that rewrites it after FAKE_DELAY seconds, waits until the child is ready, then
-# hangs (FAKE_MODE=hang), exits 0 (ok), or exits 3 (fail).
+# hangs (FAKE_MODE=hang), exits 0 (ok), or exits 3 (fail). Output is codex --json JSONL.
 FAKE_CLI = """\
 import os, subprocess, sys, time
 state = os.environ["FAKE_STATE"]
@@ -938,7 +940,9 @@ while not os.path.exists(os.path.join(state, "child.ready")) and time.time() < d
 mode = os.environ["FAKE_MODE"]
 if mode == "hang":
     time.sleep(60)
-print("RESULT: worker " + mode)
+import json
+print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "RESULT: worker " + mode}}))
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}}))
 sys.exit(3 if mode == "fail" else 0)
 """
 FAKE_CHILD = """\
@@ -954,7 +958,7 @@ open(os.path.join(state, "child.wrote"), "w").close()
 CHILD_DELAY = 1.0
 
 
-class TestProcessContainment(Harness):
+class ContainmentHarness(Harness):
     """The real run_cli with a fake CLI whose background child writes AGENTS.md late."""
 
     def setUp(self):
@@ -1001,6 +1005,8 @@ class TestProcessContainment(Harness):
         self.assertFalse((self.state / "child.wrote").exists(), "background child wrote after cleanup")
         self.assertEqual(self.agents.read_text(), "# rules\n")
 
+
+class TestProcessContainment(ContainmentHarness):
     def test_background_child_stopped_on_every_exit(self):
         cases = [("hang", "", "failed", "timed out after 0.5s"), ("ok", "", "done", "worker ok"),
                  ("fail", "", "failed", "worker fail"), ("ok", "1", "done", "worker ok")]
@@ -1021,7 +1027,7 @@ class TestProcessContainment(Harness):
             self.assertEqual(self.dispatch(platform="codex")["status"], "failed")
         seen = []
 
-        def next_worker(platform, prompt, cwd, review=False):
+        def next_worker(platform, prompt, cwd, review=False, task_id=None):
             time.sleep(CHILD_DELAY + 0.5)  # past the moment the first task's child would write
             seen.append(((cwd / "AGENTS.md").read_text(), (self.state / "child.wrote").exists()))
             return True, "RESULT: next", None
@@ -1078,6 +1084,70 @@ class TestProcessContainment(Harness):
         self.assertEqual(len(groups), 1)
         self.assertNotEqual(groups[0], os.getpgrp())
         self.assert_child_gone()
+
+
+class TestTelemetry(Harness):
+    def setUp(self):
+        super().setUp()
+        self.which = mock.patch.object(md.shutil, "which", return_value="/usr/bin/true")
+        self.which.start()
+        self.addCleanup(self.which.stop)
+
+    def test_worker_and_review_receive_task_id(self):
+        body = self.dispatch(reviewer_platform="codex")
+        self.assertEqual(body["status"], "done")
+        self.assertEqual([(c[0], c[1]) for c in self.cli_calls], [("claude-code", False), ("codex", True)])
+        self.assertEqual(self.cli_task_ids, [7, 7])
+
+
+class TestTelemetryContainment(ContainmentHarness):
+    """run_complete carries the real child exit, sent after the group stops and before AGENTS.md cleanup."""
+
+    # The child's delayed write must land well past hang timeout + kill grace (0.5 + 0.5),
+    # or the kill can catch it mid-truncate of AGENTS.md and falsely clear block_present.
+    TELEMETRY_CHILD_DELAY = 3.0
+
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ, {"FAKE_DELAY": str(self.TELEMETRY_CHILD_DELAY)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.reports = []
+
+        def record(kind, title, agent_id, platform, detail=None, quiet=False):
+            if kind == "run_complete":
+                pid = int((self.state / "child.pid").read_text())
+                try:
+                    os.kill(pid, 0)
+                    alive = True
+                except ProcessLookupError:
+                    alive = False
+                self.reports.append((detail, alive, BLOCK in self.agents.read_text()))
+
+        p = mock.patch.object(md, "ingest", side_effect=record)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_run_complete_reports_child_result_before_cleanup(self):
+        # A finishing CLI gets a roomy timeout so a loaded host cannot turn it into a timeout.
+        cases = [("ok", 30, "done", "completed", None), ("fail", 30, "failed", "failed", "process_error"),
+                 ("hang", 0.5, "failed", "timeout", "timeout")]
+        for mode, timeout, status, outcome, error_class in cases:
+            with self.subTest(mode=mode):
+                self.calls.clear()
+                self.reports.clear()
+                self.reset_state()
+                with mock.patch.dict(os.environ, {"FAKE_MODE": mode, "FAKE_IGNORE_TERM": "1"}), \
+                        mock.patch.object(md, "TASK_TIMEOUT", timeout):
+                    body = self.dispatch(platform="codex")
+                self.assertEqual(body["status"], status)
+                self.assertEqual(len(self.reports), 1)
+                detail, child_alive, block_present = self.reports[0]
+                self.assertEqual((detail["outcome"], detail["error_class"]), (outcome, error_class))
+                self.assertEqual((detail["role"], detail["task_id"]), ("worker", 7))
+                self.assertFalse(child_alive, "run_complete sent while the CLI's group was still running")
+                self.assertTrue(block_present, "run_complete sent after AGENTS.md cleanup")
+                self.assertEqual(self.agents.read_text(), "# rules\n")
 
 
 if __name__ == "__main__":

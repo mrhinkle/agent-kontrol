@@ -3,6 +3,7 @@ import { enforceBearer } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { report, type ReportInput } from "@/lib/store";
+import { parseRunTelemetry } from "@/lib/run-telemetry";
 
 export const maxDuration = 30;
 
@@ -43,6 +44,9 @@ export async function POST(req: Request) {
     if (!body.agent_id) fields.agent_id = "agent_id is required";
     if (!body.kind) fields.kind = "kind is required";
     return apiError("missing_field", { message: "agent_id and kind are required", fields });
+  }
+  if (body.kind === "run_complete" && !parseRunTelemetry(body.detail)) {
+    return NextResponse.json({ error: "invalid completed-run metadata" }, { status: 400 });
   }
 
   try {

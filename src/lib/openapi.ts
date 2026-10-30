@@ -1816,6 +1816,19 @@ export function openApiDocument(): Json {
           },
         }),
       },
+      "/api/observability": {
+        get: operation({
+          operationId: "getObservability",
+          tags: ["usage"],
+          summary: "Run metrics for the Langfuse page.",
+          security: cookieOrBearer,
+          responses: {
+            "200": jsonResponse("Run totals, recent runs, and per-model rollups. Carries demo: true without a database.", { type: "object" }),
+            "503": jsonResponse("The run store is unavailable.", ref("ErrorMessage")),
+            ...flatErrors,
+          },
+        }),
+      },
       "/api/usage/ingest": {
         post: operation({
           operationId: "ingestUsage",
