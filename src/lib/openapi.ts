@@ -2412,16 +2412,18 @@ export function openApiDocument(): Json {
           tags: ["sweep"],
           summary: "Read-only sweeper status: registrations, active latches, and the Paused section.",
           description:
-            "Never writes. Same access as the brief: the dashboard session, MC_TOKEN, or an agent credential with progress:read. Each part fails on its own: consumers or latches null with a line in errors, and paused.measured false. scripts/morning-brief.sh prints paused from this route when it cannot use GET /api/brief.",
+            "Never writes. Every list is bounded and says when it is partial; more than 1000 scheduler jobs makes paused unmeasured rather than a partial count. Same access as the brief: the dashboard session, MC_TOKEN, or an agent credential with progress:read. Each part fails on its own: consumers or latches null with a line in errors, and paused.measured false. scripts/morning-brief.sh prints paused from this route when it cannot use GET /api/brief.",
           security: cookieOrBearer,
           responses: {
             "200": jsonResponse("Status at one database instant.", {
               type: "object",
-              required: ["generated_at", "consumers", "latches", "paused", "errors"],
+              required: ["generated_at", "consumers", "consumers_truncated", "latches", "latches_truncated", "paused", "errors"],
               properties: {
                 generated_at: { type: "string", format: "date-time" },
-                consumers: { type: ["array", "null"], items: { type: "object", additionalProperties: true } },
-                latches: { type: ["array", "null"], items: { type: "object", additionalProperties: true } },
+                consumers: { type: ["array", "null"], items: { type: "object", additionalProperties: true }, description: "At most 200." },
+                consumers_truncated: { type: "boolean", description: "True when more consumers exist; the list is partial and errors says so." },
+                latches: { type: ["array", "null"], items: { type: "object", additionalProperties: true }, description: "Active latches, at most 500." },
+                latches_truncated: { type: "boolean", description: "True when more active latches exist; the list is partial and errors says so." },
                 paused: ref("PausedSection"),
                 errors: { type: "array", items: { type: "string" } },
               },

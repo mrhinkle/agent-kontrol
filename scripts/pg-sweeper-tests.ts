@@ -660,10 +660,34 @@ export async function testSweeper(tag: string, applyCanonicalSchema: () => Promi
       const before = Number((await sql()`select (select count(*) from sweep_latches) + (select count(*) from gh_events) + (select count(*) from sweep_observations) as n`)[0].n);
       const status = await sweepGet(new Request("http://localhost/api/sweep", { headers: { authorization: `Bearer ${generic.token}` } }));
       assert.equal(status.status, 200, "progress:read can read status");
-      const body = await status.json() as { paused: { measured: boolean; counts: Json }; consumers: unknown[]; latches: unknown[] };
+      const body = await status.json() as { paused: { measured: boolean; counts: Json }; consumers: unknown[]; latches: unknown[]; latches_truncated: boolean; consumers_truncated: boolean };
       assert.equal(body.paused.measured, true);
+      assert.equal(body.latches_truncated, false);
+      assert.equal(body.consumers_truncated, false);
       assert.ok(Array.isArray(body.consumers) && Array.isArray(body.latches));
       assert.equal(Number((await sql()`select (select count(*) from sweep_latches) + (select count(*) from gh_events) + (select count(*) from sweep_observations) as n`)[0].n), before, "GET never mutates");
+      // Over the bounded read: unmeasured, never a partial "none"; latch list says it is partial.
+      await sql()`
+        insert into scheduler_jobs (source, job_id, state, transition, transition_received_at, last_received_at)
+        select 'bulk', ${`${tag}-bulk-`} || g, 'active', 1, now(), now() from generate_series(1, 1001) g
+      `;
+      await sql()`
+        insert into sweep_latches (condition, entity_key, active)
+        select 'pr-stuck', ${`pr:${tag}-bulk/x#`} || g, true from generate_series(1, 501) g
+      `;
+      try {
+        const bounded = await readPaused();
+        assert.equal(bounded.measured, false);
+        assert.match(formatPausedLines(bounded)[0], /^PAUSED: DATA INCOMPLETE \(more than 1000 scheduler jobs/);
+        const partial = await (await sweepGet(new Request("http://localhost/api/sweep", { headers: { authorization: `Bearer ${token}` } }))).json() as { latches: unknown[]; latches_truncated: boolean; errors: string[] };
+        assert.equal(partial.latches.length, 500);
+        assert.equal(partial.latches_truncated, true);
+        assert.ok(partial.errors.some((e) => e.includes("truncated")));
+      } finally {
+        await sql()`delete from scheduler_jobs where source = 'bulk'`;
+        await sql()`delete from sweep_latches where entity_key like ${`pr:${tag}-bulk/%`}`;
+      }
+
       const viaRoute = await sweepPost(req("/api/sweep", {}, token));
       assert.equal(viaRoute.status, 200);
       const out = await viaRoute.json() as { ok: boolean; checks: unknown[] };

@@ -17,6 +17,7 @@ import {
   queueReady,
   resumeVerdict,
   stepLatch,
+  unmeasuredPaused,
   type LatchState,
   type PausedSection,
   type PrFacts,
@@ -704,10 +705,17 @@ export async function runSweep(): Promise<SweepRun> {
 
 // ------------------------------------------------------------------ status
 
+export const STATUS_JOB_LIMIT = 1000;
+export const STATUS_CONSUMER_LIMIT = 200;
+export const STATUS_LATCH_LIMIT = 500;
+
 export interface SweepStatus {
   generated_at: string;
   consumers: Record<string, unknown>[] | null;
+  /** True when more rows exist than the list holds. The list is then partial, never the whole set. */
+  consumers_truncated: boolean;
   latches: Record<string, unknown>[] | null;
+  latches_truncated: boolean;
   paused: PausedSection;
   errors: string[];
 }
@@ -716,19 +724,13 @@ export interface SweepStatus {
 export async function readPaused(db: SqlTag = sql()): Promise<PausedSection> {
   try {
     const now = await dbInstant(db);
-    const rows = await db`select * from scheduler_jobs order by source, job_id limit 1000`;
+    const rows = await db`select * from scheduler_jobs order by source, job_id limit ${STATUS_JOB_LIMIT + 1}`;
+    // A bounded read that hit its limit could hide a paused or stale job: unmeasured, never "none".
+    if (rows.length > STATUS_JOB_LIMIT) return unmeasuredPaused(`more than ${STATUS_JOB_LIMIT} scheduler jobs; the read is bounded`);
     return pausedSection(rows.map(schedulerFacts), now);
   } catch (err) {
     console.error("[sweep] paused read failed", err);
-    return {
-      measured: false,
-      error: "scheduler status unavailable",
-      generated_at: null,
-      jobs_total: null,
-      jobs: [],
-      truncated: false,
-      counts: { held: 0, unexplained: 0, expired: 0, unknown: 0 },
-    };
+    return unmeasuredPaused("scheduler status unavailable");
   }
 }
 
@@ -738,22 +740,28 @@ export async function readSweepStatus(): Promise<SweepStatus> {
   const generatedAt = await dbInstant(db);
   let consumers: Record<string, unknown>[] | null = null;
   let latches: Record<string, unknown>[] | null = null;
+  let consumersTruncated = false;
+  let latchesTruncated = false;
   try {
     const rows = await db`
       select id, agent_ids, reporters, queue, scheduler_source, scheduler_job, enabled,
              max_silence_hours::float8 as max_silence_hours, registered_at, updated_at
-      from sweep_consumers order by id limit 200
+      from sweep_consumers order by id limit ${STATUS_CONSUMER_LIMIT + 1}
     `;
-    consumers = rows.map((row) => ({ ...row, registered_at: iso(row.registered_at), updated_at: iso(row.updated_at) }));
+    consumersTruncated = rows.length > STATUS_CONSUMER_LIMIT;
+    if (consumersTruncated) errors.push(`consumers truncated at ${STATUS_CONSUMER_LIMIT}`);
+    consumers = rows.slice(0, STATUS_CONSUMER_LIMIT).map((row) => ({ ...row, registered_at: iso(row.registered_at), updated_at: iso(row.updated_at) }));
   } catch {
     errors.push("consumers unavailable");
   }
   try {
     const rows = await db`
       select condition, entity_key, active, episode, seq, first_fired_at, last_emitted_at, cleared_at, last_state, last_evaluated_at
-      from sweep_latches where active order by condition, entity_key limit 500
+      from sweep_latches where active order by condition, entity_key limit ${STATUS_LATCH_LIMIT + 1}
     `;
-    latches = rows.map((row) => ({
+    latchesTruncated = rows.length > STATUS_LATCH_LIMIT;
+    if (latchesTruncated) errors.push(`active latches truncated at ${STATUS_LATCH_LIMIT}`);
+    latches = rows.slice(0, STATUS_LATCH_LIMIT).map((row) => ({
       ...row,
       first_fired_at: iso(row.first_fired_at),
       last_emitted_at: iso(row.last_emitted_at),
@@ -765,5 +773,13 @@ export async function readSweepStatus(): Promise<SweepStatus> {
   }
   const paused = await readPaused(db);
   if (!paused.measured) errors.push(paused.error ?? "scheduler status unavailable");
-  return { generated_at: generatedAt, consumers, latches, paused, errors };
+  return {
+    generated_at: generatedAt,
+    consumers,
+    consumers_truncated: consumersTruncated,
+    latches,
+    latches_truncated: latchesTruncated,
+    paused,
+    errors,
+  };
 }

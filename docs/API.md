@@ -159,7 +159,7 @@ Every field is validated before any write and unknown fields are `400` `validati
 
 `POST /api/sweep/consumers` registers or updates one consumer: `id`, `agent_ids`, `reporters` (`[{ "kind": "agent", "id": "<credential id>" }]`), `queue` (`{ "type": "tasks", "platform": "codex" }` or `{ "type": "collector", "queue": "issues:owner/name" }`), optional `scheduler { source, job_id }`, `enabled`, `max_silence_hours` (default 3). There are no implicit registrations. `registered_at` is set once.
 
-`GET /api/sweep` is read-only status: `consumers`, active `latches`, and `paused` (the brief's Paused section, by database time), plus `errors` for any part that could not be read.
+`GET /api/sweep` is read-only status: `consumers` (200 max), active `latches` (500 max), and `paused` (the brief's Paused section, by database time), plus `errors` for any part that could not be read. `consumers_truncated` and `latches_truncated` say when a list is partial. More than 1,000 scheduler jobs makes `paused` unmeasured (DATA INCOMPLETE), never a partial count.
 
 ### Memory
 
