@@ -188,13 +188,20 @@ async function main() {
     assert.equal(q.raw.count, 115);
     assert.equal(q.ready.refs.length, 50);
     assert.equal(q.ready.refs[0], "#2", "refs are the lowest numbers");
-    assert.equal(fx.calls().filter((c) => c.includes("SweepIssues")).length, 3);
+    assert.equal(fx.calls().filter((c) => c.includes("SweepIssues ")).length, 3);
+    assert.equal(fx.calls().filter((c) => c.includes("SweepIssuesVerify ")).length, 3, "the whole set is read a second time");
   });
 
   await check("queue failures are newer complete:false observations, never zeros", async () => {
     const cases: [string, (fx: Fixture) => void, RegExp][] = [
       ["cap", (fx) => fx.issues(REPO, [{ number: 1, labels: [] }], { total: 1001 }), /more than 1000 open issues/],
       ["set moved", (fx) => fx.issues(REPO, Array.from({ length: 150 }, (_, i) => ({ number: i + 1, labels: [] })), { lastTotal: 151 }), /changed during collection/],
+      ["one closed and one opened while paging", (fx) => {
+        const list = Array.from({ length: 150 }, (_, i) => ({ number: i + 1, labels: [] as string[] }));
+        fx.issues(REPO, list, { verify: [...list.filter((i) => i.number !== 120), { number: 151, labels: [] }] });
+      }, /changed during collection/],
+      ["labels changed while paging", (fx) => fx.issues(REPO, [{ number: 1, labels: [] }], { verify: [{ number: 1, labels: ["dispatch-ready"] }] }), /changed during collection/],
+      ["verify read fails", (fx) => { fx.issues(REPO, [{ number: 1, labels: [] }]); fx.raw(REPO, "SweepIssuesVerify", "first", "", { exit: 1 }); }, /GitHub API request failed/],
       ["label overflow", (fx) => fx.issues(REPO, [{ number: 1, labels: ["x"], labelTotal: 51 }]), /more than 50 labels/],
       ["page 2 fails", (fx) => { fx.issues(REPO, Array.from({ length: 150 }, (_, i) => ({ number: i + 1, labels: ["dispatch-ready"] }))); fx.raw(REPO, "SweepIssues", "c1", null, { exit: 1 }); }, /GitHub API request failed/],
       ["rate limit", (fx) => fx.raw(REPO, "SweepIssues", "first", "", { exit: 1, stderr: "gh: API rate limit exceeded for user" }), /rate limited/],

@@ -156,6 +156,9 @@ ISSUES_QUERY='query SweepIssues($owner: String!, $name: String!, $after: String)
   }
 }'
 
+# The same read again, named apart so a log or fixture can tell the passes apart.
+ISSUES_VERIFY_QUERY="${ISSUES_QUERY/query SweepIssues(/query SweepIssuesVerify(}"
+
 PRS_QUERY='query SweepPrs($owner: String!, $name: String!, $after: String) {
   repository(owner: $owner, name: $name) {
     pullRequests(states: OPEN, first: 50, after: $after, orderBy: {field: CREATED_AT, direction: ASC}) {
@@ -252,8 +255,36 @@ CLASSIFY='
 '
 
 # collect_queue <outfile> — writes the observation body without seq.
+# page_issues <query> <nodes-file> — 0 with every open issue node; else ISSUE_ERR.
+# ISSUE_FIRST and ISSUE_LAST are the totalCount on the first and last page.
+ISSUE_ERR=""; ISSUE_FIRST=""; ISSUE_LAST=""
+page_issues() {
+  local query="$1" nodes="$2" after="" page=0 out
+  ISSUE_FIRST=""; ISSUE_LAST=""
+  : >"$nodes"
+  while :; do
+    page=$((page + 1))
+    if (( page > ISSUE_CAP / 100 + 1 )); then ISSUE_ERR="more than $ISSUE_CAP open issues"; return 1; fi
+    out="$TMP_DIR/issues-$page.json"
+    if ! gh_graphql "$query" "$after" "$out"; then ISSUE_ERR="$GH_ERR"; return 1; fi
+    if ! jq -e "$ISSUES_PAGE_OK" "$out" >/dev/null 2>&1; then ISSUE_ERR="malformed GitHub response"; return 1; fi
+    ISSUE_LAST="$(jq '.data.repository.issues.totalCount' "$out")"
+    [[ -z "$ISSUE_FIRST" ]] && ISSUE_FIRST="$ISSUE_LAST"
+    if (( ISSUE_LAST > ISSUE_CAP )); then ISSUE_ERR="more than $ISSUE_CAP open issues"; return 1; fi
+    jq -c '.data.repository.issues.nodes[]' "$out" >>"$nodes"
+    [[ "$(jq -r '.data.repository.issues.pageInfo.hasNextPage' "$out")" == "true" ]] || return 0
+    after="$(jq -r '.data.repository.issues.pageInfo.endCursor' "$out")"
+  done
+}
+
+# Issue numbers and lower-cased label names, sorted: what classification reads.
+ISSUE_KEY='map([.number, ([.labels.nodes[].name | ascii_downcase] | sort)]) | sort'
+
+# collect_queue <outfile> — writes the observation body without seq. The set
+# is read twice; it is complete only when both reads match exactly, so an
+# issue that closed, opened, or changed labels while paging is never mixed in.
 collect_queue() {
-  local result="$1" nodes="$TMP_DIR/issues.jsonl" after="" page=0 first="" total out counts observed queue
+  local result="$1" nodes="$TMP_DIR/issues.jsonl" again="$TMP_DIR/issues-verify.jsonl" first last counts observed queue
   observed="$(now_iso)"
   queue="$(jq -r '.queue | ascii_downcase' <<<"$REPO_CFG")"
   queue_fail() {
@@ -262,21 +293,14 @@ collect_queue() {
       '{source: $source, queue: $queue, classification: "issue_dispatch", repo: $repo, observed_at: $at,
         complete: false, error: ($err | .[:300]), stale_after_minutes: $stale}' >"$result"
   }
-  : >"$nodes"
-  while :; do
-    page=$((page + 1))
-    if (( page > ISSUE_CAP / 100 + 1 )); then queue_fail "more than $ISSUE_CAP open issues"; return 0; fi
-    out="$TMP_DIR/issues-$page.json"
-    if ! gh_graphql "$ISSUES_QUERY" "$after" "$out"; then queue_fail "$GH_ERR"; return 0; fi
-    if ! jq -e "$ISSUES_PAGE_OK" "$out" >/dev/null 2>&1; then queue_fail "malformed GitHub response"; return 0; fi
-    total="$(jq '.data.repository.issues.totalCount' "$out")"
-    [[ -z "$first" ]] && first="$total"
-    if (( total > ISSUE_CAP )); then queue_fail "more than $ISSUE_CAP open issues"; return 0; fi
-    jq -c '.data.repository.issues.nodes[]' "$out" >>"$nodes"
-    [[ "$(jq -r '.data.repository.issues.pageInfo.hasNextPage' "$out")" == "true" ]] || break
-    after="$(jq -r '.data.repository.issues.pageInfo.endCursor' "$out")"
-  done
-  counts="$(jq -sc --argjson cfg "$REPO_CFG" --argjson first "$first" --argjson last "$total" --argjson cap "$REFS_CAP" "$CLASSIFY" "$nodes")"
+  if ! page_issues "$ISSUES_QUERY" "$nodes"; then queue_fail "$ISSUE_ERR"; return 0; fi
+  first="$ISSUE_FIRST"; last="$ISSUE_LAST"
+  if ! page_issues "$ISSUES_VERIFY_QUERY" "$again"; then queue_fail "$ISSUE_ERR"; return 0; fi
+  if [[ "$ISSUE_FIRST" != "$last" || "$ISSUE_LAST" != "$last" ]] \
+    || [[ "$(jq -sc "$ISSUE_KEY" "$nodes" 2>/dev/null)" != "$(jq -sc "$ISSUE_KEY" "$again" 2>/dev/null)" ]]; then
+    queue_fail "the open issue set changed during collection"; return 0
+  fi
+  counts="$(jq -sc --argjson cfg "$REPO_CFG" --argjson first "$first" --argjson last "$last" --argjson cap "$REFS_CAP" "$CLASSIFY" "$nodes")"
   if [[ -z "$counts" ]]; then queue_fail "classification failed"; return 0; fi
   if jq -e 'has("error")' >/dev/null <<<"$counts"; then queue_fail "$(jq -r '.error' <<<"$counts")"; return 0; fi
   jq -nc --arg source "$SOURCE" --arg queue "$queue" --arg repo "$REPO" --arg at "$observed" \

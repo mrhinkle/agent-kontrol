@@ -100,8 +100,16 @@ export class Fixture {
     if (opts.sleep !== undefined) fs.writeFileSync(this.file(repo, op, after, "sleep"), String(opts.sleep));
   }
 
-  /** Pages of 100; totalCount defaults to the issue count. */
-  issues(repo: string, list: IssueFixture[], opts: { total?: number; lastTotal?: number } = {}): void {
+  /**
+   * Pages of 100; totalCount defaults to the issue count. The producer reads
+   * the set twice; `verify` is what the second read sees (default: the same).
+   */
+  issues(repo: string, list: IssueFixture[], opts: { total?: number; lastTotal?: number; verify?: IssueFixture[] } = {}): void {
+    this.issuePages(repo, "SweepIssues", list, opts);
+    this.issuePages(repo, "SweepIssuesVerify", opts.verify ?? list, opts);
+  }
+
+  private issuePages(repo: string, op: string, list: IssueFixture[], opts: { total?: number; lastTotal?: number }): void {
     const pages = Math.max(1, Math.ceil(list.length / 100));
     for (let p = 0; p < pages; p++) {
       const nodes = list.slice(p * 100, p * 100 + 100).map((i) => ({
@@ -110,7 +118,7 @@ export class Fixture {
       }));
       const more = p < pages - 1;
       const total = p === pages - 1 && opts.lastTotal !== undefined ? opts.lastTotal : opts.total ?? list.length;
-      this.raw(repo, "SweepIssues", p === 0 ? "first" : `c${p}`, JSON.stringify({
+      this.raw(repo, op, p === 0 ? "first" : `c${p}`, JSON.stringify({
         data: { repository: { issues: { totalCount: total, pageInfo: { hasNextPage: more, endCursor: more ? `c${p + 1}` : null }, nodes } } },
       }));
     }
