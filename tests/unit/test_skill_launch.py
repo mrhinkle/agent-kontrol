@@ -631,12 +631,14 @@ mode = os.environ.get("STUB_MODE", "ok")
 if mode == "hang":
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     time.sleep(60)
+if mode == "write":
+    open("written.txt", "w").write("edit\\n")
 sys.exit(5 if mode == "fail" else 0)
 """
 
 
 class TestDirect(ProcessHarness):
-    def direct(self, runtime="codex", timeout=30, **extra):
+    def direct(self, runtime="codex", timeout=30, purpose=None, **extra):
         bindir = self.base / "bin"
         bindir.mkdir(exist_ok=True)
         cli = bindir / runtime
@@ -645,8 +647,43 @@ class TestDirect(ProcessHarness):
         env = {**self.env, **extra, "PATH": f"{bindir}{os.pathsep}{self.env['PATH']}"}
         return subprocess.run(
             [sys.executable, str(HELPER), "direct", "--runtime", runtime, "--cwd", str(self.wt), "--lane", "lane-a",
-             "--spec", str(self.base / "spec.md"), "--timeout", str(timeout), "--log", str(self.base / "d.log")],
+             "--spec", str(self.base / "spec.md"), "--timeout", str(timeout), "--log", str(self.base / "d.log")]
+            + (["--purpose", purpose] if purpose else []),
             env=env, capture_output=True, text=True, timeout=60)
+
+    def test_pilot_purpose_keeps_the_pilot_argv(self):
+        for runtime, tail in (("codex", ["exec", "-s", "read-only"]), ("claude", ["--permission-mode", "default"])):
+            r = self.direct(runtime, purpose="pilot")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            argv = (self.state / "argv").read_text().split("\n")
+            self.assertEqual(argv[:3] if runtime == "codex" else argv[-2:], tail)
+            self.assert_clean()
+
+    def test_coding_purpose_codex_workspace_write(self):
+        r = self.direct(purpose="coding", STUB_MODE="write")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        argv = (self.state / "argv").read_text().split("\n")
+        self.assertEqual(argv[:3], ["exec", "--sandbox", "workspace-write"])
+        self.assertIn("runtime=codex", argv[3])
+        self.assertNotIn("read-only", argv)
+        self.assertEqual((self.wt / "written.txt").read_text(), "edit\n")
+        self.assert_clean()
+
+    def test_coding_purpose_claude_accept_edits(self):
+        r = self.direct("claude", purpose="coding", STUB_MODE="write")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        argv = (self.state / "argv").read_text().split("\n")
+        self.assertEqual(argv[0], "-p")
+        self.assertEqual(argv[-4:], ["--output-format", "json", "--permission-mode", "acceptEdits"])
+        self.assertFalse(any("bypass" in a or "dangerously" in a for a in argv))
+        self.assertEqual((self.wt / "written.txt").read_text(), "edit\n")
+        self.assert_clean()
+
+    def test_unknown_purpose_starts_nothing(self):
+        r = self.direct(purpose="review")
+        self.assertEqual(r.returncode, 2)
+        self.assertFalse((self.state / "argv").exists())
+        self.assertEqual(self.server.requests, [])
 
     def test_codex_read_only_argv(self):
         r = self.direct()

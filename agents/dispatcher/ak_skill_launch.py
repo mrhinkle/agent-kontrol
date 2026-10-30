@@ -26,7 +26,9 @@ Modes (argv[1]):
                one completion event. The supervisor never kills its own group.
   ctl          hello | finish <rc>: the wrapper's side of the socket.
   worker-exec  -- argv: new session, register, wait for ACK, exec argv.
-  direct       Claude/Codex pilot: prepare, run one contained CLI, finish.
+  direct       Claude/Codex: prepare, run one contained CLI, finish. --purpose pilot
+               (default) keeps Claude's default permission mode and Codex read-only;
+               --purpose coding is Claude acceptEdits and Codex workspace-write.
   recover      clear an interrupted launch once its worker group is gone.
 
 Exit codes: 69 unavailable (config, pointer lookup), 73 invalid or busy context,
@@ -565,13 +567,17 @@ def main_worker_exec(ns: argparse.Namespace) -> int:
     return 127
 
 
-# --- direct mode (Claude / Codex pilot) ------------------------------------------------
+# --- direct mode (Claude / Codex) --------------------------------------------------------
 
-def direct_argv(runtime: str, prompt: str) -> list[str]:
+def direct_argv(runtime: str, prompt: str, purpose: str = "pilot") -> list[str]:
+    """The fixed CLI argv per runtime and purpose. Nothing from the caller reaches it but the prompt."""
+    coding = purpose == "coding"
+    if purpose not in ("pilot", "coding"):
+        raise ContextError(EX_CANTCREAT, "direct mode purpose is pilot or coding")
     if runtime == "claude":
-        return ["claude", "-p", prompt, "--output-format", "json", "--permission-mode", "default"]
+        return ["claude", "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits" if coding else "default"]
     if runtime == "codex":
-        return ["codex", "exec", "-s", "read-only", prompt]
+        return ["codex", "exec", "--sandbox", "workspace-write", prompt] if coding else ["codex", "exec", "-s", "read-only", prompt]
     raise ContextError(EX_CANTCREAT, "direct mode serves claude and codex; grok goes through fleet-dispatch.sh")
 
 
@@ -581,7 +587,7 @@ def main_direct(ns: argparse.Namespace) -> int:
         return 64
     try:
         spec_text = Path(ns.spec).read_text(encoding="utf-8")
-        direct_argv(ns.runtime, "")
+        direct_argv(ns.runtime, "", ns.purpose)
         ctx = prepare_context(ns.cwd, ns.lane, ns.runtime)
     except ContextError as e:
         print(f"ak-skill-launch: skills-prepare-failed exit={e.code}: {e}", file=sys.stderr)
@@ -602,7 +608,7 @@ def main_direct(ns: argparse.Namespace) -> int:
         prompt = (worker_instruction(ns.runtime, ns.lane) if ctx.pointers_written else "") + spec_text
         with open(ns.log, "ab") as log:
             try:
-                proc = subprocess.Popen(direct_argv(ns.runtime, prompt), cwd=str(ctx.cwd), stdin=subprocess.DEVNULL,
+                proc = subprocess.Popen(direct_argv(ns.runtime, prompt, ns.purpose), cwd=str(ctx.cwd), stdin=subprocess.DEVNULL,
                                         stdout=log, stderr=log, start_new_session=True)
                 ctx.register_worker(proc.pid)
                 deadline = start + ns.timeout
@@ -728,6 +734,7 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("--cwd", "--lane", "--spec", "--log"):
         d.add_argument(name, required=True)
     d.add_argument("--timeout", type=int, default=300)
+    d.add_argument("--purpose", choices=("pilot", "coding"), default="pilot")
     r = sub.add_parser("recover")
     r.add_argument("--cwd", required=True)
     ns = p.parse_args(argv)
