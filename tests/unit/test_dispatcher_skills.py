@@ -1097,8 +1097,15 @@ class TestTelemetry(Harness):
 class TestTelemetryContainment(ContainmentHarness):
     """run_complete carries the real child exit, sent after the group stops and before AGENTS.md cleanup."""
 
+    # The child's delayed write must land well past hang timeout + kill grace (0.5 + 0.5),
+    # or the kill can catch it mid-truncate of AGENTS.md and falsely clear block_present.
+    TELEMETRY_CHILD_DELAY = 3.0
+
     def setUp(self):
         super().setUp()
+        env = mock.patch.dict(os.environ, {"FAKE_DELAY": str(self.TELEMETRY_CHILD_DELAY)})
+        env.start()
+        self.addCleanup(env.stop)
         self.reports = []
 
         def record(kind, title, agent_id, platform, detail=None, quiet=False):
