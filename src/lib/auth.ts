@@ -167,6 +167,35 @@ export async function resolveApiAccess(req: Request): Promise<Access> {
   return decideBearer(req, "dashboard-open", false);
 }
 
+/**
+ * Sweeper evidence, registrations, and runs (#79). Only the legacy MC_TOKEN,
+ * or the signed-in dashboard when `allowSession` and a password is set. An
+ * agent credential, OAuth, and dev-open are refused: an open dashboard is not
+ * an authenticated operator, and requireScope's null-scope pass is not this
+ * allow-list.
+ */
+export function isTrustedWriter(principal: Principal, opts: { allowSession: boolean }): boolean {
+  return principal.kind === "legacy" || (opts.allowSession && principal.kind === "session");
+}
+
+export async function requireTrustedWriter(
+  req: Request,
+  opts: { allowSession: boolean },
+): Promise<{ ok: true; principal: Principal } | { ok: false; response: Response }> {
+  const access = await resolveApiAccess(req);
+  if (!access.ok) return { ok: false, response: deny(access) };
+  if (isTrustedWriter(access.principal, opts)) return { ok: true, principal: access.principal };
+  if (access.principal.kind === "dev-open") return { ok: false, response: deny(UNAUTHORIZED as Exclude<Access, { ok: true }>) };
+  return { ok: false, response: trustedWriterRequired() };
+}
+
+export function trustedWriterRequired(): Response {
+  return new Response(JSON.stringify(errorBody("trusted_writer_required")), {
+    status: 403,
+    headers: { "content-type": "application/json" },
+  });
+}
+
 /** Ingest-style routes. 401 for a bad credential, 403 for a missing scope. */
 export async function enforceBearer(
   req: Request,

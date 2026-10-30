@@ -2331,7 +2331,9 @@ describe("GET /api/brief", { concurrency: false }, () => {
           return decisions.slice(0, limit);
         }
         if (text.includes("from agents") || text.includes("from events")) return [];
-        if (!text.includes("from repo_snapshots")) throw new Error(`unexpected sql: ${text}`);
+        const scheduler = schedulerSql(text);
+    if (scheduler) return scheduler;
+    if (!text.includes("from repo_snapshots")) throw new Error(`unexpected sql: ${text}`);
         return snapshots;
       });
     };
@@ -2498,7 +2500,9 @@ describe("GET /api/brief", { concurrency: false }, () => {
       }
       if (text.includes("from decisions")) return [];
       if (text.includes("from agents") || text.includes("from events")) return [];
-      if (!text.includes("from repo_snapshots")) throw new Error(`unexpected sql: ${text}`);
+      const scheduler = schedulerSql(text);
+    if (scheduler) return scheduler;
+    if (!text.includes("from repo_snapshots")) throw new Error(`unexpected sql: ${text}`);
       return newestSnapshots(text, values, [snapshotRow({
         repo: stored,
         collected_at: "2026-10-27T14:00:00.000Z",
@@ -2581,6 +2585,23 @@ function legacyDecision(over: Partial<Decision>): Decision {
   };
 }
 
+/**
+ * The Paused section (#79) reads the database clock and scheduler_jobs. These
+ * fixtures report one fresh active job, so the section is a measured "none"
+ * and the rest of each brief reads as it did before the section existed.
+ */
+function schedulerSql(text: string): Row[] | null {
+  if (text.includes("clock_timestamp()")) return [{ now: "2026-10-27T12:00:00.000000Z" }];
+  if (text.includes("from scheduler_jobs")) {
+    return [{
+      source: "fixture", job_id: "tick", state: "active", transition: 1, paused_at: null, paused_reason: null,
+      until: null, decision: null, prior_state: null, resumed: false, stale_after_minutes: 30,
+      last_received_at: "2026-10-27T11:59:00.000Z",
+    }];
+  }
+  return null;
+}
+
 function installBriefSql(snapshots: Row[], decisions: Row[] | "missing" | "fail"): void {
   env.DATABASE_URL = "postgres://brief:brief@127.0.0.1:9/brief_test";
   setSqlForTests(async (strings, ...values) => {
@@ -2596,6 +2617,8 @@ function installBriefSql(snapshots: Row[], decisions: Row[] | "missing" | "fail"
       return decisions;
     }
     if (text.includes("from agents") || text.includes("from events")) return [];
+    const scheduler = schedulerSql(text);
+    if (scheduler) return scheduler;
     if (!text.includes("from repo_snapshots")) throw new Error(`unexpected sql: ${text}`);
     return newestSnapshots(text, values, snapshots);
   });
@@ -2609,6 +2632,8 @@ function installSnapshotSql(rows: Row[]): void {
     // No saved owners: getWatchedRepos stays on the file list these fixtures use.
     if (text.includes("from watched_owners")) return [];
     if (text.includes("from decisions")) return [];
+    const scheduler = schedulerSql(text);
+    if (scheduler) return scheduler;
     if (!text.includes("from repo_snapshots")) throw new Error(`unexpected sql: ${text}`);
     let pool = rows;
     if (/open_issues\s+is\s+not\s+null/i.test(text)) {

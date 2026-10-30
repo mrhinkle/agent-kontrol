@@ -26,6 +26,9 @@ The `agent_credentials` table stores the label, the first 8 characters of the to
 | `GET /api/skill-bundles` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `skills:read` or `skills:write` |
 | Credential management: `GET`/`POST`/`DELETE /api/settings/credentials` | Dashboard session only |
 | `POST /api/watch/beat`, `GET /api/watch/beats` | Verified `akc_` credential only. `watch:write` for the POST, `watch:read` for the GET. `MC_TOKEN`, the dashboard session, an OAuth access token, and a caller allowed only because the dashboard password is unset are `401` |
+| `POST /api/sweep`, `POST /api/sweep/consumers` | `Authorization: Bearer <MC_TOKEN>`, or the dashboard session cookie when `MC_DASHBOARD_PASSWORD` is set. An agent credential, an OAuth token, and a caller allowed only because the password is unset are refused (`403` `trusted_writer_required`, `403` `insufficient_scope`, or `401`) |
+| `GET /api/sweep` | Session cookie, `MC_TOKEN`, or an agent credential with `progress:read`. Read-only |
+| Sweeper observations on `POST /api/ingest` (`kind` `sweep.scheduler_job`, `sweep.queue`, `sweep.pr_snapshot`) | `Authorization: Bearer <MC_TOKEN>` only. An agent credential with `status:write`, an OAuth token, and a dev-open caller are `403` `trusted_writer_required` and nothing is written |
 | `POST /api/webhooks/github` (exact path) | A valid `X-Hub-Signature-256` HMAC under `MC_GITHUB_WEBHOOK_SECRET`, and nothing else. A session cookie, `MC_TOKEN`, an agent credential, or an OAuth token does not stand in for it. Neighboring paths stay behind the dashboard gate |
 | Login, OAuth, and discovery: `/login`, `/api/login`, `/oauth/*`, `/.well-known/*` | No cookie gate; these routes enforce their own auth |
 | Public agent docs: `GET /llms.txt`, `GET /docs/mcp.md`, `GET /docs/api.md`, `GET /docs/agents.md` | None. Any other `/docs` name stays behind the dashboard gate |
@@ -129,6 +132,34 @@ Body:
 | `status` | string | no | Explicit session status override. |
 
 Invalid JSON answers `400`.
+
+Each stored event records who sent it in `events.principal_kind` and `events.principal_id`, taken from the verified credential: `legacy`/`mc-token`, `agent`/the credential id, `oauth`/the client id (MCP), or `session`/`operator`. Fields with those names in the body are ignored. A caller allowed only because `MC_TOKEN` is unset in development stores null, and so does every event written before this column existed: those rows are unmeasured for the sweeper's consumer liveness. Nothing else about ordinary telemetry changes.
+
+#### Sweeper observations
+
+Three reserved kinds carry trusted evidence for the absence sweeper (see [VELOCITY.md](VELOCITY.md#absence-sweeper)). Only `MC_TOKEN` may send them; `/api/ingest` has no credential bound to a collector yet. The body is `{ "agent_id": "<reporter label>", "kind": "<kind>", "observation": { ... } }`. `agent_id` is an audit label, not provenance.
+
+| `kind` | `observation` |
+| --- | --- |
+| `sweep.scheduler_job` | `source`, `job_id`, `state` (`active` or `paused`), `transition` (the source's monotonic transition id for the job), `observed_at`, and for a pause `paused_at`, `paused_reason` (500 max), `until`; `decision` is the citation for this transition. Optional `stale_after_minutes` (5 to 1440, default 30). |
+| `sweep.queue` | `source`, `queue` (stored lowercase), `classification` (`issue_dispatch` or `pr_review`), `repo`, `seq`, `observed_at`, `complete`, `error`, `ready {count, refs}`, `raw {count, refs}` (50 refs max). A complete observation needs both counts. |
+| `sweep.pr_snapshot` | `source`, `repo`, `seq`, `observed_at`, `complete`, `error`, and `prs`: every open PR (200 max) with `number`, `draft`, `opened_at`, `mergeable` (`mergeable`, `conflicting`, `unknown`), `head_sha`, `required_checks {state, head_sha}`, `review {started, head_sha}`, and optional `title`, `url`. |
+
+Every field is validated before any write and unknown fields are `400` `validation_failed`. A citation is `decision:<id>`, `owner/name#<n>`, an `https` URL, or `doc:<path>`, at most 300 characters; the syntax check does not prove an approval. The audit row (`sweep_observations`) and the projection commit in one transaction, stamped with the database receipt time. The answer names the outcome:
+
+- `applied`: newer than what is stored.
+- `refreshed`: the same scheduler transition again. A non-null field adds or replaces; an omitted or null field keeps the stored value, so a replay cannot drop a citation. A different `state` on the same transition is `409` `conflict` and writes nothing.
+- `older` or `replay`: a lower or equal `transition`/`seq`. Audited; the projection keeps the newer state, including a newer failure.
+
+`complete: false` is stored as unknown, never as zero, and an older success does not replace it. Any other kind starting with `sweep.`, or named after a synthetic sweeper event (`consumer-silent`, `pr-stuck-cleared`, ...), is reserved: `403` for those callers and `400` for `MC_TOKEN`.
+
+### Sweeper
+
+`POST /api/sweep` runs the absence sweeper once and returns `{ ok, checks, retention }`. The body is ignored; there is no caller clock. Each entry in `checks` has `check`, `state` (`firing`, `clear`, `held`, `unknown`, `not_configured`), `evaluated_at` (the database instant), `counts`, `emitted` (delivery ids written), `entities` (100 max), `complete`, `unvisited`, and `error`. A check that failed is `unknown` with an error and does not stop the others. The status is `200` whenever the run finished; read each check. `retention` reports `deleted`, `batches`, `complete`, and `error`.
+
+`POST /api/sweep/consumers` registers or updates one consumer: `id`, `agent_ids`, `reporters` (`[{ "kind": "agent", "id": "<credential id>" }]`), `queue` (`{ "type": "tasks", "platform": "codex" }` or `{ "type": "collector", "queue": "issues:owner/name" }`), optional `scheduler { source, job_id }`, `enabled`, `max_silence_hours` (default 3). There are no implicit registrations. `registered_at` is set once.
+
+`GET /api/sweep` is read-only status: `consumers`, active `latches`, and `paused` (the brief's Paused section, by database time), plus `errors` for any part that could not be read.
 
 ### Memory
 
@@ -396,7 +427,7 @@ OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this sha
 | `invalid_json` | 400 | no | The body is not JSON. On `POST /api/login` the `error` string stays `invalid request`. On `POST /api/mcp` an empty or non-JSON body uses this code and `error` `invalid JSON`. A missing bearer on that route is still `401` with `WWW-Authenticate`. |
 | `missing_field` | 400 | no | A required field is absent. `fields` names it. |
 | `rate_limited` | 429 | yes | More than 5 `POST /api/login` attempts in 10 minutes from one client IP. `Retry-After` is seconds. The OAuth consent form shares this limiter and answers with HTML, not this JSON. |
-| `conflict` | 409 | no | `PUT /api/settings/repos` and MCP `set_watched_repos` when no database is connected. A short name that is already used is the same code. |
+| `conflict` | 409 | no | `PUT /api/settings/repos` and MCP `set_watched_repos` when no database is connected. A short name that is already used is the same code. Also a `sweep.scheduler_job` observation that changes `state` without a higher `transition`. |
 | `idempotency_conflict` | 409 | no | `POST /api/tasks`, `POST /api/messages`, or `POST /api/messages/reply` reused an `Idempotency-Key` with different arguments, or the first request with that key is still inside its 30 second lease. MCP `create_task` and `reply_to_operator` (and its `reply_to_mark` alias) return the same code. The same key, the same actor, the same route, and the same arguments return the original result for 24 hours. Different arguments stay `retryable: false`. While the first request is inside its 30 second lease, the same arguments are `retryable: true` and the response carries `Retry-After` in seconds plus `retry_after` in the body. After that lease, the same key and the same arguments take over a claim that never stored a result and run the write once. A claim insert whose result is lost is re-read, and the write runs once when this attempt owns the claim. The resource insert and the stored response commit in one statement, and that insert runs only while this attempt's claim token still matches. A committed write therefore has a stored response. A retry returns that response and does not insert another row while the claim is inside its 24 hour window. A caller that dies before reading the response gets the same row on retry. After that window the same key starts a new write. The key is scoped by actor and route. |
 | `stale` | 409 | no | `PUT /api/settings/repos` when `version` does not match the list currently stored, and MCP `set_watched_repos` when `expected_version` does not match. Also `PATCH /api/decisions/:id` and `POST /api/decisions/:id/writeback` when `expected_revision` does not match the row. |
 | `writeback_in_progress` | 409 | yes | `PATCH /api/decisions/:id` with `status` `open`, or `POST /api/decisions` with `force: true`, while an unexpired write-back claim holds the row. The claim expires after 180 seconds. |
@@ -408,6 +439,7 @@ OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this sha
 | `payload_too_large` | 413 | no | `POST /api/v1/traces` over 2 MB, `POST /api/watch/beat` over 8 KiB, or `POST /api/webhooks/github` over 1 MiB. |
 | `unsupported_media_type` | 415 | no | `POST /api/v1/traces` or `POST /api/watch/beat` when the body is not `application/json`. |
 | `setup_required` | 503 | no | Messaging routes or `POST /api/usage/ingest` when those tables are missing, or a production `/api/*` request when a database is set and `MC_DASHBOARD_PASSWORD` is not (other pages are `text/plain`). `GET /api/usage` stays HTTP 200 with `setup_required: true` and no `code`. Messaging and usage-ingest bodies keep `setup_required` and `message`. |
+| `trusted_writer_required` | 403 | no | A sweeper write from a caller that is not `MC_TOKEN` (or, for `POST /api/sweep` and `POST /api/sweep/consumers`, the signed-in dashboard): an agent credential with `status:write` sending a reserved `sweep.` kind to `POST /api/ingest`, or an OAuth or dev-open caller. Nothing is written. |
 | `not_configured` | 503 | no | `POST /api/webhooks/github` when `MC_GITHUB_WEBHOOK_SECRET` is unset or blank. Nothing is read or stored. Set the secret, redeploy, then redeliver from GitHub. |
 | `internal_error` | 500 | yes | Anything else that failed while handling the request. `GET /api/progress/digest` uses this JSON body too. Success from that route stays `text/plain`. |
 

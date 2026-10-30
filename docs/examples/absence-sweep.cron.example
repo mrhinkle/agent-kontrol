@@ -1,0 +1,7 @@
+# Absence detection (#79): run the sweeper every five minutes.
+# INERT EXAMPLE. Nothing installs this file. Activation is the owner's decision
+# and needs consumer registrations and collector observations to be useful.
+# Install by hand with `crontab -e` only after that decision. MC_URL and
+# MC_TOKEN must come from the host's own secret store, not from this file.
+#
+# */5 * * * * /path/to/agent-kontrol/scripts/sweep-once.sh >>"$HOME/Library/Logs/agent-kontrol-sweep.log" 2>&1

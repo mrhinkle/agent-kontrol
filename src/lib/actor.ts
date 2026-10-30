@@ -27,6 +27,13 @@ export const DASHBOARD_ACTOR_ID = "operator";
 export const LEGACY_ACTOR_ID = "mc-token";
 
 const storage = new AsyncLocalStorage<Actor>();
+const principalStorage = new AsyncLocalStorage<Principal>();
+
+/** Authenticated reporter recorded on an event. Never read from a request body. */
+export interface Provenance {
+  principal_kind: "legacy" | "agent" | "oauth" | "session";
+  principal_id: string;
+}
 
 /** Null when the caller is dev-open: allowed, but not an authenticated actor. */
 export function actorFromPrincipal(principal: Principal): Actor | null {
@@ -52,4 +59,33 @@ export function runWithActor<T>(actor: Actor | null, fn: () => T): T {
 
 export function currentActor(): Actor | null {
   return storage.getStore() ?? null;
+}
+
+/**
+ * Null for dev-open: allowed, but nobody authenticated, so the event stays
+ * unmeasured for consumer liveness. Ids use the actor vocabulary above.
+ */
+export function provenanceFromPrincipal(principal: Principal | null | undefined): Provenance | null {
+  if (!principal) return null;
+  switch (principal.kind) {
+    case "legacy":
+      return { principal_kind: "legacy", principal_id: LEGACY_ACTOR_ID };
+    case "session":
+      return { principal_kind: "session", principal_id: DASHBOARD_ACTOR_ID };
+    case "agent":
+      return principal.id ? { principal_kind: "agent", principal_id: principal.id } : null;
+    case "oauth":
+      return principal.id ? { principal_kind: "oauth", principal_id: principal.id } : null;
+    case "dev-open":
+      return null;
+  }
+}
+
+/** MCP requests: the actor and the verified principal for the handlers below. */
+export function runWithPrincipal<T>(principal: Principal, fn: () => T): T {
+  return principalStorage.run(principal, () => runWithActor(actorFromPrincipal(principal), fn));
+}
+
+export function currentPrincipal(): Principal | null {
+  return principalStorage.getStore() ?? null;
 }
