@@ -1087,6 +1087,12 @@ class TestProcessContainment(ContainmentHarness):
 
 
 class TestTelemetry(Harness):
+    def setUp(self):
+        super().setUp()
+        self.which = mock.patch.object(md.shutil, "which", return_value="/usr/bin/true")
+        self.which.start()
+        self.addCleanup(self.which.stop)
+
     def test_worker_and_review_receive_task_id(self):
         body = self.dispatch(reviewer_platform="codex")
         self.assertEqual(body["status"], "done")
