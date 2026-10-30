@@ -12,6 +12,7 @@ import {
   dispatchVerdict,
   evaluatePr,
   ms,
+  prSourceGap,
   pauseVerdicts,
   pausedSection,
   queueReady,
@@ -104,6 +105,8 @@ interface Finding {
   version: number | null;
   meta?: { repo?: string | null; number?: number | null; head_sha?: string | null };
   evidence: Record<string, unknown>;
+  /** Counted in the check result only: no latch row and no inbox row. Always unknown. */
+  report_only?: true;
 }
 
 interface DomainOutput {
@@ -285,6 +288,7 @@ async function runDomain(
       const out = await evaluate(tx, now);
       const map = new Map<string, string | null>();
       for (const finding of out.findings) {
+        if (finding.report_only) continue;
         map.set(`${finding.condition}\u0000${finding.entity_key}`, await applyFinding(tx, finding, now));
       }
       return { output: out, emittedBy: map };
@@ -435,6 +439,30 @@ async function evaluatePrs(tx: SqlTag, now: string): Promise<DomainOutput> {
   `;
   const { keys, unvisited } = bounded(latches, open.map((row) => `pr:${String(row.repo_key)}#${Number(row.number)}`));
   const findings: Finding[] = [];
+  // A repository whose evidence is incomplete or stale is unknown as a whole,
+  // even with no PR row or latch to carry it: its open set is not measured.
+  // The finding names the repository, never a PR, and is not latched.
+  for (const src of sources) {
+    const facts: PrSourceFacts = { complete: src.complete === true, received_at: iso(src.received_at) ?? "", stale_after_minutes: Number(src.stale_after_minutes) };
+    const gap = prSourceGap(facts, nowMs);
+    if (gap === null) continue;
+    findings.push({
+      condition: "pr-stuck",
+      entity_key: `repo:${String(src.repo_key)}`,
+      verdict: "unknown",
+      version: null,
+      report_only: true,
+      evidence: {
+        repo: str(src.repo),
+        reasons: [`pr evidence ${gap}`],
+        complete: facts.complete,
+        received_at: iso(src.received_at),
+        stale_after_minutes: facts.stale_after_minutes,
+        snapshot_seq: num(src.seq),
+        observation_id: src.last_observation_id != null ? String(src.last_observation_id) : null,
+      },
+    });
+  }
   for (const key of keys) {
     const match = /^pr:(.+)#(\d+)$/.exec(key);
     if (!match) continue;
@@ -565,17 +593,23 @@ async function evaluateDecisions(tx: SqlTag, now: string): Promise<DomainOutput>
   const conditions: SweepCondition[] = ["decision-aging"];
   const latches = (await activeLatchKeys(tx, conditions)).get("decision-aging") ?? [];
   const latchKeys = latches.map((key) => key.slice("decision:".length));
-  const rows = await tx`
+  // Active latches are looked up by key, apart from the bounded candidate
+  // scan, so a latch is cleared as absent only when this exact lookup proves
+  // the row is gone. A scan truncated by older rows says nothing about it.
+  const latched = latchKeys.length === 0 ? [] : await tx`
+    select key, status, defer_until, opened_at, first_seen_at, repo, number
+    from decisions where key = any(${latchKeys}::text[])
+  `;
+  const candidates = await tx`
     select key, status, defer_until, opened_at, first_seen_at, repo, number
     from decisions
-    where key = any(${latchKeys}::text[])
-       or (status in ('open', 'deferred')
-           and coalesce(opened_at, first_seen_at) <= ${now}::timestamptz - make_interval(days => ${DECISION_AGING_DAYS}))
+    where status in ('open', 'deferred')
+      and coalesce(opened_at, first_seen_at) <= ${now}::timestamptz - make_interval(days => ${DECISION_AGING_DAYS})
     order by coalesce(opened_at, first_seen_at), key
     limit ${DOMAIN_ENTITY_LIMIT * 2 + 1}
   `;
-  const byKey = new Map(rows.map((row) => [`decision:${String(row.key)}`, row]));
-  const { keys, unvisited } = bounded(latches, [...byKey.keys()]);
+  const byKey = new Map([...candidates, ...latched].map((row) => [`decision:${String(row.key)}`, row]));
+  const { keys, unvisited } = bounded(latches, candidates.map((row) => `decision:${String(row.key)}`));
   const findings: Finding[] = [];
   for (const key of keys) {
     const row = byKey.get(key);
@@ -599,7 +633,7 @@ async function evaluateDecisions(tx: SqlTag, now: string): Promise<DomainOutput>
       },
     });
   }
-  return { conditions, findings, configured: true, unvisited: unvisited + Math.max(0, rows.length - DOMAIN_ENTITY_LIMIT * 2) };
+  return { conditions, findings, configured: true, unvisited: unvisited + Math.max(0, candidates.length - DOMAIN_ENTITY_LIMIT * 2) };
 }
 
 // ---------------------------------------------------------------- dispatch

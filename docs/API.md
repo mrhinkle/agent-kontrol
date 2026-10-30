@@ -161,8 +161,8 @@ Three reserved kinds carry trusted evidence for the absence sweeper (see [VELOCI
 Every field is validated before any write and unknown fields are `400` `validation_failed`. A citation is `decision:<id>`, `owner/name#<n>`, an `https` URL, or `doc:<path>`, at most 300 characters; the syntax check does not prove an approval. The audit row (`sweep_observations`) and the projection commit in one transaction, stamped with the database receipt time. The answer names the outcome:
 
 - `applied`: newer than what is stored.
-- `refreshed`: the same scheduler transition again. A non-null field adds or replaces; an omitted or null field keeps the stored value, so a replay cannot drop a citation. A different `state` on the same transition is `409` `conflict` and writes nothing.
-- `older` or `replay`: a lower or equal `transition`/`seq`. Audited; the projection keeps the newer state, including a newer failure.
+- `refreshed`: the same scheduler transition with a later `observed_at` than the stored one. A non-null field adds or replaces; an omitted or null field keeps the stored value, so a refresh cannot drop a citation. Only a refresh renews the job's freshness. A different `state` on the same transition is `409` `conflict` and writes nothing.
+- `older` or `replay`: a lower or equal `transition`/`seq`, or for a scheduler job the same transition with an earlier (`older`) or equal (`replay`) `observed_at`. Audited; the projection keeps the newer state, including a newer failure, a corrected `until`, and its freshness. Retrying after a lost response is a `replay`. Two reports of one transition at the same `observed_at` whose non-null fields differ are `409` `conflict`; a correction needs a later `observed_at`.
 
 `complete: false` is stored as unknown, never as zero, and an older success does not replace it. Any other kind starting with `sweep.`, or named after a synthetic sweeper event (`consumer-silent`, `pr-stuck-cleared`, ...), is reserved: `403` for those callers and `400` for `MC_TOKEN`.
 
