@@ -7,6 +7,7 @@ import { toolResultFromCaught } from "../../src/lib/api-error";
 import { authCookieValue } from "../../src/lib/authcrypto";
 import { createCredential, resetCredentialsForTests } from "../../src/lib/credentials";
 import { setSqlForTests, type Row } from "../../src/lib/db";
+import { fakeQuotaSql } from "./quota-fake";
 import {
   hashPayload,
   IDEMPOTENCY_LEASE_MS,
@@ -119,6 +120,8 @@ function installFake() {
   setSqlForTests(async (strings, ...values) => {
     const text = strings.join(" ").replace(/\s+/g, " ").trim();
     const lower = text.toLowerCase();
+    const quota = fakeQuotaSql(text, values);
+    if (quota) return quota;
     if (lower.includes("insert into agent_credentials")) {
       creds.push(rowFrom(strings, values));
       return [];

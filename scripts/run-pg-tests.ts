@@ -369,6 +369,7 @@ async function main() {
   await testZeroMergeCaseFold(tag);
   await testDecisionWritebackHardening(tag);
   await testRepoCaseIdentity(tag);
+  await testCredentialQuotas(tag);
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
 }
@@ -2551,6 +2552,285 @@ async function testRepoSettingsVersionAndReceipt(tag: string): Promise<void> {
     await dropTrigger();
     await sql()`delete from watched_repos where repo = ${repoA} or repo = ${repoB} or repo = 'acme/kept'`;
     await sql()`delete from events where kind = 'set_watched_repos' and id > ${floorId}::bigint`;
+    if (savedPassword === undefined) delete process.env.MC_DASHBOARD_PASSWORD;
+    else process.env.MC_DASHBOARD_PASSWORD = savedPassword;
+    if (savedToken === undefined) delete process.env.MC_TOKEN;
+    else process.env.MC_TOKEN = savedToken;
+  }
+}
+
+/**
+ * Per-credential request quotas (issue #51) against the real row lock and
+ * the database clock. One unit is one authorized request.
+ */
+async function testCredentialQuotas(tag: string) {
+  const { createCredential, updateCredentialLimits, setCredentialClockForTests } = await import("../src/lib/credentials");
+  const { chargeCredentialRequest } = await import("../src/lib/credential-rate-limit");
+  const ids: string[] = [];
+  const savedPassword = process.env.MC_DASHBOARD_PASSWORD;
+  const savedToken = process.env.MC_TOKEN;
+  const realDateNow = Date.now;
+  const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+  const fresh = () => new Request("http://localhost/api/fleet");
+  const make = async (limits: { perMinute?: number; perDay?: number }, scopes: string[] = ["fleet:read"]) => {
+    const created = await createCredential({
+      label: `${tag} quota`,
+      scopes,
+      rate_limit_per_minute: limits.perMinute,
+      rate_limit_per_day: limits.perDay,
+    });
+    if (!created.ok) throw new Error(created.error);
+    ids.push(created.credential.id);
+    return created;
+  };
+  const state = async (id: string) => {
+    const rows = await sql()`
+      select rate_limit_per_minute, rate_limit_per_day, rate_minute_start, rate_minute_count,
+             rate_day_start, rate_day_count, revoked_at, expires_at
+      from agent_credentials where id = ${id}
+    `;
+    const row = rows[0];
+    return {
+      perMinute: Number(row.rate_limit_per_minute),
+      perDay: Number(row.rate_limit_per_day),
+      minuteStart: row.rate_minute_start ? new Date(row.rate_minute_start).toISOString() : null,
+      minuteCount: Number(row.rate_minute_count),
+      dayStart: row.rate_day_start ? new Date(row.rate_day_start).toISOString() : null,
+      dayCount: Number(row.rate_day_count),
+    };
+  };
+  /** Milliseconds until the next window boundary, by the database clock. */
+  const msToBoundary = async (unit: "minute" | "day") => {
+    const rows = unit === "minute"
+      ? await sql()`select extract(epoch from (date_trunc('minute', clock_timestamp() at time zone 'UTC') + interval '1 minute' - (clock_timestamp() at time zone 'UTC')))::float8 * 1000 as ms`
+      : await sql()`select extract(epoch from (date_trunc('day', clock_timestamp() at time zone 'UTC') + interval '1 day' - (clock_timestamp() at time zone 'UTC')))::float8 * 1000 as ms`;
+    return Number(rows[0].ms);
+  };
+  /** Keep a test that must stay inside one window from straddling a boundary. */
+  const awayFromBoundary = async (unit: "minute" | "day", needMs: number) => {
+    const left = await msToBoundary(unit);
+    if (left < needMs) await pause(left + 250);
+  };
+  const lockRow = async (id: string) => {
+    const holder = new Client({ connectionString: process.env.DATABASE_URL });
+    await holder.connect();
+    await holder.query("begin");
+    await holder.query("select id from agent_credentials where id = $1 for update", [id]);
+    return holder;
+  };
+  const settled = async (p: Promise<unknown>) => {
+    let done = false;
+    void p.then(() => { done = true; }, () => { done = true; });
+    await pause(250);
+    return done;
+  };
+
+  delete process.env.MC_DASHBOARD_PASSWORD;
+  delete process.env.MC_TOKEN;
+  try {
+    // Defaults are stored on the row, and new counters start empty.
+    const plain = await make({});
+    const plainState = await state(plain.credential.id);
+    assert.equal(plainState.perMinute, 60);
+    assert.equal(plainState.perDay, 10000);
+    assert.equal(plainState.minuteCount, 0);
+    assert.equal(plainState.dayCount, 0);
+    await assert.rejects(
+      () => sql()`update agent_credentials set rate_limit_per_day = 0 where id = ${plain.credential.id}`,
+      "the database rejects a zero limit",
+    );
+
+    // A concurrent burst of 25 distinct requests, with a limit edit in the
+    // middle, admits exactly the day cap. Both counters match the admitted count.
+    await awayFromBoundary("minute", 10_000);
+    await awayFromBoundary("day", 10_000);
+    const burst = await make({ perMinute: 1_000_000, perDay: 7 });
+    const results = await Promise.all([
+      ...Array.from({ length: 25 }, () => chargeCredentialRequest(fresh(), burst.credential.id)),
+      updateCredentialLimits({ id: burst.credential.id, rate_limit_per_minute: 999_999, rate_limit_per_day: null }).then(() => null),
+    ]);
+    const charged = results.filter((item): item is NonNullable<typeof item> => item !== null);
+    assert.equal(charged.filter((item) => item.status === "ok").length, 7, "exactly the cap succeeds");
+    assert.equal(charged.filter((item) => item.status === "limited").length, 18);
+    const afterBurst = await state(burst.credential.id);
+    assert.equal(afterBurst.dayCount, 7);
+    assert.equal(afterBurst.minuteCount, 7);
+    assert.equal(afterBurst.perMinute, 999_999, "the edit landed");
+    assert.equal(afterBurst.perDay, 7);
+
+    // A rejected request leaves both counters as they were.
+    const denied = await chargeCredentialRequest(fresh(), burst.credential.id);
+    assert.equal(denied.status, "limited");
+    if (denied.status === "limited") {
+      assert.equal(denied.window, "day");
+      assert.ok(denied.retryAfterSec >= 1);
+    }
+    assert.deepEqual(await state(burst.credential.id), afterBurst);
+
+    // Two auth passes over one Request charge once.
+    const once = await make({ perMinute: 5 });
+    const shared = fresh();
+    const pair = await Promise.all([
+      chargeCredentialRequest(shared, once.credential.id),
+      chargeCredentialRequest(shared, once.credential.id),
+    ]);
+    assert.deepEqual(pair.map((item) => item.status), ["ok", "ok"]);
+    assert.equal((await state(once.credential.id)).dayCount, 1);
+
+    // A settings edit keeps the requests already counted.
+    await awayFromBoundary("minute", 10_000);
+    const edited = await make({ perMinute: 3, perDay: 100 });
+    for (let i = 0; i < 3; i++) assert.equal((await chargeCredentialRequest(fresh(), edited.credential.id)).status, "ok");
+    assert.equal((await chargeCredentialRequest(fresh(), edited.credential.id)).status, "limited");
+    const beforeEdit = await state(edited.credential.id);
+    await updateCredentialLimits({ id: edited.credential.id, rate_limit_per_minute: 5, rate_limit_per_day: null });
+    const afterEdit = await state(edited.credential.id);
+    assert.equal(afterEdit.minuteCount, beforeEdit.minuteCount);
+    assert.equal(afterEdit.dayCount, beforeEdit.dayCount);
+    assert.equal(afterEdit.minuteStart, beforeEdit.minuteStart);
+    assert.equal(afterEdit.perDay, 100);
+    assert.equal((await chargeCredentialRequest(fresh(), edited.credential.id)).status, "ok");
+    assert.equal((await chargeCredentialRequest(fresh(), edited.credential.id)).status, "ok");
+    assert.equal((await chargeCredentialRequest(fresh(), edited.credential.id)).status, "limited");
+
+    // Applying the canonical schema twice keeps limits and counters.
+    const kept = await state(edited.credential.id);
+    await applyCanonicalSchema();
+    await applyCanonicalSchema();
+    assert.deepEqual(await state(edited.credential.id), kept);
+
+    // A skewed process clock is ignored: the window comes from the database.
+    const skew = 3 * 86_400_000;
+    const skewed = await make({ perMinute: 1000, perDay: 1000 });
+    setCredentialClockForTests(() => realDateNow() + skew);
+    Date.now = () => realDateNow() + skew;
+    let skewedAt: string;
+    try {
+      const first = await chargeCredentialRequest(fresh(), skewed.credential.id);
+      const second = await chargeCredentialRequest(fresh(), skewed.credential.id);
+      assert.equal(first.status, "ok");
+      assert.equal(second.status, "ok");
+      skewedAt = first.status === "ok" ? first.at : "";
+    } finally {
+      Date.now = realDateNow;
+      setCredentialClockForTests(null);
+    }
+    const dbDay = await sql()`select date_trunc('day', now() at time zone 'UTC') at time zone 'UTC' as day, now() as now`;
+    const skewedState = await state(skewed.credential.id);
+    assert.equal(skewedState.dayStart, new Date(dbDay[0].day).toISOString());
+    assert.equal(skewedState.dayCount, 2, "both requests land in the database's day");
+    assert.ok(Math.abs(Date.parse(skewedAt) - new Date(dbDay[0].now).getTime()) < 60_000, "the charge time is the database clock");
+
+    // A request that waits on the row lock across a minute boundary is
+    // judged by the time after the lock. The minute before is full.
+    const boundary = await make({ perMinute: 1, perDay: 100 });
+    let left = await msToBoundary("minute");
+    if (left < 3_000) {
+      await pause(left + 250);
+      left = await msToBoundary("minute");
+    }
+    await pause(Math.max(0, left - 2_000));
+    assert.equal((await chargeCredentialRequest(fresh(), boundary.credential.id)).status, "ok");
+    const holder = await lockRow(boundary.credential.id);
+    try {
+      const waiting = chargeCredentialRequest(fresh(), boundary.credential.id);
+      assert.equal(await settled(waiting), false, "the charge waits on the row lock");
+      // Still in the full minute: hold the lock until just past its end.
+      const untilNext = await msToBoundary("minute");
+      if (untilNext < 30_000) await pause(untilNext + 300);
+      const releasedMs = Number((await holder.query(
+        "select (extract(epoch from clock_timestamp()) * 1000)::float8 as ms",
+      )).rows[0].ms);
+      await holder.query("commit");
+      const result = await waiting;
+      assert.equal(result.status, "ok", "the post-lock clock is in the next minute");
+      if (result.status === "ok") {
+        assert.ok(Date.parse(result.at) >= Math.floor(releasedMs), "time read after the lock");
+      }
+    } finally {
+      await holder.end().catch(() => {});
+    }
+    const boundaryState = await state(boundary.credential.id);
+    assert.equal(boundaryState.minuteCount, 1, "a new minute window");
+    assert.equal(boundaryState.dayCount, 2);
+
+    // Revoked while the charge waited: 401-class reject, counters unchanged.
+    const revokedRace = await make({});
+    const revokeHolder = await lockRow(revokedRace.credential.id);
+    try {
+      const waiting = chargeCredentialRequest(fresh(), revokedRace.credential.id);
+      assert.equal(await settled(waiting), false);
+      await revokeHolder.query("update agent_credentials set revoked_at = now() where id = $1", [revokedRace.credential.id]);
+      await revokeHolder.query("commit");
+      assert.equal((await waiting).status, "reject");
+    } finally {
+      await revokeHolder.end().catch(() => {});
+    }
+    assert.equal((await state(revokedRace.credential.id)).dayCount, 0);
+
+    // Expired while the charge waited, judged by the database clock after the lock.
+    const expiryRace = await make({});
+    const expiryHolder = await lockRow(expiryRace.credential.id);
+    try {
+      const waiting = chargeCredentialRequest(fresh(), expiryRace.credential.id);
+      assert.equal(await settled(waiting), false);
+      await expiryHolder.query(
+        "update agent_credentials set expires_at = clock_timestamp() + interval '100 milliseconds' where id = $1",
+        [expiryRace.credential.id],
+      );
+      await pause(300);
+      await expiryHolder.query("commit");
+      assert.equal((await waiting).status, "reject");
+    } finally {
+      await expiryHolder.end().catch(() => {});
+    }
+    assert.equal((await state(expiryRace.credential.id)).dayCount, 0);
+
+    // The real routes share one counter per credential: REST, then watch.
+    const routeCred = await make({ perMinute: 1000, perDay: 1 }, ["fleet:read", "watch:read"]);
+    const { GET: getFleet } = await import("../src/app/api/fleet/route");
+    const { GET: getBeats } = await import("../src/app/api/watch/beats/route");
+    const bearer = { authorization: `Bearer ${routeCred.token}` };
+    assert.equal((await getFleet(new Request("http://localhost/api/fleet", { headers: bearer }))).status, 200);
+    const watchLimited = await getBeats(new Request("http://localhost/api/watch/beats", { headers: bearer }));
+    assert.equal(watchLimited.status, 429);
+    assert.ok(Number(watchLimited.headers.get("retry-after")) >= 1);
+    const watchBody = await watchLimited.json();
+    assert.equal(watchBody.code, "rate_limited");
+    assert.equal(watchBody.retryable, true);
+    assert.equal(watchBody.window, "day");
+    const restLimited = await getFleet(new Request("http://localhost/api/fleet", { headers: bearer }));
+    assert.equal(restLimited.status, 429);
+    assert.equal((await restLimited.json()).retry_after, Number(restLimited.headers.get("retry-after")));
+    assert.equal((await state(routeCred.credential.id)).dayCount, 1);
+
+    // MCP: an initialize is one request against the same row.
+    const mcpCred = await make({ perMinute: 1000, perDay: 1 });
+    const { POST: mcp } = await import("../src/app/api/[transport]/route");
+    const initialize = () =>
+      mcp(new Request("http://localhost/api/mcp", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${mcpCred.token}`,
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "pg-quota", version: "0" } },
+        }),
+      }));
+    assert.equal((await initialize()).status, 200);
+    const mcpLimited = await initialize();
+    assert.equal(mcpLimited.status, 429);
+    assert.equal((await mcpLimited.json()).code, "rate_limited");
+    assert.equal((await state(mcpCred.credential.id)).dayCount, 1);
+  } finally {
+    Date.now = realDateNow;
+    setCredentialClockForTests(null);
+    for (const id of ids) await sql()`delete from agent_credentials where id = ${id}`;
     if (savedPassword === undefined) delete process.env.MC_DASHBOARD_PASSWORD;
     else process.env.MC_DASHBOARD_PASSWORD = savedPassword;
     if (savedToken === undefined) delete process.env.MC_TOKEN;

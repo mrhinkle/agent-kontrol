@@ -1,6 +1,7 @@
 import { authCookieValue, secretsMatch } from "./authcrypto";
 import { errorBody } from "@/lib/api-error";
 import { resolveAgentCredential } from "./credentials";
+import { chargeCredentialRequest, rateLimitedBody } from "./credential-rate-limit";
 import {
   authorizeRoute,
   type Principal,
@@ -19,6 +20,10 @@ import {
  * A bearer that starts with `akc_` is always checked, including when
  * MC_TOKEN is unset. Revoked, expired, unknown, and unreadable credentials
  * are rejected. A scope the credential does not have is 403.
+ * An allowed agent credential request is then charged to that credential's
+ * request quota (see credential-rate-limit.ts). Over a limit is 429
+ * `rate_limited` with Retry-After. A quota store error is 503.
+ * MC_TOKEN, the session cookie, and dev-open callers are not metered.
  *
  * If MC_TOKEN is unset and the request is not an agent credential:
  *   - in development or test: ingest-style checks allow the request.
@@ -26,22 +31,26 @@ import {
  *
  * Data routes (`enforceApi`) also accept the dashboard session cookie.
  * When the dashboard password is unset they stay open for ordinary
- * callers, and they still enforce an `akc_` bearer.
+ * callers, and they still enforce an `akc_` bearer. An `akc_` bearer wins
+ * over the cookie, so adding a session cookie cannot skip the quota.
  */
 
 export type Access =
   | { ok: true; principal: Principal }
   | { ok: false; status: 401; body: ReturnType<typeof errorBody> }
   | { ok: false; status: 403; body: ScopeErrorBody }
+  | { ok: false; status: 429; body: ReturnType<typeof rateLimitedBody>; retryAfter: number }
   | { ok: false; status: 503; body: { error: "credential_store_unavailable" } };
 
 const STORE_UNAVAILABLE: Access = { ok: false, status: 503, body: { error: "credential_store_unavailable" } };
 const UNAUTHORIZED: Access = { ok: false, status: 401, body: errorBody("unauthorized") };
 
 export function deny(access: Exclude<Access, { ok: true }>): Response {
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (access.status === 429) headers["Retry-After"] = String(access.retryAfter);
   return new Response(JSON.stringify(access.body), {
     status: access.status,
-    headers: { "content-type": "application/json" },
+    headers,
   });
 }
 
@@ -108,6 +117,12 @@ async function decideBearer(
     }
     const decision = authorizeRoute(principal, req.method, pathname);
     if (!decision.ok) return decision;
+    const charged = await chargeCredentialRequest(req, principal.id);
+    if (charged.status === "unavailable") return STORE_UNAVAILABLE;
+    if (charged.status === "reject") return UNAUTHORIZED;
+    if (charged.status === "limited") {
+      return { ok: false, status: 429, body: rateLimitedBody(charged), retryAfter: charged.retryAfterSec };
+    }
     return { ok: true, principal };
   }
 
@@ -158,6 +173,7 @@ export async function resolveBearerAccess(
 export async function resolveApiAccess(req: Request): Promise<Access> {
   const password = process.env.MC_DASHBOARD_PASSWORD;
   if (password) {
+    if (bearerFrom(req)?.startsWith("akc_")) return decideBearer(req, "strict", false);
     const cookie = readCookie(req, "mc_auth");
     if (cookie && (await secretsMatch(cookie, await authCookieValue(password)))) {
       return { ok: true, principal: { kind: "session" } };
