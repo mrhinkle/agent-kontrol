@@ -53,7 +53,9 @@ create table if not exists messages (
   id bigint generated always as identity primary key,
   agent_id text not null,                 -- conversation peer (the agent)
   body text not null,
-  created_by text default 'dashboard',
+  created_by text default 'dashboard',    -- free-text label from the caller; not the authenticated actor
+  actor_type text,                        -- human | agent; null on rows written before this column
+  actor_id text,                          -- credential id, mc-token, oauth client id, or operator
   created_at timestamptz default now(),
   delivered_at timestamptz,               -- when the agent fetched an inbound message
   acked_at timestamptz,                   -- when the agent consumed it (history kept)
@@ -67,6 +69,8 @@ alter table messages add column if not exists direction text not null default 'i
 alter table messages add column if not exists in_reply_to bigint;
 alter table messages add column if not exists thread_id text;
 alter table messages add column if not exists read_by_dashboard_at timestamptz;
+alter table messages add column if not exists actor_type text;
+alter table messages add column if not exists actor_id text;
 update messages set thread_id = id::text where thread_id is null;
 
 create index if not exists messages_pending_idx on messages (agent_id, acked_at, created_at);
@@ -98,14 +102,26 @@ create table if not exists tasks (
   session_id text,                        -- platform session id of the run, if known
   result text,                            -- final summary (and review verdict)
   cost_usd numeric,                       -- from claude -p json / dispatcher estimate
-  created_by text default 'dashboard',
+  created_by text default 'dashboard',    -- free-text label from the caller; not the authenticated actor
+  actor_type text,                        -- human | agent; null on rows written before this column
+  actor_id text,                          -- credential id, mc-token, oauth client id, or operator
   created_at timestamptz default now(),
   claimed_at timestamptz,
   updated_at timestamptz default now(),
   completed_at timestamptz
 );
+alter table tasks add column if not exists actor_type text;
+alter table tasks add column if not exists actor_id text;
 create index if not exists tasks_queue_idx on tasks (status, platform, priority, created_at);
 create index if not exists tasks_updated_idx on tasks (updated_at desc);
+
+-- One open scheduler task per skill. The skill tick checks for an open task and
+-- then inserts; this index is what makes that atomic when two ticks race.
+create unique index if not exists tasks_skill_schedule_one_open_idx
+  on tasks (title)
+  where actor_id = 'skill-scheduler'
+    and title like 'Run scheduled skill %'
+    and status in ('queued', 'claimed', 'running', 'review');
 
 -- OAuth 2.1 authorization server (self-hosted, for MCP clients).
 -- Access tokens are stateless signed JWTs; only clients + auth codes are stored.
@@ -165,7 +181,7 @@ create table if not exists repo_snapshots (
   review_rounds numeric,
   no_verdict_rate numeric,
 
-  detail jsonb,                           -- lane_mix, stalled_prs, collector notes
+  detail jsonb,                           -- lane_mix, stalled_prs, notes; brief keys stuck_prs, median_lead_hours, stale_issues, drafts, merged are optional
   created_at timestamptz default now()
 );
 -- One row per repo per tick. Re-running the collector for the same instant
@@ -269,9 +285,10 @@ on conflict (version, model) do update set
   cache_read_per_mtok = excluded.cache_read_per_mtok,
   notes = excluded.notes;
 
--- Settings: the repos the progress board watches. Edited from the Settings page;
--- with no rows the app falls back to progress.config.json. Uniqueness of the short
--- name is enforced by validation, not an index, so rows can be reordered freely.
+-- Settings: the repos the progress board watches. Edited from the Settings page.
+-- With no rows and no watched owners, the app falls back to progress.config.json.
+-- Short names are unique. The constraint is deferrable so one statement can swap
+-- two shorts without a false conflict. Discovery also serializes allocation.
 create table if not exists watched_repos (
   repo text primary key,                  -- owner/name
   label text not null,
@@ -282,6 +299,66 @@ create table if not exists watched_repos (
   created_at timestamptz default now(),
   updated_at timestamptz default now()
 );
+
+-- Owner discovery (#66). watched_owners names the GitHub logins to list.
+-- watched_repos stays the override layer: origin manual|auto, pin, hide.
+-- Hide wins over pin. gone means the repo left the last successful gh list
+-- and is not shown, including when pinned. A failed or empty gh list must
+-- not delete or hide rows; it records last_error on the owner instead.
+create table if not exists watched_owners (
+  owner text primary key,
+  activity_days integer not null default 30,
+  include_forks boolean not null default false,
+  include_archived boolean not null default false,
+  last_error text,
+  last_error_at timestamptz,
+  last_discovered_at timestamptz,
+  actor_type text,                        -- human | agent; null for dev-open
+  actor_id text,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
+alter table watched_repos add column if not exists origin text not null default 'manual';
+alter table watched_repos add column if not exists pinned boolean not null default false;
+alter table watched_repos add column if not exists hidden boolean not null default false;
+alter table watched_repos add column if not exists gone boolean not null default false;
+alter table watched_repos add column if not exists is_fork boolean not null default false;
+alter table watched_repos add column if not exists is_archived boolean not null default false;
+alter table watched_repos add column if not exists last_activity_at timestamptz;
+-- null: discovery owns label, short, color, and blocked_label.
+-- true: a hand-added save overrode those fields. false: a later save cleared them.
+-- No default, so an existing row stays null until a hand-added save touches it.
+alter table watched_repos add column if not exists fields_overridden boolean;
+
+-- Deferrable so replaceWatchedRepos can swap two short names in one statement.
+-- Checked at the end of that statement (initially immediate). Discovery retries
+-- a 23505 once, then the route answers 409.
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'watched_repos_short_key'
+      and conrelid = 'watched_repos'::regclass
+  ) and exists (
+    select 1 from watched_repos group by short having count(*) > 1
+  ) then
+    -- Never fail the build on legacy data: every deploy applies this file. Skip the
+    -- constraint and say why; discovery's advisory lock still serializes allocation.
+    raise warning 'watched_repos has duplicate short names; watched_repos_short_key not added. Rename the duplicates, then redeploy.';
+  elsif not exists (
+    select 1
+    from pg_constraint
+    where conname = 'watched_repos_short_key'
+      and conrelid = 'watched_repos'::regclass
+  ) then
+    alter table watched_repos
+      add constraint watched_repos_short_key
+      unique (short)
+      deferrable initially immediate;
+  end if;
+end $$;
 
 -- Traces: OpenTelemetry-style spans from agents. A trace is the tree of spans that
 -- share a trace_id (a session, its turns, the tool and model calls inside them).
@@ -319,3 +396,232 @@ alter table memory add column if not exists facts_at timestamptz;
 create index if not exists memory_auto_idx on memory (updated_at) where source = 'automatic-session';
 create index if not exists events_session_idx on events (session_id, created_at);
 create index if not exists spans_session_kind_idx on spans (session_id, kind);
+
+-- Per-agent credentials. The token is shown once at creation and is not stored.
+-- token_prefix is the first 8 characters, for the settings list.
+-- token_hash is the SHA-256 hex of the full token.
+-- scopes is the allow-list enforced on MCP tools and agent REST routes.
+-- Timestamps record creation, optional expiry, revocation, and last successful use.
+-- Prompts and tool input/output are not stored in this table.
+create table if not exists agent_credentials (
+  id text primary key,
+  label text not null,
+  token_prefix text not null,
+  token_hash text not null,
+  scopes text[] not null,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz,
+  revoked_at timestamptz,
+  last_used_at timestamptz
+);
+alter table agent_credentials add column if not exists label text;
+alter table agent_credentials add column if not exists token_prefix text;
+alter table agent_credentials add column if not exists token_hash text;
+alter table agent_credentials add column if not exists scopes text[];
+alter table agent_credentials add column if not exists created_at timestamptz not null default now();
+alter table agent_credentials add column if not exists expires_at timestamptz;
+alter table agent_credentials add column if not exists revoked_at timestamptz;
+alter table agent_credentials add column if not exists last_used_at timestamptz;
+create unique index if not exists agent_credentials_token_hash_idx on agent_credentials (token_hash);
+
+-- Decisions queue (see supabase/migrations/20261025_decisions.sql and docs/VELOCITY.md).
+-- kind, labels, opened_at, repo_short and github_present are nullable additions
+-- so a database that already created the table still upgrades. The brief's
+-- decisions list is computed from these columns; it does not call GitHub again.
+create table if not exists decisions (
+  id bigint generated always as identity primary key,
+  key text not null unique,
+  source text not null,
+  repo text,
+  number int,
+  url text,
+  title text not null,
+  why text,
+  options jsonb,
+  recommended text,
+  requested_by text,
+  status text not null default 'open',
+  decision text,
+  decided_by text,
+  decided_at timestamptz,
+  defer_until timestamptz,
+  kind text,
+  labels jsonb,
+  opened_at timestamptz,
+  repo_short text,
+  github_present boolean,
+  actor_type text,
+  actor_id text,
+  chosen_option text,
+  writeback text,
+  writeback_lock text,
+  writeback_lock_at timestamptz,
+  revision integer not null default 0,
+  first_seen_at timestamptz not null default now(),
+  last_seen_at timestamptz not null default now(),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+alter table decisions add column if not exists kind text;
+alter table decisions add column if not exists labels jsonb;
+alter table decisions add column if not exists opened_at timestamptz;
+alter table decisions add column if not exists repo_short text;
+alter table decisions add column if not exists github_present boolean;
+alter table decisions add column if not exists actor_type text;
+alter table decisions add column if not exists actor_id text;
+alter table decisions add column if not exists chosen_option text;
+alter table decisions add column if not exists writeback text;
+alter table decisions add column if not exists writeback_lock text;
+alter table decisions add column if not exists writeback_lock_at timestamptz;
+alter table decisions add column if not exists revision integer not null default 0;
+create index if not exists decisions_status_first_seen_idx on decisions (status, first_seen_at);
+create index if not exists decisions_repo_number_idx on decisions (repo, number);
+
+-- Threshold-alert dedupe (see supabase/migrations/20261028_brief_alerts.sql).
+-- One row per alert key. Coordinator silence re-claims while last_sent_at is
+-- older than the repeat interval, and only when cleared_at is null or older
+-- than the claim's compute instant. A zero-merge row re-arms only after
+-- cleared_at is set, and only when that clear is older than the claim.
+-- A decision row is inserted once, and only while the decision is still open
+-- and old enough. A clear cannot overwrite a newer last_sent_at.
+-- cleared_at is nullable: null means the alert is still latched.
+-- claim_token is the attempt that owns a claim. A failed message insert
+-- restores the previous row only while this token still matches and
+-- cleared_at is still the null the claim wrote.
+create table if not exists brief_alerts (
+  key text primary key,
+  first_sent_at timestamptz not null,
+  last_sent_at timestamptz not null,
+  cleared_at timestamptz,
+  claim_token text
+);
+alter table brief_alerts add column if not exists cleared_at timestamptz;
+alter table brief_alerts add column if not exists claim_token text;
+
+-- Client idempotency keys for create_task, operator messages, and replies.
+-- scope is actor_type:actor_id:route, so two callers can reuse one key string.
+-- response is null until the write stores a result. The resource insert
+-- and that response commit in one statement, and the insert runs only
+-- while claim_token still matches. started_at begins a 30 second lease on
+-- an empty claim. claim_token is the attempt that owns the lease, including
+-- when the claim insert commits and the connection drops before RETURNING
+-- arrives. A key is unused after expires_at (24 hours from the claim).
+-- Changelog: supabase/migrations/20261025_idempotency.sql
+-- and supabase/migrations/20261026_idempotency_lease.sql.
+create table if not exists idempotency_keys (
+  scope text not null,
+  idempotency_key text not null,
+  request_hash text not null,
+  response jsonb,
+  expires_at timestamptz not null,
+  created_at timestamptz not null default now(),
+  started_at timestamptz,
+  claim_token text,
+  primary key (scope, idempotency_key)
+);
+alter table idempotency_keys add column if not exists started_at timestamptz;
+alter table idempotency_keys add column if not exists claim_token text;
+
+-- Skills mirror (see supabase/migrations/20261027_skills.sql and docs/MCP.md).
+-- Agent Kontrol copies SKILL.md files from the seeded git sources. It does not
+-- execute them. skill_runs stores a start and an end, plus an optional note of
+-- at most 500 characters. It does not store prompts or tool input or output.
+-- A second sync cannot insert another status='running' row: the partial unique
+-- index is the lease. A row left running is expired by the next sync after
+-- 10 minutes, which is what keeps a crashed sync from wedging the mirror.
+create table if not exists skill_sources (
+  id text primary key,
+  repo text not null,
+  ref text,
+  path_globs jsonb not null,
+  label text not null,
+  enabled boolean not null default true,
+  position integer not null
+);
+
+insert into skill_sources (id, repo, ref, path_globs, label, enabled, position)
+values
+  ('master-skills', 'mrhinkle/master-skills', null, '["skills/*"]'::jsonb, 'master-skills', true, 0),
+  ('the-gibson', 'The-AIE/the-gibson', null, '["skills/*", ".agents/skills/*"]'::jsonb, 'the-gibson', true, 1)
+on conflict (id) do nothing;
+
+create table if not exists skills (
+  id text primary key,
+  source_id text not null references skill_sources (id),
+  path text not null,
+  name text not null,
+  description text not null default '',
+  version text,
+  sha text not null,
+  commit_sha text,
+  body text not null,
+  "references" jsonb not null default '[]'::jsonb,
+  runtimes jsonb not null,
+  frontmatter jsonb not null default '{}'::jsonb,
+  category text,
+  tags jsonb not null default '[]'::jsonb,
+  removed_at timestamptz,
+  synced_at timestamptz not null default now()
+);
+alter table skills add column if not exists category text;
+alter table skills add column if not exists tags jsonb not null default '[]'::jsonb;
+
+create table if not exists skill_settings (
+  skill_id text primary key references skills (id),
+  trigger text not null default 'off' check (trigger in ('off', 'on_request', 'auto_inject', 'scheduled')),
+  scope jsonb not null default '{"mode":"all","lanes":[]}'::jsonb,
+  schedule text,
+  updated_by text,
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists skill_runs (
+  run_id uuid primary key,
+  skill_id text not null,
+  skill_sha text not null,
+  agent_id text not null,
+  lane text,
+  runtime text not null,
+  started_at timestamptz not null default now(),
+  ended_at timestamptz,
+  status text not null default 'running' check (status in ('running', 'done', 'failed')),
+  note text check (note is null or char_length(note) <= 500),
+  actor_type text,
+  actor_id text
+);
+create index if not exists skill_runs_skill_started_idx on skill_runs (skill_id, started_at desc);
+create index if not exists skill_runs_started_idx on skill_runs (started_at desc);
+
+create table if not exists skill_sync_runs (
+  id uuid primary key,
+  started_at timestamptz not null default now(),
+  finished_at timestamptz,
+  trigger text not null check (trigger in ('manual', 'scheduled')),
+  status text not null,
+  summary jsonb,
+  error text
+);
+create unique index if not exists skill_sync_one_running_idx
+  on skill_sync_runs (status)
+  where status = 'running';
+
+create table if not exists skill_drift (
+  host text not null,
+  dir text not null,
+  reported_at timestamptz not null default now(),
+  entries jsonb not null,
+  primary key (host, dir)
+);
+
+-- Host liveness beats (see supabase/migrations/20261027_watch_beats.sql).
+-- One row per source. received_at is the database clock at the last successful
+-- write; beat_at is the sender's instant and does not decide acceptance,
+-- overwrite order, or liveness age. detail is at most 500 Unicode code points
+-- (char_length). The dated migration is a changelog; apply-schema runs this file.
+create table if not exists watch_beats (
+  source text primary key check (char_length(source) > 0),
+  status text not null check (status in ('ok', 'held', 'paused', 'stale', 'failing', 'unknown')),
+  detail text not null check (char_length(detail) <= 500),
+  beat_at timestamptz not null,
+  received_at timestamptz not null default now()
+);

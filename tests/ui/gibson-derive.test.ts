@@ -29,6 +29,7 @@ function task(id: number, project: string | null, status: Task["status"], extra:
   return {
     id, title: `task ${id}`, description: null, project, platform: "codex", machine: null, priority: 2, status,
     reviewer_platform: null, assigned_agent: null, session_id: null, result: null, cost_usd: null, created_by: "test",
+    actor_type: null, actor_id: null,
     created_at: ago(120), claimed_at: null, updated_at: ago(10), completed_at: status === "done" ? ago(10) : null, ...extra,
   };
 }

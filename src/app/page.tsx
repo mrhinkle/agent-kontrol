@@ -4,7 +4,9 @@ import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useFleet } from "@/components/use-fleet";
 import { ConversationDrawer } from "@/components/ConversationDrawer";
-import { DemoBanner, PlatformBadge, STATUS_STYLES, StatusChip, TimeAgo } from "@/components/ui";
+import { PlatformBadge, STATUS_STYLES, StatusChip, TimeAgo } from "@/components/ui";
+import { PanelHeader } from "@/components/PanelHeader";
+import { sortAgentsByUrgency } from "@/lib/attention";
 import { buildFeed } from "@/lib/feed";
 import { sessionTitle } from "@/lib/history";
 import type { AgentStatus, Event, FleetAgent } from "@/lib/types";
@@ -44,8 +46,15 @@ function AgentCard({ agent, events }: { agent: FleetAgent; events: Event[] }) {
   // With no open session, say how the last one ended (why a FAILED agent failed).
   const last = s ? null : agent.recent_sessions[0] ?? null;
   const lastHeadline = last ? sessionTitle(last, agent.platform, events) : null;
+  // The card edge carries the status too, so a NEEDS YOU or FAILED card reads from across the room.
+  const edge =
+    agent.derived_status === "waiting"
+      ? "border-[#ffb020]/40 hover:border-[#ffb020]/70"
+      : agent.derived_status === "failed"
+        ? "border-[#ff3b5c]/40 hover:border-[#ff3b5c]/70"
+        : "border-white/10 hover:border-white/20";
   return (
-    <div className="flex flex-col gap-3 rounded-xl border border-white/10 bg-[#101828] p-4 transition-colors hover:border-white/20">
+    <div className={`flex flex-col gap-3 rounded-xl border bg-[#101828] p-4 transition-colors ${edge}`}>
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
           {/* Full name, wrapped — never truncated. */}
@@ -153,9 +162,11 @@ export default function FleetPage() {
   const { data, error } = useFleet();
   const [showBackground, setShowBackground] = useState(false);
 
-  // Keep the server's order (most recently seen first). Re-sorting by status would
-  // move cards under the cursor while someone is typing in a conversation.
-  const agents = data?.agents ?? [];
+  // Urgent first: failed, needs you, active, done, offline. Within a tier the
+  // server's order (most recently seen first) holds. A card moves when its
+  // status changes or when the server reorders a tier, which it does only when
+  // last-seen order changes; neither happens on an ordinary poll.
+  const agents = useMemo(() => sortAgentsByUrgency(data?.agents ?? []), [data]);
   const feed = useMemo(() => buildFeed(data?.events ?? [], { showBackground, limit: FEED_LIMIT }), [data, showBackground]);
 
   if (error && !data) return <div className="text-sm text-red-400">Failed to load fleet: {error}</div>;
@@ -169,8 +180,6 @@ export default function FleetPage() {
 
   return (
     <div>
-      {data.demo && <DemoBanner />}
-
       <div className="mb-5 flex flex-wrap items-center gap-x-6 gap-y-1">
         <h1 className="text-lg font-semibold">Fleet</h1>
         <div className="text-sm text-gray-500">
@@ -198,13 +207,12 @@ export default function FleetPage() {
         )}
       </div>
 
-      <div className="mb-2 mt-10 flex flex-wrap items-center gap-3">
-        <h2 className="text-sm font-semibold uppercase tracking-wider text-gray-400">Live activity</h2>
+      <PanelHeader title="Live activity" count={feed.items.length} href="/history" hrefLabel="Full history" className="mt-10">
         <label className="flex cursor-pointer items-center gap-1.5 text-xs text-gray-500">
           <input type="checkbox" checked={showBackground} onChange={(e) => setShowBackground(e.target.checked)} className="accent-[#2ee6a6]" />
           Show heartbeats &amp; telemetry{!showBackground && feed.hidden > 0 ? ` (${feed.hidden} hidden)` : ""}
         </label>
-      </div>
+      </PanelHeader>
       <div className="rounded-xl border border-white/10 bg-[#101828] px-4 py-2">
         {feed.items.map((it) => (
           <EventRow key={it.event.id} e={it.event} count={it.count} agent={byId.get(it.event.agent_id)} />

@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { enforceApi } from "@/lib/auth";
+import { publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { fleet } from "@/lib/store";
 import { demoFleet } from "@/lib/demo-data";
@@ -8,7 +10,9 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 30;
 
 /** GET /api/fleet — everything the dashboard needs in one call. */
-export async function GET() {
+export async function GET(req: Request) {
+  const denied = await enforceApi(req);
+  if (denied) return denied;
   if (!isConfigured()) {
     return NextResponse.json(demoFleet());
   }
@@ -22,6 +26,6 @@ export async function GET() {
     };
     return NextResponse.json(res);
   } catch (e) {
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    return publicError("[fleet]", e);
   }
 }

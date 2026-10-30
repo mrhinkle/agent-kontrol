@@ -46,6 +46,9 @@ export interface Message {
   agent_id: string;
   body: string;
   created_by: string | null;
+  /** Set by the server from the authenticated credential. Null on older rows. */
+  actor_type: "human" | "agent" | null;
+  actor_id: string | null;
   created_at: string;
   delivered_at: string | null;
   acked_at: string | null;
@@ -55,14 +58,17 @@ export interface Message {
   read_by_dashboard_at: string | null;
 }
 
-export type TaskStatus =
-  | "queued"
-  | "claimed"
-  | "running"
-  | "review"
-  | "done"
-  | "failed"
-  | "cancelled";
+export const TASK_STATUSES = [
+  "queued",
+  "claimed",
+  "running",
+  "review",
+  "done",
+  "failed",
+  "cancelled",
+] as const;
+
+export type TaskStatus = (typeof TASK_STATUSES)[number];
 
 export interface Task {
   id: number;
@@ -79,6 +85,9 @@ export interface Task {
   result: string | null;
   cost_usd: number | null;
   created_by: string | null;
+  /** Set by the server from the authenticated credential. Null on older rows. */
+  actor_type: "human" | "agent" | null;
+  actor_id: string | null;
   created_at: string;
   claimed_at: string | null;
   updated_at: string;

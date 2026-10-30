@@ -22,7 +22,7 @@ opinions on another agent's plan, fast large-context summarization.
 Add Agent Kontrol to `~/.grok/config.toml` as an MCP server:
 
 ```toml
-[mcp_servers.mission-control]
+[mcp_servers.agent-kontrol]
 url = "https://YOUR-DEPLOY.vercel.app/api/mcp"
 headers = { Authorization = "Bearer YOUR_MC_TOKEN" }
 ```

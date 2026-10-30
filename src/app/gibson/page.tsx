@@ -2,7 +2,6 @@
 
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { DemoBanner } from "@/components/ui";
 import { useGibson } from "@/components/use-gibson";
 import {
   AgentPanel,
@@ -192,11 +191,6 @@ export default function GibsonPage() {
           {model && <StatusBanner banner={model.banner} onItem={onBannerItem} />}
         </div>
       </div>
-      {model?.demo && (
-        <div className="px-4 pt-2">
-          <DemoBanner />
-        </div>
-      )}
 
       <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[16.5rem_minmax(0,1fr)_21rem]">
         <aside className="hidden min-h-0 border-r border-white/10 bg-[#080d19] lg:flex lg:flex-col">

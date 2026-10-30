@@ -1,15 +1,23 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { DryRunResult } from "@/lib/dry-run";
 import { MAX_REPOS, validateRepoList, type RepoError, type RepoInput } from "@/lib/repo-validation";
-import { fromRepos, groupErrors, isDirty, moveRow, newRow, toPayload, type Row } from "@/lib/repo-settings-helpers";
+import { fromRepos, groupErrors, isDirty, moveRow, newRow, preserveDirtyRows, splitWatchedRepos, toPayload, type Row } from "@/lib/repo-settings-helpers";
+import { PreviewDialog } from "@/components/PreviewDialog";
+
+interface ListedRepo extends RepoInput {
+  gone?: boolean;
+  shown?: boolean;
+  fieldsOverridden?: boolean | null;
+}
 
 interface Loaded {
   source: "database" | "file";
   writable: boolean;
   max: number;
   version?: string;
-  repos: RepoInput[];
+  repos: ListedRepo[];
 }
 
 const input =
@@ -25,16 +33,20 @@ export function RepoSettings() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [initial, setInitial] = useState<RepoInput[]>([]);
   const [rows, setRows] = useState<Row[]>([]);
+  const [autoRepos, setAutoRepos] = useState<ListedRepo[]>([]);
   const [attempted, setAttempted] = useState(false);
   const [serverErrors, setServerErrors] = useState<RepoError[]>([]);
   const [saving, setSaving] = useState(false);
   const [stale, setStale] = useState(false);
   const [message, setMessage] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+  const [preview, setPreview] = useState<DryRunResult | null>(null);
 
   const apply = useCallback((data: Loaded) => {
+    const split = splitWatchedRepos(data.repos);
     setLoaded(data);
-    setInitial(data.repos);
-    setRows(fromRepos(data.repos));
+    setAutoRepos(split.discovered);
+    setInitial(split.editable);
+    setRows(fromRepos(split.editable));
     setAttempted(false);
     setServerErrors([]);
     setStale(false);
@@ -55,6 +67,8 @@ export function RepoSettings() {
     void load();
   }, [load]);
 
+  const draftRef = useRef<Row[]>(rows);
+  draftRef.current = rows;
   const dirty = useMemo(() => isDirty(initial, rows), [initial, rows]);
 
   useEffect(() => {
@@ -84,7 +98,11 @@ export function RepoSettings() {
     return () => document.removeEventListener("click", guard, true);
   }, [dirty]);
 
-  const clientCheck = useMemo(() => validateRepoList(toPayload(rows)), [rows]);
+  const hasAuto = loaded?.repos.some((repo) => repo.origin === "auto") ?? false;
+  const clientCheck = useMemo(() => {
+    if (rows.length === 0 && hasAuto) return { ok: true as const, errors: [] as RepoError[] };
+    return validateRepoList(toPayload(rows));
+  }, [rows, hasAuto]);
   const errors = attempted ? (clientCheck.ok ? serverErrors : clientCheck.errors) : serverErrors;
   const grouped = useMemo(() => groupErrors(errors), [errors]);
   const writable = loaded?.writable ?? false;
@@ -102,32 +120,105 @@ export function RepoSettings() {
     setMessage(null);
   }
 
+  type SaveBody = Partial<Loaded> & { errors?: RepoError[]; error?: string; dry_run?: boolean };
+
+  function explainSave(res: Response, body: SaveBody) {
+    if (res.status === 400 && body.errors) {
+      setServerErrors(body.errors);
+    } else if (res.status === 409 && (body as { code?: string }).code === "stale") {
+      setMessage({ kind: "error", text: body.error ?? "The list changed elsewhere. Reload and try again." });
+      setStale(true);
+    } else {
+      setMessage({ kind: "error", text: body.error ?? `Save failed (${res.status}).` });
+    }
+  }
+
+  async function putList(dryRun: boolean) {
+    const res = await fetch("/api/settings/repos", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        repos: toPayload(rows),
+        version: loaded?.version,
+        ...(dryRun ? { dry_run: true } : {}),
+      }),
+    });
+    const body = (await res.json().catch(() => ({}))) as SaveBody;
+    return { res, body };
+  }
+
   async function save() {
     setAttempted(true);
     setMessage(null);
-    if (!validateRepoList(toPayload(rows)).ok) {
+    const payload = toPayload(rows);
+    const allowEmpty = rows.length === 0 && hasAuto;
+    if (!allowEmpty && !validateRepoList(payload).ok) {
       requestAnimationFrame(() => document.querySelector<HTMLElement>("[data-repo-settings] [aria-invalid='true']")?.focus());
       return;
     }
     setSaving(true);
     try {
-      const res = await fetch("/api/settings/repos", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repos: toPayload(rows), version: loaded?.version }),
-      });
-      const body = (await res.json().catch(() => ({}))) as Partial<Loaded> & { errors?: RepoError[]; error?: string };
+      const { res, body } = await putList(true);
+      if (res.ok && body.dry_run === true) {
+        setPreview(body as DryRunResult);
+        return;
+      }
+      explainSave(res, body);
+    } catch (e) {
+      setMessage({ kind: "error", text: (e as Error).message });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function confirmSave() {
+    setSaving(true);
+    setMessage(null);
+    try {
+      const { res, body } = await putList(false);
       if (res.ok) {
+        setPreview(null);
         apply(body as Loaded);
         setMessage({ kind: "ok", text: "Saved. The collector picks this up within 15 minutes." });
-      } else if (res.status === 400 && body.errors) {
-        setServerErrors(body.errors);
-      } else if (res.status === 409 && (body as { code?: string }).code === "stale") {
-        setMessage({ kind: "error", text: body.error ?? "The list changed elsewhere. Reload and try again." });
-        setStale(true);
       } else {
-        setMessage({ kind: "error", text: body.error ?? `Save failed (${res.status}).` });
+        setPreview(null);
+        explainSave(res, body);
       }
+    } catch (e) {
+      setMessage({ kind: "error", text: (e as Error).message });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function setOverride(repo: string, patch: { pinned?: boolean; hidden?: boolean }) {
+    setSaving(true);
+    setMessage(null);
+    try {
+      const res = await fetch("/api/settings/repos", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repo, ...patch }),
+      });
+      const body = (await res.json().catch(() => ({}))) as SaveBody;
+      if (res.ok && body.dry_run !== true) {
+        const data = body as Loaded;
+        const split = splitWatchedRepos(data.repos);
+        const dirtyNow = isDirty(initial, draftRef.current);
+        setLoaded(data);
+        setAutoRepos(split.discovered);
+        setInitial(split.editable);
+        setRows((current) => (
+          isDirty(initial, current) ? preserveDirtyRows(current, split.editable) : fromRepos(split.editable)
+        ));
+        if (!dirtyNow) {
+          setAttempted(false);
+          setServerErrors([]);
+          setStale(false);
+        }
+        return;
+      }
+      explainSave(res, body);
     } catch (e) {
       setMessage({ kind: "error", text: (e as Error).message });
     } finally {
@@ -157,6 +248,51 @@ export function RepoSettings() {
     <div className="space-y-4">
       <div className="rounded-lg border border-[#2563eb]/40 bg-[#2563eb]/10 px-3 py-2 text-sm text-blue-100">{banner}</div>
 
+      {autoRepos.length > 0 && (
+        <div className="rounded-xl border border-white/10 bg-[#101828] p-4 md:p-6">
+          <h3 className="text-sm font-medium text-gray-200">Discovered</h3>
+          <p className="mt-1 text-xs text-gray-500">
+            These stay collected. Pin keeps a quiet repo on the brief. Hide wins over pin. A repo marked gone is not shown, including when it is pinned.
+          </p>
+          <ul className="mt-3 space-y-2">
+            {autoRepos.map((repo) => {
+              const pinned = repo.pinned === true;
+              const hidden = repo.hidden === true;
+              return (
+                <li key={repo.repo} className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 px-3 py-2 text-sm">
+                  <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-gray-300">auto</span>
+                  <span className="mono text-gray-100">{repo.repo}</span>
+                  <span className="text-gray-400">{repo.label}</span>
+                  {repo.gone && <span className="text-xs text-amber-300">gone</span>}
+                  {repo.shown === false && !repo.gone && <span className="text-xs text-gray-500">off the brief</span>}
+                  <label className="ml-auto flex items-center gap-1 text-xs text-gray-300">
+                    <input
+                      type="checkbox"
+                      checked={pinned}
+                      disabled={disabled}
+                      aria-label={`Pin ${repo.repo}`}
+                      onChange={(ev) => void setOverride(repo.repo, { pinned: ev.target.checked })}
+                    />
+                    Pin
+                  </label>
+                  <label className="flex items-center gap-1 text-xs text-gray-300">
+                    <input
+                      type="checkbox"
+                      checked={hidden}
+                      disabled={disabled}
+                      aria-label={`Hide ${repo.repo}`}
+                      onChange={(ev) => void setOverride(repo.repo, { hidden: ev.target.checked })}
+                    />
+                    Hide
+                  </label>
+                  {pinned && hidden && <span className="text-xs text-amber-300">Hide wins, so this repo stays off the brief.</span>}
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
+
       <div data-repo-settings className="rounded-xl border border-white/10 bg-[#101828] p-4 md:p-6">
         <div className={`hidden ${GRID} mb-2 text-[11px] uppercase tracking-wider text-gray-500`}>
           <span>Order</span>
@@ -185,6 +321,11 @@ export function RepoSettings() {
                 <label className="mb-2 block md:mb-0">
                   <span className="mb-1 block text-xs text-gray-400 md:sr-only">Repo (owner/name)</span>
                   <input className={input} value={r.repo} disabled={disabled} placeholder="acme/app" onChange={(ev) => edit(r.id, { repo: ev.target.value })} aria-label={`Repo for row ${i + 1}`} aria-invalid={!!e.repo} aria-describedby={e.repo ? `${r.id}-repo-err` : undefined} />
+                  {r.origin === "auto" && (
+                    <span className="mt-1 block text-xs text-gray-500">
+                      Discovered. Removing this row clears the label, short, color, and blocked-label override. Pin and hide remain.
+                    </span>
+                  )}
                   {e.repo && <span id={`${r.id}-repo-err`} className="mt-1 block text-xs text-red-400">{e.repo}</span>}
                 </label>
                 <label className="mb-2 block md:mb-0">
@@ -227,6 +368,30 @@ export function RepoSettings() {
                   {e.blockedLabel && <span id={`${r.id}-blocked-err`} className="mt-1 block text-xs text-red-400">{e.blockedLabel}</span>}
                 </label>
                 <div>
+                  {r.origin === "auto" && (
+                    <span className="mb-2 flex flex-wrap gap-2 text-xs text-gray-300 md:mb-1">
+                      <label className="flex items-center gap-1">
+                        <input
+                          type="checkbox"
+                          checked={r.pinned === true}
+                          disabled={disabled}
+                          aria-label={`Pin ${r.repo}`}
+                          onChange={(ev) => void setOverride(r.repo, { pinned: ev.target.checked })}
+                        />
+                        Pin
+                      </label>
+                      <label className="flex items-center gap-1">
+                        <input
+                          type="checkbox"
+                          checked={r.hidden === true}
+                          disabled={disabled}
+                          aria-label={`Hide ${r.repo}`}
+                          onChange={(ev) => void setOverride(r.repo, { hidden: ev.target.checked })}
+                        />
+                        Hide
+                      </label>
+                    </span>
+                  )}
                   <button
                     className={iconBtn}
                     disabled={disabled}
@@ -244,7 +409,11 @@ export function RepoSettings() {
           })}
         </ul>
 
-        {rows.length === 0 && <p className="text-sm text-gray-400">No repos yet. Add one to start.</p>}
+        {rows.length === 0 && (
+          <p className="text-sm text-gray-400">
+            {hasAuto ? "No hand-added repos. Discovered repos stay tracked." : "No repos yet. Add one to start."}
+          </p>
+        )}
 
         {attempted && errors.length > 0 && (
           <p role="alert" className="mt-3 text-sm text-red-400">
@@ -290,6 +459,16 @@ export function RepoSettings() {
           </p>
         )}
       </div>
+      {preview && (
+        <PreviewDialog
+          title="Replace watched repos"
+          preview={preview}
+          confirmLabel="Replace list"
+          busy={saving}
+          onConfirm={() => void confirmSave()}
+          onCancel={() => setPreview(null)}
+        />
+      )}
     </div>
   );
 }

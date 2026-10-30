@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
-import { isAuthorized } from "@/lib/auth";
+import { actorFromPrincipal } from "@/lib/actor";
+import { deny, resolveBearerAccess } from "@/lib/auth";
+import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
+import { readIdempotencyHeader } from "@/lib/idempotency";
 import { replyFromAgent } from "@/lib/store";
 import { isMessagesSetupError, MESSAGES_SETUP_MESSAGE } from "@/lib/message-errors";
 
@@ -12,11 +15,12 @@ export const maxDuration = 30;
  * Non-MCP agents (hooks, watchers, scripts) post replies here with Bearer MC_TOKEN.
  *
  * Body: { agent_id, body, in_reply_to?, created_by? }
+ * Optional header Idempotency-Key. Same key, actor, and route return the
+ * original reply for 24 hours. After that window the key starts a new write.
  */
 export async function POST(req: Request) {
-  if (!(await isAuthorized(req))) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
-  }
+  const access = await resolveBearerAccess(req);
+  if (!access.ok) return deny(access);
   if (!isConfigured()) {
     return NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; reply dropped" });
   }
@@ -29,10 +33,13 @@ export async function POST(req: Request) {
   try {
     body = await req.json();
   } catch {
-    return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
+    return apiError("invalid_json");
   }
   if (!body.agent_id || !body.body?.trim()) {
-    return NextResponse.json({ error: "agent_id and body are required" }, { status: 400 });
+    const fields: Record<string, string> = {};
+    if (!body.agent_id) fields.agent_id = "agent_id is required";
+    if (!body.body?.trim()) fields.body = "body is required";
+    return apiError("missing_field", { message: "agent_id and body are required", fields });
   }
   try {
     const msg = await replyFromAgent({
@@ -40,15 +47,18 @@ export async function POST(req: Request) {
       body: body.body.trim(),
       in_reply_to: body.in_reply_to,
       created_by: body.created_by,
+      actor: actorFromPrincipal(access.principal),
+      idempotency_key: readIdempotencyHeader(req),
     });
     return NextResponse.json({ ok: true, id: msg.id, message: msg });
   } catch (e) {
     if (isMessagesSetupError(e)) {
-      return NextResponse.json(
-        { setup_required: true, error: MESSAGES_SETUP_MESSAGE, message: MESSAGES_SETUP_MESSAGE },
-        { status: 503 }
-      );
+      return apiError("setup_required", {
+        message: MESSAGES_SETUP_MESSAGE,
+        fix: "Run supabase/migrations/20261005_messages_two_way.sql (or supabase/schema.sql), then retry.",
+        extra: { setup_required: true, message: MESSAGES_SETUP_MESSAGE },
+      });
     }
-    return NextResponse.json({ error: (e as Error).message }, { status: 500 });
+    return publicError("[messages] reply failed", e);
   }
 }

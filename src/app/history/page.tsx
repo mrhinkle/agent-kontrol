@@ -4,7 +4,7 @@ import { Suspense, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useFleet } from "@/components/use-fleet";
-import { DemoBanner, StatusChip, TimeAgo } from "@/components/ui";
+import { StatusChip, TimeAgo } from "@/components/ui";
 import { Pager } from "@/components/Pager";
 import { isBackground } from "@/lib/events";
 import { filterEvents, historySessions, paginate, sessionSpan, shortId, type HistorySession } from "@/lib/history";
@@ -40,7 +40,6 @@ function History() {
 
   return (
     <div>
-      {data.demo && <DemoBanner />}
       <div className="mb-5 flex flex-wrap items-center gap-3">
         <h1 className="text-lg font-semibold">History</h1>
         <label className="flex items-center gap-2 text-xs text-gray-500">

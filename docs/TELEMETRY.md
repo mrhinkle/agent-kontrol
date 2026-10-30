@@ -82,7 +82,7 @@ Spans older than `MC_TRACE_RETENTION_DAYS` (default 30) are deleted. Pruning run
 
 ## Reading traces from other tools
 
-- `GET /api/traces?agent=<id>&errors=1&before=<ISO>&limit=<1-100>` returns summaries.
+- `GET /api/traces?agent=<id>&errors=1&before=<ISO>&limit=<1-200>&cursor=&fields=` returns summaries. `limit` above 200 is 400. `next_cursor` is present only when `limit` or `cursor` was passed.
 - `GET /api/traces/<traceId>` returns the spans.
 
 Both accept the dashboard cookie or the bearer token. Forwarding traces on to Grafana, Honeycomb or another OpenTelemetry backend is not built yet; for now you can send the same spans to both places by configuring two exporters.

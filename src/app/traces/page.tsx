@@ -2,12 +2,11 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { DemoBanner, TimeAgo } from "@/components/ui";
+import { TimeAgo } from "@/components/ui";
 import { formatDuration, type TraceSummary } from "@/lib/traces";
 
 export default function TracesPage() {
   const [traces, setTraces] = useState<TraceSummary[] | null>(null);
-  const [demo, setDemo] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [errorsOnly, setErrorsOnly] = useState(false);
 
@@ -20,7 +19,6 @@ export default function TracesPage() {
         const body = await res.json();
         if (!live) return;
         setTraces(body.traces);
-        setDemo(Boolean(body.demo));
         setError(null);
       } catch (e) {
         if (live) setError((e as Error).message);
@@ -36,7 +34,6 @@ export default function TracesPage() {
 
   return (
     <div>
-      {demo && <DemoBanner />}
       <div className="mb-5 flex flex-wrap items-center gap-3">
         <h1 className="text-lg font-semibold">Traces</h1>
         <label className="flex items-center gap-2 text-xs text-gray-400">

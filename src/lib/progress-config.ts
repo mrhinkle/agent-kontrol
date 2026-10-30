@@ -144,7 +144,12 @@ export const THRESHOLDS = {
   reviewRounds: 3.0,
   /** share of review rounds that returned no parseable verdict */
   noVerdictRate: 0.15,
+  /** a skill run with no end is stalled after this many minutes, unless AK_SKILL_STALL_MINUTES overrides it */
+  skillStallMinutes: 60,
 } as const;
+
+/** Label patterns that mark an owner decision. A trailing `*` matches a prefix. */
+export const DECISION_LABEL_PATTERNS: readonly string[] = config.brief.decisionLabels;
 
 export const WINDOWS = ["24h", "7d", "30d", "90d"] as const;
 export type TimeWindow = (typeof WINDOWS)[number];
@@ -155,4 +160,120 @@ export function windowDays(w: TimeWindow): number {
 
 export function isWindow(v: string | null): v is TimeWindow {
   return !!v && (WINDOWS as readonly string[]).includes(v);
+}
+
+/** Thresholds for `GET /api/brief`. Defaults match `scripts/morning-brief.sh`. */
+export interface BriefSettings {
+  decisionLabels: string[];
+  stuckPrHours: number;
+  staleIssueDays: number;
+  coordinator: {
+    agentId: string | null;
+    maxSilenceHours: number;
+    /**
+     * Exact event kinds that count as work. `heartbeat`, `telemetry`,
+     * `turn_start`, `status_update`, and `error` are removed even when
+     * configured. `status_update` is not `status`. An `error` is a failure,
+     * not completed work.
+     */
+    workKinds: string[];
+  };
+  /**
+   * Between-brief pushes. `enabled` defaults off: VELOCITY keeps alerts
+   * quiet until the owner has cleared the decision backlog once.
+   */
+  alerts: BriefAlertSettings;
+}
+
+/** Thresholds for `GET /api/brief/alerts`. Missing keys keep these defaults. */
+export interface BriefAlertSettings {
+  /** False sends nothing. Only a boolean true turns delivery on. */
+  enabled: boolean;
+  /** Coordinator silence re-sends after this many hours while it still holds. */
+  coordinatorRepeatHours: number;
+  /** Quiet stretch that fires a zero-merge alert. */
+  zeroMergeHours: number;
+  /** The repo must have merged at least once inside this many days. */
+  zeroMergeLookbackDays: number;
+  /** An open decision older than this many days fires once. */
+  decisionAgeDays: number;
+}
+
+export const DEFAULT_BRIEF_ALERTS: BriefAlertSettings = {
+  enabled: false,
+  coordinatorRepeatHours: 12,
+  zeroMergeHours: 72,
+  zeroMergeLookbackDays: 7,
+  decisionAgeDays: 14,
+};
+
+const DEFAULT_WORK_KINDS = ["session_end", "milestone", "status"];
+
+/** Never coordinator work. A configured list cannot put these back. */
+const NEVER_WORK_KINDS = new Set(["heartbeat", "telemetry", "turn_start", "status_update", "error"]);
+
+export function filterWorkKinds(kinds: readonly string[]): string[] {
+  return kinds.filter((kind) => kind.length > 0 && !NEVER_WORK_KINDS.has(kind));
+}
+
+/** Filtered work kinds. An empty result, including an error-only list, is the default three. */
+export function resolveWorkKinds(kinds: readonly string[]): string[] {
+  const filtered = filterWorkKinds(kinds);
+  return filtered.length > 0 ? filtered : [...DEFAULT_WORK_KINDS];
+}
+
+function finiteNumber(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function positiveNumber(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+/** A missing block, or any `enabled` other than boolean true, stays off. */
+export function readBriefAlerts(raw: unknown): BriefAlertSettings {
+  const row = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  return {
+    enabled: row.enabled === true,
+    coordinatorRepeatHours: positiveNumber(row.coordinatorRepeatHours, DEFAULT_BRIEF_ALERTS.coordinatorRepeatHours),
+    zeroMergeHours: positiveNumber(row.zeroMergeHours, DEFAULT_BRIEF_ALERTS.zeroMergeHours),
+    zeroMergeLookbackDays: positiveNumber(row.zeroMergeLookbackDays, DEFAULT_BRIEF_ALERTS.zeroMergeLookbackDays),
+    decisionAgeDays: positiveNumber(row.decisionAgeDays, DEFAULT_BRIEF_ALERTS.decisionAgeDays),
+  };
+}
+
+/** Reads `brief` from the resolved progress config. A missing block keeps the script's defaults. */
+export function readBriefSettings(raw: unknown): BriefSettings {
+  const root = raw && typeof raw === "object" ? (raw as { brief?: unknown }).brief : undefined;
+  const brief = root && typeof root === "object" ? (root as Record<string, unknown>) : {};
+  const coord = brief.coordinator && typeof brief.coordinator === "object"
+    ? (brief.coordinator as Record<string, unknown>)
+    : {};
+  const labels = Array.isArray(brief.decisionLabels)
+    ? brief.decisionLabels.filter((item): item is string => typeof item === "string")
+    : [];
+  const agent = coord.agentId;
+  const agentId = typeof agent === "string" && agent.trim() ? agent.trim() : null;
+  let workKinds: string[] = DEFAULT_WORK_KINDS;
+  if (typeof coord.workKinds === "string") {
+    workKinds = coord.workKinds.split("|").map((kind) => kind.trim()).filter(Boolean);
+  } else if (Array.isArray(coord.workKinds)) {
+    workKinds = coord.workKinds.filter((kind): kind is string => typeof kind === "string" && kind.length > 0);
+  }
+  workKinds = resolveWorkKinds(workKinds);
+  return {
+    decisionLabels: labels,
+    stuckPrHours: finiteNumber(brief.stuckPrHours, 48),
+    staleIssueDays: finiteNumber(brief.staleIssueDays, 21),
+    coordinator: {
+      agentId,
+      maxSilenceHours: finiteNumber(coord.maxSilenceHours, 3),
+      workKinds,
+    },
+    alerts: readBriefAlerts(brief.alerts),
+  };
+}
+
+export function briefConfig(): BriefSettings {
+  return readBriefSettings(config);
 }

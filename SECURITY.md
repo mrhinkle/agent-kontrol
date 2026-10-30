@@ -10,13 +10,22 @@ Use GitHub's private vulnerability reporting on this repository (Security tab, "
 
 ## Security model
 
-Agent Kontrol is designed for one operator running one deployment. It is not multi-tenant. There are no per-user accounts or roles.
+Agent Kontrol is designed for one operator running one deployment. It is not multi-tenant. There are no per-user accounts. Agent credentials carry scopes; they are not user accounts.
 
 Credentials:
 
-- `MC_DASHBOARD_PASSWORD` — the single shared dashboard password. A successful login sets the session cookie `mc_auth` (30 days, httpOnly, sameSite lax, secure in production).
-- `MC_TOKEN` — shared secret for agents, sent as `Authorization: Bearer`.
-- OAuth 2.1 with PKCE for MCP hosts. Consent is gated by the dashboard password.
+- `MC_DASHBOARD_PASSWORD` — the single shared dashboard password. A successful login sets the session cookie `mc_auth` (30 days, httpOnly, sameSite lax, secure in production). The session is the only credential that can issue or revoke agent credentials.
+- `MC_TOKEN` — shared secret for agents, sent as `Authorization: Bearer`. It has every scope.
+- Agent credentials — one revocable `akc_…` token per agent, with scopes enforced on MCP tools and the agent REST routes. The token is shown once. The row stores a SHA-256 hash, not the token.
+- OAuth 2.1 with PKCE for MCP hosts. Consent is gated by the dashboard password. A verified access token keeps full access to mapped tools. Issuance is unchanged.
+
+Where each credential goes:
+
+- The MCP server (`/api/mcp`) runs inside the app. It reads its secrets from the deployment's environment. Callers authenticate to it; it never forwards `MC_TOKEN` or a caller's credential to another host.
+- `MC_TOKEN` leaves a machine in one case: the agent-side collectors and hooks under `agents/` and `scripts/` send it as a bearer token to your own `MC_URL`. Point `MC_URL` at your own deployment over https.
+- Those collectors read `MC_URL` and `MC_TOKEN` from the environment or from `~/.claude/mission-control.env` (`chmod 600`, written by `agents/claude-code/install.sh`). The path keeps the pre-rename name so existing installs work. They read nothing else from `~/.claude`. The usage collector and `scripts/collect-progress.sh` also honor `MC_ENV_FILE` to use another path; the Claude Code hook always reads the fixed path, and the dispatcher and `mc-agent` also check `~/.mission-control/env`.
+- `MC_COOKIE_SECRET`, `MC_DASHBOARD_PASSWORD`, `MC_OAUTH_SECRET` and the OpenRouter management keys are read only by the server, for the dashboard, OAuth and usage features. Agents never need them.
+- `MC_TRACE_CAPTURE_CONTENT` controls whether trace capture stores message content. Leave it unset unless you want that.
 
 ## Controls
 
@@ -34,7 +43,7 @@ Credentials:
 
 Read these before deploying.
 
-1. **A leaked `MC_TOKEN` is remote code execution.** Anyone holding `MC_TOKEN` or a dashboard session can queue tasks. Dispatchers run those tasks as headless agent CLIs (`claude`, `codex`, `grok`) on your machines with whatever permissions those CLIs have. Treat `MC_TOKEN` like an SSH key. Run dispatchers as an unprivileged user in a project directory you are comfortable exposing. Use per-machine pinning where possible.
+1. **A leaked `MC_TOKEN` is remote code execution.** Anyone holding `MC_TOKEN` or a dashboard session can queue tasks. Dispatchers run those tasks as headless agent CLIs (`claude`, `codex`, `grok`) on your machines with whatever permissions those CLIs have. Treat `MC_TOKEN` like an SSH key. An agent credential can queue a task only when it has `tasks:write`, and it cannot mint another credential. A credential that has `tasks:write` is still remote code execution for the tasks it can queue. Run dispatchers as an unprivileged user in a project directory you are comfortable exposing. Use per-machine pinning where possible.
 2. **Agent-reported text is untrusted input.** Task results, messages and notes are rendered as text, never as HTML.
 3. **Data is stored in Postgres unencrypted by this app.** It can include project names, task prompts and results, and repo metadata. Use your provider's encryption at rest.
 4. **Deploy only behind TLS**, except on localhost.
