@@ -131,6 +131,12 @@ export const API_ERRORS = {
     fix: "Finish the setup step named in error, then retry.",
     retryable: false,
   },
+  not_configured: {
+    status: 503,
+    message: "not configured",
+    fix: "Set MC_GITHUB_WEBHOOK_SECRET to the GitHub webhook secret, redeploy, then redeliver.",
+    retryable: false,
+  },
   internal_error: {
     status: 500,
     message: "Internal error.",

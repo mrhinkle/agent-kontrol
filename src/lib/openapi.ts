@@ -21,6 +21,7 @@ import { ACTIVITY_LIST, LIST_MAX } from "./list-params";
 import { RUNTIMES } from "./skills/types";
 import { WATCH_STATUSES } from "./watch";
 import { WATCH_SOURCES } from "./watch-sources";
+import { GH_ACCEPTED_EVENTS, GH_WEBHOOK_BODY_MAX_BYTES } from "./gh-events";
 
 /**
  * OpenAPI 3.1 for the documented REST routes.
@@ -229,6 +230,7 @@ export function openApiDocument(): Json {
       { name: "auth" },
       { name: "mcp" },
       { name: "watch" },
+      { name: "webhooks" },
     ],
     components: {
       securitySchemes: {
@@ -244,6 +246,13 @@ export function openApiDocument(): Json {
           scheme: "bearer",
           bearerFormat: "MC_TOKEN",
           description: "Operator MC_TOKEN. An agent credential and an OAuth access token are not accepted on operations that use this scheme.",
+        },
+        githubWebhookSignature: {
+          type: "apiKey",
+          in: "header",
+          name: "X-Hub-Signature-256",
+          description:
+            "sha256= followed by 64 lowercase hex characters: the HMAC SHA-256 of the exact request body bytes, keyed with MC_GITHUB_WEBHOOK_SECRET. Compared in constant time. A session cookie, MC_TOKEN, an agent credential, and an OAuth token are not accepted in its place.",
         },
         agentCredential: {
           type: "http",
@@ -2195,6 +2204,61 @@ export function openApiDocument(): Json {
             ...flatErrors,
             "429": jsonResponse("The credential's per-minute or per-UTC-day request quota is used. rate_limited, retryable true, with Retry-After seconds.", ref("Error")),
             "503": jsonResponse("The credential store or the beat table is unavailable.", ref("Error")),
+          },
+        }),
+      },
+      "/api/webhooks/github": {
+        post: operation({
+          operationId: "postGithubWebhook",
+          tags: ["webhooks"],
+          summary: "Store one signed GitHub webhook delivery in gh_events.",
+          description:
+            `The signature is the only credential. Checks run in this order: MC_GITHUB_WEBHOOK_SECRET unset or blank is 503 not_configured; a missing or malformed X-Hub-Signature-256 is 401; the body is read from the stream and is 413 above ${GH_WEBHOOK_BODY_MAX_BYTES} bytes (Content-Length is not trusted); an HMAC that does not match the raw body bytes is 401; a bad X-GitHub-Event or X-GitHub-Delivery header is 400 validation_failed; a body that is not UTF-8 JSON is 400 invalid_json. Every one of those writes nothing and runs no SQL. A signed ping is 200. A signed event outside the accepted list is 202 and is not stored. An accepted event whose payload is not an object or lacks its required fields is 400 validation_failed. A new delivery is 200 with stored true and the row id. A delivery id already stored is 200 with duplicate true and the row is not changed. No database is 503 setup_required; a failed insert is 503 internal_error. Both are retryable and neither is a stored receipt. Delivery ids starting with sweep: are reserved and rejected.`,
+          security: [{ githubWebhookSignature: [] }],
+          parameters: [
+            {
+              name: "X-GitHub-Event",
+              in: "header",
+              required: true,
+              schema: { type: "string", pattern: "^[a-z][a-z_]{0,63}$" },
+              description: `Stored when one of ${GH_ACCEPTED_EVENTS.join(", ")}. ping is 200. Others are 202.`,
+            },
+            {
+              name: "X-GitHub-Delivery",
+              in: "header",
+              required: true,
+              schema: { type: "string", pattern: "^[A-Za-z0-9-]{1,128}$" },
+              description: "GitHub's delivery GUID. The dedupe key.",
+            },
+          ],
+          requestBody: body({ type: "object", additionalProperties: true, description: "The GitHub webhook payload, signed as sent." }),
+          responses: {
+            "200": jsonResponse("ping, a stored delivery, or a duplicate.", {
+              type: "object",
+              required: ["ok", "delivery_id"],
+              properties: {
+                ok: { type: "boolean", const: true },
+                stored: { type: "boolean" },
+                duplicate: { type: "boolean" },
+                id: { type: "string", description: "gh_events.id as a decimal string. Present when stored is true." },
+                event: { type: "string" },
+                delivery_id: { type: "string" },
+              },
+            }),
+            "202": jsonResponse("A signed event that is not in the accepted list. Not stored.", {
+              type: "object",
+              required: ["ok", "ignored", "event", "delivery_id"],
+              properties: {
+                ok: { type: "boolean", const: true },
+                ignored: { type: "boolean", const: true },
+                event: { type: "string" },
+                delivery_id: { type: "string" },
+              },
+            }),
+            "400": jsonResponse("invalid_json, or validation_failed for a header or payload field.", ref("Error")),
+            "401": jsonResponse("X-Hub-Signature-256 is missing, malformed, or does not match the body.", ref("Error")),
+            "413": jsonResponse(`The body is larger than ${GH_WEBHOOK_BODY_MAX_BYTES} bytes.`, ref("Error")),
+            "503": jsonResponse("not_configured (no secret), setup_required (no database), or internal_error (the insert failed). Redeliver.", ref("Error")),
           },
         }),
       },

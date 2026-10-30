@@ -229,6 +229,18 @@ describe("scope table", { concurrency: false }, () => {
       // become a pattern for other routes to skip enforcement.
       if (file.includes(`${path.sep}openapi.json${path.sep}`)) continue;
       const src = fs.readFileSync(file, "utf8");
+      // The GitHub webhook's credential is its HMAC signature. It must check
+      // that and must not fall back to a session, bearer, or OAuth grant.
+      if (file.endsWith(path.join("webhooks", "github", "route.ts"))) {
+        assert.match(src, /webhookSecret\(\)/, `${file} does not require the webhook secret`);
+        assert.match(src, /verifySignature\(/, `${file} does not verify the signature`);
+        assert.doesNotMatch(
+          src,
+          /enforceApi|enforceBearer|requireDashboardSession|resolveApiAccess|resolveBearerAccess/,
+          `${file} must not accept another credential in place of the signature`,
+        );
+        continue;
+      }
       assert.match(
         src,
         /enforceApi|enforceBearer|requireDashboardSession|resolveApiAccess|resolveBearerAccess/,
