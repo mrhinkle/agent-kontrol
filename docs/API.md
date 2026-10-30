@@ -26,6 +26,7 @@ The `agent_credentials` table stores the label, the first 8 characters of the to
 | `GET /api/skill-bundles` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `skills:read` or `skills:write` |
 | Credential management: `GET`/`POST`/`DELETE /api/settings/credentials` | Dashboard session only |
 | `POST /api/watch/beat`, `GET /api/watch/beats` | Verified `akc_` credential only. `watch:write` for the POST, `watch:read` for the GET. `MC_TOKEN`, the dashboard session, an OAuth access token, and a caller allowed only because the dashboard password is unset are `401` |
+| `POST /api/webhooks/github` (exact path) | A valid `X-Hub-Signature-256` HMAC under `MC_GITHUB_WEBHOOK_SECRET`, and nothing else. A session cookie, `MC_TOKEN`, an agent credential, or an OAuth token does not stand in for it. Neighboring paths stay behind the dashboard gate |
 | Login, OAuth, and discovery: `/login`, `/api/login`, `/oauth/*`, `/.well-known/*` | No cookie gate; these routes enforce their own auth |
 | Public agent docs: `GET /llms.txt`, `GET /docs/mcp.md`, `GET /docs/api.md`, `GET /docs/agents.md` | None. Any other `/docs` name stays behind the dashboard gate |
 
@@ -88,6 +89,7 @@ Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI
 | POST | `/api/login` | Own (rate-limited) | Dashboard password login |
 | POST | `/api/watch/beat` | `akc_` `watch:write` | Store one host liveness beat. The credential must be bound to `source` |
 | GET | `/api/watch/beats` | `akc_` `watch:read` | Every host beat, with `age_s` from the database clock. `Cache-Control: no-store` |
+| POST | `/api/webhooks/github` | GitHub HMAC signature | Store one signed GitHub delivery in `gh_events`, once per `X-GitHub-Delivery`. See [EVENTS.md](EVENTS.md) |
 
 ### OAuth and discovery routes
 
@@ -258,6 +260,23 @@ A successful POST is `200` `{ "ok": true }`.
 
 `scripts/watch-beat.sh` reads one JSON object from stdin and POSTs it. Set `WATCH_API_URL` to the full `https://` URL (loopback `http://` is only for `localhost`, `127.0.0.1`, and `::1`) and `WATCH_CREDENTIAL` to the `akc_` token. The script always exits 0. A missing setting, bad stdin, DNS or TLS failure, timeout, refused connection, non-2xx response, or a 2xx body that is not `{ "ok": true }` prints one short line and does not print the credential, the Authorization header, the response body, or the curl command. It does not queue or replay.
 
+### GitHub webhooks
+
+`POST /api/webhooks/github` receives GitHub App or repository webhook deliveries and stores the accepted ones in `gh_events`. The full contract, the stored columns, and the per-event field map are in [EVENTS.md](EVENTS.md).
+
+The signature is the credential. The route checks, in this order, and stops at the first failure:
+
+1. `MC_GITHUB_WEBHOOK_SECRET` unset or blank: `503` `not_configured`. An unsigned delivery is never accepted.
+2. `X-Hub-Signature-256` missing, or not `sha256=` plus 64 lowercase hex: `401` `unauthorized`.
+3. The body is read from the stream and counted. Above 1,048,576 bytes it is `413` `payload_too_large`. `Content-Length` is not trusted. Exactly 1,048,576 bytes is accepted.
+4. HMAC SHA-256 of the raw body bytes, compared in constant time. A mismatch, including a valid signature over a different body, is `401`.
+5. `X-GitHub-Event` must be 1 to 64 lowercase letters or underscores, and `X-GitHub-Delivery` 1 to 128 letters, digits, or hyphens. Otherwise `400` `validation_failed`. Ids starting with `sweep:` are reserved for synthetic rows and are rejected.
+6. A body that is not UTF-8 JSON is `400` `invalid_json` (a webhook set to `application/x-www-form-urlencoded` lands here).
+
+None of these steps runs SQL. After them, `ping` is `200` `{ "ok": true, "event": "ping", "delivery_id" }`. An event outside `pull_request`, `check_suite`, `status`, `issue_comment`, `issues`, `push`, `pull_request_review`, `workflow_run` is `202` `{ "ok": true, "ignored": true, "event", "delivery_id" }` and is not stored. For an accepted event, a payload that is not a JSON object or lacks the fields GitHub always sends for it is `400` `validation_failed` with `fields`.
+
+A new delivery is `200` `{ "ok": true, "stored": true, "duplicate": false, "id", "delivery_id" }`. A delivery id already stored is `200` `{ "ok": true, "duplicate": true, "delivery_id" }` and the stored row, including `received_at`, is not changed. That covers GitHub redelivering after an insert committed and the response was lost. With no `DATABASE_URL` the answer is `503` `setup_required`; a failed insert is `503` `internal_error`. Both are `retryable: true`, and neither is a stored receipt. Every response sends `Cache-Control: no-store`.
+
 ### Decisions
 
 The morning brief's decisions list comes from this table when every brief-eligible row for that repo has `kind`, `labels`, `opened_at`, and `repo_short`. Those rows are `source` `github-label`, `status` not `withdrawn`, and `github_present` not `false` (a null `github_present` still counts as present). `repo` is `owner/name`. `repo_short` is the config short name and is display only. The brief joins a row onto a watched repo by `owner/name`, so two repos that share a short name do not both receive the row. `age_hours` drops fractional seconds before `Z`, subtracts the unix times, and divides by 3600. `age_days` is `floor(age_hours / 24)` from `opened_at` (GitHub `createdAt`). GitHub `createdAt` is stored as `opened_at` and, on insert only, as `first_seen_at`.
@@ -386,9 +405,10 @@ OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this sha
 | `task_not_claimable` | 409 | no | Defined, not returned. See above. |
 | `memory_key_invalid` | 400 | no | MCP `remember` or `recall` when `key` is empty, longer than 200 characters, or contains a control character. |
 | `repo_list_invalid` | 400 | no | `PUT /api/settings/repos` and MCP `set_watched_repos` when the list fails validation. `errors` is unchanged. |
-| `payload_too_large` | 413 | no | `POST /api/v1/traces` over 2 MB, or `POST /api/watch/beat` over 8 KiB. |
+| `payload_too_large` | 413 | no | `POST /api/v1/traces` over 2 MB, `POST /api/watch/beat` over 8 KiB, or `POST /api/webhooks/github` over 1 MiB. |
 | `unsupported_media_type` | 415 | no | `POST /api/v1/traces` or `POST /api/watch/beat` when the body is not `application/json`. |
 | `setup_required` | 503 | no | Messaging routes or `POST /api/usage/ingest` when those tables are missing, or a production `/api/*` request when a database is set and `MC_DASHBOARD_PASSWORD` is not (other pages are `text/plain`). `GET /api/usage` stays HTTP 200 with `setup_required: true` and no `code`. Messaging and usage-ingest bodies keep `setup_required` and `message`. |
+| `not_configured` | 503 | no | `POST /api/webhooks/github` when `MC_GITHUB_WEBHOOK_SECRET` is unset or blank. Nothing is read or stored. Set the secret, redeploy, then redeliver from GitHub. |
 | `internal_error` | 500 | yes | Anything else that failed while handling the request. `GET /api/progress/digest` uses this JSON body too. Success from that route stays `text/plain`. |
 
 `fix` tells the caller what to change. It is a sentence, specific to the code, and overridable per response when the default would be the wrong instruction (a wrong dashboard password does not ask for `MC_TOKEN`).

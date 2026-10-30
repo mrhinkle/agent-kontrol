@@ -435,6 +435,7 @@ The HTTP `401` for a missing or invalid bearer is unchanged: `WWW-Authenticate` 
 | `repo_list_invalid` | no | `set_watched_repos` and `PUT /api/settings/repos` when the list fails validation. `errors` is unchanged. Nothing is written. |
 | `payload_too_large` | no | Not returned by a tool. REST trace export only. |
 | `unsupported_media_type` | no | Not returned by a tool. REST trace export only. |
+| `not_configured` | no | Not returned by a tool. HTTP 503 from `POST /api/webhooks/github` when `MC_GITHUB_WEBHOOK_SECRET` is unset. |
 | `setup_required` | no | Not returned by a tool. HTTP 503 from messaging routes, `POST /api/usage/ingest`, and the production middleware on `/api/*` when a database is set and `MC_DASHBOARD_PASSWORD` is not. `GET /api/usage` stays HTTP 200. |
 | `internal_error` | yes | The handler threw. Retry once. The server log has the detail. |
 

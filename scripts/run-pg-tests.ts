@@ -11,7 +11,9 @@ import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import { evaluateAlerts, setBeforeClaimForTests, setBriefSettingsForTests } from "../src/lib/brief-alerts";
 import type { BriefSettings } from "../src/lib/progress-config";
-import { sql } from "../src/lib/db";
+import { sql, withTransaction } from "../src/lib/db";
+import { insertGhEvent, signBody } from "../src/lib/gh-events";
+import { EVENT_FIXTURES, PING_PAYLOAD } from "../tests/ui/gh-event-fixtures";
 import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
 import { StaleWrite } from "../src/lib/revision";
 import { readReceipt } from "../src/lib/activity";
@@ -369,6 +371,7 @@ async function main() {
   await testZeroMergeCaseFold(tag);
   await testDecisionWritebackHardening(tag);
   await testRepoCaseIdentity(tag);
+  await testGhEvents(tag);
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
 }
@@ -2555,6 +2558,183 @@ async function testRepoSettingsVersionAndReceipt(tag: string): Promise<void> {
     else process.env.MC_DASHBOARD_PASSWORD = savedPassword;
     if (savedToken === undefined) delete process.env.MC_TOKEN;
     else process.env.MC_TOKEN = savedToken;
+  }
+}
+
+/**
+ * #77: the gh_events inbox against real Postgres. Schema and dated migration
+ * apply twice without touching rows; every accepted fixture is stored once;
+ * serial, concurrent, and lost-response replays leave one unchanged row.
+ */
+async function testGhEvents(tag: string): Promise<void> {
+  const { POST } = await import("../src/app/api/webhooks/github/route");
+  const savedSecret = process.env.MC_GITHUB_WEBHOOK_SECRET;
+  const secret = `pg-secret-${tag}`;
+  process.env.MC_GITHUB_WEBHOOK_SECRET = secret;
+  const prefix = randomUUID().slice(0, 8);
+  let seq = 0;
+  const nextDelivery = () => `${prefix}-${randomUUID().slice(9)}-${seq++}`;
+  const sweepPrefix = `sweep:${tag}:`;
+
+  const post = (event: string, body: string, delivery: string) => POST(new Request("http://localhost/api/webhooks/github", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-github-event": event,
+      "x-github-delivery": delivery,
+      "x-hub-signature-256": signBody(secret, body),
+    },
+    body,
+  }));
+  const rowOf = async (delivery: string) => {
+    const rows = await sql()`
+      select id::text as id, delivery_id, event, action, repo, number::int as number, head_sha,
+             payload::text as payload, received_at::text as received_at, processed_at
+      from gh_events where delivery_id = ${delivery}
+    `;
+    return rows[0] ?? null;
+  };
+  const countAll = async () => Number((await sql()`
+    select count(*)::int as n from gh_events where delivery_id like ${prefix + "%"} or delivery_id like ${sweepPrefix + "%"}
+  `)[0].n);
+
+  try {
+    // Canonical schema, then the dated migration, each twice, around a stored row.
+    await applyCanonicalSchema();
+    const keep = nextDelivery();
+    const kept = await insertGhEvent({ delivery_id: keep, event: "push", repo: "acme/widgets", payload: { keep: true } });
+    assert.equal(kept.stored, true);
+    const keptBefore = await rowOf(keep);
+    await applyCanonicalSchema();
+    const migration = fs.readFileSync("supabase/migrations/20261030012111_gh_events.sql", "utf8");
+    const statements = migration
+      .split(";")
+      .map((part) => part.split("\n").filter((line) => !line.trim().startsWith("--")).join("\n").trim())
+      .filter(Boolean);
+    const client = new Client({ connectionString: process.env.DATABASE_URL });
+    await client.connect();
+    try {
+      for (let pass = 0; pass < 2; pass += 1) {
+        for (const statement of statements) await client.query(statement);
+      }
+    } finally {
+      await client.end();
+    }
+    assert.deepEqual(await rowOf(keep), keptBefore, "applying the schema and migration twice leaves the row unchanged");
+
+    const cols = await sql()`
+      select column_name, is_nullable, data_type, column_default
+      from information_schema.columns
+      where table_schema = 'public' and table_name = 'gh_events'
+    `;
+    const col = new Map(cols.map((row) => [String(row.column_name), row]));
+    for (const name of ["id", "delivery_id", "event", "payload", "received_at"]) {
+      assert.equal(col.get(name)?.is_nullable, "NO", name);
+    }
+    for (const name of ["action", "repo", "number", "head_sha", "processed_at"]) {
+      assert.equal(col.get(name)?.is_nullable, "YES", name);
+    }
+    assert.equal(col.get("id")?.data_type, "bigint");
+    assert.equal(col.get("payload")?.data_type, "jsonb");
+    assert.match(String(col.get("received_at")?.column_default), /now\(\)/);
+    const indexes = await sql()`select indexname from pg_indexes where schemaname = 'public' and tablename = 'gh_events'`;
+    const names = indexes.map((row) => String(row.indexname));
+    assert.ok(names.includes("gh_events_received_at_idx"));
+    assert.ok(names.includes("gh_events_pending_idx"));
+    assert.ok(names.includes("gh_events_delivery_id_key"));
+    await assert.rejects(
+      () => sql()`insert into gh_events (delivery_id, event, payload) values (${nextDelivery()}, 'x', '[1]'::jsonb)`,
+      (err: unknown) => pgCode(err) === "23514",
+      "payload must be an object",
+    );
+
+    // Every accepted event is stored once with its metadata.
+    for (const f of EVENT_FIXTURES) {
+      const delivery = nextDelivery();
+      const raw = JSON.stringify(f.payload, null, 1);
+      const res = await post(f.event, raw, delivery);
+      assert.equal(res.status, 200, f.event);
+      const out = await res.json() as { stored: boolean; id: string };
+      assert.equal(out.stored, true);
+      const row = await rowOf(delivery);
+      assert.ok(row, f.event);
+      assert.equal(row.id, out.id);
+      assert.equal(row.event, f.event);
+      assert.equal(row.action, f.expect.action);
+      assert.equal(row.repo, f.expect.repo);
+      assert.equal(row.number, f.expect.number);
+      assert.equal(row.head_sha, f.expect.head_sha);
+      assert.equal(row.processed_at, null);
+      assert.deepEqual(JSON.parse(String(row.payload)), f.payload, f.event);
+    }
+
+    // Quotes, SQL, and shell text in the payload are data.
+    const comment = EVENT_FIXTURES.find((f) => f.event === "issue_comment")!;
+    const nasty = { ...comment.payload, comment: { id: 1, body: "it's \"quoted\" '; delete from gh_events; -- $1 \\ é\n🚀" } };
+    const nastyId = nextDelivery();
+    assert.equal((await post("issue_comment", JSON.stringify(nasty), nastyId)).status, 200);
+    const nastyBody = await sql()`select payload->'comment'->>'body' as body from gh_events where delivery_id = ${nastyId}`;
+    assert.equal(nastyBody[0].body, nasty.comment.body);
+
+    // ping and an unlisted event write nothing.
+    const beforeIgnored = await countAll();
+    assert.equal((await post("ping", JSON.stringify(PING_PAYLOAD), nextDelivery())).status, 200);
+    assert.equal((await post("star", JSON.stringify({ action: "created" }), nextDelivery())).status, 202);
+    assert.equal(await countAll(), beforeIgnored);
+
+    // Serial replay: same id, even with a different signed body, changes nothing.
+    const pr = EVENT_FIXTURES[0];
+    const serial = nextDelivery();
+    assert.equal((await post(pr.event, JSON.stringify(pr.payload), serial)).status, 200);
+    const first = await rowOf(serial);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    for (const body of [JSON.stringify(pr.payload), JSON.stringify({ ...pr.payload, action: "closed" })]) {
+      const again = await post(pr.event, body, serial);
+      assert.equal(again.status, 200);
+      assert.deepEqual(await again.json(), { ok: true, duplicate: true, delivery_id: serial });
+    }
+    assert.deepEqual(await rowOf(serial), first, "a duplicate does not update payload or received_at");
+
+    // Concurrent replay: one insert, the rest duplicates.
+    const racing = nextDelivery();
+    const raced = await Promise.all(Array.from({ length: 12 }, () => post(pr.event, JSON.stringify(pr.payload), racing)));
+    const bodies = await Promise.all(raced.map((res) => res.json() as Promise<{ stored?: boolean; duplicate: boolean }>));
+    assert.ok(raced.every((res) => res.status === 200));
+    assert.equal(bodies.filter((b) => b.stored === true).length, 1);
+    assert.equal(bodies.filter((b) => b.duplicate === true).length, 11);
+    const racedRows = await sql()`select count(*)::int as n from gh_events where delivery_id = ${racing}`;
+    assert.equal(Number(racedRows[0].n), 1);
+
+    // Committed insert whose response was lost: GitHub's redelivery is a no-op.
+    const lost = nextDelivery();
+    await withTransaction(async (tx) => {
+      const row = await insertGhEvent({ delivery_id: lost, event: pr.event, ...pr.expect, payload: pr.payload }, tx);
+      assert.equal(row.stored, true);
+    });
+    const committed = await rowOf(lost);
+    const redelivered = await post(pr.event, JSON.stringify(pr.payload), lost);
+    assert.equal(redelivered.status, 200);
+    assert.equal((await redelivered.json() as { duplicate: boolean }).duplicate, true);
+    assert.deepEqual(await rowOf(lost), committed);
+
+    // Synthetic rows (#79): the helper joins the caller's transaction and
+    // never commits on its own; the route refuses the namespace.
+    const rolled = `${sweepPrefix}rolled`;
+    await assert.rejects(() => withTransaction(async (tx) => {
+      await insertGhEvent({ delivery_id: rolled, event: "sweep_condition", payload: { n: 1 } }, tx);
+      throw new Error("abort after insert");
+    }), /abort after insert/);
+    assert.equal(await rowOf(rolled), null, "a rolled-back transaction leaves no row");
+    const synthetic = `${sweepPrefix}kept`;
+    const out = await withTransaction((tx) => insertGhEvent({ delivery_id: synthetic, event: "sweep_condition", payload: { n: 2 } }, tx));
+    assert.equal(out.stored, true);
+    const viaRoute = await post(pr.event, JSON.stringify(pr.payload), synthetic);
+    assert.equal(viaRoute.status, 400);
+    assert.equal((await rowOf(synthetic))?.event, "sweep_condition");
+  } finally {
+    await sql()`delete from gh_events where delivery_id like ${prefix + "%"} or delivery_id like ${sweepPrefix + "%"}`;
+    if (savedSecret === undefined) delete process.env.MC_GITHUB_WEBHOOK_SECRET;
+    else process.env.MC_GITHUB_WEBHOOK_SECRET = savedSecret;
   }
 }
 
