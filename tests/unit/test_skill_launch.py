@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -148,6 +149,15 @@ class TestContext(ContextHarness):
         self.assertEqual(e.exception.code, 73)
         self.assertIn("interrupted", str(e.exception))
 
+    def test_confirmed_finish_completes_after_unconfirmed_receipt(self):
+        self.agents.write_text("# rules\n")
+        ctx = self.prepare()
+        self.assertFalse(sl.finish_context(ctx, containment_confirmed=False).ok)
+        receipt = self.finish(ctx)
+        self.assertTrue(receipt.ok, receipt.note)
+        self.assertEqual(self.agents.read_text(), "# rules\n")
+        self.assertFalse(ctx.recovery_path.exists())
+
     def test_refusals_start_nothing(self):
         cases = [
             ({"cwd": "relative/path"}, 73, "absolute"),
@@ -223,6 +233,91 @@ class TestRecover(ContextHarness):
         self.assertEqual(self.agents.read_text(), "# rules\n")
         self.assertFalse(ctx.recovery_path.exists())
 
+    def record_path(self):
+        return md.linked_worktree_git_dir(self.wt) / sl.RECOVERY_NAME
+
+    def fail_prepared_record(self):
+        real = sl.SkillContext.record
+
+        def record(ctx, state):
+            if state == "prepared":
+                raise OSError(28, "No space left on device")
+            return real(ctx, state)
+        return mock.patch.object(sl.SkillContext, "record", record)
+
+    def test_prepared_record_failure_restores_and_clears(self):
+        self.agents.write_text("# rules\n")
+        with self.fail_prepared_record(), self.assertRaises(sl.ContextError) as e:
+            self.prepare()
+        self.assertEqual(e.exception.code, 73)
+        self.assertEqual(self.agents.read_text(), "# rules\n")
+        self.assertFalse(self.record_path().exists())
+        self.assert_unlocked()
+
+    def test_prepared_record_and_restore_failure_keeps_recoverable_journal(self):
+        self.agents.write_text("# rules\n")
+        with self.fail_prepared_record(), \
+                mock.patch.object(ak_pointers, "cleanup", side_effect=ak_pointers.PointerFileError("busy")), \
+                self.assertRaises(sl.ContextError) as e:
+            self.prepare()
+        self.assertEqual(e.exception.code, 74)
+        self.assertIn("kept", str(e.exception))
+        self.assertIn(BLOCK, self.agents.read_text())
+        self.assertEqual(json.loads(self.record_path().read_text())["state"], "preparing")
+        with self.assertRaises(sl.ContextError):
+            self.prepare()
+        self.assertEqual(self.run_recover(), 0)
+        self.assertEqual(self.agents.read_text(), "# rules\n")
+        self.assertFalse(self.record_path().exists())
+
+    def crash_preparing(self, failpoint):
+        """Kill a real preparing process at a failpoint: os._exit, so no handler or finally runs."""
+        script = textwrap.dedent(f"""
+            import os, sys
+            from pathlib import Path
+            sys.path.insert(0, {str(DISPATCHER)!r})
+            import ak_pointers, ak_skill_launch as sl, mc_dispatcher as md
+            md.WORKDIR, md.MC_URL, md.MC_TOKEN = Path({str(self.root)!r}), "https://ak.invalid", "t"
+            md.fetch_pointers = lambda lane, runtime: {BLOCK!r}
+            if {failpoint!r} == "after-write":
+                real = sl.SkillContext.record
+                sl.SkillContext.record = lambda ctx, st: os._exit(9) if st == "prepared" else real(ctx, st)
+            else:
+                ak_pointers.write_replacing = lambda *a: os._exit(9)
+            sl.prepare_context({str(self.wt)!r}, "lane-a", "grok")
+            os._exit(0)
+        """)
+        r = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 9, r.stderr)
+        self.assertEqual(json.loads(self.record_path().read_text())["state"], "preparing")
+        with self.assertRaises(sl.ContextError) as e:
+            self.prepare()
+        self.assertIn("interrupted", str(e.exception))
+
+    def test_crash_after_injection_before_prepared_record(self):
+        self.agents.write_text("# rules\n")
+        self.crash_preparing("after-write")
+        self.assertIn(BLOCK, self.agents.read_text())
+        self.assertEqual(self.run_recover(), 0)
+        self.assertEqual(self.agents.read_text(), "# rules\n")
+        self.assertFalse(self.record_path().exists())
+
+    def test_crash_before_injection_after_preparing_record(self):
+        self.agents.write_text("# rules\n")
+        self.crash_preparing("before-write")
+        self.assertEqual(self.agents.read_text(), "# rules\n")
+        self.assertEqual(self.run_recover(), 0)
+        self.assertEqual(self.agents.read_text(), "# rules\n")
+        self.assertFalse(self.record_path().exists())
+
+    def test_ambiguous_preparing_state_is_kept(self):
+        self.agents.write_text("# rules\n")
+        self.crash_preparing("after-write")
+        self.agents.write_text("# someone else\n")
+        self.assertEqual(self.run_recover(), 74)
+        self.assertEqual(self.agents.read_text(), "# someone else\n")
+        self.assertTrue(self.record_path().exists())
+
     def test_recover_refuses_live_group_without_signalling(self):
         ctx = self.prepare()
         live = subprocess.Popen(["sleep", "30"], start_new_session=True)
@@ -269,6 +364,13 @@ if mode == "bgchild":
         open(os.path.join(state, "child.wrote"), "w").write("1")
         os._exit(0)
     time.sleep(0.2)
+    sys.exit(0)
+if mode == "bgfinish":
+    if os.fork() == 0:
+        signal.signal(signal.SIGTERM, lambda *a: open(os.path.join(state, "term.hit"), "w").write("1"))
+        open(os.path.join(state, "child.pid"), "w").write(str(os.getpid()))
+        time.sleep(30)
+        os._exit(0)
     sys.exit(0)
 if mode == "hang":
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -419,6 +521,57 @@ class TestSupervisorProcess(ProcessHarness):
         self.assertIn("supervisor-failure", err)
         self.assertFalse(alive(worker))
         self.assert_clean()
+
+    def test_controller_killed_during_finish_containment(self):
+        p = self.launch(STUB_MODE="bgfinish")
+        self.assertTrue(wait_for(lambda: (self.state / "term.hit").exists()), "finish containment never began")
+        child = int((self.state / "child.pid").read_text())
+        os.kill(int((self.state / "wrapper.pid").read_text()), signal.SIGKILL)
+        _, err = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 70, err)
+        self.assertIn("while its finish cleanup ran", err)
+        self.assertFalse(alive(child), "TERM-ignoring child outlived the supervisor")
+        self.assert_clean()
+
+    def test_supervisor_killed_then_queue_dispatch_refused(self):
+        tmp = self.base / "tmp"  # a SIGKILLed supervisor cannot remove its socket dir; keep it in this test's tree
+        tmp.mkdir()
+        p = self.launch(STUB_MODE="hang", TMPDIR=str(tmp))
+        self.assertTrue(wait_for(lambda: (self.state / "grok.ready").exists()))
+        worker = self.worker_pid()
+        wrapper = int((self.state / "wrapper.pid").read_text())
+
+        def reap():
+            for g in (worker, wrapper):
+                try:
+                    os.killpg(g, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        self.addCleanup(reap)
+        p.kill()  # the supervisor only: its lock goes, the worker stays
+        p.wait(timeout=30)  # not communicate: the surviving wrapper and worker still hold its pipes
+        for f in (p.stdout, p.stderr):
+            f.close()
+        self.assertTrue(alive(worker))
+        calls, cli = [], []
+
+        def fake_api(path, body=None, method="POST", max_bytes=None):
+            calls.append((path, body, method))
+            return {}
+        sem = threading.Semaphore(1)
+        sem.acquire()
+        with mock.patch.object(md, "WORKDIR", self.wt.parent), mock.patch.object(md, "api", side_effect=fake_api), \
+                mock.patch.object(md, "ingest"), \
+                mock.patch.object(md, "run_cli", side_effect=lambda *a, **k: cli.append(a) or (True, "x", None)):
+            md.run_task({"id": 9, "title": "t", "project": "proj"}, "grok", sem)
+        self.assertEqual(cli, [])
+        self.assertFalse([c for c in calls if c[0].startswith("/api/skills/pointers")])
+        final = [c for c in calls if c[2] == "PATCH"][-1][1]
+        self.assertEqual(final["status"], "failed")
+        self.assertIn("interrupted skills launch", final["result"])
+        self.assertTrue(alive(worker))
+        self.assertIn(BLOCK, self.agents.read_text())  # the live worker's view is left alone
+        self.assertTrue((self.git_dir / sl.RECOVERY_NAME).exists())
 
     def test_controller_killed_before_registration_then_barrier_refuses(self):
         p = self.launch(STUB_HANG_BEFORE_WORKER="1")

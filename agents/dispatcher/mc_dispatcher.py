@@ -108,6 +108,7 @@ LANE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}")
 MAX_POINTER_RESPONSE = 256_000
 MAX_POINTER_BLOCK = 64_000
 LOCK_NAME = "ak-dispatch.lock"
+SKILL_RECOVERY_NAME = "ak-skill-recovery.json"  # written by ak_skill_launch; blocks every dispatch until recovered
 KILL_GRACE = 5.0  # seconds a CLI's process group gets after SIGTERM, then again after SIGKILL
 
 
@@ -453,6 +454,16 @@ class WorktreeLock:
                 self.fd = None
 
 
+def refuse_unresolved_recovery(git_dir: Path) -> None:
+    """Call with the worktree lock held. An interrupted skills launch may still have a live worker here."""
+    path = git_dir / SKILL_RECOVERY_NAME
+    if os.path.lexists(path):
+        raise DispatchRefused(
+            f"{path} records an interrupted skills launch; confirm its worker group is gone, "
+            "then run `ak_skill_launch.py recover --cwd <worktree>`"
+        )
+
+
 def fetch_pointers(lane: str, runtime: str) -> str:
     """The lane's pointer block from GET /api/skills/pointers. Only lane and runtime are sent."""
     query = urllib.parse.urlencode({"lane": lane, "runtime": runtime})
@@ -511,9 +522,11 @@ def run_task(task: dict, platform: str, sem: threading.Semaphore) -> None:
                     f"digits, and . _ : / - starting with a letter or digit (got {project!r})"
                 )
             cwd = resolve_project(project, WORKDIR)
-            candidate = WorktreeLock(linked_worktree_git_dir(cwd))
+            git_dir = linked_worktree_git_dir(cwd)
+            candidate = WorktreeLock(git_dir)
             candidate.acquire(cwd)
             lock = candidate
+            refuse_unresolved_recovery(git_dir)
         except DispatchRefused as e:
             fail_task(tid, agent_id, str(e))
             return

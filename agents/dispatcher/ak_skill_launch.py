@@ -8,10 +8,11 @@ usable by a single launch:
   prepare_context(cwd, lane, runtime) -> SkillContext
       confine cwd to a linked worktree under MC_WORKDIR, refuse an unresolved
       recovery record, take ak-dispatch.lock, read HEAD, GET the lane's pointers,
-      persist a recovery record in the worktree git dir, inject the block.
+      journal the planned AGENTS.md change in the worktree git dir, then apply it.
   finish_context(ctx, containment_confirmed=True) -> CleanupReceipt
       take the block out again and check the index/HEAD for it. Runs at most once.
-      Without confirmed containment it writes nothing and keeps the recovery record.
+      Without confirmed containment it writes nothing and keeps the recovery record;
+      a later call with containment confirmed may then finish the cleanup.
 
 Modes (argv[1]):
   fleet        parent supervisor for fleet-dispatch.sh --skills-lane. Prepares the
@@ -56,7 +57,7 @@ import mc_dispatcher as md
 
 EX_SOFTWARE, EX_UNAVAILABLE, EX_CANTCREAT, EX_IOERR = 70, 69, 73, 74
 RUNTIMES = ("claude", "codex", "grok")
-RECOVERY_NAME = "ak-skill-recovery.json"
+RECOVERY_NAME = md.SKILL_RECOVERY_NAME
 CONTROL_ENV = "AK_SKILL_CONTROL"
 NONCE_ENV = "AK_SKILL_NONCE"
 MAX_MESSAGE = 4096
@@ -175,10 +176,10 @@ def prepare_context(cwd: str, lane: str, runtime: str) -> SkillContext:
         raise ContextError(EX_CANTCREAT, str(e)) from None
     ctx = SkillContext(real, lane, runtime, git_dir, lock)
     try:
-        if os.path.lexists(ctx.recovery_path):
-            raise ContextError(EX_CANTCREAT, (
-                f"{ctx.recovery_path} records an interrupted skills launch; confirm its worker group is gone, "
-                "then run `ak_skill_launch.py recover --cwd <worktree>`"))
+        try:
+            md.refuse_unresolved_recovery(git_dir)
+        except md.DispatchRefused as e:
+            raise ContextError(EX_CANTCREAT, str(e)) from None
         if not md.MC_URL or not md.MC_TOKEN:
             raise ContextError(EX_UNAVAILABLE, "MC_URL and MC_TOKEN are not configured")
         try:
@@ -187,15 +188,26 @@ def prepare_context(cwd: str, lane: str, runtime: str) -> SkillContext:
             raise ContextError(EX_UNAVAILABLE, f"skill pointers unavailable, no worker started: {e}") from None
         head = md.git(real, "rev-parse", "--verify", "-q", "HEAD")
         ctx.base_head = head.stdout.strip() if head.returncode == 0 else None
-        snap = ak_pointers.read_snapshot(real / ak_pointers.AGENTS_MD)
-        ctx.injection = ak_pointers.Injection(real / ak_pointers.AGENTS_MD, snap.text, None, ctx.block)
+        # ak_pointers.inject, split so the planned text is journaled before the file changes.
+        path = real / ak_pointers.AGENTS_MD
+        snap = ak_pointers.read_snapshot(path)
+        try:
+            planned, changed = ak_pointers.apply_pointer_block(snap.text, ctx.block)
+        except ak_pointers.MalformedBlockError as e:
+            raise ak_pointers.PointerFileError(f"{ak_pointers.AGENTS_MD}: {e}; fix or remove the marker by hand") from e
+        ctx.injection = ak_pointers.Injection(path, snap.text, planned, ctx.block)
         ctx.record("preparing")
         try:
-            ctx.injection = ak_pointers.inject(real, ctx.block)
+            if changed:
+                ak_pointers.write_replacing(path, snap, planned, snap.mode)
         except BaseException:
-            os.unlink(ctx.recovery_path)  # inject writes atomically or not at all
+            discard_journal_if_unchanged(ctx)  # write_replacing swaps atomically or not at all
             raise
-        ctx.record("prepared")
+        try:
+            ctx.record("prepared")
+        except BaseException as e:
+            undo_preparation(ctx, e)
+            raise
         return ctx
     except (ak_pointers.PointerFileError, OSError, subprocess.SubprocessError) as e:
         lock.release()
@@ -205,10 +217,37 @@ def prepare_context(cwd: str, lane: str, runtime: str) -> SkillContext:
         raise
 
 
+def discard_journal_if_unchanged(ctx: SkillContext) -> None:
+    """After a failed write: drop the journal only if AGENTS.md still holds the original bytes."""
+    try:
+        same = ak_pointers.read_snapshot(ctx.injection.path).text == ctx.injection.original
+    except (ak_pointers.PointerFileError, OSError):
+        same = False
+    if same:
+        try:
+            os.unlink(ctx.recovery_path)
+        except OSError:
+            pass  # a "preparing" journal over an unchanged file recovers cleanly
+
+
+def undo_preparation(ctx: SkillContext, cause: BaseException) -> None:
+    """The block is written but the journal could not say so: restore, then drop the "preparing" journal.
+
+    If the restore fails the journal stays; it holds the original and the planned text, so recover can
+    still put the file back. Raises ContextError(74) in that case instead of the original error."""
+    try:
+        ak_pointers.cleanup(ctx.injection)
+    except (ak_pointers.PointerFileError, OSError) as e:
+        raise ContextError(EX_IOERR, (
+            f"could not record the prepared launch ({cause}) nor remove the pointer block ({e}); no worker "
+            f"started; {ctx.recovery_path} kept: run `ak_skill_launch.py recover --cwd {ctx.cwd}`")) from None
+    discard_journal_if_unchanged(ctx)
+
+
 def finish_context(ctx: SkillContext, containment_confirmed: bool = True) -> CleanupReceipt:
     """Clean up once. Never unstages, amends or discards worker edits. Keeps the lock (release_context does)."""
     with ctx._mutex:
-        if ctx.receipt is not None:
+        if ctx.receipt is not None and (ctx.receipt.contained or not containment_confirmed):
             return ctx.receipt
         if not containment_confirmed:
             ctx.receipt = CleanupReceipt(False, False, (
@@ -305,8 +344,11 @@ class Supervisor:
         self.worker_spec = worker_spec
         self.sock_path = str(sock_dir / "ctl")
         self.nonce = secrets.token_hex(16)
-        self.state = "starting"  # starting -> running (hello) -> finished | aborting
+        # starting -> running (hello) -> finishing (finish received) -> finished (cleanup done, ACK sent)
+        #                                           \-> aborting (controller gone or signal before finished)
+        self.state = "starting"
         self.state_lock = threading.Lock()
+        self.contain_lock = threading.Lock()  # one containment operation at a time; run() waits for finish's
         self.controller: subprocess.Popen | None = None
         self.finish_rc: int | None = None
         self.abort_signal: int | None = None
@@ -362,24 +404,28 @@ class Supervisor:
                 rc = msg.get("rc")
                 if type(rc) is not int:
                     raise ValueError("rc missing")
-                self.state = "finished"
+                self.state = "finishing"
                 self.finish_rc = rc
         if op != "finish":
             raise ValueError(f"unknown op {op!r}")
         receipt = self.contain_and_clean(stop_controller=False)
+        with self.state_lock:
+            if self.state == "finishing":  # run() may have moved to aborting meanwhile; it then cleans up itself
+                self.state = "finished"
         return {"ok": receipt.ok, **receipt.as_dict()}
 
     def contain_and_clean(self, stop_controller: bool) -> CleanupReceipt:
-        pgid = self.ctx.worker_pgid
-        contained = True
-        if pgid is not None:
-            contained = md.stop_group_id(pgid, lambda: None, WORKER_GRACE)
-        if stop_controller and self.controller is not None:
-            c_ok = md.stop_group_id(self.controller.pid, self.controller.poll, CONTROLLER_GRACE)
-            if pgid is not None and not contained:  # the worker's zombie leader is reaped once its parent is gone
+        with self.contain_lock:
+            pgid = self.ctx.worker_pgid
+            contained = True
+            if pgid is not None:
                 contained = md.stop_group_id(pgid, lambda: None, WORKER_GRACE)
-            contained = contained and c_ok
-        return finish_context(self.ctx, containment_confirmed=contained)
+            if stop_controller and self.controller is not None:
+                c_ok = md.stop_group_id(self.controller.pid, self.controller.poll, CONTROLLER_GRACE)
+                if pgid is not None and not contained:  # the worker's zombie leader is reaped once its parent is gone
+                    contained = md.stop_group_id(pgid, lambda: None, WORKER_GRACE)
+                contained = contained and c_ok
+            return finish_context(self.ctx, containment_confirmed=contained)
 
     def on_signal(self, signum, _frame) -> None:
         if self.abort_signal is None:
@@ -397,15 +443,16 @@ class Supervisor:
             time.sleep(0.05)
         with self.state_lock:
             finished = self.state == "finished"
+            was_finishing = self.state == "finishing"
             if not finished:
                 self.state = "aborting"  # no hello, register or finish is accepted from here on
         if finished and self.abort_signal is None:
             rc = self.controller.wait()
             return rc
-        receipt = self.contain_and_clean(stop_controller=True)
+        receipt = self.contain_and_clean(stop_controller=True)  # waits for an in-progress finish containment
         why = (f"signal {self.abort_signal}" if self.abort_signal is not None
                else f"controller exited {self.controller.returncode if self.controller else 'unstarted'} "
-                    "without finishing")
+                    + ("while its finish cleanup ran" if was_finishing else "without finishing"))
         print(f"ak-skill-launch: supervisor-failure ({why}); cleanup: {receipt.note}", file=sys.stderr)
         if not receipt.ok:
             return EX_IOERR
@@ -617,7 +664,13 @@ def main_recover(ns: argparse.Namespace) -> int:
             return EX_CANTCREAT
         orig = rec.get("original_b64")
         original = None if orig is None else base64.b64decode(orig).decode("utf-8")
-        if rec.get("injected") is not None:
+        if rec.get("state") == "preparing":
+            try:
+                note = recover_preparing(real / ak_pointers.AGENTS_MD, original, rec)
+            except (ak_pointers.PointerFileError, OSError, ValueError) as e:
+                print(f"ak-skill-launch: cannot recover an interrupted preparation, record kept: {e}", file=sys.stderr)
+                return EX_IOERR
+        elif rec.get("injected") is not None:
             inj = ak_pointers.Injection(real / ak_pointers.AGENTS_MD, original, rec["injected"], rec.get("block", ""))
             try:
                 note = ak_pointers.cleanup(inj)
@@ -631,6 +684,26 @@ def main_recover(ns: argparse.Namespace) -> int:
         return 0
     finally:
         lock.release()
+
+
+def recover_preparing(path: Path, original: str | None, rec: dict) -> str:
+    """No worker ran: AGENTS.md is either the original or the planned text. Anything else is left alone."""
+    block = rec.get("block", "")
+    if not isinstance(block, str):
+        raise ValueError("record has no block")
+    try:
+        planned, _ = ak_pointers.apply_pointer_block(original, block)
+    except ak_pointers.MalformedBlockError as e:
+        raise ValueError(f"recorded original has a {e}") from None
+    if rec.get("injected") is not None and rec["injected"] != planned:
+        raise ValueError("recorded planned text does not match the recorded original and block")
+    snap = ak_pointers.read_snapshot(path)
+    if snap.text == original:
+        return f"preparation did not change {ak_pointers.AGENTS_MD}"
+    if snap.text == planned:
+        ak_pointers.write_replacing(path, snap, original, snap.mode)
+        return f"{ak_pointers.AGENTS_MD} restored byte for byte"
+    raise ValueError(f"{ak_pointers.AGENTS_MD} matches neither the original nor the planned text; left as it is")
 
 
 def load_settings() -> None:
