@@ -272,9 +272,9 @@ Issue #79, Gibson doc 33 (draft, non-normative). A stuck PR, a silent consumer, 
 
 ### What is shipped and what is not
 
-Shipped: `POST /api/sweep` (one run), `GET /api/sweep` (read-only status), `POST /api/sweep/consumers` (registrations), the three sweeper observation kinds on `POST /api/ingest`, the brief's Paused section, the manual runner `scripts/sweep-once.sh`, and an inert five-minute example in `docs/examples/absence-sweep.cron.example`.
+Shipped: `POST /api/sweep` (one run), `GET /api/sweep` (read-only status), `POST /api/sweep/consumers` (registrations), the three sweeper observation kinds on `POST /api/ingest`, the brief's Paused section, the manual runner `scripts/sweep-once.sh`, and an inert five-minute example in `docs/examples/absence-sweep.cron.example`, and the queue and PR producer `scripts/sweep-producer.sh` (off by default; see [Producer](#producer)).
 
-Not performed: no `vercel.json` cron, no launchd job, no Mini change, no collector scheduling, no consumer registration, and no live migration. The five-minute cadence and its operational acceptance are left for the owner. Until registrations and observations exist, the checks report `not_configured` or `unknown`, never `clear`.
+Not performed: no `vercel.json` cron, no launchd job, no Mini change, no collector scheduling, no producer config installed or enabled, no live GitHub collection, no consumer registration, and no live migration. The five-minute cadence and its operational acceptance are left for the owner. Until registrations and observations exist, the checks report `not_configured` or `unknown`, never `clear`.
 
 ### Conditions
 
@@ -310,6 +310,17 @@ Only trusted writers create evidence. Scheduler, queue, and PR observations need
 - The existing `repo_snapshots` ages and stuck lists are not used as the sweeper clock: they lack raw timestamps and review-start facts.
 
 Freshness defaults to 30 minutes, twice the 15 minute collector tick. A source may send `stale_after_minutes` (5 to 1440) with each observation. Stale, failed, or truncated evidence is unknown, never zero, and an older success never replaces a newer failure.
+
+### Producer
+
+`scripts/sweep-producer.sh --repo owner/name` measures one repository and POSTs `sweep.queue` (`issue_dispatch`) and `sweep.pr_snapshot` with `MC_TOKEN`. `--dry-run` prints both envelopes and posts nothing. `scripts/collect-progress.sh` runs it per repo on each tick, as a child process whose failure never stops the progress tick; `--backfill` never runs it, so no historical tick carries current queue or PR state. The installer copies the script beside the collector and changes nothing else.
+
+It is off until `sweep-producer.config.json` (beside the script, or `MC_SWEEP_PRODUCER_CONFIG`) sets `"enabled": true`. That file is separate from `progress.config.json` and from the dashboard's repo list, which carry no readiness policy. It names the `source` id and, per repo, the `queue` id, `ready_labels`, `blocked_labels` (may be `[]`, must be stated), optional `raw_exclude_labels`, `required_checks` (context names), and an optional `review_start.status_context`. `scripts/sweep-producer.config.example.json` is an inert example. A repo with no entry is unconfigured: nothing is emitted and readiness is never guessed. Label and context names compare case-insensitively.
+
+- Queue: every open issue with its labels, paged to at most 1,000. Ready has a ready label and no blocked label; raw has no ready, blocked, or excluded label. Counts are the whole set; refs are the 50 lowest numbers.
+- PRs: every open PR (at most 200) with raw `createdAt`, draft, mergeability, head, the required contexts on the head commit, and reviews. A second pass re-reads every head; a moved head or a changed open set makes the snapshot incomplete. A missing, truncated, or unconfigured required context is `unknown`, never green, and a rollup not at the head is `unknown`. A published review counts only at the current head. `started: false` is sent only when the configured review-start status context is absent from a complete context list at the head; otherwise `review` is omitted.
+- Any GitHub failure, rate limit, timeout, malformed page, cap overflow, or a set that changed while paging is a newer `complete: false` observation with a short error, never a zero or an empty list. Each repo and each subject is independent.
+- Sequence numbers are persisted per subject in `MC_SWEEP_STATE_DIR` under a lock held for the whole collect-and-post, so a later collection always has the higher `seq`. The body is stored before the POST; an unacknowledged POST (transport failure, `429`, `5xx`) is retried first on the next run with the same `seq` and the same bytes. A `4xx` rejection or a `replay`/`older` answer to a new `seq` is logged as `REJECTED` or `STALE` and the run exits non-zero. State never holds a token, and response bodies are not printed.
 
 ### Consumer liveness and provenance
 

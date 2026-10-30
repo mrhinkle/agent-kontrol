@@ -9,7 +9,9 @@
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import { Client } from "pg";
+import { FAKE_TOKEN, Fixture, IngestServer, baseConfig, repoConfig, runProducer } from "./sweep-producer-fixtures";
 import { sql } from "../src/lib/db";
 import { createCredential } from "../src/lib/credentials";
 import { runWithPrincipal } from "../src/lib/actor";
@@ -552,6 +554,104 @@ export async function testSweeper(tag: string, applyCanonicalSchema: () => Promi
       assert.equal(verdictOf(run, "dispatch-ready-empty", qKey), "clear");
     }
 
+    // ------------------------------- producer envelopes, end to end (stub gh)
+    // scripts/sweep-producer.sh runs against fixture GitHub data; each body it
+    // POSTed is forwarded byte for byte through the real ingest route.
+    {
+      const capture = await new IngestServer().start();
+      const fx = new Fixture(os.tmpdir());
+      const prodRepo = `Prod-${tag.slice(-6)}/Gadgets`;
+      const prodKey = prodRepo.toLowerCase();
+      const pq = `queue:issues:${prodKey}`;
+      const pr1 = `pr:${prodKey}#1`;
+      const pr2 = `pr:${prodKey}#2`;
+      const pr3 = `pr:${prodKey}#3`;
+      const h = (c: string) => c.repeat(40);
+      fx.config(baseConfig({ [prodRepo]: repoConfig(prodRepo) }, { source: "collector-pg" }));
+      const collect = async () => {
+        capture.reset();
+        const r = await runProducer(fx, ["--repo", prodRepo], { MC_URL: capture.url, MC_TOKEN: FAKE_TOKEN });
+        assert.equal(r.code, 0, r.stderr);
+        assert.equal(capture.got.length, 2);
+        const out: Record<string, any>[] = [];
+        for (const g of capture.got) {
+          const res = await ingestPost(new Request("http://localhost/api/ingest", {
+            method: "POST",
+            headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+            body: g.raw,
+          }));
+          const body = await res.json() as Json;
+          assert.equal(res.status, 200, JSON.stringify(body));
+          assert.equal(body.outcome, "applied");
+          out.push(g.body.observation);
+        }
+        return out;
+      };
+      const stuckWorld = async () => {
+        fx.clear(prodRepo);
+        fx.issues(prodRepo, [{ number: 1, labels: [] }, { number: 2, labels: ["Bug"] }, { number: 3, labels: ["blocked", "dispatch-ready"] }]);
+        const green = [{ kind: "check" as const, name: "ci" }, { kind: "status" as const, name: "postgres" }];
+        fx.prs(prodRepo, [
+          { number: 1, head: h("1"), createdAt: await isoAgo(49 * HOUR), contexts: green },
+          { number: 2, head: h("2"), createdAt: await isoAgo(HOUR), contexts: green },
+          { number: 3, head: h("3"), createdAt: await isoAgo(HOUR), contexts: green, reviews: [{ state: "COMMENTED", oid: h("3") }] },
+        ]);
+      };
+      try {
+        await stuckWorld();
+        const [q1, p1] = await collect();
+        assert.deepEqual([q1.ready.count, q1.raw.count], [0, 2]);
+        assert.deepEqual(p1.prs[1].review, { started: false, head_sha: h("2") }, "the configured review-start source proves absence");
+        let run = await runSweep();
+        assert.equal(verdictOf(run, "pr-stuck", pr1), "firing", "age from the raw createdAt");
+        assert.equal(verdictOf(run, "pr-stuck", pr2), "clear", "green, not yet 30 minutes");
+        assert.equal(verdictOf(run, "pr-stuck", pr3), "clear", "a review started at this head");
+        assert.equal(verdictOf(run, "dispatch-ready-empty", pq), "clear", "empty, not yet an hour");
+        for (const step of [25, 25, 15]) {
+          advance(step * MIN);
+          await collect();
+        }
+        run = await runSweep();
+        assert.equal(verdictOf(run, "dispatch-ready-empty", pq), "firing", "raw work and nothing ready for over an hour");
+        assert.equal(verdictOf(run, "pr-stuck", pr2), "firing", "green at head for 30 minutes with no review started");
+        assert.equal(verdictOf(run, "pr-stuck", pr3), "clear");
+        assert.equal((await inbox("dispatch-ready-empty", pq)).length, 1);
+        assert.equal((await inbox("pr-stuck", pr1)).length, 1);
+        assert.equal(Number((await sql()`select seq from sweep_queues where queue = ${`issues:${prodKey}`}`)[0].seq), 4, "the producer's persisted seq");
+
+        // GitHub fails: newer complete:false observations; unknown keeps every latch and emits nothing.
+        fx.clear(prodRepo);
+        fx.raw(prodRepo, "SweepIssues", "first", "", { exit: 1, stderr: "API rate limit exceeded" });
+        fx.raw(prodRepo, "SweepPrs", "first", "", { exit: 1 });
+        advance(5 * MIN);
+        const [qf, pf] = await collect();
+        assert.deepEqual([qf.complete, pf.complete], [false, false]);
+        const before = Number((await sql()`select count(*) as n from gh_events where delivery_id like 'sweep:%'`)[0].n);
+        run = await runSweep();
+        for (const key of [pr1, pr2]) assert.equal(verdictOf(run, "pr-stuck", key), "unknown");
+        assert.equal(verdictOf(run, "dispatch-ready-empty", pq), "unknown");
+        for (const [c, k] of [["pr-stuck", pr1], ["pr-stuck", pr2], ["dispatch-ready-empty", pq]] as [SweepCondition, string][]) {
+          assert.equal((await latch(c, k))?.active, true, `${k}: unknown preserves the latch`);
+        }
+        assert.equal(Number((await sql()`select count(*) as n from gh_events where delivery_id like 'sweep:%'`)[0].n), before, "unknown emits nothing");
+
+        // Ready work and no open PRs: measured, so everything clears.
+        fx.clear(prodRepo);
+        fx.issues(prodRepo, [{ number: 1, labels: ["DISPATCH-READY"] }]);
+        fx.prs(prodRepo, []);
+        advance(5 * MIN);
+        await collect();
+        run = await runSweep();
+        assert.equal(verdictOf(run, "dispatch-ready-empty", pq), "clear");
+        for (const key of [pr1, pr2]) assert.equal(verdictOf(run, "pr-stuck", key), "clear", "closed by a complete snapshot");
+        assert.equal((await inbox("dispatch-ready-empty", pq)).at(-1)?.event, "dispatch-ready-empty-cleared");
+        assert.equal((await inbox("pr-stuck", pr1)).at(-1)?.event, "pr-stuck-cleared");
+      } finally {
+        await capture.stop();
+        fs.rmSync(fx.dir, { recursive: true, force: true });
+      }
+    }
+
     // ------------------------------------------------ races and replays
     {
       const raceJob = `${tag}-race`.toLowerCase();
@@ -699,6 +799,45 @@ export async function testSweeper(tag: string, applyCanonicalSchema: () => Promi
       const text = formatBriefText(brief);
       assert.match(text, /\nPAUSED: DATA INCOMPLETE \u2014 \d+ job\(s\) stale; known rows below\n  \?\? mini\//, "stale jobs are unknown, never none");
       assert.match(text, /\nHELD VERSUS UNEXPLAINED: \d+ held, \d+ unexplained, \d+ expired/);
+    }
+
+    // -------------- combined schema and all three new migrations, twice
+    // The webhook (#77), quota (#51), and sweeper (#79) migrations stacked:
+    // stored events with provenance, quota counters, inbox rows, latches, and
+    // observations survive every re-apply unchanged.
+    {
+      const evidence = async () => ({
+        events: await sql()`select id::text, agent_id, kind, principal_kind, principal_id from events where agent_id like ${`${tag.toLowerCase()}%`} order by id`,
+        quota: await sql()`
+          select id, rate_limit_per_minute, rate_limit_per_day, rate_minute_start::text, rate_minute_count, rate_day_start::text, rate_day_count
+          from agent_credentials where id = any(${credentialIds}::text[]) order by id
+        `,
+        inbox: await sql()`select delivery_id, event, payload from gh_events where delivery_id like 'sweep:%' order by delivery_id`,
+        latches: await sql()`select condition, entity_key, active, episode, seq, last_state, last_evaluated_at::text from sweep_latches order by condition, entity_key`,
+        observations: await sql()`select count(*)::int as n, max(id)::text as top from sweep_observations`,
+      });
+      const before = await evidence();
+      assert.ok(before.events.some((e) => e.principal_kind !== null), "there is an event with provenance to keep");
+      assert.ok(before.quota.some((q) => Number(q.rate_day_count) > 0), "there is a charged credential to keep");
+      assert.ok(before.latches.some((l) => l.active === true), "there is an active latch to keep");
+      assert.ok(before.inbox.length > 0);
+      const client = new Client({ connectionString: process.env.DATABASE_URL });
+      await client.connect();
+      try {
+        for (let pass = 0; pass < 2; pass += 1) {
+          await applyCanonicalSchema();
+          for (const file of [
+            "supabase/migrations/20261030012111_gh_events.sql",
+            "supabase/migrations/20261030012556_agent_credential_rate_limits.sql",
+            MIGRATION,
+          ]) {
+            await client.query(fs.readFileSync(file, "utf8"));
+          }
+        }
+      } finally {
+        await client.end();
+      }
+      assert.deepEqual(await evidence(), before, "schema and migrations re-applied twice leave existing evidence unchanged");
     }
   } finally {
     setSweepClockOffsetForTests(0);
