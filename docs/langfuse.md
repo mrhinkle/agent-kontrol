@@ -57,7 +57,7 @@ The updated dispatcher emits `kind=run_complete` with a strict `mc.run.v2` metad
 
 ## Fleet coverage and remaining native instrumentation
 
-Updating the server alone does not update a running local dispatcher. Activate the dispatcher changes separately on approved machines, using both `mc_dispatcher.py` and `run_telemetry.py`. No daemon was installed/restarted by this change. The obsolete Codex `--full-auto` default is replaced with the supported `--sandbox workspace-write`. An explicit old `MC_CODEX_ARGS` override still needs correction during approved activation. Other dispatcher review/autonomy behavior is unchanged.
+Updating the server alone does not update a running local dispatcher. Activate the dispatcher changes separately on approved machines, using `mc_dispatcher.py` together with `run_telemetry.py` and `ak_pointers.py`, which it imports. No daemon was installed/restarted by this change. The obsolete Codex `--full-auto` default is replaced with the supported `--sandbox workspace-write`. An explicit old `MC_CODEX_ARGS` override still needs correction during approved activation. Other dispatcher review/autonomy behavior is unchanged.
 
 Interactive sessions outside the dispatcher still have activity telemetry only. Detailed model-request latency, nested tool spans, native Langfuse generation token charts, and evaluations require native runtime instrumentation.
 

@@ -1,7 +1,11 @@
-import type { Actor } from "./actor";
+import { currentActor, type Actor } from "./actor";
+import { activityRow, attachReceipt, receiptFromParts, type ActivityRow, type Receipt } from "./activity";
 import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } from "./idempotency";
+import { StaleWrite, absentRevision } from "./revision";
 import { writeSessionNote } from "./session-memory";
-import { sql, sqlTransaction, type SqlTag } from "./db";
+import { sql, withTransaction, type SqlTag } from "./db";
+import { insertToolReceipt } from "./tool-receipt";
+import { stampSortAt } from "./list-params";
 import { queueLangfuseEvent } from "./langfuse-report";
 import { parseRunTelemetry } from "./run-telemetry";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
@@ -57,6 +61,10 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+function isUniqueViolation(e: unknown): boolean {
+  return typeof e === "object" && e !== null && (e as { code?: unknown }).code === "23505";
+}
+
 /** Keep a connection loss typed so idempotency does not drop a claim that may have committed. */
 function rethrowStore(e: unknown): never {
   const unknown = asUnknownWriteOutcome(e);
@@ -64,7 +72,7 @@ function rethrowStore(e: unknown): never {
   throw new Error(errMsg(e));
 }
 
-export async function report(input: ReportInput): Promise<void> {
+export async function report(input: ReportInput): Promise<Receipt | null> {
   const run = input.kind === "run_complete" ? parseRunTelemetry(input.detail) : null;
   if (input.kind === "run_complete" && !run) throw new Error("invalid run telemetry");
   const db = sql();
@@ -78,124 +86,119 @@ export async function report(input: ReportInput): Promise<void> {
   let storedPlatform = platform;
   const machine = input.machine ?? null;
   const displayName = input.display_name ?? null;
-  try {
-    const agents = await db`
-      insert into agents (id, platform, machine, display_name, last_seen_at)
-      values (
-        ${agentId},
-        coalesce(${platform}, 'other'),
-        ${machine},
-        ${displayName},
-        ${now}
-      )
-      on conflict (id) do update set
-        last_seen_at = excluded.last_seen_at,
-        platform = coalesce(${platform}, agents.platform),
-        machine = coalesce(${machine}, agents.machine),
-        display_name = coalesce(${displayName}, agents.display_name)
-      returning platform
-    `;
-    const savedPlatform = agents[0]?.platform;
-    if (typeof savedPlatform === "string") storedPlatform = savedPlatform;
-  } catch (e) {
-    throw new Error(`agents upsert: ${errMsg(e)}`);
-  }
+  const sessionId = input.session_id ? input.session_id : null;
+  const status = input.status ?? KIND_TO_STATUS[input.kind] ?? "active";
+  const project = input.project ?? null;
+  const summary = input.summary ?? null;
+  // A closed session only reopens on an explicit session_start / active
+  // report — a straggling Stop/heartbeat can't resurrect it.
+  const reopens = input.kind === "session_start" || input.status === "active";
+  const setEndedAt = input.kind === "session_end";
+  const title = input.title ?? null;
+  const detail = JSON.stringify(input.detail ?? null);
 
-  if (input.session_id) {
-    const status = input.status ?? KIND_TO_STATUS[input.kind] ?? "active";
-    let existing: { id: string; status: string } | null = null;
-    try {
-      const rows = await db`
-        select id, status from sessions where id = ${input.session_id} limit 1
-      `;
-      existing = (rows[0] as { id: string; status: string } | undefined) ?? null;
-    } catch (e) {
-      throw new Error(`sessions select: ${errMsg(e)}`);
-    }
-
-    const isClosed = existing?.status === "done" || existing?.status === "failed";
-    const reopens = input.kind === "session_start" || input.status === "active";
-
-    if (!existing) {
-      const project = input.project ?? null;
-      const summary = input.summary ?? null;
-      const endedAt = input.kind === "session_end" ? now : null;
-      try {
-        await db`
-          insert into sessions (id, agent_id, status, updated_at, ended_at, project, summary)
-          values (
-            ${input.session_id},
-            ${agentId},
-            ${status},
-            ${now},
-            ${endedAt},
-            ${project},
-            ${summary}
-          )
-          on conflict (id) do update set
-            agent_id = excluded.agent_id,
-            status = excluded.status,
-            updated_at = excluded.updated_at,
-            ended_at = excluded.ended_at,
-            project = coalesce(excluded.project, sessions.project),
-            summary = coalesce(excluded.summary, sessions.summary)
-        `;
-      } catch (e) {
-        throw new Error(`sessions insert: ${errMsg(e)}`);
-      }
-    } else if (!isClosed || reopens) {
-      // A closed session only reopens on an explicit session_start / active
-      // report — a straggling Stop/heartbeat can't resurrect it.
-      const project = input.project ?? null;
-      const summary = input.summary ?? null;
-      const setEndedAt = input.kind === "session_end";
-      const clearEndedAt = Boolean(isClosed && reopens);
-      try {
-        await db`
-          update sessions set
-            status = ${status},
-            updated_at = ${now},
-            project = coalesce(${project}, project),
-            summary = coalesce(${summary}, summary),
-            ended_at = case
-              when ${setEndedAt} then ${now}::timestamptz
-              when ${clearEndedAt} then null
-              else ended_at
-            end
-          where id = ${input.session_id}
-        `;
-      } catch (e) {
-        throw new Error(`sessions update: ${errMsg(e)}`);
-      }
-    }
-  }
-
+  // One statement. The event insert depends on the agent and session
+  // writes, so a rejecting events trigger rolls all of them back.
+  let receipt: Receipt | null = null;
   let persistedEvent: { id: number; created_at: string | Date } | undefined;
   try {
-    const events = run ? (await sqlTransaction([
-      { text: "select pg_advisory_xact_lock(hashtextextended($1, 0))", params: [JSON.stringify([agentId, run.run_id])] },
-      { text: `
-        insert into events (agent_id, session_id, kind, title, detail)
-        select $1, $2, 'run_complete', 'CLI run completed', $3::jsonb
-        where not exists (
-          select 1 from events where agent_id = $1 and kind = 'run_complete' and detail->>'run_id' = $4
+    // A completed run is stored once per (agent, run_id): its sanitized detail
+    // replaces the raw one, and an advisory lock serializes concurrent deliveries.
+    const write = (q: SqlTag) => q`
+      with agent_row as (
+        insert into agents (id, platform, machine, display_name, last_seen_at)
+        values (
+          ${agentId},
+          coalesce(${platform}::text, 'other'),
+          ${machine}::text,
+          ${displayName}::text,
+          ${now}::timestamptz
         )
-        returning id, created_at
-      `, params: [agentId, input.session_id ?? null, JSON.stringify(run), run.run_id] },
-    ]))[1] : await db`
-      insert into events (agent_id, session_id, kind, title, detail)
-      values (
-        ${agentId},
-        ${input.session_id ?? null},
-        ${input.kind},
-        ${input.title ?? null},
-        ${JSON.stringify(input.detail ?? null)}::jsonb
+        on conflict (id) do update set
+          last_seen_at = excluded.last_seen_at,
+          platform = coalesce(${platform}::text, agents.platform),
+          machine = coalesce(${machine}::text, agents.machine),
+          display_name = coalesce(${displayName}::text, agents.display_name)
+        returning id, platform
+      ),
+      prior_session as (
+        select id, status
+        from sessions
+        where id = ${sessionId}::text
+      ),
+      session_insert as (
+        insert into sessions (id, agent_id, status, updated_at, ended_at, project, summary)
+        select
+          ${sessionId}::text,
+          agent_row.id,
+          ${status},
+          ${now}::timestamptz,
+          case when ${setEndedAt}::boolean then ${now}::timestamptz else null end,
+          ${project}::text,
+          ${summary}::text
+        from agent_row
+        where ${sessionId}::text is not null
+          and not exists (select 1 from prior_session)
+        on conflict (id) do update set
+          agent_id = excluded.agent_id,
+          status = excluded.status,
+          updated_at = excluded.updated_at,
+          ended_at = excluded.ended_at,
+          project = coalesce(excluded.project, sessions.project),
+          summary = coalesce(excluded.summary, sessions.summary)
+        returning id
+      ),
+      session_update as (
+        update sessions as s set
+          status = ${status},
+          updated_at = now(),
+          project = coalesce(${project}::text, s.project),
+          summary = coalesce(${summary}::text, s.summary),
+          ended_at = case
+            when ${setEndedAt}::boolean then ${now}::timestamptz
+            when p.status in ('done', 'failed') and ${reopens}::boolean then null
+            else s.ended_at
+          end
+        from prior_session as p
+        where s.id = p.id
+          and ${sessionId}::text is not null
+          and (p.status not in ('done', 'failed') or ${reopens}::boolean)
+        returning s.id
+      ),
+      event_row as (
+        insert into events (agent_id, session_id, kind, title, detail)
+        select
+          agent_row.id,
+          ${sessionId}::text,
+          ${input.kind},
+          ${run ? "CLI run completed" : title}::text,
+          ${run ? JSON.stringify(run) : detail}::jsonb
+        from agent_row
+        where (select count(*) from session_insert) >= 0
+          and (select count(*) from session_update) >= 0
+          and (${run?.run_id ?? null}::text is null or not exists (
+            select 1 from events
+            where agent_id = agent_row.id and kind = 'run_complete' and detail->>'run_id' = ${run?.run_id ?? null}::text
+          ))
+        returning id, kind, created_at
       )
-      returning id, created_at
+      select event_row.id, event_row.kind, event_row.created_at, agent_row.platform
+      from event_row cross join agent_row
     `;
-    persistedEvent = events[0] as typeof persistedEvent;
+    const rows = run
+      ? await withTransaction(async (tx) => {
+          await tx`select pg_advisory_xact_lock(hashtextextended(${JSON.stringify([agentId, run.run_id])}, 0))`;
+          return write(tx);
+        })
+      : await write(db);
+    const row = rows[0] as Record<string, unknown> | undefined;
+    if (row) {
+      receipt = receiptFromParts(row.id, row.kind, row.created_at);
+      persistedEvent = { id: Number(row.id), created_at: row.created_at as string | Date };
+      if (typeof row.platform === "string") storedPlatform = row.platform;
+    }
   } catch (e) {
-    throw new Error(`events insert: ${errMsg(e)}`);
+    throw new Error(`report: ${errMsg(e)}`);
   }
 
   // Any platform that ends a session (hook, watcher, or an MCP report with status
@@ -207,8 +210,9 @@ export async function report(input: ReportInput): Promise<void> {
     await Promise.race([work, new Promise<void>((resolve) => (timer = setTimeout(resolve, 2500)))]);
     clearTimeout(timer);
   }
+  // Only a newly stored event is exported; a duplicate run delivery is not.
   if (persistedEvent) queueLangfuseEvent({
-    id: Number(persistedEvent.id),
+    id: persistedEvent.id,
     created_at: persistedEvent.created_at,
     agent_id: agentId,
     session_id: input.session_id,
@@ -217,6 +221,7 @@ export async function report(input: ReportInput): Promise<void> {
     status: input.status,
     ...(run ? { run } : {}),
   });
+  return receipt;
 }
 
 const OFFLINE_AFTER_MS = 15 * 60 * 1000;
@@ -314,6 +319,12 @@ export async function remember(input: {
   key?: string;
   tags?: string[];
   agent_id?: string;
+  /**
+   * Preview token. When set, a keyed write is one conditional statement:
+   * `md5(m::text)` must still match, or the insert lands only when the key
+   * is still absent. A miss writes nothing.
+   */
+  expected_revision?: string;
 }): Promise<MemoryItem> {
   const db = sql();
   const key = input.key ?? null;
@@ -321,34 +332,205 @@ export async function remember(input: {
   const tags = input.tags ?? [];
   const agentId = input.agent_id ?? null;
   const updatedAt = new Date().toISOString();
+  const expected = input.expected_revision;
+  const actor = currentActor();
+  const actorType = actor?.actor_type ?? null;
+  const actorId = actor?.actor_id ?? null;
 
   try {
-    if (key) {
+    if (expected === undefined) {
+      if (key) {
+        const rows = await db`
+          with w as (
+            insert into memory (key, content, tags, agent_id, updated_at)
+            values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
+            on conflict (key) do update set
+              content = excluded.content,
+              tags = excluded.tags,
+              agent_id = excluded.agent_id,
+              updated_at = excluded.updated_at,
+              source = null,
+              facts_at = null
+            returning *
+          ),
+          e as (
+            insert into events (agent_id, session_id, kind, title, detail)
+            select
+              null,
+              null,
+              'remember',
+              'Stored memory #' || w.id::text || case when w.key is not null then ' (key: ' || w.key || ')' else '' end,
+              jsonb_build_object(
+                'memory_id', w.id::text,
+                'memory_key', w.key,
+                'tool', 'remember',
+                'actor_type', ${actorType}::text,
+                'actor_id', ${actorId}::text
+              )
+            from w
+            returning id, kind, created_at
+          )
+          select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+          from w, e
+        `;
+        if (!rows[0]) throw new Error("memory upsert returned no row");
+        return asMemory(rows[0] as Record<string, unknown>);
+      }
       const rows = await db`
-        insert into memory (key, content, tags, agent_id, updated_at)
-        values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
-        on conflict (key) do update set
-          content = excluded.content,
-          tags = excluded.tags,
-          agent_id = excluded.agent_id,
-          updated_at = excluded.updated_at,
-          source = null,
-          facts_at = null
-        returning *
+        with w as (
+          insert into memory (key, content, tags, agent_id, updated_at)
+          values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
+          returning *
+        ),
+        e as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            'remember',
+            'Stored memory #' || w.id::text || case when w.key is not null then ' (key: ' || w.key || ')' else '' end,
+            jsonb_build_object(
+              'memory_id', w.id::text,
+              'memory_key', w.key,
+              'tool', 'remember',
+              'actor_type', ${actorType}::text,
+              'actor_id', ${actorId}::text
+            )
+          from w
+          returning id, kind, created_at
+        )
+        select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+        from w, e
       `;
-      if (!rows[0]) throw new Error("memory upsert returned no row");
-      return rows[0] as MemoryItem;
+      if (!rows[0]) throw new Error("memory insert returned no row");
+      return asMemory(rows[0] as Record<string, unknown>);
     }
-    const rows = await db`
-      insert into memory (key, content, tags, agent_id, updated_at)
-      values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
-      returning *
-    `;
-    if (!rows[0]) throw new Error("memory insert returned no row");
-    return rows[0] as MemoryItem;
+
+    if (!key) {
+      if (expected !== absentRevision()) throw new StaleWrite(absentRevision());
+      const rows = await db`
+        with w as (
+          insert into memory (key, content, tags, agent_id, updated_at)
+          values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
+          returning *
+        ),
+        e as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            'remember',
+            'Stored memory #' || w.id::text || case when w.key is not null then ' (key: ' || w.key || ')' else '' end,
+            jsonb_build_object(
+              'memory_id', w.id::text,
+              'memory_key', w.key,
+              'tool', 'remember',
+              'actor_type', ${actorType}::text,
+              'actor_id', ${actorId}::text
+            )
+          from w
+          returning id, kind, created_at
+        )
+        select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+        from w, e
+      `;
+      if (!rows[0]) throw new Error("memory insert returned no row");
+      return asMemory(rows[0] as Record<string, unknown>);
+    }
+
+    if (expected === absentRevision()) {
+      const rows = await db`
+        with w as (
+          insert into memory (key, content, tags, agent_id, updated_at)
+          values (${key}, ${content}, ${tags}, ${agentId}, ${updatedAt})
+          on conflict (key) do nothing
+          returning *
+        ),
+        e as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            'remember',
+            'Stored memory #' || w.id::text || case when w.key is not null then ' (key: ' || w.key || ')' else '' end,
+            jsonb_build_object(
+              'memory_id', w.id::text,
+              'memory_key', w.key,
+              'tool', 'remember',
+              'actor_type', ${actorType}::text,
+              'actor_id', ${actorId}::text
+            )
+          from w
+          returning id, kind, created_at
+        )
+        select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+        from w, e
+      `;
+      if (rows[0]) return asMemory(rows[0] as Record<string, unknown>);
+    } else {
+      const rows = await db`
+        with w as (
+          update memory m set
+            content = ${content},
+            tags = ${tags},
+            agent_id = ${agentId},
+            updated_at = ${updatedAt},
+            source = null,
+            facts_at = null
+          where m.key = ${key}
+            and md5(m::text) = ${expected}
+          returning *
+        ),
+        e as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            'remember',
+            'Stored memory #' || w.id::text || case when w.key is not null then ' (key: ' || w.key || ')' else '' end,
+            jsonb_build_object(
+              'memory_id', w.id::text,
+              'memory_key', w.key,
+              'tool', 'remember',
+              'actor_type', ${actorType}::text,
+              'actor_id', ${actorId}::text
+            )
+          from w
+          returning id, kind, created_at
+        )
+        select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+        from w, e
+      `;
+      if (rows[0]) return asMemory(rows[0] as Record<string, unknown>);
+    }
   } catch (e) {
-    throw new Error(errMsg(e));
+    if (e instanceof StaleWrite) throw e;
+    if (expected === undefined || !key || !isUniqueViolation(e)) throw new Error(errMsg(e));
   }
+
+  const current = await memoryRevisionOf(key);
+  if (!current) throw new Error("Memory not found");
+  throw new StaleWrite(current);
+}
+
+/** The revision a new preview would return, from the same expression as the guard. */
+async function memoryRevisionOf(key: string): Promise<string | null> {
+  const db = sql();
+  const rows = await db`
+    select md5(m::text) as revision
+    from memory m
+    where m.key = ${key}
+    limit 1
+  `;
+  const revision = rows[0]?.revision;
+  return typeof revision === "string" ? revision : null;
+}
+
+function stampListed<T extends Record<string, unknown>>(row: T): T {
+  const sortAt = row.list_sort_at;
+  delete row.list_sort_at;
+  if (typeof sortAt === "string") stampSortAt(row, sortAt);
+  return row;
 }
 
 export async function recall(input: {
@@ -356,6 +538,10 @@ export async function recall(input: {
   key?: string;
   tags?: string[];
   limit?: number;
+  /** Set when the caller asked for a page. Adds the id tiebreak and a sort stamp. */
+  keyset?: boolean;
+  /** Millisecond updated_at and id of the last row already returned. */
+  cursor?: { updatedAt: string; id: string } | null;
 }): Promise<MemoryItem[]> {
   const db = sql();
   const limit = input.limit ?? 20;
@@ -366,23 +552,50 @@ export async function recall(input: {
 
   try {
     // Optional filters: null means "no filter" (predicate short-circuits).
+    if (!input.keyset) {
+      const rows = await db`
+        select * from memory
+        where
+          (${key}::text is null or key = ${key})
+          and (${like}::text is null or content ilike ${like})
+          and (${tags}::text[] is null or tags && ${tags}::text[])
+        order by updated_at desc
+        limit ${limit}
+      `;
+      return rows as MemoryItem[];
+    }
+    const hasCursor = input.cursor != null;
+    const updatedAt = input.cursor?.updatedAt ?? "1970-01-01T00:00:00.000Z";
+    const cursorId = input.cursor?.id ?? "1";
+    // Keyset predicate matches pageRows: updated_at desc, truncated to
+    // milliseconds, then id ascending. The stamp is not part of the JSON body.
     const rows = await db`
-      select * from memory
+      select memory.*,
+        to_char(date_trunc('milliseconds', updated_at) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as list_sort_at
+      from memory
       where
         (${key}::text is null or key = ${key})
         and (${like}::text is null or content ilike ${like})
         and (${tags}::text[] is null or tags && ${tags}::text[])
-      order by updated_at desc
+        and (
+          ${hasCursor}::boolean = false
+          or date_trunc('milliseconds', updated_at) < ${updatedAt}::timestamptz
+          or (
+            date_trunc('milliseconds', updated_at) = ${updatedAt}::timestamptz
+            and id > ${cursorId}::bigint
+          )
+        )
+      order by date_trunc('milliseconds', updated_at) desc, id asc
       limit ${limit}
     `;
-    return rows as MemoryItem[];
+    return (rows as Record<string, unknown>[]).map(stampListed) as unknown as MemoryItem[];
   } catch (e) {
     throw new Error(errMsg(e));
   }
 }
 
 function asMessage(row: Record<string, unknown>): Message {
-  return {
+  const message: Message = {
     id: Number(row.id),
     agent_id: String(row.agent_id),
     body: String(row.body),
@@ -397,6 +610,21 @@ function asMessage(row: Record<string, unknown>): Message {
     thread_id: (row.thread_id as string | null) ?? null,
     read_by_dashboard_at: (row.read_by_dashboard_at as string | null) ?? null,
   };
+  const receipt = receiptFromParts(row.receipt_id, row.receipt_kind, row.receipt_at);
+  if (receipt) attachReceipt(message, receipt);
+  return message;
+}
+
+/** Drop the receipt columns the statement joined on, and keep the receipt on the object. */
+function asMemory(row: Record<string, unknown>): MemoryItem {
+  const receipt = receiptFromParts(row.receipt_id, row.receipt_kind, row.receipt_at);
+  const copy: Record<string, unknown> = { ...row };
+  delete copy.receipt_id;
+  delete copy.receipt_kind;
+  delete copy.receipt_at;
+  const item = copy as unknown as MemoryItem;
+  if (receipt) attachReceipt(item, receipt);
+  return item;
 }
 
 function actorFields(actor: Actor | null | undefined): { actor_type: string | null; actor_id: string | null } {
@@ -405,11 +633,18 @@ function actorFields(actor: Actor | null | undefined): { actor_type: string | nu
 }
 
 function asTask(row: Record<string, unknown>): Task {
-  return {
+  const receipt = receiptFromParts(row.receipt_id, row.receipt_kind, row.receipt_at);
+  const task: Task = {
     ...(row as unknown as Task),
     actor_type: row.actor_type === "human" || row.actor_type === "agent" ? row.actor_type : null,
     actor_id: row.actor_id == null || row.actor_id === "" ? null : String(row.actor_id),
   };
+  const extra = task as unknown as Record<string, unknown>;
+  delete extra.receipt_id;
+  delete extra.receipt_kind;
+  delete extra.receipt_at;
+  if (receipt) attachReceipt(task, receipt);
+  return task;
 }
 
 /** The atomic statement returns the jsonb it stored, not the driver row. */
@@ -485,49 +720,97 @@ async function insertMessage(
 async function insertPlainMessage(db: SqlTag, input: MessageWrite): Promise<Record<string, unknown>[]> {
   if (input.threadId == null) {
     return db`
-      insert into messages (
-        id, agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id
+      with w as (
+        insert into messages (
+          id, agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id
+        )
+        overriding system value
+        select
+          allocated.nid,
+          ${input.agentId},
+          ${input.body},
+          ${input.createdBy},
+          ${input.direction},
+          ${input.inReplyTo},
+          allocated.nid::text,
+          ${input.actorType},
+          ${input.actorId}
+        from (
+          select nextval(pg_get_serial_sequence('messages', 'id')) as nid
+        ) allocated
+        returning *
+      ),
+      e as (
+        insert into events (agent_id, session_id, kind, title, detail)
+        select
+          null,
+          null,
+          case when w.direction = 'inbound' then 'send_message' else 'reply_to_operator' end,
+          case
+            when w.direction = 'inbound'
+              then 'Message #' || w.id::text || ' sent to ' || w.agent_id
+            else 'Reply #' || w.id::text || ' delivered'
+          end,
+          jsonb_build_object(
+            'tool', case when w.direction = 'inbound' then 'send_message' else 'reply_to_operator' end,
+            'actor_type', w.actor_type,
+            'actor_id', w.actor_id,
+            'message_id', w.id::text
+          )
+        from w
+        returning id, kind, created_at
       )
-      overriding system value
-      select
-        allocated.nid,
+      select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+      from w, e
+    `;
+  }
+  return db`
+    with w as (
+      insert into messages (
+        agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id
+      )
+      values (
         ${input.agentId},
         ${input.body},
         ${input.createdBy},
         ${input.direction},
         ${input.inReplyTo},
-        allocated.nid::text,
+        ${input.threadId},
         ${input.actorType},
         ${input.actorId}
-      from (
-        select nextval(pg_get_serial_sequence('messages', 'id')) as nid
-      ) allocated
+      )
       returning *
-    `;
-  }
-  return db`
-    insert into messages (
-      agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id
+    ),
+    e as (
+      insert into events (agent_id, session_id, kind, title, detail)
+      select
+        null,
+        null,
+        case when w.direction = 'inbound' then 'send_message' else 'reply_to_operator' end,
+        case
+          when w.direction = 'inbound'
+            then 'Message #' || w.id::text || ' sent to ' || w.agent_id
+          else 'Reply #' || w.id::text || ' delivered'
+        end,
+        jsonb_build_object(
+          'tool', case when w.direction = 'inbound' then 'send_message' else 'reply_to_operator' end,
+          'actor_type', w.actor_type,
+          'actor_id', w.actor_id,
+          'message_id', w.id::text
+        )
+      from w
+      returning id, kind, created_at
     )
-    values (
-      ${input.agentId},
-      ${input.body},
-      ${input.createdBy},
-      ${input.direction},
-      ${input.inReplyTo},
-      ${input.threadId},
-      ${input.actorType},
-      ${input.actorId}
-    )
-    returning *
+    select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+    from w, e
   `;
 }
 
 /**
- * Insert the message and store the claim response in one statement.
- * `gate` locks the claim. The insert's WHERE repeats the token check, so a
- * token that was taken over inserts no row. thread_id is set here, not by a
- * later update.
+ * Insert the message, its activity event, and the claim response in one
+ * statement. `gate` locks the claim. The insert's WHERE repeats the token
+ * check, so a token that was taken over inserts no row. A replay reads the
+ * stored response and does not run this statement. thread_id is set here.
  */
 async function insertClaimedMessage(
   db: SqlTag,
@@ -545,7 +828,7 @@ async function insertClaimedMessage(
           and response is null
         for update
       ),
-      inserted as (
+      w as (
         insert into messages (
           id, agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id
         )
@@ -574,14 +857,42 @@ async function insertClaimedMessage(
         )
         returning *
       ),
+      e as (
+        insert into events (agent_id, session_id, kind, title, detail)
+        select
+          null,
+          null,
+          case when w.direction = 'inbound' then 'send_message' else 'reply_to_operator' end,
+          case
+            when w.direction = 'inbound'
+              then 'Message #' || w.id::text || ' sent to ' || w.agent_id
+            else 'Reply #' || w.id::text || ' delivered'
+          end,
+          jsonb_build_object(
+            'tool', case when w.direction = 'inbound' then 'send_message' else 'reply_to_operator' end,
+            'actor_type', w.actor_type,
+            'actor_id', w.actor_id,
+            'message_id', w.id::text
+          )
+        from w
+        returning id, kind, created_at
+      ),
       stored as (
         update idempotency_keys as k
-        set response = (select to_jsonb(i) from inserted i)
+        set response = (
+          select to_jsonb(w) || jsonb_build_object(
+            'receipt_id', e.id,
+            'receipt_kind', e.kind,
+            'receipt_at', e.created_at
+          )
+          from w, e
+        )
         from gate
         where k.scope = gate.scope
           and k.idempotency_key = gate.idempotency_key
           and k.claim_token = ${claim.token}
-          and exists (select 1 from inserted)
+          and exists (select 1 from w)
+          and exists (select 1 from e)
         returning k.response
       )
       select response from stored
@@ -597,7 +908,7 @@ async function insertClaimedMessage(
         and response is null
       for update
     ),
-    inserted as (
+    w as (
       insert into messages (
         agent_id, body, created_by, direction, in_reply_to, thread_id, actor_type, actor_id
       )
@@ -621,14 +932,42 @@ async function insertClaimedMessage(
       )
       returning *
     ),
+    e as (
+      insert into events (agent_id, session_id, kind, title, detail)
+      select
+        null,
+        null,
+        case when w.direction = 'inbound' then 'send_message' else 'reply_to_operator' end,
+        case
+          when w.direction = 'inbound'
+            then 'Message #' || w.id::text || ' sent to ' || w.agent_id
+          else 'Reply #' || w.id::text || ' delivered'
+        end,
+        jsonb_build_object(
+          'tool', case when w.direction = 'inbound' then 'send_message' else 'reply_to_operator' end,
+          'actor_type', w.actor_type,
+          'actor_id', w.actor_id,
+          'message_id', w.id::text
+        )
+      from w
+      returning id, kind, created_at
+    ),
     stored as (
       update idempotency_keys as k
-      set response = (select to_jsonb(i) from inserted i)
+      set response = (
+        select to_jsonb(w) || jsonb_build_object(
+          'receipt_id', e.id,
+          'receipt_kind', e.kind,
+          'receipt_at', e.created_at
+        )
+        from w, e
+      )
       from gate
       where k.scope = gate.scope
         and k.idempotency_key = gate.idempotency_key
         and k.claim_token = ${claim.token}
-        and exists (select 1 from inserted)
+        and exists (select 1 from w)
+        and exists (select 1 from e)
       returning k.response
     )
     select response from stored
@@ -865,7 +1204,7 @@ async function insertTask(
               and response is null
             for update
           ),
-          inserted as (
+          w as (
             insert into tasks (
               title, description, project, platform, machine,
               priority, reviewer_platform, created_by, actor_type, actor_id
@@ -892,36 +1231,80 @@ async function insertTask(
             )
             returning *
           ),
+          e as (
+            insert into events (agent_id, session_id, kind, title, detail)
+            select
+              null,
+              null,
+              'create_task',
+              'Task #' || w.id::text || ' queued',
+              jsonb_build_object(
+                'tool', 'create_task',
+                'actor_type', w.actor_type,
+                'actor_id', w.actor_id,
+                'task_id', w.id::text
+              )
+            from w
+            returning id, kind, created_at
+          ),
           stored as (
             update idempotency_keys as k
-            set response = (select to_jsonb(i) from inserted i)
+            set response = (
+              select to_jsonb(w) || jsonb_build_object(
+                'receipt_id', e.id,
+                'receipt_kind', e.kind,
+                'receipt_at', e.created_at
+              )
+              from w, e
+            )
             from gate
             where k.scope = gate.scope
               and k.idempotency_key = gate.idempotency_key
               and k.claim_token = ${claim.token}
-              and exists (select 1 from inserted)
+              and exists (select 1 from w)
+              and exists (select 1 from e)
             returning k.response
           )
           select response from stored
         `
       : await db`
-          insert into tasks (
-            title, description, project, platform, machine,
-            priority, reviewer_platform, created_by, actor_type, actor_id
+          with w as (
+            insert into tasks (
+              title, description, project, platform, machine,
+              priority, reviewer_platform, created_by, actor_type, actor_id
+            )
+            values (
+              ${input.title},
+              ${input.description ?? null},
+              ${input.project ?? null},
+              ${input.platform ?? "any"},
+              ${input.machine ?? null},
+              ${input.priority ?? 2},
+              ${input.reviewer_platform ?? null},
+              ${input.created_by ?? "dashboard"},
+              ${actor.actor_type},
+              ${actor.actor_id}
+            )
+            returning *
+          ),
+          e as (
+            insert into events (agent_id, session_id, kind, title, detail)
+            select
+              null,
+              null,
+              'create_task',
+              'Task #' || w.id::text || ' queued',
+              jsonb_build_object(
+                'tool', 'create_task',
+                'actor_type', w.actor_type,
+                'actor_id', w.actor_id,
+                'task_id', w.id::text
+              )
+            from w
+            returning id, kind, created_at
           )
-          values (
-            ${input.title},
-            ${input.description ?? null},
-            ${input.project ?? null},
-            ${input.platform ?? "any"},
-            ${input.machine ?? null},
-            ${input.priority ?? 2},
-            ${input.reviewer_platform ?? null},
-            ${input.created_by ?? "dashboard"},
-            ${actor.actor_type},
-            ${actor.actor_id}
-          )
-          returning *
+          select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+          from w, e
         `;
     const row = claim ? responseRow(rows as Record<string, unknown>[]) : rows[0] as Record<string, unknown> | undefined;
     if (!row) {
@@ -936,15 +1319,66 @@ async function insertTask(
 
 const OPEN_STATUSES: TaskStatus[] = ["queued", "claimed", "running", "review"];
 
+function taskFromRow(row: Record<string, unknown>): Task {
+  const sortAt = row.list_sort_at;
+  delete row.list_sort_at;
+  const task = asTask(row);
+  if (typeof sortAt === "string") stampSortAt(task, sortAt);
+  return task;
+}
+
 export async function listTasks(input?: {
   status?: string; // a status, "open", or "all"
   limit?: number;
+  /** Set when the caller asked for a page. Adds the id tiebreak and a sort stamp. */
+  keyset?: boolean;
+  /** Sort key of the last row already returned. */
+  cursor?: { status: string; priority: number; updatedAt: string; id: string } | null;
 }): Promise<Task[]> {
   const db = sql();
   const limit = input?.limit ?? 100;
   const status = input?.status ?? "all";
 
   try {
+    if (input?.keyset) {
+      const hasCursor = input.cursor != null;
+      const cursorStatus = input.cursor?.status ?? "queued";
+      const cursorPriority = input.cursor?.priority ?? 0;
+      const updatedAt = input.cursor?.updatedAt ?? "1970-01-01T00:00:00.000Z";
+      const cursorId = input.cursor?.id ?? "1";
+      // Keyset predicate matches pageRows: status asc, priority asc, updated_at
+      // desc truncated to milliseconds, then id ascending.
+      const rows = await db`
+        select tasks.*,
+          to_char(date_trunc('milliseconds', updated_at) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as list_sort_at
+        from tasks
+        where
+          (
+            ${status}::text = 'all'
+            or (${status}::text = 'open' and status = any(${OPEN_STATUSES}::text[]))
+            or status = ${status}
+          )
+          and (
+            ${hasCursor}::boolean = false
+            or status > ${cursorStatus}
+            or (status = ${cursorStatus} and priority > ${cursorPriority}::int)
+            or (
+              status = ${cursorStatus}
+              and priority = ${cursorPriority}::int
+              and date_trunc('milliseconds', updated_at) < ${updatedAt}::timestamptz
+            )
+            or (
+              status = ${cursorStatus}
+              and priority = ${cursorPriority}::int
+              and date_trunc('milliseconds', updated_at) = ${updatedAt}::timestamptz
+              and id > ${cursorId}::bigint
+            )
+          )
+        order by status asc, priority asc, date_trunc('milliseconds', updated_at) desc, id asc
+        limit ${limit}
+      `;
+      return (rows as Record<string, unknown>[]).map(taskFromRow);
+    }
     if (status === "open") {
       const rows = await db`
         select * from tasks
@@ -1000,18 +1434,51 @@ export async function claimNextTask(input: {
   }
 
   const now = new Date().toISOString();
+  const actor = currentActor();
+  const activityActorType = actor?.actor_type ?? null;
+  const activityActorId = actor?.actor_id ?? null;
   for (const t of candidates) {
     if (t.machine && input.machine && t.machine !== input.machine) continue;
     if (t.machine && !input.machine) continue;
     try {
+      // One statement. The event insert reads only the updated row, so a lost
+      // race (zero rows) writes no event. Actor parameters follow `where id`
+      // so the claim's existing binds stay $1..$4.
       const claimed = await db`
-        update tasks set
-          status = 'claimed',
-          assigned_agent = ${input.agent_id},
-          claimed_at = ${now},
-          updated_at = ${now}
-        where id = ${t.id} and status = 'queued'
-        returning *
+        with changed as (
+          update tasks set
+            status = 'claimed',
+            assigned_agent = ${input.agent_id},
+            claimed_at = ${now},
+            updated_at = ${now}
+          where id = ${t.id} and status = 'queued'
+          returning *
+        ),
+        logged as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            'task_claimed',
+            'Claimed task #' || changed.id::text || ': ' || coalesce(changed.title, ''),
+            jsonb_build_object(
+              'task_id', changed.id,
+              'tool', 'claim_task',
+              'status', changed.status,
+              'assigned_agent', changed.assigned_agent,
+              'actor_type', ${activityActorType}::text,
+              'actor_id', ${activityActorId}::text
+            )
+          from changed
+          returning id, kind, created_at
+        )
+        select
+          changed.*,
+          logged.id as receipt_id,
+          logged.kind as receipt_kind,
+          logged.created_at as receipt_at
+        from changed
+        left join logged on true
       `;
       if (claimed.length > 0) return asTask(claimed[0] as Record<string, unknown>);
     } catch (e) {
@@ -1028,10 +1495,29 @@ export async function updateTask(input: {
   cost_usd?: number;
   session_id?: string;
   assigned_agent?: string;
+  /**
+   * Preview token. When set, the update is one conditional statement:
+   * `md5(t::text)` must still match. A miss writes nothing. Omitted keeps
+   * the unconditional update.
+   */
+  expected_revision?: string;
+  /**
+   * Set only by a caller that knows the authenticated actor. Omitted leaves
+   * actor_type and actor_id alone, so a status update does not rewrite the
+   * creator. requeue_task passes it. created_by never does.
+   */
+  actor?: Actor | null;
+  /** Audit kind recorded in the same statement. Default task_updated. */
+  eventKind?: string;
+  /** Tool name stored on the event. Default update_task. */
+  activityTool?: string;
 }): Promise<Task> {
   const db = sql();
   const now = new Date().toISOString();
   const hasStatus = input.status !== undefined && input.status !== null;
+  const hasActor = input.actor != null;
+  const actorType = input.actor?.actor_type ?? null;
+  const actorId = input.actor?.actor_id ?? null;
   const status = input.status ?? null;
   const complete =
     input.status === "done" || input.status === "failed" || input.status === "cancelled";
@@ -1039,28 +1525,125 @@ export async function updateTask(input: {
   const hasCost = input.cost_usd !== undefined;
   const hasSession = input.session_id !== undefined;
   const hasAgent = input.assigned_agent !== undefined;
+  const expected = input.expected_revision;
+  const activity = currentActor();
+  const eventKind = input.eventKind ?? "task_updated";
+  const activityTool = input.activityTool ?? "update_task";
+  const activityActorType = activity?.actor_type ?? null;
+  const activityActorId = activity?.actor_id ?? null;
 
+  let rows: Record<string, unknown>[] = [];
   try {
-    const rows = await db`
-      update tasks set
-        updated_at = ${now},
-        status = case when ${hasStatus} then ${status} else status end,
-        completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
-        result = case when ${hasResult} then ${input.result ?? null} else result end,
-        cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
-        session_id = case when ${hasSession} then ${input.session_id ?? null} else session_id end,
-        assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end
-      where id = ${input.id}
-      returning *
-    `;
-    if (!rows[0]) throw new Error("Task not found");
-    return asTask(rows[0] as Record<string, unknown>);
+    // Activity binds are after the task predicate. A zero-row update inserts
+    // no event, because the insert selects from the updated rows only.
+    if (expected === undefined) {
+      rows = await db`
+        with changed as (
+          update tasks set
+            updated_at = ${now},
+            status = case when ${hasStatus} then ${status} else status end,
+            completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
+            result = case when ${hasResult} then ${input.result ?? null} else result end,
+            cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
+            session_id = case when ${hasSession} then ${input.session_id ?? null} else session_id end,
+            assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end,
+            actor_type = case when ${hasActor} then ${actorType} else actor_type end,
+            actor_id = case when ${hasActor} then ${actorId} else actor_id end
+          where id = ${input.id}
+          returning *
+        ),
+        logged as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            ${eventKind},
+            'Task #' || changed.id::text || ' → ' || changed.status || ': ' || coalesce(changed.title, ''),
+            jsonb_build_object(
+              'task_id', changed.id,
+              'tool', ${activityTool}::text,
+              'status', changed.status,
+              'actor_type', ${activityActorType}::text,
+              'actor_id', ${activityActorId}::text
+            )
+          from changed
+          returning id, kind, created_at
+        )
+        select
+          changed.*,
+          logged.id as receipt_id,
+          logged.kind as receipt_kind,
+          logged.created_at as receipt_at
+        from changed
+        left join logged on true
+      `;
+    } else {
+      rows = await db`
+        with changed as (
+          update tasks t set
+            updated_at = ${now},
+            status = case when ${hasStatus} then ${status} else status end,
+            completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
+            result = case when ${hasResult} then ${input.result ?? null} else result end,
+            cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
+            session_id = case when ${hasSession} then ${input.session_id ?? null} else session_id end,
+            assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end,
+            actor_type = case when ${hasActor} then ${actorType} else actor_type end,
+            actor_id = case when ${hasActor} then ${actorId} else actor_id end
+          where t.id = ${input.id}
+            and md5(t::text) = ${expected}
+          returning *
+        ),
+        logged as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            ${eventKind},
+            'Task #' || changed.id::text || ' → ' || changed.status || ': ' || coalesce(changed.title, ''),
+            jsonb_build_object(
+              'task_id', changed.id,
+              'tool', ${activityTool}::text,
+              'status', changed.status,
+              'actor_type', ${activityActorType}::text,
+              'actor_id', ${activityActorId}::text
+            )
+          from changed
+          returning id, kind, created_at
+        )
+        select
+          changed.*,
+          logged.id as receipt_id,
+          logged.kind as receipt_kind,
+          logged.created_at as receipt_at
+        from changed
+        left join logged on true
+      `;
+    }
   } catch (e) {
     throw new Error(errMsg(e));
   }
+  if (rows[0]) return asTask(rows[0]);
+  if (expected === undefined) throw new Error("Task not found");
+  const current = await taskRevisionOf(input.id);
+  if (!current) throw new Error("Task not found");
+  throw new StaleWrite(current);
 }
 
-/** Read one task. Dry-run previews use this so a cancel can show the row without updating it. */
+/** The revision a new task preview would return. Same expression as the guard. */
+async function taskRevisionOf(id: number): Promise<string | null> {
+  const db = sql();
+  const rows = await db`
+    select md5(t::text) as revision
+    from tasks t
+    where t.id = ${id}
+    limit 1
+  `;
+  const revision = rows[0]?.revision;
+  return typeof revision === "string" ? revision : null;
+}
+
+/** Read one task. Callers that confirm a preview use `readTaskForPreview` instead. */
 export async function getTask(id: number): Promise<Task | null> {
   const db = sql();
   try {
@@ -1072,14 +1655,223 @@ export async function getTask(id: number): Promise<Task | null> {
 }
 
 /**
- * Read the note stored at a key, if any. Dry-run previews use this so an
- * overwrite can show the current note without writing.
+ * The task and its revision from one statement. `md5(t::text)` is the whole
+ * row, including microseconds `updated_at` still has in the database.
+ */
+export async function readTaskForPreview(id: number): Promise<{ task: Task; revision: string } | null> {
+  const db = sql();
+  try {
+    const rows = await db`
+      select t.*, md5(t::text) as revision
+      from tasks t
+      where t.id = ${id}
+      limit 1
+    `;
+    const row = rows[0] as (Record<string, unknown> & { revision?: unknown }) | undefined;
+    if (!row) return null;
+    if (typeof row.revision !== "string") throw new Error("task preview returned no revision");
+    const { revision, ...rest } = row;
+    return { task: asTask(rest), revision };
+  } catch (e) {
+    if (e instanceof Error && e.message === "task preview returned no revision") throw e;
+    throw new Error(errMsg(e));
+  }
+}
+
+/**
+ * Read the note stored at a key, if any. Callers that confirm a preview use
+ * `readMemoryForPreview` so the row and the token come from one statement.
  */
 export async function findMemoryByKey(key: string): Promise<MemoryItem | null> {
   const db = sql();
   try {
     const rows = await db`select * from memory where key = ${key} limit 1`;
     return (rows[0] as MemoryItem | undefined) ?? null;
+  } catch (e) {
+    throw new Error(errMsg(e));
+  }
+}
+
+/** The note and its revision from one statement. No row → the caller uses `absent`. */
+export async function readMemoryForPreview(key: string): Promise<{ item: MemoryItem; revision: string } | null> {
+  const db = sql();
+  try {
+    const rows = await db`
+      select m.*, md5(m::text) as revision
+      from memory m
+      where m.key = ${key}
+      limit 1
+    `;
+    const row = rows[0] as (MemoryItem & { revision?: unknown }) | undefined;
+    if (!row) return null;
+    if (typeof row.revision !== "string") throw new Error("memory preview returned no revision");
+    const { revision, ...item } = row;
+    return { item, revision };
+  } catch (e) {
+    if (e instanceof Error && e.message === "memory preview returned no revision") throw e;
+    throw new Error(errMsg(e));
+  }
+}
+
+/**
+ * One events row for a write that already committed in its own statement.
+ * Decision tools use this after the row is stored. The kind is the tool name.
+ * A write that must roll back with its receipt calls `insertToolReceipt` on its own transaction instead.
+ */
+export async function recordToolReceipt(input: {
+  kind: string;
+  title: string;
+  extra?: Record<string, unknown>;
+}): Promise<Receipt | null> {
+  try {
+    return await insertToolReceipt(sql(), input);
+  } catch (e) {
+    throw new Error(`recordToolReceipt: ${errMsg(e)}`);
+  }
+}
+
+/**
+ * Look up an agent that has already reported. Does not insert.
+ * The id is slugified the same way report() stores it. An empty slug is absent.
+ */
+export async function findAgent(agentId: string): Promise<{ id: string } | null> {
+  const id = slugify(agentId);
+  if (!id) return null;
+  const db = sql();
+  try {
+    const rows = await db`select id from agents where id = ${id} limit 1`;
+    const found = rows[0]?.id;
+    return typeof found === "string" ? { id: found } : null;
+  } catch (e) {
+    throw new Error(errMsg(e));
+  }
+}
+
+/**
+ * Delete one memory row. One statement. When expected_revision is set, the
+ * delete matches md5(m::text) from the same row, so a stale preview writes
+ * nothing. Omitting the token deletes whatever is stored at the key.
+ */
+export async function deleteMemory(input: { key: string; expected_revision?: string }): Promise<MemoryItem> {
+  const db = sql();
+  const expected = input.expected_revision;
+  const actor = currentActor();
+  const actorType = actor?.actor_type ?? null;
+  const actorId = actor?.actor_id ?? null;
+  let rows: Record<string, unknown>[] = [];
+  try {
+    if (expected === undefined) {
+      rows = await db`
+        with w as (
+          delete from memory where key = ${input.key} returning *
+        ),
+        e as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            'delete_note',
+            'Deleted memory key "' || coalesce(w.key, '') || '"',
+            jsonb_build_object(
+              'tool', 'delete_note',
+              'actor_type', ${actorType}::text,
+              'actor_id', ${actorId}::text,
+              'memory_key', w.key,
+              'memory_id', w.id::text
+            )
+          from w
+          returning id, kind, created_at
+        )
+        select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+        from w, e
+      `;
+    } else {
+      rows = await db`
+        with w as (
+          delete from memory m
+          where m.key = ${input.key}
+            and md5(m::text) = ${expected}
+          returning *
+        ),
+        e as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            'delete_note',
+            'Deleted memory key "' || coalesce(w.key, '') || '"',
+            jsonb_build_object(
+              'tool', 'delete_note',
+              'actor_type', ${actorType}::text,
+              'actor_id', ${actorId}::text,
+              'memory_key', w.key,
+              'memory_id', w.id::text
+            )
+          from w
+          returning id, kind, created_at
+        )
+        select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+        from w, e
+      `;
+    }
+  } catch (e) {
+    rethrowStore(e);
+  }
+  if (rows[0]) return asMemory(rows[0] as Record<string, unknown>);
+  if (expected === undefined) throw new Error("Memory not found");
+  const current = await memoryRevisionOf(input.key);
+  if (!current) throw new Error("Memory not found");
+  throw new StaleWrite(current);
+}
+
+export interface ActivityListQuery {
+  actor: string | null;
+  kind: string | null;
+  since: string | null;
+  until: string | null;
+  limit: number;
+  cursorCreatedAt: string | null;
+  cursorId: string | null;
+}
+
+/**
+ * Newest first, id ascending on a tie. since is inclusive. until includes
+ * the whole named millisecond. The cursor is the last row already returned.
+ */
+export async function listActivity(query: ActivityListQuery): Promise<ActivityRow[]> {
+  const db = sql();
+  try {
+    const rows = await db`
+      select
+        id,
+        agent_id,
+        session_id,
+        kind,
+        title,
+        detail,
+        to_char(date_trunc('milliseconds', created_at) at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as created_at,
+        detail->>'actor_type' as actor_type,
+        detail->>'actor_id' as actor_id
+      from events
+      where (${query.actor}::text is null or detail->>'actor_id' = ${query.actor})
+        and (${query.kind}::text is null or kind = ${query.kind})
+        and (${query.since}::timestamptz is null or created_at >= ${query.since}::timestamptz)
+        and (
+          ${query.until}::timestamptz is null
+          or created_at < (${query.until}::timestamptz + interval '1 millisecond')
+        )
+        and (
+          ${query.cursorCreatedAt}::timestamptz is null
+          or date_trunc('milliseconds', created_at) < ${query.cursorCreatedAt}::timestamptz
+          or (
+            date_trunc('milliseconds', created_at) = ${query.cursorCreatedAt}::timestamptz
+            and id > ${query.cursorId}::bigint
+          )
+        )
+      order by date_trunc('milliseconds', created_at) desc, id asc
+      limit ${query.limit}
+    `;
+    return (rows as Record<string, unknown>[]).map((row) => activityRow(row));
   } catch (e) {
     throw new Error(errMsg(e));
   }

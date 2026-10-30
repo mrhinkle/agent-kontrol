@@ -4,7 +4,7 @@ import { enforceApi } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import { demoList, demoUpstream } from "@/lib/skills/demo";
 import { listSkillViews } from "@/lib/skills/query";
-import { isRuntime } from "@/lib/skills/types";
+import { isRuntime, runtimeMustBeMessage } from "@/lib/skills/types";
 
 export const dynamic = "force-dynamic";
 
@@ -24,7 +24,7 @@ export async function GET(req: Request) {
   if (runtime != null && !isRuntime(runtime)) {
     return apiError("validation_failed", {
       message: "invalid runtime",
-      fields: { runtime: "runtime must be claude, codex, grok, hermes, or mini." },
+      fields: { runtime: runtimeMustBeMessage() },
     });
   }
   if (!isConfigured()) {

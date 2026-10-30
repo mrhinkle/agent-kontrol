@@ -1,11 +1,15 @@
 /**
  * Scopes for per-agent credentials.
  *
- * One table maps every MCP tool and every agent-facing REST route to exactly
- * one scope. `requireScope` is the only allow decision. A tool that is not in
- * the table is denied for every principal. A REST route that is not in the
- * table is denied for an agent credential; the legacy MC_TOKEN, the dashboard
- * session, and OAuth keep the access they already had.
+ * One table maps every agent-facing MCP tool and every agent-facing REST
+ * route to exactly one scope. `requireScope` is the only allow decision.
+ * A tool name that is not registered is denied for every principal.
+ * `list_activity`, `get_settings`, and `set_watched_repos` are registered and
+ * are not in the table: an agent credential is denied, and the legacy
+ * MC_TOKEN, the dashboard session, and OAuth can call them. A REST route
+ * that is not in the table is denied for an agent
+ * credential; the legacy MC_TOKEN, the dashboard session, and OAuth keep the
+ * access they already had.
  *
  * OAuth tokens are still issued with the scope string "mcp". That string is
  * not an entry in this table and is not what we check.
@@ -21,9 +25,13 @@ export const SCOPES = [
   "messages:read",
   "messages:write",
   "progress:read",
+  "decisions:read",
+  "decisions:request",
   "decisions:write",
   "skills:read",
   "skills:write",
+  "watch:read",
+  "watch:write",
 ] as const;
 
 export type Scope = (typeof SCOPES)[number];
@@ -39,6 +47,7 @@ export const TOOL_SCOPES: Record<string, Scope> = {
   report_status: "status:write",
   get_fleet_status: "fleet:read",
   get_progress_digest: "progress:read",
+  get_morning_brief: "progress:read",
   remember: "memory:write",
   recall: "memory:read",
   check_inbox: "messages:read",
@@ -51,6 +60,12 @@ export const TOOL_SCOPES: Record<string, Scope> = {
   list_skills: "skills:read",
   get_skill: "skills:read",
   run_skill: "skills:write",
+  list_decisions: "decisions:read",
+  request_decision: "decisions:request",
+  resolve_decision: "decisions:write",
+  send_message: "messages:write",
+  requeue_task: "tasks:write",
+  delete_note: "memory:write",
 };
 
 /**
@@ -60,6 +75,9 @@ export const TOOL_SCOPES: Record<string, Scope> = {
  */
 const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   { method: "GET", path: /^\/api\/fleet$/, scope: "fleet:read" },
+  // GET /api/activity stays off this table, same as GET /api/traces.
+  // An agent credential cannot read the activity stream. MC_TOKEN and the
+  // dashboard session still can.
   { method: "POST", path: /^\/api\/ingest$/, scope: "status:write" },
   { method: "GET", path: /^\/api\/memory$/, scope: "memory:read" },
   { method: "POST", path: /^\/api\/memory$/, scope: "memory:write" },
@@ -67,6 +85,11 @@ const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   { method: "POST", path: /^\/api\/messages\/reply$/, scope: "messages:write" },
   { method: "GET", path: /^\/api\/progress$/, scope: "progress:read" },
   { method: "GET", path: /^\/api\/progress\/digest$/, scope: "progress:read" },
+  { method: "GET", path: /^\/api\/brief$/, scope: "progress:read" },
+  { method: "GET", path: /^\/api\/brief\/alerts$/, scope: "progress:read" },
+  // POST /api/brief/alerts/evaluate stays off this table. The cron uses
+  // MC_TOKEN, the same way POST /api/progress/ingest does. An agent
+  // credential cannot send alerts.
   { method: "GET", path: /^\/api\/tasks$/, scope: "tasks:read" },
   { method: "POST", path: /^\/api\/tasks$/, scope: "tasks:write" },
   { method: "POST", path: /^\/api\/tasks\/claim$/, scope: "tasks:write" },
@@ -75,13 +98,22 @@ const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   // dashboard uses the session. An agent credential can change a decision
   // only when it holds decisions:write.
   { method: "PATCH", path: /^\/api\/decisions\/[^/]+$/, scope: "decisions:write" },
-  // GET only. PATCH, POST /api/skills/sync, and POST /api/skills/drift are
-  // operator routes: an agent must not be able to turn a skill on, sync, or
-  // file a drift report. The lookahead keeps those two paths off skills:read.
+  { method: "POST", path: /^\/api\/decisions\/[^/]+\/writeback$/, scope: "decisions:write" },
+  // GET only. PATCH, POST /api/skills/sync, POST /api/skills/drift, and
+  // GET /api/skill-bundles are operator routes: an agent must not be able to
+  // turn a skill on, sync, file a drift report, or download the skill tree.
+  // The lookahead keeps sync and drift off skills:read. A skill id of
+  // "export" stays on this route: the bundle download is /api/skill-bundles.
   { method: "GET", path: /^\/api\/skills$/, scope: "skills:read" },
   { method: "GET", path: /^\/api\/skills\/(?!sync$|drift$)[^/]+$/, scope: "skills:read" },
   // Read-only: renders the pointer block, and POST only transforms the text sent.
   { method: "POST", path: /^\/api\/skills\/pointers$/, scope: "skills:read" },
+  // The scope an agent credential needs. The watch handlers reject every
+  // other principal with 401 before they consult this table. requireScope
+  // still treats legacy, session, OAuth, and dev-open as unrestricted, so
+  // authorizeRoute alone is not the guard for these two paths.
+  { method: "POST", path: /^\/api\/watch\/beat$/, scope: "watch:write" },
+  { method: "GET", path: /^\/api\/watch\/beats$/, scope: "watch:read" },
 ];
 
 export type Principal =
@@ -139,8 +171,21 @@ export function requireScope(principal: Principal, scope: Scope | null): ScopeDe
   return { ok: false, status: 403, body: insufficientScopeBody(scope) };
 }
 
+/**
+ * Registered tools with the traces boundary: no agent scope grants them.
+ * Unrestricted principals (legacy MC_TOKEN, dashboard session, OAuth,
+ * dev-open) are allowed. An unknown name is still denied for every
+ * principal, including those.
+ */
+const OPERATOR_TOOLS: ReadonlySet<string> = new Set([
+  "list_activity",
+  "get_settings",
+  "set_watched_repos",
+]);
+
 /** Tool calls fail closed for every principal when the name is not mapped. */
 export function authorizeTool(principal: Principal, tool: string): ScopeDecision {
+  if (OPERATOR_TOOLS.has(tool)) return requireScope(principal, null);
   const scope = TOOL_SCOPES[tool];
   if (!scope) {
     return { ok: false, status: 403, body: insufficientScopeBody(null) };

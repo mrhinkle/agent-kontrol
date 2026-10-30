@@ -43,7 +43,7 @@ function skill(id: string, runtimes?: Partial<SkillRecord["runtimes"]>, removed 
     commit_sha: null,
     body: "",
     references: [],
-    runtimes: { claude: true, codex: true, grok: true, hermes: true, mini: true, ...runtimes },
+    runtimes: { claude: true, codex: true, grok: true, hermes: true, mini: true, nemoclaw: false, ...runtimes },
     category: null,
     tags: [],
     frontmatter: {},

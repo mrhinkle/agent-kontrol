@@ -239,6 +239,9 @@ describe("OpenAPI document", () => {
     assert.equal((schemaOf(doc, "PatchTask").properties?.dry_run as { type: string }).type, "boolean");
     assert.equal((schemaOf(doc, "RepoList").properties?.dry_run as { type: string }).type, "boolean");
     assert.equal(paths["/api/tasks/{id}"]?.patch?.requestBody?.content["application/json"].schema.$ref, "#/components/schemas/PatchTask");
+    const memoryPost = (doc.paths as Record<string, { post?: { responses?: Record<string, { description?: string }> } }>)["/api/memory"]?.post;
+    assert.match(memoryPost?.responses?.["404"]?.description ?? "", /not_found/);
+    assert.match(memoryPost?.responses?.["409"]?.description ?? "", /stale_write/);
     assert.equal(paths["/api/settings/repos"]?.put?.requestBody?.content["application/json"].schema.$ref, "#/components/schemas/RepoList");
 
     const types = fs.readFileSync("src/lib/types.ts", "utf8");
@@ -254,6 +257,49 @@ describe("OpenAPI document", () => {
     const create = schemaOf(doc, "CreateTask");
     assert.equal(create.properties?.actor_type, undefined);
     assert.equal(create.properties?.actor_id, undefined);
+  });
+
+  it("declares source only on the PUT /api/settings/repos dry-run result", () => {
+    const doc = openApiDocument();
+    const sourceDescription =
+      "When a database is connected and source is file, that baseline is the empty stored list, not the file fallback.";
+    assert.match(
+      fs.readFileSync("docs/API.md", "utf8"),
+      /When a database is connected and `source` is `file`, that baseline is the empty stored list, not the file fallback\./,
+    );
+
+    type ResponseSchema = { oneOf?: { $ref?: string }[] };
+    type Operation = { responses?: Record<string, { content?: { "application/json"?: { schema?: ResponseSchema } } }> };
+    const paths = doc.paths as Record<string, Record<string, Operation>>;
+    function dryRunRefs(urlPath: string, method: string): string[] {
+      const branches = paths[urlPath]?.[method]?.responses?.["200"]?.content?.["application/json"]?.schema?.oneOf ?? [];
+      return branches.map((branch) => branch.$ref ?? "");
+    }
+
+    assert.deepEqual(dryRunRefs("/api/settings/repos", "put"), [
+      "#/components/schemas/WatchedRepos",
+      "#/components/schemas/RepoDryRunResult",
+    ]);
+
+    const repoDry = schemaOf(doc, "RepoDryRunResult") as Schema & {
+      allOf?: { properties?: Record<string, { enum?: string[]; description?: string }> }[];
+    };
+    const source = repoDry.allOf?.map((part) => part.properties?.source).find((property) => property);
+    assert.ok(source, "RepoDryRunResult declares source");
+    assert.deepEqual(source.enum, ["database", "file"]);
+    assert.equal(source.description, sourceDescription);
+    assert.equal(schemaOf(doc, "DryRunResult").properties?.source, undefined);
+
+    for (const [urlPath, method] of [
+      ["/api/memory", "post"],
+      ["/api/tasks/{id}", "patch"],
+      ["/api/settings/repos", "patch"],
+      ["/api/settings/owners", "put"],
+    ] as const) {
+      const refs = dryRunRefs(urlPath, method);
+      assert.equal(refs.includes("#/components/schemas/DryRunResult"), true, `${method} ${urlPath}`);
+      assert.equal(refs.includes("#/components/schemas/RepoDryRunResult"), false, `${method} ${urlPath}`);
+    }
   });
 
   it("builds request schemas from the constants and interfaces the routes use", () => {
@@ -295,6 +341,24 @@ describe("OpenAPI document", () => {
 
     const ingest = schemaOf(doc, "ProgressIngest");
     assert.deepEqual((ingest.properties?.kind as { enum: string[] }).enum, [...PROGRESS_INGEST_KINDS]);
+
+    const watched = schemaOf(doc, "WatchedRepo");
+    for (const field of ["gone", "shown", "isFork", "isArchived", "lastActivityAt"]) {
+      assert.ok(watched.properties?.[field], `WatchedRepo.${field} is documented`);
+    }
+    const override = schemaOf(doc, "RepoOverride") as Schema & { anyOf?: { required?: string[] }[] };
+    const requiredSets = (override.anyOf ?? []).map((item) => item.required ?? []);
+    assert.ok(requiredSets.some((fields) => fields.includes("pinned")));
+    assert.ok(requiredSets.some((fields) => fields.includes("hidden")));
+    const discovery = schemaOf(doc, "OwnerDiscovery");
+    const item = (discovery.properties?.results as { items?: { required?: string[]; oneOf?: { $ref?: string }[]; properties?: { repos?: { items?: { properties?: { pushedAt?: { format?: string } } } } } } }).items;
+    assert.ok(item?.required?.includes("swept_at"));
+    assert.ok(item?.oneOf?.some((entry) => entry.$ref?.endsWith("OwnerDiscoveryOk")));
+    const okSchema = schemaOf(doc, "OwnerDiscoveryOk");
+    assert.ok(okSchema.required?.includes("repos"));
+    assert.equal((okSchema.properties?.ok as { const?: boolean } | undefined)?.const, true);
+    const listed = (okSchema.properties?.repos as { items?: { properties?: { pushedAt?: { format?: string } } } } | undefined)?.items;
+    assert.equal(listed?.properties?.pushedAt?.format, "date-time");
   });
 
   it("covers the decisions routes, decisions:write, and the api-error codes", () => {
@@ -319,6 +383,20 @@ describe("OpenAPI document", () => {
     assert.equal(patch?.requestBody?.content["application/json"].schema.$ref, "#/components/schemas/PatchDecision");
     assert.match(patch?.description ?? "", /decisions:write/);
     assert.equal((schemaOf(doc, "PatchDecision").properties?.status as { enum: string[] }).enum.includes("decided"), true);
+    const defer = schemaOf(doc, "PatchDecision").properties?.defer_until as {
+      format?: string;
+      oneOf?: { type?: string; format?: string }[];
+    };
+    assert.equal(defer.format, undefined);
+    assert.deepEqual(
+      (defer.oneOf ?? []).map((item) => item.format ?? item.type),
+      ["date-time", "date", "null"],
+    );
+    const storedDefer = schemaOf(doc, "Decision").properties?.defer_until as { format?: string; oneOf?: unknown };
+    assert.equal(storedDefer.format, "date-time");
+    assert.equal(storedDefer.oneOf, undefined);
+    const writebackParam = list.parameters?.find((item) => item.name === "writeback");
+    assert.match(JSON.stringify(writebackParam ?? {}), /180 second write-back lease/);
 
     const decisions = fs.readFileSync("src/lib/decisions.ts", "utf8");
     for (const name of ["Decision", "BriefDecision"]) {

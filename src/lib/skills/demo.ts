@@ -143,6 +143,7 @@ export function demoList(filter: { runtime?: string | null; q?: string | null; c
       tags: skill.tags,
       trigger: skill.trigger,
       scope: skill.scope,
+      schedule: skill.schedule,
       triggerCount7d: skill.id === "verify-gibson" ? 2 : 0,
       lastRun: skill.id === "verify-gibson" ? { at: "2026-10-27T09:14:00.000Z", agent: "grok-lane-3" } : null,
     }));
@@ -195,7 +196,7 @@ export function demoSkillsDigest(window: TimeWindow): SkillsDigest {
   return {
     window,
     triggers_by_skill: [{ id: "verify-gibson", count: 2 }],
-    triggers_by_runtime: { claude: 1, codex: 1, grok: 0, hermes: 0, mini: 0 },
+    triggers_by_runtime: { claude: 1, codex: 1, grok: 0, hermes: 0, mini: 0, nemoclaw: 0 },
     stalled: [
       {
         run_id: "00000000-0000-4000-8000-000000000001",

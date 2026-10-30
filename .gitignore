@@ -17,6 +17,9 @@ _xfer/
 .data/
 fixtures/hermes-slim.tgz
 
+# Watcher dedup state. GitHub Actions cache holds this. Never commit it.
+.watch-state/
+
 # Local prototype / agent scratch (do not ship)
 .data/
 token-econ*.patch

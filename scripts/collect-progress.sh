@@ -4,6 +4,8 @@
 # Sweeps each configured repo with the GitHub API, then POSTs a single snapshot
 # per repo to /api/progress/ingest and upserts label-sourced decisions to
 # /api/decisions. The dashboard never calls GitHub itself; this script owns that budget.
+# Each tick also writes morning-brief keys on detail (stuck_prs, median_lead_hours,
+# stale_issues, drafts, merged). A failure of that extra sweep does not abort the tick.
 #
 #   ./collect-progress.sh                 # rolling tick (cron, every 15 min)
 #   ./collect-progress.sh --daily         # same sweep, tagged kind=daily
@@ -364,10 +366,81 @@ sync_repo_decisions() {
   post_decision "$reconcile" || log "decisions: reconcile failed for $repo"
 }
 
+# ------------------------------------------------------------- brief metrics
+# The same stuck / stale / lead-time rules as scripts/morning-brief.sh.
+# Fail open: return 1 and the caller posts the tick without these keys.
+# BEGIN brief-metrics-jq
+BRIEF_METRICS_JQ='
+  def ts: sub("\\.[0-9]+(?=Z$)"; "") | fromdateiso8601;
+  def hours(a; b): ((b|ts) - (a|ts)) / 3600;
+  def median: if length == 0 then null else (sort | if length % 2 == 1 then .[length/2|floor] else (.[length/2-1] + .[length/2]) / 2 end) end;
+  def bad_check: (.conclusion // .state // "") | ascii_upcase | IN("FAILURE","ERROR","TIMED_OUT","ACTION_REQUIRED","CANCELLED","STARTUP_FAILURE");
+  def pending_check: ((.conclusion // "") == "") and ((.status // .state // "") | ascii_upcase | IN("PENDING","QUEUED","IN_PROGRESS","EXPECTED"));
+  def check_name: (.name // .context // "check");
+  ($issues | map(select(.updatedAt < $stale_before))) as $stale
+  | ($prs | map(. + {age_h: hours(.createdAt; $now), idle_h: hours(.updatedAt; $now),
+       failing: [ (.statusCheckRollup // [])[] | select(bad_check) | check_name ] | unique,
+       pending: [ (.statusCheckRollup // [])[] | select(pending_check) | check_name ] | unique})) as $prs2
+  | ($prs2 | map(select(.isDraft | not)
+        | select(.age_h >= $stuck_h or (.mergeStateStatus | IN("DIRTY","BLOCKED","BEHIND","UNSTABLE")))
+        | {repo: $short, number, title, url, author: .author.login, age_hours: .age_h, age_days: (.age_h/24|floor), idle_days: (.idle_h/24|floor),
+           state: .mergeStateStatus, review: (.reviewDecision // null),
+           reason: (if .mergeStateStatus == "DIRTY" then "merge conflict with base"
+                    elif (.failing|length) > 0 then "failing: " + (.failing[0:3] | join(", "))
+                    elif (.pending|length) > 0 then "waiting on: " + (.pending[0:3] | join(", "))
+                    elif .reviewDecision == "CHANGES_REQUESTED" then "changes requested"
+                    elif .reviewDecision == "REVIEW_REQUIRED" then "no review yet"
+                    elif .mergeStateStatus == "BEHIND" then "behind base, needs update"
+                    else "open " + ((.age_h/24|floor)|tostring) + "d with no blocker reported" end)})
+      | sort_by(-.age_hours)) as $stuck
+  | ([$merged[] | select(.createdAt != null and .mergedAt != null)]) as $merged_ok
+  # merged keeps the 72h sweep. merged_list and median_lead_hours are the 24h
+  # display fallback SnapshotDetail documents. A row at exactly 24h stays.
+  | ([$merged_ok[] | select(hours(.mergedAt; $now) >= 0 and hours(.mergedAt; $now) <= 24)]) as $merged_24h
+  | {
+      stuck_prs: $stuck,
+      median_lead_hours: ([$merged_24h[] | hours(.createdAt; .mergedAt)] | median),
+      stale_issues: ($stale|length),
+      stale_ratio: (if ($issues|length) > 0 then (($stale|length) / ($issues|length)) else null end),
+      drafts: ([$prs[] | select(.isDraft)] | length),
+      merged_list: [$merged_24h[] | {number, title, url, author: .author.login, lead_hours: hours(.createdAt; .mergedAt)}],
+      merged: [$merged_ok[] | {number, title, url, author: .author.login, created_at: .createdAt, merged_at: .mergedAt}],
+      notes: ([
+        (if ($issues|length) >= 200 then "open issues truncated at 200" else empty end),
+        (if ($prs|length) >= 100 then "open prs truncated at 100" else empty end),
+        (if ($merged|length) >= 200 then "merged prs truncated at 200" else empty end)
+      ])
+    }'
+# END brief-metrics-jq
+
+brief_metrics() {
+  local repo="$1" short="$2"
+  local stuck_h stale_d now since72 stale_before issues prs merged
+  stuck_h="$(jq -r '.brief.stuckPrHours // 48' "$CONFIG_FILE")" || return 1
+  stale_d="$(jq -r '.brief.staleIssueDays // 21' "$CONFIG_FILE")" || return 1
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if date -u -v-1H +%Y-%m-%dT%H:%M:%SZ >/dev/null 2>&1; then
+    since72="$(date -u -v-72H +%Y-%m-%dT%H:%M:%SZ)"
+  else
+    since72="$(date -u -d '72 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+  fi
+  stale_before="$(iso_days_ago "$stale_d")" || return 1
+  issues="$(gh issue list -R "$repo" --state open --limit 200 --json number,updatedAt 2>/dev/null)" || return 1
+  prs="$(gh pr list -R "$repo" --state open --limit 100 \
+    --json number,title,createdAt,updatedAt,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,url,author 2>/dev/null)" || return 1
+  merged="$(gh pr list -R "$repo" --state merged --search "merged:>=${since72}" --limit 200 \
+    --json number,title,createdAt,mergedAt,author,url 2>/dev/null)" || return 1
+  jq -nc \
+    --arg short "$short" --arg now "$now" --arg stale_before "$stale_before" \
+    --argjson stuck_h "$stuck_h" \
+    --argjson issues "$issues" --argjson prs "$prs" --argjson merged "$merged" \
+    "$BRIEF_METRICS_JQ"
+}
+
 # ------------------------------------------------------------- one live tick
 
 collect_repo() {
-  local repo="$1" label="$2" blocked_label="$3" since="$4"
+  local repo="$1" label="$2" blocked_label="$3" since="$4" short="$5"
   local since_date="${since%%T*}"
 
   log "sweeping $repo"
@@ -429,20 +502,31 @@ collect_repo() {
       ' 2>/dev/null || echo '[]'
   )"
 
+  local brief='{}'
+  if brief="$(brief_metrics "$repo" "$short")"; then
+    :
+  else
+    log "brief metrics unavailable for $repo; posting counts without them"
+    brief='{}'
+  fi
+
   jq -n \
     --arg repo "$repo" --arg label "$label" \
     --argjson open_issues "$open_issues" --argjson open_prs "$open_prs" \
     --argjson blocked "$blocked" \
     --argjson merged "$merged_24h" --argjson closed "$closed_24h" --argjson opened "$opened_24h" \
     --argjson tc "$total_created" --argjson tcl "$total_closed" --argjson tm "$total_merged" \
-    --argjson lane "$lane_mix" --argjson stalled "$stalled" \
+    --argjson lane "$lane_mix" --argjson stalled "$stalled" --argjson brief "$brief" \
     --arg since_date "$since_date" \
     '{
       repo: $repo, label: $label,
       open_issues: $open_issues, open_prs: $open_prs, blocked_issues: $blocked,
       merged_prs_24h: $merged, issues_closed_24h: $closed, issues_opened_24h: $opened,
       total_issues_created: $tc, total_issues_closed: $tcl, total_prs_merged: $tm,
-      detail: { lane_mix: $lane, stalled_prs: $stalled, notes: ["window from \($since_date)"] }
+      detail: (
+        { lane_mix: $lane, stalled_prs: $stalled, notes: (["window from \($since_date)"] + ($brief.notes // [])) }
+        + ($brief | del(.notes))
+      )
     }'
 }
 
@@ -453,7 +537,7 @@ run_tick() {
 
   for entry in "${REPOS[@]}"; do
     IFS='|' read -r repo label blocked_label short <<<"$entry"
-    payloads+=("$(collect_repo "$repo" "$label" "$blocked_label" "$since")")
+    payloads+=("$(collect_repo "$repo" "$label" "$blocked_label" "$since" "$short")")
     sync_repo_decisions "$repo" "$short" || log "decisions: sync failed for $repo"
   done
 
@@ -507,6 +591,92 @@ run_backfill() {
   done
 }
 
+# ------------------------------------------------------------ owner discovery
+
+# Ask the dashboard which GitHub owners to discover, run `gh repo list` for
+# each, and post the raw lists. A failed, rate-limited, or empty list is
+# reported as ok:false so the dashboard records last_error and leaves
+# tracked repos alone. This never deletes a repo. Hide wins over pin is
+# applied when the dashboard is read, not here. writable:false is an
+# unavailable store, not an empty list. swept_at is taken before gh so a
+# delayed older tick cannot overwrite a newer one.
+discover_watched_owners() {
+  local body owners owner listing errfile count truncated results status resp
+  local err swept writable
+  if [[ "${MC_REPOS_FROM_DASHBOARD:-1}" == "0" ]]; then
+    log "owners: discovery skipped (dashboard list disabled)"; return 0
+  fi
+  if [[ -z "${MC_URL:-}" || -z "${MC_TOKEN:-}" ]]; then
+    log "owners: discovery skipped (no MC_URL or MC_TOKEN)"; return 0
+  fi
+  if ! body="$(curl -fsS --max-time 15 -H "Authorization: Bearer $MC_TOKEN" "${MC_URL%/}/api/settings/owners" 2>/dev/null)"; then
+    log "owners: dashboard unreachable, leaving tracked repos unchanged"; return 0
+  fi
+  writable="$(jq -r 'if has("writable") then (.writable|tostring) else "missing" end' <<<"$body" 2>/dev/null || echo missing)"
+  if [[ "$writable" == "false" ]]; then
+    log "owners: owner store is not writable; discovery skipped and tracked repos unchanged"
+    return 0
+  fi
+  owners="$(jq -r '.owners[]?.owner // empty' <<<"$body" 2>/dev/null || true)"
+  if [[ -z "$owners" ]]; then
+    log "owners: none configured"; return 0
+  fi
+  results="[]"
+  errfile="$(mktemp)"
+  resp="$(mktemp)"
+  while IFS= read -r owner; do
+    [[ -n "$owner" ]] || continue
+    swept="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ ! "$owner" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]]; then
+      results="$(jq -c --arg owner "$owner" --arg swept "$swept" '. + [{owner:$owner, ok:false, error:"owner is not a safe GitHub login", swept_at:$swept}]' <<<"$results")" || true
+      continue
+    fi
+    : >"$errfile"
+    if listing="$(gh repo list "$owner" --limit 1000 --json name,pushedAt,isArchived,isFork 2>"$errfile")"; then
+      if ! printf '%s\n' "$listing" | jq -e 'type=="array"' >/dev/null 2>&1; then
+        err="$(tr '\n' ' ' <"$errfile" | head -c 400)"
+        results="$(jq -c --arg owner "$owner" --arg err "${err:-gh repo list returned JSON that was not an array}" --arg swept "$swept" '. + [{owner:$owner, ok:false, error:$err, swept_at:$swept}]' <<<"$results")" || true
+        continue
+      fi
+      count="$(jq 'length' <<<"$listing" 2>/dev/null || echo 0)"
+      if [[ "${count:-0}" -eq 0 ]]; then
+        err="$(tr '\n' ' ' <"$errfile" | head -c 400)"
+        results="$(jq -c --arg owner "$owner" --arg err "${err:-gh repo list returned no repos}" --arg swept "$swept" '. + [{owner:$owner, ok:false, error:$err, swept_at:$swept}]' <<<"$results")" || true
+        continue
+      fi
+      truncated=false
+      if [[ "$count" -ge 1000 ]]; then truncated=true; fi
+      results="$(jq -c --arg owner "$owner" --argjson repos "$listing" --argjson truncated "$truncated" --arg swept "$swept" '. + [{owner:$owner, ok:true, repos:$repos, truncated:$truncated, swept_at:$swept}]' <<<"$results")" || true
+    else
+      err="$(tr '\n' ' ' <"$errfile" | head -c 400)"
+      results="$(jq -c --arg owner "$owner" --arg err "${err:-gh repo list failed}" --arg swept "$swept" '. + [{owner:$owner, ok:false, error:$err, swept_at:$swept}]' <<<"$results")" || true
+    fi
+  done <<<"$owners"
+  rm -f "$errfile"
+  if ! status="$(curl -sS -o "$resp" -w '%{http_code}' --max-time 30 \
+      -H "Authorization: Bearer $MC_TOKEN" -H "Content-Type: application/json" \
+      -d "$(jq -c -n --argjson results "$results" '{results:$results}')" \
+      "${MC_URL%/}/api/settings/owners/discover")"; then
+    log "owners: discovery post failed; tracked repos unchanged"
+    rm -f "$resp"
+    return 0
+  fi
+  if [[ "$status" != "200" ]]; then
+    log "owners: discovery post returned $status; tracked repos unchanged"
+  else
+    local stale_owners applied
+    stale_owners="$(jq -r '[.results[]? | select(.skipped == "stale") | .owner] | join(" ")' <"$resp" 2>/dev/null || true)"
+    if [[ -n "$stale_owners" ]]; then
+      log "owners: discovery skipped stale sweep for ${stale_owners}"
+    fi
+    applied="$(jq -r '[.results[]? | select(.skipped != "stale")] | length' <"$resp" 2>/dev/null || echo '?')"
+    if [[ "$applied" != "0" ]]; then
+      log "owners: discovery posted (${applied} results)"
+    fi
+  fi
+  rm -f "$resp"
+}
+
 # ------------------------------------------------------------ repo list from the dashboard
 
 # Ask the dashboard which repos to sweep, so adding one in Settings needs no edit on
@@ -527,8 +697,20 @@ refresh_repos_from_dashboard() {
   if ! body="$(curl -fsS --max-time 15 -H "Authorization: Bearer $MC_TOKEN" "${MC_URL%/}/api/settings/repos" 2>/dev/null)"; then
     log "repos: dashboard unreachable, using ${#REPOS[@]} from the local config"; return 0
   fi
-  lines="$(jq -r '.repos[]? | [.repo, .label, (.blockedLabel // ""), (.short // "")] | join("|")' <<<"$body" 2>/dev/null || true)"
+  lines="$(jq -r '.repos[]? | select(.gone != true) | [.repo, .label, (.blockedLabel // ""), (.short // "")] | join("|")' <<<"$body" 2>/dev/null || true)"
   if [[ -z "$lines" ]]; then
+    if jq -e '.repos | type == "array" and any(.[]; .gone == true)' >/dev/null 2>&1 <<<"$body"; then
+      REPOS=()
+      log "repos: dashboard list is only gone repos; not sweeping them"
+      return 0
+    fi
+    # An empty database list is the owner's answer (owners watched, nothing eligible yet),
+    # not a missing list: sweep nothing rather than the local config's repos.
+    if jq -e '.source == "database"' >/dev/null 2>&1 <<<"$body"; then
+      REPOS=()
+      log "repos: dashboard database list is empty; not sweeping local-config repos"
+      return 0
+    fi
     log "repos: dashboard list was empty, using ${#REPOS[@]} from the local config"; return 0
   fi
   REPOS=()
@@ -540,6 +722,7 @@ refresh_repos_from_dashboard() {
 
 # ------------------------------------------------------------------- dispatch
 
+discover_watched_owners
 refresh_repos_from_dashboard
 
 if [[ "$MODE" == "backfill" ]]; then

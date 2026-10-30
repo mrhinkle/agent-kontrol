@@ -1,0 +1,76 @@
+# Host watcher (mrhinkle/agent-kontrol#83).
+# A live, secret-bearing run happens only when this ref is the default branch
+# AND the repository variable WATCH_ENABLED is the string true. github.ref is
+# refs/heads/<name>; repository.default_branch is the bare name, so the gate
+# compares github.ref to refs/heads/<default_branch>.
+# Any other schedule or workflow_dispatch is a dry-run. secrets.* appear only
+# in the env of the gated "Watch check" step.
+# Cache restore and save use the runner's scoped cache token. The job token
+# stays contents:read and cannot push. Both cache steps use the live gate,
+# so a dry-run or disabled run never creates a cache entry.
+
+name: Watch
+
+on:
+  schedule:
+    - cron: "7,17,27,37,47,57 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      WATCH_STATE_PATH: .watch-state/state.json
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Restore watch state
+        if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && vars.WATCH_ENABLED == 'true' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: .watch-state
+          key: watch-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: watch-state-v1-
+
+      - name: Watch check (dry-run)
+        if: ${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) || vars.WATCH_ENABLED != 'true' }}
+        run: node scripts/watch-check.mjs --dry-run
+
+      - name: Watch check
+        id: check
+        if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && vars.WATCH_ENABLED == 'true' }}
+        env:
+          WATCH_AK_URL: ${{ vars.WATCH_AK_URL }}
+          WATCH_AK_KEY: ${{ secrets.WATCH_AK_KEY }}
+          WATCH_SLACK_WEBHOOK: ${{ secrets.WATCH_SLACK_WEBHOOK }}
+          WATCH_TELEGRAM_TOKEN: ${{ secrets.WATCH_TELEGRAM_TOKEN }}
+          WATCH_TELEGRAM_CHAT: ${{ secrets.WATCH_TELEGRAM_CHAT }}
+        run: set +e; node scripts/watch-check.mjs; code=$?; echo "code=$code" >> "$GITHUB_OUTPUT"; exit 0
+
+      - name: Save watch state
+        if: ${{ always() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && vars.WATCH_ENABLED == 'true' && hashFiles('.watch-state/state.json') != '' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .watch-state
+          key: watch-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Propagate watch exit
+        if: always() && steps.check.outcome == 'success'
+        run: code="${{ steps.check.outputs.code }}"; case "$code" in ''|*[!0-9]*) echo "watch check did not report a numeric exit code" >&2; exit 1 ;; *) exit "$code" ;; esac
