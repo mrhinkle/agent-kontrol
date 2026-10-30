@@ -31,6 +31,12 @@ Config via environment (or ~/.claude/mission-control.env, read by main() only):
   MC_CLAUDE_ARGS         extra args for claude (default: --permission-mode acceptEdits)
   MC_CODEX_ARGS          extra args for codex exec (default: --full-auto)
   MC_GROK_ARGS           extra args for grok
+  MC_EVENT_CONSUMER      optional, explicitly registered event consumer id
+  MC_EVENT_TOKEN         optional events:read akc_ credential (never MC_TOKEN)
+
+An opt-in outbound SSE listener wakes the normal atomic claim path. While
+connected the fallback poll is max(MC_POLL_SECONDS, 60); when unavailable it
+keeps MC_POLL_SECONDS. No inbound listener or automatic registration is added.
 
 Safety model: every task names task.project, a linked git worktree strictly
 under MC_WORKDIR (no absolute path, no "..", no symlink below the root). One
@@ -598,6 +604,155 @@ def run_task(task: dict, platform: str, sem: threading.Semaphore) -> None:
             sem.release()
 
 
+class DispatchWake:
+    """Coalesce notifications without losing a wake that arrives during a claim."""
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._reasons: set[str] = set()
+
+    def signal(self, reason: str) -> None:
+        with self._condition:
+            self._reasons.add(reason)
+            self._condition.notify_all()
+
+    def wait(self, timeout: float) -> set[str]:
+        with self._condition:
+            self._condition.wait_for(lambda: bool(self._reasons), timeout=timeout)
+            out = self._reasons or {"fallback"}
+            self._reasons = set()
+            return out
+
+
+class NoEventRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Never forward a consumer credential to a redirect destination.
+        return None
+
+
+class EventStreamWake:
+    """Opt-in notification only. Actual work still uses the atomic claim API."""
+    MAX_FRAME = 1_048_576
+
+    def __init__(self, base: str, consumer: str, token: str, wake: DispatchWake) -> None:
+        url = urllib.parse.urlsplit(base)
+        if (url.scheme not in ("https", "http") or not url.hostname or url.username or url.password
+                or url.query or url.fragment or url.path not in ("", "/")
+                or (url.scheme == "http" and url.hostname not in ("localhost", "127.0.0.1", "::1"))):
+            raise ValueError("event stream requires an HTTPS origin (HTTP is loopback-only)")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", consumer) or not re.fullmatch(r"akc_[A-Za-z0-9_-]+", token):
+            raise ValueError("set an explicit consumer and scoped akc_ event credential")
+        self.url = base.rstrip("/") + "/api/events/stream?" + urllib.parse.urlencode({"consumer": consumer})
+        self.consumer, self.token, self.wake = consumer, token, wake
+        self.cursor: str | None = None
+        self.connected = False
+        self._had_progress = False
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="ak-event-wake")
+        self._opener = urllib.request.build_opener(NoEventRedirect())
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        # The daemon socket read is independently bounded by its read timeout.
+        # Never block shutdown waiting for an unresponsive upstream.
+        self._thread.join(timeout=1)
+
+    def _frame(self, event: str, cursor: str | None, data: list[str]) -> bool:
+        if event == "superseded":
+            self.connected = False
+            self._stop.set()  # do not compete with the replacement connection
+            self.wake.signal("reconcile")
+            return False
+        if event in ("cursor_expired", "stream_error"):
+            if event == "cursor_expired":
+                self.cursor = None
+            self.wake.signal("reconcile")
+            return False
+        if event != "github" or not data:
+            return True
+        value = json.loads("\n".join(data))
+        if (not isinstance(value, dict) or not isinstance(value.get("payload"), dict)
+                or not isinstance(value.get("event"), str) or not isinstance(cursor, str)
+                or value.get("id") != cursor or not cursor.startswith(self.consumer + ":")):
+            raise ValueError("invalid event envelope")
+        position = cursor[len(self.consumer) + 1:]
+        if not re.fullmatch(r"[1-9][0-9]{0,18}", position) or int(position) > 9223372036854775807:
+            raise ValueError("invalid event cursor")
+        # Advance only after a complete, valid envelope. Replays are harmless:
+        # wakeups carry no execution authority and the claim API is atomic.
+        self.cursor = cursor
+        self._had_progress = True
+        self.wake.signal("event")
+        return True
+
+    def _consume(self, response) -> None:
+        event, cursor, data, size = "message", None, [], 0
+        while not self._stop.is_set():
+            raw = response.readline(self.MAX_FRAME + 1)
+            if not raw:
+                return
+            size += len(raw)
+            if len(raw) > self.MAX_FRAME or size > self.MAX_FRAME:
+                raise ValueError("event frame exceeds limit")
+            line = raw.decode("utf-8").rstrip("\r\n")
+            if not line:
+                if not self._frame(event, cursor, data):
+                    return
+                event, cursor, data, size = "message", None, [], 0
+            elif line.startswith(":"):
+                self._had_progress = True
+                continue
+            else:
+                field, sep, value = line.partition(":")
+                if sep and value.startswith(" "):
+                    value = value[1:]
+                if field == "event":
+                    event = value
+                elif field == "id":
+                    cursor = value
+                elif field == "data":
+                    data.append(value)
+
+    def _run(self) -> None:
+        backoff = 0.25
+        while not self._stop.is_set():
+            retry_after = 0.0
+            self._had_progress = False
+            headers = {"Authorization": f"Bearer {self.token}", "Accept": "text/event-stream"}
+            if self.cursor:
+                headers["Last-Event-ID"] = self.cursor
+            req = urllib.request.Request(self.url, headers=headers)
+            try:
+                with self._opener.open(req, timeout=40) as response:
+                    if response.status != 200 or response.headers.get_content_type() != "text/event-stream":
+                        raise ValueError("not an event stream")
+                    self.connected = True
+                    self._consume(response)
+            except Exception as error:
+                if isinstance(error, urllib.error.HTTPError) and error.code == 429:
+                    raw_retry = error.headers.get("Retry-After", "")
+                    if raw_retry.isascii() and raw_retry.isdigit():
+                        retry_after = min(86400, int(raw_retry))
+                # Do not print headers, credentials, response bodies or payloads.
+                print(f"[mc] event stream unavailable ({type(error).__name__}); polling remains active", file=sys.stderr)
+            finally:
+                self.connected = False
+            if self._had_progress:
+                backoff = 0.25
+            if self._stop.wait(max(backoff, retry_after)):
+                break
+            backoff = min(30.0, backoff * 2)
+
+
+def run_task_and_wake(task: dict, platform: str, sem: threading.Semaphore, wake: DispatchWake) -> None:
+    try:
+        run_task(task, platform, sem)
+    finally:
+        wake.signal("capacity")
+
+
 def main() -> None:
     load_env_file()
     configure()
@@ -612,6 +767,18 @@ def main() -> None:
     print(f"[mc] dispatcher on {HOSTNAME} serving: {', '.join(platforms)} (workdir {WORKDIR})")
     sem = threading.Semaphore(MAX_CONCURRENT)
     heartbeat_at = 0.0
+    wake = DispatchWake()
+    consumer = os.environ.get("MC_EVENT_CONSUMER", "")
+    stream_token = os.environ.get("MC_EVENT_TOKEN", "")
+    stream = None
+    if consumer or stream_token:
+        try:
+            stream = EventStreamWake(MC_URL, consumer, stream_token, wake)
+            stream.start()
+        except ValueError:
+            print("[mc] invalid event stream configuration; polling remains active", file=sys.stderr)
+    reasons = {"startup"}
+    fallback_claims = 0
 
     while True:
         now = time.time()
@@ -633,8 +800,15 @@ def main() -> None:
                 task = resp.get("task")
                 if task:
                     claimed = True
+                    trigger = "event" if "event" in reasons else "capacity" if "capacity" in reasons else "fallback" if "fallback" in reasons else "reconcile"
+                    if trigger == "fallback":
+                        fallback_claims += 1
+                    # A fallback claim alone does not prove an event was missed.
+                    # Preserve trigger and stream health for later causal analysis.
+                    print(json.dumps({"kind": "claim-wake", "trigger": trigger,
+                        "fallback_claims": fallback_claims, "stream_connected": bool(stream and stream.connected)}))
                     threading.Thread(
-                        target=run_task, args=(task, platform, sem), daemon=True
+                        target=run_task_and_wake, args=(task, platform, sem, wake), daemon=True
                     ).start()
             except Exception as e:
                 print(f"[mc] claim failed ({platform}): {e}", file=sys.stderr)
@@ -642,7 +816,10 @@ def main() -> None:
                 if not claimed:
                     sem.release()
 
-        time.sleep(POLL)
+        # A healthy stream reduces polling frequency. An unavailable stream
+        # keeps the original polling interval, including after a 401/429/error.
+        fallback = max(POLL, 60) if stream and stream.connected else POLL
+        reasons = wake.wait(fallback)
 
 
 if __name__ == "__main__":

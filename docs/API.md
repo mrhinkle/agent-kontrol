@@ -534,3 +534,66 @@ curl -X POST https://YOUR-DEPLOY.vercel.app/api/tasks/claim \
 ```
 
 Returns `{task: null}` when the queue is empty.
+
+## Consumer-scoped outbound event stream (#78)
+
+This is source implementation, not evidence of a live webhook/consumer setup.
+Deployments, migrations, credentials and webhook configuration still need their
+applicable owner decisions. The stream depends on the webhook inbox (#77).
+
+`POST /api/events/consumers` explicitly registers a binding. Only the existing
+operator token or signed-in dashboard can call it; an agent credential cannot
+register or widen its own consumer. The body contains `id`, `credential_id`,
+`repos`, `event_types`, and optional `enabled` (default true). IDs use lowercase
+letters, digits, dot, underscore and hyphen, maximum 64 characters. Supply 1–50
+repository names and 1–32 event names; these are exact allowlists, not wildcards.
+The credential must exist, be active, and have the new `events:read` scope. One
+credential binds to one consumer. There is no implicit registration or demo store.
+
+`GET /api/events/stream?consumer=<id>&since=<cursor>` accepts only a scoped
+`Authorization: Bearer akc_…` credential for that registered consumer. Missing or
+invalid credentials are 401; missing scope, a different consumer binding, or a
+foreign cursor are 403. The legacy operator token, session and query-string keys
+do not grant stream access. An unavailable database/store is 503, not an empty
+healthy stream. Existing request quotas apply to opens/reconnects; heartbeats
+do not create new requests. Consumer/cursor checks follow the shared route/scope
+quota check.
+
+Responses are SSE with `Cache-Control: no-store, no-transform`. A data frame is:
+
+```text
+id: reviewer:123
+event: github
+data: {"id":"reviewer:123","event":"status","payload":{"state":"success"}}
+
+```
+
+Cursors contain the consumer id and a lossless decimal inbox position. They are
+positions, not credentials: every read independently checks the current binding,
+credential, allowlists and generation. `Last-Event-ID` may replace `since`;
+conflicting values are 400. With neither supplied, retained matching events are
+replayed from the beginning. Resume emits positions after the acknowledged cursor;
+retrying an older cursor deliberately replays events (at least once). Execution
+still needs the normal atomic task claim or reviewer revalidation.
+
+A removed cursor row produces `event: cursor_expired` with `reconcile: true` and
+closes, so the consumer sweeps/reconciles rather than assuming a complete history.
+A changed filter may reject an old cursor; restart/reconcile using the newly
+authorized scope. No event body or cursor is copied into an approval.
+
+A comment heartbeat is sent every 25 seconds. The server closes after 240 seconds
+within the route's declared 300-second cap; the deployment must support that cap.
+A new connection increments a durable generation and supersedes the previous
+one. Same-process replacement is immediate; other instances detect it on the
+next bounded database poll and close with `superseded`. Revocation, expiry,
+disabling and scope removal are rechecked on those polls. Already queued bytes
+may have been authorized before a change; no further batch is authorized from
+the retired generation.
+
+Each database batch contains one event, with backpressure and a 1 MiB frame cap.
+An oversized event or store error closes with a bounded `stream_error` control
+frame without advancing past the undelivered event. Consumers must use compatible
+frame limits and retain fallback reconciliation. A short PostgreSQL SHARE lock
+waits for concurrent inbox insert transactions before selecting a batch: sequence
+allocation alone is not commit order. No network/model work runs under this lock;
+lock/statement timeouts fail closed.

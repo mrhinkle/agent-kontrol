@@ -9,6 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "pg";
+import { runEventStreamTests } from "./pg-events-stream-tests";
 import { evaluateAlerts, setBeforeClaimForTests, setBriefSettingsForTests } from "../src/lib/brief-alerts";
 import type { BriefSettings } from "../src/lib/progress-config";
 import { sql, withTransaction } from "../src/lib/db";
@@ -69,6 +70,7 @@ async function main() {
   const driverOverride = process.env.MC_DB_DRIVER;
   const rows = await sql()`select 1 as one`;
   assert.equal(Number(rows[0].one), 1);
+  await runEventStreamTests();
 
   const tag = `pgtest-${Date.now()}`;
   await report({ agent_id: `${tag}-agent`, platform: "codex", machine: "m1", kind: "session_start", title: "hello", project: "p" } as never);
