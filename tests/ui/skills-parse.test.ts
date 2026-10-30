@@ -18,6 +18,7 @@ import { githubToken, decodeUtf8 } from "../../src/lib/skills/source";
 import { skillSha, shortSha } from "../../src/lib/skills/sha";
 import { stallMinutes } from "../../src/lib/skills/clock";
 import { ALL_RUNTIMES, CLAUDE_ONLY, NO_RUNTIMES } from "../../src/lib/skills/types";
+import { compositionPatterns, reactNative, UPSTREAM_BODY } from "./skills-upstream-frontmatter";
 
 describe("skill frontmatter and runtimes", () => {
   it("uses the directory name when name is missing and reads metadata.version", () => {
@@ -232,6 +233,222 @@ describe("skill frontmatter and runtimes", () => {
     assert.equal(parsed.parseProblem, null);
     assert.equal(parsed.name, "bom-skill");
     assert.equal(parsed.body, "Body\n");
+  });
+
+  it("reads both pinned upstream descriptions that start on the next line, with LF and CRLF", () => {
+    for (const fixture of [compositionPatterns, reactNative]) {
+      for (const raw of [fixture.raw, fixture.raw.replace(/\n/g, "\r\n")]) {
+        const directoryName = fixture.dir.slice(fixture.dir.lastIndexOf("/") + 1);
+        const parsed = parseSkillMarkdown(raw, directoryName);
+        assert.equal(parsed.parseProblem, null);
+        assert.equal(parsed.name, directoryName);
+        assert.equal(parsed.description, fixture.description);
+        assert.equal(parsed.version, "1.0.0");
+        assert.equal(parsed.category, "Design & Frontend");
+        assert.deepEqual(parsed.tags, fixture.tags);
+        assert.deepEqual(parsed.frontmatter.metadata, { author: "vercel", version: "1.0.0" });
+        assert.equal(parsed.frontmatter.license, "MIT");
+        assert.equal(parsed.frontmatter.last_updated, "2026-07-17");
+        const expectedBody = raw.includes("\r\n") ? UPSTREAM_BODY.replace(/\n/g, "\r\n") : UPSTREAM_BODY;
+        assert.equal(parsed.body, expectedBody);
+        assert.equal(skillSha(raw), createHash("sha256").update(Buffer.from(raw, "utf8")).digest("hex"));
+      }
+    }
+  });
+
+  it("folds a plain value continued from the key line and stops at the next sibling", () => {
+    const parsed = parseSkillMarkdown(
+      [
+        "---",
+        "description: Starts on the key line",
+        "  and continues here.",
+        "",
+        "  A second paragraph links https://example.com/a:b",
+        "runtimes:",
+        "  - codex",
+        "  - grok",
+        "---",
+        "Body",
+        "",
+      ].join("\n"),
+      "plain",
+    );
+    assert.equal(parsed.parseProblem, null);
+    assert.equal(parsed.description, "Starts on the key line and continues here.\nA second paragraph links https://example.com/a:b");
+    assert.deepEqual(parsed.frontmatter.runtimes, ["codex", "grok"]);
+    const decision = resolveRuntimes({ frontmatter: parsed.frontmatter, body: parsed.body, sibling: null, siblingProblem: null, parseProblem: null });
+    assert.equal(decision.flags.codex, true);
+    assert.equal(decision.flags.grok, true);
+    assert.equal(decision.flags.claude, false);
+  });
+
+  it("gives an indented plain scalar the same type as the one-line form", () => {
+    for (const [text, value] of [["false", false], ["true", true], ["null", null], ["~", null], ["123", 123], ["-7", -7]] as const) {
+      const oneLine = parseSkillMarkdown(`---\nruntimes: ${text}\n---\nNeutral body.\n`, "typed");
+      const indented = parseSkillMarkdown(`---\nruntimes:\n  ${text}\n---\nNeutral body.\n`, "typed");
+      assert.equal(oneLine.parseProblem, null);
+      assert.equal(indented.parseProblem, null);
+      assert.deepEqual(indented.frontmatter, oneLine.frontmatter);
+      assert.equal(indented.frontmatter.runtimes, value);
+      const one = resolveRuntimes({ frontmatter: oneLine.frontmatter, body: oneLine.body, sibling: null, siblingProblem: null, parseProblem: null });
+      const two = resolveRuntimes({ frontmatter: indented.frontmatter, body: indented.body, sibling: null, siblingProblem: null, parseProblem: null });
+      assert.deepEqual(two, one);
+    }
+    const prose = parseSkillMarkdown(
+      "---\ndescription:\n  false\n  alarms are rare\nnote: 123\n  more\nruntimes:\n  codex grok\n---\nBody\n",
+      "prose",
+    );
+    assert.equal(prose.parseProblem, null);
+    assert.equal(prose.description, "false alarms are rare");
+    assert.equal(prose.frontmatter.note, "123 more");
+    assert.equal(prose.frontmatter.runtimes, "codex grok");
+  });
+
+  it("keeps adjacent nested maps, both sequence styles, and block scalars in their shapes", () => {
+    const parsed = parseSkillMarkdown(
+      [
+        "---",
+        "metadata:",
+        "  author: a",
+        "  note:",
+        "    nested plain",
+        "    text",
+        "  version: 2",
+        "restrictions:",
+        "  network: none",
+        "tags:",
+        "- x",
+        "- y",
+        "runtimes:",
+        "  - claude",
+        "folded: >",
+        "  one",
+        "  two",
+        "literal: |",
+        "  l1",
+        "  l2",
+        "---",
+        "Body",
+        "",
+      ].join("\n"),
+      "shapes",
+    );
+    assert.equal(parsed.parseProblem, null);
+    assert.deepEqual(parsed.frontmatter, {
+      metadata: { author: "a", note: "nested plain text", version: 2 },
+      restrictions: { network: "none" },
+      tags: ["x", "y"],
+      runtimes: ["claude"],
+      folded: "one two",
+      literal: "l1\nl2",
+    });
+    assert.equal(parsed.version, "2");
+  });
+
+  it("still fails explicitly on malformed or unsupported multiline values", () => {
+    const cases: [string, RegExp][] = [
+      ["description:\n  text here\n  key: value\n", /cannot parse frontmatter line: key: value/],
+      ["description:\n  \"quoted\"\n", /cannot parse frontmatter line/],
+      ["description: \"open\n  more\"\n", /multiline quoted value/],
+      ["description:\n  one\n  # note\n  two\n", /cannot parse frontmatter line: two/],
+      ["description: one # note\n  two\n", /comment inside a multiline value/],
+      ["description:\n  one\n\ttwo\n", /tabs/],
+    ];
+    for (const [frontmatter, problem] of cases) {
+      const parsed = parseSkillMarkdown(`---\n${frontmatter}---\nBody that mentions every runtime.\n`, "bad");
+      assert.match(parsed.parseProblem ?? "", problem, frontmatter);
+      assert.deepEqual(parsed.frontmatter, {});
+      assert.equal(parsed.description, "");
+    }
+  });
+
+  it("does not read flow, explicit-key, sequence, or other indicator starts as multiline plain text", () => {
+    const cases: [string, RegExp][] = [
+      ["runtimes: [\n  codex\n", /does not start as plain text/],
+      ["runtimes: [claude,\n  codex]\n", /does not start as plain text/],
+      ["runtimes: {\n  codex\n", /unsupported frontmatter syntax/],
+      ["runtimes: -\n  codex\n", /does not start as plain text/],
+      ["runtimes: ?\n  codex\n", /does not start as plain text/],
+      ["runtimes: :\n  codex\n", /does not start as plain text/],
+      ["runtimes: ,codex\n  grok\n", /does not start as plain text/],
+      ["runtimes: @codex\n  grok\n", /does not start as plain text/],
+      ["runtimes: `codex\n  grok\n", /does not start as plain text/],
+      ["runtimes: %codex\n  grok\n", /does not start as plain text/],
+      ["runtimes: claude:\n  codex\n", /mapping value inside a multiline value/],
+      ["runtimes: claude: x\n  codex\n", /mapping value inside a multiline value/],
+      ["runtimes: claude:  \n  codex\n", /mapping value inside a multiline value/],
+      ["runtimes:\n  ? codex\n", /cannot parse frontmatter line: \? codex/],
+      ["runtimes:\n  ?\n", /cannot parse frontmatter line: \?/],
+      ["runtimes:\n  [claude,\n  codex]\n", /cannot parse frontmatter line: \[claude,/],
+      ["runtimes:\n  [\n  codex\n", /cannot parse frontmatter line: \[/],
+      ["runtimes:\n  {codex\n", /cannot parse frontmatter line: \{codex/],
+      ["runtimes:\n  &a codex\n", /cannot parse frontmatter line: &a codex/],
+      ["runtimes:\n  *a\n", /cannot parse frontmatter line: \*a/],
+      ["runtimes:\n  !tag codex\n", /cannot parse frontmatter line: !tag codex/],
+      ["runtimes:\n  -\n  codex\n", /cannot parse frontmatter line: -/],
+      ["runtimes:\n  : codex\n", /cannot parse frontmatter line: : codex/],
+      ["description:\n  prose\n  # comment\n  runtimes: [codex]\n", /cannot parse frontmatter line: runtimes: \[codex\]/],
+      ["description:\n  prose\n# comment\n  runtimes: [codex]\n", /cannot parse frontmatter line: runtimes: \[codex\]/],
+      ["description: prose\n  more\n  # comment\n\n  runtimes: [codex]\n", /cannot parse frontmatter line: runtimes: \[codex\]/],
+    ];
+    for (const [frontmatter, problem] of cases) {
+      const raw = `---\n${frontmatter}---\nNeutral stand-in body that mentions codex.\n`;
+      const parsed = parseSkillMarkdown(raw, "probe");
+      assert.match(parsed.parseProblem ?? "", problem, frontmatter);
+      assert.deepEqual(parsed.frontmatter, {}, frontmatter);
+      const decision = resolveRuntimes({
+        frontmatter: parsed.frontmatter,
+        body: parsed.body,
+        sibling: null,
+        siblingProblem: null,
+        parseProblem: parsed.parseProblem,
+      });
+      assert.equal(decision.flags.codex, false, frontmatter);
+      const assembled = assembleSkills({
+        source_id: "test",
+        position: 0,
+        globs: ["skills/*"],
+        files: [{ path: "skills/probe/SKILL.md", content: raw }],
+      });
+      assert.equal(assembled.skills.length, 0, frontmatter);
+      assert.equal(assembled.errors.length, 1, frontmatter);
+      assert.equal(assembled.preserved[0]?.id, "probe", frontmatter);
+    }
+  });
+
+  it("still reads plain text that starts with -, ?, or : followed by a non-space", () => {
+    const parsed = parseSkillMarkdown(
+      [
+        "---",
+        "description: -dash start",
+        "  continues",
+        "note:",
+        "  ?query start",
+        "  continues",
+        "extra: :colon start",
+        "  continues",
+        "link: see https://example.com/a and a:b",
+        "  continues",
+        "metadata:",
+        "  author: a",
+        "  # trailing comment",
+        "  version: 3",
+        "runtimes: [codex]",
+        "---",
+        "Body",
+        "",
+      ].join("\n"),
+      "starts",
+    );
+    assert.equal(parsed.parseProblem, null);
+    assert.deepEqual(parsed.frontmatter, {
+      description: "-dash start continues",
+      note: "?query start continues",
+      extra: ":colon start continues",
+      link: "see https://example.com/a and a:b continues",
+      metadata: { author: "a", version: 3 },
+      runtimes: ["codex"],
+    });
   });
 });
 

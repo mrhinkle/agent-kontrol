@@ -110,6 +110,7 @@ LANE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}")
 MAX_POINTER_RESPONSE = 256_000
 MAX_POINTER_BLOCK = 64_000
 LOCK_NAME = "ak-dispatch.lock"
+SKILL_RECOVERY_NAME = "ak-skill-recovery.json"  # written by ak_skill_launch; blocks every dispatch until recovered
 KILL_GRACE = 5.0  # seconds a CLI's process group gets after SIGTERM, then again after SIGKILL
 
 
@@ -252,18 +253,24 @@ def stop_group(proc: subprocess.Popen, grace: float) -> bool:
     The group id is the CLI's pid (start_new_session), never this process's group.
     A process that moved itself to another group or session is outside it.
     """
-    pgid = proc.pid
+    return stop_group_id(proc.pid, proc.poll, grace)
+
+
+def stop_group_id(pgid: int, reap, grace: float) -> bool:
+    """stop_group for a process group known only by id. reap() collects the leader if it is our child."""
+    if pgid <= 1 or pgid == os.getpgrp():
+        raise ValueError(f"refusing to signal process group {pgid}")
     for sig in (signal.SIGTERM, signal.SIGKILL):
         deadline = time.monotonic() + grace
         try:
             os.killpg(pgid, sig)
         except ProcessLookupError:
-            proc.poll()
+            reap()
             return True
         except PermissionError:
             pass
         while time.monotonic() < deadline:
-            proc.poll()  # reap the leader so its zombie does not keep the group alive
+            reap()  # reap the leader so its zombie does not keep the group alive
             try:
                 os.killpg(pgid, 0)
             except ProcessLookupError:
@@ -271,7 +278,7 @@ def stop_group(proc: subprocess.Popen, grace: float) -> bool:
             except PermissionError:
                 pass
             time.sleep(0.05)
-    proc.poll()
+    reap()
     return False
 
 
@@ -492,6 +499,16 @@ class WorktreeLock:
                 self.fd = None
 
 
+def refuse_unresolved_recovery(git_dir: Path) -> None:
+    """Call with the worktree lock held. An interrupted skills launch may still have a live worker here."""
+    path = git_dir / SKILL_RECOVERY_NAME
+    if os.path.lexists(path):
+        raise DispatchRefused(
+            f"{path} records an interrupted skills launch; confirm its worker group is gone, "
+            "then run `ak_skill_launch.py recover --cwd <worktree>`"
+        )
+
+
 def fetch_pointers(lane: str, runtime: str) -> str:
     """The lane's pointer block from GET /api/skills/pointers. Only lane and runtime are sent."""
     query = urllib.parse.urlencode({"lane": lane, "runtime": runtime})
@@ -550,9 +567,11 @@ def run_task(task: dict, platform: str, sem: threading.Semaphore) -> None:
                     f"digits, and . _ : / - starting with a letter or digit (got {project!r})"
                 )
             cwd = resolve_project(project, WORKDIR)
-            candidate = WorktreeLock(linked_worktree_git_dir(cwd))
+            git_dir = linked_worktree_git_dir(cwd)
+            candidate = WorktreeLock(git_dir)
             candidate.acquire(cwd)
             lock = candidate
+            refuse_unresolved_recovery(git_dir)
         except DispatchRefused as e:
             fail_task(tid, agent_id, str(e))
             return

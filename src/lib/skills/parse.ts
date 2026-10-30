@@ -240,6 +240,13 @@ function parseYamlMap(text: string): { ok: true; data: Record<string, unknown> }
         i += 1;
         continue;
       }
+      if (!MAPPING_INDICATOR.test(nextTrim) && isPlainStart(nextTrim)) {
+        const plain = readPlainContinuation(lines, i + 1, indent);
+        if (!plain.ok) return plain;
+        map[key] = plainValue(foldPlain([], plain.lines));
+        i = plain.next;
+        continue;
+      }
       const child: Record<string, unknown> = {};
       map[key] = child;
       stack.push({ indent, kind: "map", container: child });
@@ -257,12 +264,96 @@ function parseYamlMap(text: string): { ok: true; data: Record<string, unknown> }
     if (rest.startsWith("{") || rest.startsWith("&") || rest.startsWith("*") || rest.startsWith("!")) {
       return { ok: false, error: "unsupported frontmatter syntax" };
     }
+    const continuation = readPlainContinuation(lines, i + 1, indent);
+    if (!continuation.ok) return continuation;
+    if (continuation.lines.length > 0) {
+      if (rest.startsWith('"') || rest.startsWith("'")) return { ok: false, error: "multiline quoted value is not supported" };
+      if (!isPlainStart(rest)) return { ok: false, error: "multiline value does not start as plain text" };
+      if (/\s#/.test(rest)) return { ok: false, error: "comment inside a multiline value is not supported" };
+      if (MAPPING_INDICATOR.test(rest.trim())) return { ok: false, error: "mapping value inside a multiline value is not supported" };
+      map[key] = plainValue(foldPlain([rest.trim()], continuation.lines));
+      i = continuation.next;
+      continue;
+    }
     const scalar = parseScalar(rest);
     if (!scalar.ok) return scalar;
     map[key] = scalar.value;
     i += 1;
   }
   return { ok: true, data: root };
+}
+
+/** `key:` followed by a space or the end of the line. A colon inside text, as in a URL, is not one. */
+const MAPPING_INDICATOR = /:(\s|$)/;
+/**
+ * A YAML plain scalar cannot start with an indicator: a quote, flow collection,
+ * anchor, alias, tag, block scalar, comment, directive, or reserved character.
+ * `-`, `?` and `:` start plain text only when a non-space character follows;
+ * otherwise they open a sequence entry, an explicit key, or a value.
+ */
+function isPlainStart(text: string): boolean {
+  if (/^[,[\]{}#&*!|>'"%@`]/.test(text)) return false;
+  return !/^[-?:](\s|$)/.test(text);
+}
+
+/**
+ * Lines of a multiline plain scalar: every line from `start` indented deeper
+ * than its key, up to the next sibling, dedent, or comment line. Blank lines
+ * are kept only when more text follows. A continuation line that holds a
+ * mapping indicator or a comment is not plain text and is a parse problem.
+ */
+function readPlainContinuation(
+  lines: string[],
+  start: number,
+  keyIndent: number,
+): { ok: true; lines: string[]; next: number } | { ok: false; error: string } {
+  const taken: string[] = [];
+  let blanks = 0;
+  let j = start;
+  while (j < lines.length) {
+    const line = lines[j];
+    if (line.trim() === "") {
+      blanks += 1;
+      j += 1;
+      continue;
+    }
+    if (line.includes("\t")) return { ok: false, error: "tabs are not allowed in frontmatter" };
+    const lineIndent = line.match(/^ */)?.[0].length ?? 0;
+    const text = line.trim();
+    if (text.startsWith("#")) {
+      // A comment ends the value. Anything still deeper than the key after it
+      // has no container to belong to and must not reach the parent map.
+      const after = nextContent(lines, j + 1);
+      if (after != null && (lines[after].match(/^ */)?.[0].length ?? 0) > keyIndent) {
+        return { ok: false, error: `cannot parse frontmatter line: ${lines[after].trim().slice(0, 80)}` };
+      }
+      break;
+    }
+    if (lineIndent <= keyIndent) break;
+    if (MAPPING_INDICATOR.test(text)) return { ok: false, error: `cannot parse frontmatter line: ${text.slice(0, 80)}` };
+    if (/\s#/.test(text)) return { ok: false, error: "comment inside a multiline value is not supported" };
+    for (; blanks > 0; blanks -= 1) taken.push("");
+    taken.push(text);
+    j += 1;
+  }
+  // Every line before the last taken one was blank or text, so the count is the span consumed.
+  return { ok: true, lines: taken, next: start + taken.length };
+}
+
+/** YAML plain-scalar folding: a single line break is a space, and each blank line is one newline. */
+function foldPlain(head: string[], rest: string[]): string {
+  let out = "";
+  let breaks = 0;
+  for (const part of [...head, ...rest]) {
+    if (part === "") {
+      breaks += 1;
+      continue;
+    }
+    if (out === "") out = part;
+    else out += breaks > 0 ? "\n".repeat(breaks) + part : ` ${part}`;
+    breaks = 0;
+  }
+  return out;
 }
 
 function nextContent(lines: string[], start: number): number | null {
@@ -316,10 +407,14 @@ function parseScalar(text: string): { ok: true; value: unknown } | { ok: false; 
     return { ok: true, value: trimmed.slice(1, -1) };
   }
   if (trimmed.startsWith('"') || trimmed.startsWith("'")) return { ok: false, error: "unclosed quote in frontmatter" };
-  const unquoted = trimmed.replace(/[ \t]+#[ \t].*$/, "");
-  if (unquoted === "null" || unquoted === "~") return { ok: true, value: null };
-  if (unquoted === "true") return { ok: true, value: true };
-  if (unquoted === "false") return { ok: true, value: false };
-  if (/^-?[0-9]+$/.test(unquoted)) return { ok: true, value: Number(unquoted) };
-  return { ok: true, value: unquoted };
+  return { ok: true, value: plainValue(trimmed.replace(/[ \t]+#[ \t].*$/, "")) };
+}
+
+/** The type of an unquoted scalar, the same whether it was written on one line or folded from several. */
+function plainValue(text: string): unknown {
+  if (text === "null" || text === "~") return null;
+  if (text === "true") return true;
+  if (text === "false") return false;
+  if (/^-?[0-9]+$/.test(text)) return Number(text);
+  return text;
 }
