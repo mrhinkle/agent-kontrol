@@ -248,18 +248,24 @@ def stop_group(proc: subprocess.Popen, grace: float) -> bool:
     The group id is the CLI's pid (start_new_session), never this process's group.
     A process that moved itself to another group or session is outside it.
     """
-    pgid = proc.pid
+    return stop_group_id(proc.pid, proc.poll, grace)
+
+
+def stop_group_id(pgid: int, reap, grace: float) -> bool:
+    """stop_group for a process group known only by id. reap() collects the leader if it is our child."""
+    if pgid <= 1 or pgid == os.getpgrp():
+        raise ValueError(f"refusing to signal process group {pgid}")
     for sig in (signal.SIGTERM, signal.SIGKILL):
         deadline = time.monotonic() + grace
         try:
             os.killpg(pgid, sig)
         except ProcessLookupError:
-            proc.poll()
+            reap()
             return True
         except PermissionError:
             pass
         while time.monotonic() < deadline:
-            proc.poll()  # reap the leader so its zombie does not keep the group alive
+            reap()  # reap the leader so its zombie does not keep the group alive
             try:
                 os.killpg(pgid, 0)
             except ProcessLookupError:
@@ -267,7 +273,7 @@ def stop_group(proc: subprocess.Popen, grace: float) -> bool:
             except PermissionError:
                 pass
             time.sleep(0.05)
-    proc.poll()
+    reap()
     return False
 
 
