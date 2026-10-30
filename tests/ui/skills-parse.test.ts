@@ -339,6 +339,89 @@ describe("skill frontmatter and runtimes", () => {
       assert.equal(parsed.description, "");
     }
   });
+
+  it("does not read flow, explicit-key, sequence, or other indicator starts as multiline plain text", () => {
+    const cases: [string, RegExp][] = [
+      ["runtimes: [\n  codex\n", /does not start as plain text/],
+      ["runtimes: [claude,\n  codex]\n", /does not start as plain text/],
+      ["runtimes: {\n  codex\n", /unsupported frontmatter syntax/],
+      ["runtimes: -\n  codex\n", /does not start as plain text/],
+      ["runtimes: ?\n  codex\n", /does not start as plain text/],
+      ["runtimes: :\n  codex\n", /does not start as plain text/],
+      ["runtimes: ,codex\n  grok\n", /does not start as plain text/],
+      ["runtimes: @codex\n  grok\n", /does not start as plain text/],
+      ["runtimes: `codex\n  grok\n", /does not start as plain text/],
+      ["runtimes: %codex\n  grok\n", /does not start as plain text/],
+      ["runtimes:\n  ? codex\n", /cannot parse frontmatter line: \? codex/],
+      ["runtimes:\n  ?\n", /cannot parse frontmatter line: \?/],
+      ["runtimes:\n  [claude,\n  codex]\n", /cannot parse frontmatter line: \[claude,/],
+      ["runtimes:\n  [\n  codex\n", /cannot parse frontmatter line: \[/],
+      ["runtimes:\n  {codex\n", /cannot parse frontmatter line: \{codex/],
+      ["runtimes:\n  &a codex\n", /cannot parse frontmatter line: &a codex/],
+      ["runtimes:\n  *a\n", /cannot parse frontmatter line: \*a/],
+      ["runtimes:\n  !tag codex\n", /cannot parse frontmatter line: !tag codex/],
+      ["runtimes:\n  -\n  codex\n", /cannot parse frontmatter line: -/],
+      ["runtimes:\n  : codex\n", /cannot parse frontmatter line: : codex/],
+      ["description:\n  prose\n  # comment\n  runtimes: [codex]\n", /cannot parse frontmatter line: runtimes: \[codex\]/],
+      ["description:\n  prose\n# comment\n  runtimes: [codex]\n", /cannot parse frontmatter line: runtimes: \[codex\]/],
+      ["description: prose\n  more\n  # comment\n\n  runtimes: [codex]\n", /cannot parse frontmatter line: runtimes: \[codex\]/],
+    ];
+    for (const [frontmatter, problem] of cases) {
+      const raw = `---\n${frontmatter}---\nNeutral stand-in body that mentions codex.\n`;
+      const parsed = parseSkillMarkdown(raw, "probe");
+      assert.match(parsed.parseProblem ?? "", problem, frontmatter);
+      assert.deepEqual(parsed.frontmatter, {}, frontmatter);
+      const decision = resolveRuntimes({
+        frontmatter: parsed.frontmatter,
+        body: parsed.body,
+        sibling: null,
+        siblingProblem: null,
+        parseProblem: parsed.parseProblem,
+      });
+      assert.equal(decision.flags.codex, false, frontmatter);
+      const assembled = assembleSkills({
+        source_id: "test",
+        position: 0,
+        globs: ["skills/*"],
+        files: [{ path: "skills/probe/SKILL.md", content: raw }],
+      });
+      assert.equal(assembled.skills.length, 0, frontmatter);
+      assert.equal(assembled.errors.length, 1, frontmatter);
+      assert.equal(assembled.preserved[0]?.id, "probe", frontmatter);
+    }
+  });
+
+  it("still reads plain text that starts with -, ?, or : followed by a non-space", () => {
+    const parsed = parseSkillMarkdown(
+      [
+        "---",
+        "description: -dash start",
+        "  continues",
+        "note:",
+        "  ?query start",
+        "  continues",
+        "extra: :colon start",
+        "  continues",
+        "metadata:",
+        "  author: a",
+        "  # trailing comment",
+        "  version: 3",
+        "runtimes: [codex]",
+        "---",
+        "Body",
+        "",
+      ].join("\n"),
+      "starts",
+    );
+    assert.equal(parsed.parseProblem, null);
+    assert.deepEqual(parsed.frontmatter, {
+      description: "-dash start continues",
+      note: "?query start continues",
+      extra: ":colon start continues",
+      metadata: { author: "a", version: 3 },
+      runtimes: ["codex"],
+    });
+  });
 });
 
 describe("settings patch validation", () => {

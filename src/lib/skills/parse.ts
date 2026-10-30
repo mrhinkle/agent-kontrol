@@ -240,7 +240,7 @@ function parseYamlMap(text: string): { ok: true; data: Record<string, unknown> }
         i += 1;
         continue;
       }
-      if (!MAPPING_INDICATOR.test(nextTrim) && !PLAIN_START_INDICATOR.test(nextTrim)) {
+      if (!MAPPING_INDICATOR.test(nextTrim) && isPlainStart(nextTrim)) {
         const plain = readPlainContinuation(lines, i + 1, indent);
         if (!plain.ok) return plain;
         map[key] = foldPlain([], plain.lines);
@@ -268,6 +268,7 @@ function parseYamlMap(text: string): { ok: true; data: Record<string, unknown> }
     if (!continuation.ok) return continuation;
     if (continuation.lines.length > 0) {
       if (rest.startsWith('"') || rest.startsWith("'")) return { ok: false, error: "multiline quoted value is not supported" };
+      if (!isPlainStart(rest)) return { ok: false, error: "multiline value does not start as plain text" };
       if (/\s#/.test(rest)) return { ok: false, error: "comment inside a multiline value is not supported" };
       map[key] = foldPlain([rest.trim()], continuation.lines);
       i = continuation.next;
@@ -283,8 +284,16 @@ function parseYamlMap(text: string): { ok: true; data: Record<string, unknown> }
 
 /** `key:` followed by a space or the end of the line. A colon inside text, as in a URL, is not one. */
 const MAPPING_INDICATOR = /:(\s|$)/;
-/** A first line that starts like a quote, flow collection, anchor, tag, or block indicator is not read as plain text. */
-const PLAIN_START_INDICATOR = /^["'[\]{}&*!|>%@`]/;
+/**
+ * A YAML plain scalar cannot start with an indicator: a quote, flow collection,
+ * anchor, alias, tag, block scalar, comment, directive, or reserved character.
+ * `-`, `?` and `:` start plain text only when a non-space character follows;
+ * otherwise they open a sequence entry, an explicit key, or a value.
+ */
+function isPlainStart(text: string): boolean {
+  if (/^[,[\]{}#&*!|>'"%@`]/.test(text)) return false;
+  return !/^[-?:](\s|$)/.test(text);
+}
 
 /**
  * Lines of a multiline plain scalar: every line from `start` indented deeper
@@ -310,7 +319,16 @@ function readPlainContinuation(
     if (line.includes("\t")) return { ok: false, error: "tabs are not allowed in frontmatter" };
     const lineIndent = line.match(/^ */)?.[0].length ?? 0;
     const text = line.trim();
-    if (lineIndent <= keyIndent || text.startsWith("#")) break;
+    if (text.startsWith("#")) {
+      // A comment ends the value. Anything still deeper than the key after it
+      // has no container to belong to and must not reach the parent map.
+      const after = nextContent(lines, j + 1);
+      if (after != null && (lines[after].match(/^ */)?.[0].length ?? 0) > keyIndent) {
+        return { ok: false, error: `cannot parse frontmatter line: ${lines[after].trim().slice(0, 80)}` };
+      }
+      break;
+    }
+    if (lineIndent <= keyIndent) break;
     if (MAPPING_INDICATOR.test(text)) return { ok: false, error: `cannot parse frontmatter line: ${text.slice(0, 80)}` };
     if (/\s#/.test(text)) return { ok: false, error: "comment inside a multiline value is not supported" };
     for (; blanks > 0; blanks -= 1) taken.push("");
