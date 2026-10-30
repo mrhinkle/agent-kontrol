@@ -382,6 +382,20 @@ describe("POST /api/webhooks/github accepted deliveries", () => {
     assert.equal(mismatched.status, 401);
   });
 
+  it("stores repositories named like .github and owners with underscores", async () => {
+    for (const fullName of ["acme/.github", "octo_acme/widgets", "a/b", "Acme-Co/Widgets.js"]) {
+      calls = [];
+      const payload = { ...fixture.payload, repository: { full_name: fullName } };
+      const res = await POST(signedRequest(JSON.stringify(payload)));
+      assert.equal(res.status, 200, fullName);
+      assert.equal(calls[0].values[3], fullName);
+    }
+    for (const fullName of ["acme", "acme/", "/widgets", "acme/wid gets", "acme/a/b", "acme/w\nx"]) {
+      const res = await POST(signedRequest(JSON.stringify({ ...fixture.payload, repository: { full_name: fullName } })));
+      assert.equal(res.status, 400, fullName);
+    }
+  });
+
   it("answers a duplicate delivery 200 duplicate:true", async () => {
     respond = () => [];
     const delivery = randomUUID();
