@@ -46,6 +46,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Notices: copyright is Mark Hinkle and The AIE Network; Agent Kontrol™ is a trademark of Mark Hinkle (The AIE Network™ stays with Peripety Labs LLC). Added an Apache `NOTICE` file and `author` in package.json.
 - Demo mode (no `DATABASE_URL`) keeps MCP `report_status`, `remember`, `create_task`, `claim_task`, and `update_task` in an in-memory store for the life of the process. `get_fleet_status`, `recall`, and `get_task_queue` read it. Successful responses are labeled demo. The store is cleared when the process restarts. Dashboard sample data and dropped REST writes are unchanged (#56).
 - The OpenAPI document includes `POST /api/memory`, optional `dry_run` on that route and on `PATCH /api/tasks/:id` and `PUT /api/settings/repos`, and `actor_type` / `actor_id` on the Task and Message schemas. The route-parity check is unchanged.
 - The OpenAPI document includes `GET` and `POST /api/decisions` and `PATCH /api/decisions/{id}`: `status` and `shape` query parameters, the `decisions:write` scope on the patch, and the error codes from `src/lib/api-error.ts`. It also documents the optional `Idempotency-Key` header and `409` `idempotency_conflict` on `POST /api/tasks`, `POST /api/messages`, and `POST /api/messages/reply`. The route-parity check is unchanged.
