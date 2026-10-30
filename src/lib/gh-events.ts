@@ -42,7 +42,9 @@ const WEBHOOK_DELIVERY_ID = /^[A-Za-z0-9-]{1,128}$/;
 const EVENT_HEADER = /^[a-z][a-z_]{0,63}$/;
 const SIGNATURE_HEADER = /^sha256=([0-9a-f]{64})$/;
 const ACTION = /^[a-z_]{1,64}$/;
-const REPO_FULL_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
+// owner/name. Owners allow `_` (Enterprise Managed User logins) and names may
+// start with `.` (owner/.github). Loose on purpose: a stricter rule drops real deliveries.
+const REPO_FULL_NAME = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
 const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const CONTROL = /[\u0000-\u001f\u007f]/;
 // Postgres jsonb cannot hold U+0000 or an unpaired surrogate.
