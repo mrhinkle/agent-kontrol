@@ -41,7 +41,9 @@ import {
   WRITEBACK_LOCK_LEASE_SECONDS,
   type UpsertInput,
 } from "../src/lib/decisions";
-import { finishSyncRun, markSkillRemoved, SyncLeaseLost, upsertSettings, upsertSkill } from "../src/lib/skills/store";
+import { finishSyncRun, getSkillRow, markSkillRemoved, SyncLeaseLost, upsertSettings, upsertSkill } from "../src/lib/skills/store";
+import { planSync } from "../src/lib/skills/plan";
+import type { AssembledSkill } from "../src/lib/skills/assemble";
 import { runScheduleTick, type TickResult } from "../src/lib/skills/schedule";
 import { listLastScheduledTasks, listOpenScheduledTasks } from "../src/lib/skills/schedule-store";
 import type { SkillRecord } from "../src/lib/skills/types";
@@ -374,6 +376,7 @@ async function main() {
   await testReportStatusAtomic(tag);
   await testDecisions(tag);
   await testSkillLeaseFence(tag);
+  await testSkillJsonbRoundTripPlan(tag);
   await testSkillSchedule(tag);
   await testWatchBeats(tag);
   await testWatchBeatRoute(tag);
@@ -1119,6 +1122,69 @@ async function testSkillLeaseFence(tag: string): Promise<void> {
     await holder.end();
     await sql()`delete from skills where id = ${skillId}`;
     await sql()`delete from skill_sync_runs where id = ${runId}::uuid`;
+  }
+}
+
+/**
+ * jsonb does not keep object key order. A row written from upstream
+ * frontmatter and read back must still plan as unchanged, and a real change
+ * must still plan an upsert.
+ */
+async function testSkillJsonbRoundTripPlan(tag: string): Promise<void> {
+  const skillId = `roundtrip-${tag}`.replace(/[^a-z0-9-]/gi, "").slice(0, 48);
+  const frontmatter = {
+    name: skillId,
+    description: "jsonb roundtrip",
+    version: "1.0.0",
+    metadata: { author: "vercel", version: "1.0.0", internal: false, nested: { zeta: 1, alpha: null } },
+    runtimes: ["claude", "codex"],
+    list: [{ beta: "2", a: true }, { zz: 0, y: "0" }],
+  };
+  const next: AssembledSkill = {
+    ...skillRecord(skillId, "body"),
+    description: "jsonb roundtrip",
+    runtimes: { claude: true, codex: true, grok: false, hermes: false, mini: false, nemoclaw: false },
+    category: "build",
+    tags: ["x", "y"],
+    frontmatter,
+    position: 0,
+    problems: [],
+  };
+  await sql()`delete from skills where id = ${skillId}`;
+  try {
+    await sql()`
+      insert into skills (
+        id, source_id, path, name, description, version, sha, commit_sha, body,
+        "references", runtimes, frontmatter, category, tags, removed_at, synced_at
+      ) values (
+        ${skillId}, ${next.source_id}, ${next.path}, ${next.name}, ${next.description}, ${next.version},
+        ${next.sha}, ${"b".repeat(40)}, ${next.body},
+        ${JSON.stringify(next.references)}::jsonb, ${JSON.stringify(next.runtimes)}::jsonb,
+        ${JSON.stringify(next.frontmatter)}::jsonb, ${next.category}, ${JSON.stringify(next.tags)}::jsonb, null, now()
+      )
+    `;
+    const row = await getSkillRow(skillId);
+    assert.ok(row);
+    assert.deepEqual(row.frontmatter, frontmatter);
+    assert.notEqual(JSON.stringify(row.frontmatter), JSON.stringify(frontmatter), "jsonb hands keys back in another order");
+    const planFor = (candidate: AssembledSkill) => planSync({
+      failedSourceIds: [],
+      successfulSourceIds: [next.source_id],
+      existing: [row],
+      candidates: [candidate],
+      preserved: [],
+    });
+    const same = planFor(next);
+    assert.deepEqual(same.upserts, [], "an unchanged row read back from jsonb plans no upsert");
+    assert.deepEqual(same.unchanged, [skillId]);
+    const changed = planFor({ ...next, frontmatter: { ...frontmatter, metadata: { ...frontmatter.metadata, internal: "false" } } });
+    assert.deepEqual(changed.upserts.map((skill) => skill.id), [skillId], "a changed frontmatter value still plans an upsert");
+    const reordered = planFor({ ...next, frontmatter: { ...frontmatter, runtimes: ["codex", "claude"] } });
+    assert.deepEqual(reordered.upserts.map((skill) => skill.id), [skillId], "array order still counts");
+    const body = planFor({ ...next, body: "body 2" });
+    assert.deepEqual(body.upserts.map((skill) => skill.id), [skillId], "a changed body still plans an upsert");
+  } finally {
+    await sql()`delete from skills where id = ${skillId}`;
   }
 }
 
