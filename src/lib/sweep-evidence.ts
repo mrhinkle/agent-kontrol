@@ -36,7 +36,8 @@ export const AGENT_IDS_MAX = 20;
 
 const IDENT = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const QUEUE_ID = /^[a-z0-9][a-z0-9._:/-]{0,127}$/;
-const REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
+// Same rule as gh-events REPO_FULL_NAME: `_` owners and `.`-leading names are real repos.
+const REPO = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
 const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const CONTROL = /[\u0000-\u001f\u007f]/;
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2})$/;
@@ -46,7 +47,7 @@ const PRINCIPAL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
  * a document: `decision:<id>`, `owner/name#<n>`, an https URL, or
  * `doc:<path>`. Syntax is all this checks; it does not prove an approval.
  */
-const CITATION = /^(?:decision:[0-9]{1,18}|[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}#[0-9]{1,9}|https:\/\/[^\s<>"'`\\]{1,290}|doc:[A-Za-z0-9._/#-]{1,200})$/;
+const CITATION = /^(?:decision:[0-9]{1,18}|[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}#[0-9]{1,9}|https:\/\/[^\s<>"'`\\]{1,290}|doc:[A-Za-z0-9._/#-]{1,200})$/;
 
 /** Kinds no ingest caller may store as telemetry: the observation namespace and the synthetic event names. */
 export function isReservedIngestKind(kind: unknown): boolean {

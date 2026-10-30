@@ -295,6 +295,7 @@ describe("observation validation", () => {
     const row = { number: 1, draft: false, opened_at: "2026-10-27T00:00:00Z", mergeable: "mergeable", head_sha: "a".repeat(40) };
     const snap = { source: "collector", repo: "acme/app", seq: 1, observed_at: "2026-10-29T12:00:00Z", complete: true };
     assert.equal(checkPrSnapshotObservation({ ...snap, prs: [row] }).ok, true);
+    assert.equal(checkPrSnapshotObservation({ ...snap, repo: "emu_owner/.github", prs: [row] }).ok, true, "matches the webhook repo rule");
     assert.equal(checkPrSnapshotObservation({ ...snap, prs: Array.from({ length: 201 }, (_, i) => ({ ...row, number: i + 1 })) }).ok, false);
     assert.equal(checkPrSnapshotObservation({ ...snap, prs: [row, row] }).ok, false, "a duplicate number");
     assert.equal(checkPrSnapshotObservation({ ...snap, prs: [{ ...row, head_sha: "HEAD" }] }).ok, false);
