@@ -433,6 +433,34 @@ async function main() {
     assert.equal(fs.statSync(file).ino, inode, "the run kept the lock file");
   });
 
+  await check("subject lock: a waiter killed while waiting leaves no orphan to take the lock", async () => {
+    reset();
+    const fx = new Fixture(root);
+    standard(fx);
+    fx.config(baseConfig({ [REPO]: repoConfig(REPO) }));
+    fs.mkdirSync(fx.state, { recursive: true, mode: 0o700 });
+    const file = lockFile(fx, QUEUE_SUBJECT);
+    const holder = await holdLock(file);
+    const a = startProducer(fx, ["--repo", REPO], { ...live, MC_SWEEP_LOCK_WAIT: "300" });
+    const apid = a.pid!;
+    // The waiter is perl with the producer shell's pid as its last argument.
+    const waiters = () => spawnSync("ps", ["-A", "-o", "pid=,command="], { encoding: "utf8" }).stdout
+      .split("\n").filter((l) => l.includes("perl") && l.includes("LOCK_NB") && l.trim().endsWith(` ${apid}`));
+    try {
+      await until("the producer to wait on the lock", () => waiters().length === 1);
+      await kill9(a);
+      await until("the orphaned waiter to give up", () => waiters().length === 0, 3000);
+    } finally {
+      if (a.exitCode === null && a.signalCode === null) await kill9(a);
+      for (const l of waiters()) process.kill(Number(l.trim().split(/\s+/)[0]), "SIGKILL");
+      await kill9(holder);
+    }
+    assert.ok(lockFree(file), "nobody holds the lock once the holder is gone");
+    const r = await runProducer(fx, ["--repo", REPO], { ...live, MC_SWEEP_LOCK_WAIT: "0" });
+    assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual(server.of("sweep.queue").map((o) => o.seq), [1], "the killed waiter never collected or posted");
+  });
+
   await check("subject lock: competing recovery after a killed holder; an unlocked leftover never strands", async () => {
     reset();
     const fx = new Fixture(root);

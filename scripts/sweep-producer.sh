@@ -458,19 +458,22 @@ subject_id() {
 # fd 9 or dies. The kernel releases it on any exit, so there is no owner file,
 # no stale-owner recovery, and no window that strands the lock. The file is
 # never removed: removing it would let two holders lock different inodes.
-# Waits up to MC_SWEEP_LOCK_WAIT seconds (0 tries once). One lock at a time.
+# Waits up to MC_SWEEP_LOCK_WAIT seconds (0 tries once); a waiter whose shell
+# is killed stops within one poll. One lock at a time.
 lock_subject() {
   exec 9>>"$STATE_DIR/$1.flock" || return 1
   if ! perl -MFcntl=:flock -MTime::HiRes=time -e '
-      my $wait = shift @ARGV;
+      my ($wait, $shell) = @ARGV;
       exit 2 unless defined $wait && $wait =~ /^\d+$/;
       open(my $fh, ">>&=9") or exit 2;
       my $deadline = time + $wait;
-      until (flock($fh, LOCK_EX | LOCK_NB)) {
-        exit 1 if time >= $deadline;
+      # A waiter whose producer died is orphaned (new parent): it gives up
+      # rather than wait on, or take, the lock for nobody.
+      until (getppid() == $shell && flock($fh, LOCK_EX | LOCK_NB)) {
+        exit 1 if getppid() != $shell || time >= $deadline;
         select(undef, undef, undef, 0.2);
       }
-      exit 0' "$LOCK_WAIT"; then
+      exit(getppid() == $shell ? 0 : 1)' "$LOCK_WAIT" "$$"; then
     exec 9>&-
     return 1
   fi
