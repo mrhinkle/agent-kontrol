@@ -2560,6 +2560,7 @@ export function openApiDocument(): Json {
             "400": jsonResponse("Invalid JSON, registration, or ineligible credential.", ref("StreamError")),
             "401": jsonResponse("A valid operator credential is required.", ref("StreamError")),
             "403": jsonResponse("Only MC_TOKEN or the dashboard session may register a consumer.", ref("StreamError")),
+            "409": jsonResponse("credential_already_bound: another consumer already uses this credential, including concurrent registrations.", ref("StreamError")),
             "413": jsonResponse("The body is larger than 16 KiB.", ref("StreamError")),
             "503": jsonResponse("The database is not configured or the binding could not be stored.", ref("StreamError")),
           },

@@ -71,6 +71,12 @@ export async function registerStreamConsumer(c: ConsumerRegistration): Promise<v
       on conflict (id) do update set credential_id = excluded.credential_id, repos = excluded.repos,
       event_types = excluded.event_types, enabled = excluded.enabled,
       generation = event_stream_consumers.generation + 1, updated_at = clock_timestamp()`;
+  }).catch(error => {
+    const pg = error as { code?: string; constraint?: string };
+    if (pg?.code === "23505" && pg.constraint === "event_stream_consumers_credential_id_key") {
+      throw new EventStreamError("credential_already_bound", 409);
+    }
+    throw error;
   });
 }
 
@@ -79,7 +85,7 @@ async function binding(tx: SqlTag, consumer: string, credential: string) {
     from event_stream_consumers c join agent_credentials a on a.id = c.credential_id
     where c.id = ${consumer} and c.credential_id = ${credential} and c.enabled
     and a.revoked_at is null and (a.expires_at is null or a.expires_at > clock_timestamp())
-    and 'events:read' = any(a.scopes) for update of c`;
+    and 'events:read' = any(a.scopes) for update of c for share of a`;
   if (!rows.length) throw new EventStreamError("consumer_forbidden", 403);
   return rows[0];
 }
@@ -103,6 +109,15 @@ export async function acquireStream(consumer: string, credential: string): Promi
 
 export interface StreamEvent { id: string; event: string; payload: Record<string, unknown> }
 export interface StreamBatch { expired: boolean; events: StreamEvent[] }
+
+/** Serialize each enqueue with binding updates and credential revocation. */
+async function enqueueStreamFrame(consumer: string, credential: string, generation: string, enqueue: () => void): Promise<void> {
+  await boundedTransaction(async tx => {
+    const current = await binding(tx, consumer, credential);
+    if (String(current.generation) !== generation) throw new EventStreamError("superseded", 409);
+    enqueue(); // synchronous: no payload can cross the boundary after these locks release
+  });
+}
 
 /**
  * A sequence allocation is not commit order. A short SHARE table lock waits
@@ -153,6 +168,7 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
 export function eventStreamResponse(opts: {
   consumer: string; position: string; generation: string; credential: string; signal: AbortSignal;
   first: StreamBatch; read?: typeof readStreamBatch; pollMs?: number; heartbeatMs?: number; lifetimeMs?: number;
+  enqueue?: (push: () => void) => Promise<void>;
 }): Response {
   const stop = new AbortController();
   const id = randomUUID();
@@ -174,8 +190,15 @@ export function eventStreamResponse(opts: {
       const send = async (frame: string): Promise<boolean> => {
         while ((controller.desiredSize ?? 0) <= 0 && !stop.signal.aborted) await delay(10, stop.signal);
         if (stop.signal.aborted) return false;
-        controller.enqueue(encoder.encode(frame));
-        return true;
+        let sent = false;
+        const push = () => {
+          if (stop.signal.aborted) return;
+          controller.enqueue(encoder.encode(frame));
+          sent = true;
+        };
+        if (opts.enqueue) await opts.enqueue(push);
+        else await enqueueStreamFrame(opts.consumer, opts.credential, opts.generation, push);
+        return sent;
       };
       try {
         let batch = opts.first;

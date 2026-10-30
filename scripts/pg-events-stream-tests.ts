@@ -4,7 +4,7 @@ import { Client } from "pg";
 import { createCredential } from "../src/lib/credentials";
 import { sql } from "../src/lib/db";
 import { insertGhEvent } from "../src/lib/gh-events";
-import { acquireStream, cursorPosition, EventStreamError, readStreamBatch, registerStreamConsumer, streamCursor } from "../src/lib/events-stream";
+import { acquireStream, cursorPosition, EventStreamError, eventStreamResponse, readStreamBatch, registerStreamConsumer, streamCursor } from "../src/lib/events-stream";
 import { GET } from "../src/app/api/events/stream/route";
 import { POST } from "../src/app/api/events/consumers/route";
 
@@ -90,6 +90,53 @@ export async function runEventStreamTests(): Promise<void> {
     assert.match(frame, new RegExp(`id: ${a}:${second}`));
     assert.doesNotMatch(frame, /other-repo|other-type/);
     await reader.cancel();
+
+    // Exercise the review findings through the actual route and held transport.
+    const reviewFailures: string[] = [];
+    const probe = async (name: string, test: () => Promise<void>) => {
+      try { await test(); }
+      catch (error) { reviewFailures.push(`${name}: ${String(error)}`); }
+    };
+    await probe("concurrent credential conflict", async () => {
+      const shared = await credential(["events:read"]);
+      const attempts = await Promise.all(["c", "d"].map(id => POST(new Request("http://localhost/api/events/consumers", {
+        method: "POST", headers: { authorization: "Bearer stream-test-operator", "content-type": "application/json" },
+        body: JSON.stringify({ ...registration, id: `${prefix}-${id}`, credential_id: shared.credential.id }),
+      }))));
+      assert.deepEqual(attempts.map(r => r.status).sort(), [200, 409]);
+      const conflict = attempts.find(r => r.status === 409)!;
+      assert.equal((await conflict.json()).error, "credential_already_bound");
+    });
+    for (const mutation of ["filters", "revocation"] as const) {
+      await probe(`pending frame after ${mutation}`, async () => {
+        generation = await acquireStream(a, ca.credential.id);
+        let prefetched!: () => void;
+        const ready = new Promise<void>(resolve => { prefetched = resolve; });
+        const held = eventStreamResponse({ consumer: a, position: "0", generation, credential: ca.credential.id,
+          signal: new AbortController().signal, first: await readStreamBatch(a, ca.credential.id, generation, "0"),
+          read: async (...args) => {
+            const next = await readStreamBatch(...args);
+            if (next.events[0]?.id === second) prefetched();
+            return next;
+          }, pollMs: 1, lifetimeMs: 2000 });
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([ready, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("no pending second frame")), 1000); })]);
+          if (mutation === "filters") await registerStreamConsumer({ ...registration, repos: [`other/${prefix}`] });
+          else await sql()`update agent_credentials set revoked_at = clock_timestamp() where id = ${ca.credential.id}`;
+          const wire = await held.text();
+          assert.match(wire, new RegExp(`id: ${a}:${first}\\n`), "already queued frame remains valid");
+          assert.doesNotMatch(wire, new RegExp(`id: ${a}:${second}\\n`), "pending frame must not survive committed authority change");
+          assert.match(wire, mutation === "filters" ? /event: superseded/ : /event: stream_error/);
+        } finally {
+          clearTimeout(timer);
+          await held.body?.cancel().catch(() => {});
+          await sql()`update agent_credentials set revoked_at = null where id = ${ca.credential.id}`;
+          await registerStreamConsumer(registration);
+        }
+      });
+    }
+    assert.deepEqual(reviewFailures, [], "review regressions");
 
     const previousGeneration = await acquireStream(a, ca.credential.id);
     generation = await acquireStream(a, ca.credential.id);

@@ -6,6 +6,11 @@ import { GET } from "../../src/app/api/events/stream/route";
 
 const registration = { id: "reviewer", credential_id: "credential-1", repos: ["The-AIE/the-gibson"], event_types: ["status"] };
 
+// Transport-only cases inject the authorization boundary; real PostgreSQL tests
+// drive the default enqueue path across committed registration/revocation races.
+const transportResponse = (opts: Parameters<typeof eventStreamResponse>[0]) =>
+  eventStreamResponse({ ...opts, enqueue: async push => { push(); } });
+
 describe("consumer registration and cursor authority", () => {
   it("requires explicit bounded filters and rejects unknown fields", () => {
     assert.deepEqual(checkStreamRegistration(registration), { ...registration, enabled: true });
@@ -51,7 +56,7 @@ describe("bounded SSE transport", () => {
   });
 
   it("emits an explicit expired-cursor reconciliation without an invented event id", async () => {
-    const res = eventStreamResponse({ consumer: "expired", position: "1", generation: "1", credential: "c", signal: new AbortController().signal,
+    const res = transportResponse({ consumer: "expired", position: "1", generation: "1", credential: "c", signal: new AbortController().signal,
       first: { expired: true, events: [] } });
     assert.equal(res.headers.get("content-type"), "text/event-stream; charset=utf-8");
     const text = await res.text();
@@ -61,7 +66,7 @@ describe("bounded SSE transport", () => {
 
   it("sends heartbeat comments and closes on cancellation", async () => {
     const abort = new AbortController();
-    const res = eventStreamResponse({ consumer: "heartbeat", position: "0", generation: "1", credential: "c", signal: abort.signal,
+    const res = transportResponse({ consumer: "heartbeat", position: "0", generation: "1", credential: "c", signal: abort.signal,
       first: { expired: false, events: [] }, read: async () => ({ expired: false, events: [] }), pollMs: 1, heartbeatMs: 5, lifetimeMs: 2000 });
     const reader = res.body!.getReader();
     const first = await reader.read();
@@ -71,14 +76,14 @@ describe("bounded SSE transport", () => {
   });
 
   it("closes at the configured lifetime even without events", async () => {
-    const res = eventStreamResponse({ consumer: "duration", position: "0", generation: "1", credential: "c", signal: new AbortController().signal,
+    const res = transportResponse({ consumer: "duration", position: "0", generation: "1", credential: "c", signal: new AbortController().signal,
       first: { expired: false, events: [] }, read: async () => ({ expired: false, events: [] }), pollMs: 1, heartbeatMs: 10000, lifetimeMs: 20 });
     assert.equal(await res.text(), "");
   });
 
   it("bounds prefetch for a reader that does not drain, then cancels cleanly", async () => {
     let reads = 0;
-    const res = eventStreamResponse({ consumer: "slow", position: "0", generation: "1", credential: "c", signal: new AbortController().signal,
+    const res = transportResponse({ consumer: "slow", position: "0", generation: "1", credential: "c", signal: new AbortController().signal,
       first: { expired: false, events: [{ id: "1", event: "status", payload: {} }] },
       read: async () => { reads++; return { expired: false, events: [{ id: "2", event: "status", payload: {} }] }; }, pollMs: 1, lifetimeMs: 2000 });
     await new Promise(resolve => setTimeout(resolve, 30));
@@ -89,14 +94,14 @@ describe("bounded SSE transport", () => {
   it("terminates an older same-consumer connection with superseded", async () => {
     const options = { consumer: "duplicate", position: "0", generation: "1", credential: "c", signal: new AbortController().signal,
       first: { expired: false, events: [] }, read: async () => ({ expired: false, events: [] }), pollMs: 1, lifetimeMs: 2000 };
-    const older = eventStreamResponse(options);
-    const newer = eventStreamResponse({ ...options, generation: "2" });
+    const older = transportResponse(options);
+    const newer = transportResponse({ ...options, generation: "2" });
     assert.match(await older.text(), /event: superseded/);
     await newer.body!.cancel();
   });
 
   it("reports a store failure without leaking the exception or advancing a cursor", async () => {
-    const res = eventStreamResponse({ consumer: "failure", position: "0", generation: "1", credential: "c", signal: new AbortController().signal,
+    const res = transportResponse({ consumer: "failure", position: "0", generation: "1", credential: "c", signal: new AbortController().signal,
       first: { expired: false, events: [] }, read: async () => { throw new Error("password=private"); }, pollMs: 1, lifetimeMs: 2000 });
     const text = await res.text();
     assert.match(text, /stream_unavailable/);
@@ -107,8 +112,8 @@ describe("bounded SSE transport", () => {
     const options = { consumer: "buffered", position: "0", generation: "1", credential: "c", signal: new AbortController().signal,
       first: { expired: false, events: [{ id: "1", event: "status", payload: {} }] },
       read: async () => ({ expired: false, events: [] }), pollMs: 1000, lifetimeMs: 2000 };
-    const older = eventStreamResponse(options);
-    const newer = eventStreamResponse({ ...options, generation: "2", first: { expired: false, events: [] } });
+    const older = transportResponse(options);
+    const newer = transportResponse({ ...options, generation: "2", first: { expired: false, events: [] } });
     const text = await older.text();
     assert.match(text, /id: buffered:1/);
     assert.match(text, /event: superseded/);

@@ -585,10 +585,11 @@ A comment heartbeat is sent every 25 seconds. The server closes after 240 second
 within the route's declared 300-second cap; the deployment must support that cap.
 A new connection increments a durable generation and supersedes the previous
 one. Same-process replacement is immediate; other instances detect it on the
-next bounded database poll and close with `superseded`. Revocation, expiry,
-disabling and scope removal are rechecked on those polls. Already queued bytes
-may have been authorized before a change; no further batch is authorized from
-the retired generation.
+next bounded database poll or enqueue and close with `superseded`. Revocation,
+expiry, disabling and scope removal are also rechecked after backpressure clears,
+before enqueueing a frame. Consumer and credential row locks cover that check
+through the synchronous enqueue, so a committed authority change rejects a
+prefetched pending frame. Already queued bytes may still drain after a change.
 
 Each database batch contains one event, with backpressure and a 1 MiB frame cap.
 An oversized event or store error closes with a bounded `stream_error` control
