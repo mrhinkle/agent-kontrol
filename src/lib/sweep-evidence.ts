@@ -1,5 +1,5 @@
 import type { Provenance } from "./actor";
-import { withTransaction, type SqlTag } from "./db";
+import { withTransaction, type Row, type SqlTag } from "./db";
 import { slugify } from "./store";
 import { dbInstant } from "./sweep-clock";
 import { DEFAULT_SILENCE_HOURS, DEFAULT_STALE_MINUTES, SWEEP_CONDITIONS, ms, repoKey } from "./sweep-logic";
@@ -622,19 +622,46 @@ function prevFresh(receivedAt: unknown, staleMinutes: unknown, nowIso: string): 
   return at !== null && now !== null && Number.isFinite(minutes) && at >= now - minutes * 60_000;
 }
 
+function iso(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const date = value instanceof Date ? value : new Date(String(value));
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+/** True when a same-transition observation at the stored observed_at carries a field that differs from what is stored. */
+function conflictsWithStored(obs: SchedulerObservation, row: Row): boolean {
+  const sameInstant = (a: string | null, b: unknown) => a === null || ms(a) === ms(iso(b));
+  return !sameInstant(obs.paused_at, row.paused_at)
+    || !sameInstant(obs.until, row.until)
+    || (obs.paused_reason !== null && obs.paused_reason !== row.paused_reason)
+    || (obs.decision !== null && obs.decision !== row.decision)
+    || (obs.stale_after_minutes !== null && obs.stale_after_minutes !== Number(row.stale_after_minutes));
+}
+
 /**
- * Lower transition: audit only. Same transition: a refresh; a different
- * state is 409 and writes nothing; a non-null field adds or replaces, an
- * omitted or null field keeps what is stored, so a replay cannot drop a
- * citation. Higher transition: fresh fields, prior_* keeps what it replaced,
- * and resumed marks an observed paused-to-active change. The pause's
- * decision moves to prior_decision; it never cites the resume.
+ * Lower transition: audit only. Same transition, a different state: 409 and
+ * nothing written. Same transition, same state, ordered by the source's
+ * observed_at:
+ *   - later than stored: a refresh. A non-null field adds or replaces, an
+ *     omitted or null field keeps what is stored, so a refresh cannot drop a
+ *     citation. It renews freshness.
+ *   - equal: a replay (a retry after a lost response). Audit only, no
+ *     freshness renewal. If a non-null field differs from what is stored, the
+ *     two reports of one instant disagree: 409 and nothing written.
+ *   - earlier: older. Audit only; it cannot restore an outdated expiry or
+ *     citation, and it does not renew freshness.
+ * A source whose clock ran ahead makes its later reports older until the next
+ * transition; the job then goes stale (unknown), never falsely held.
+ * Higher transition: fresh fields, prior_* keeps what it replaced, and
+ * resumed marks an observed paused-to-active change. The pause's decision
+ * moves to prior_decision; it never cites the resume.
  */
 export async function writeSchedulerObservation(obs: SchedulerObservation, provenance: Provenance): Promise<WriteOutcome> {
   return withTransaction(async (tx) => {
     const now = await lockSubject(tx, `scheduler:${obs.source}/${obs.job_id}`);
     const rows = await tx`
-      select state, transition::text as transition from scheduler_jobs
+      select state, transition::text as transition, observed_at, paused_at, paused_reason, until, decision, stale_after_minutes
+      from scheduler_jobs
       where source = ${obs.source} and job_id = ${obs.job_id}
       for update
     `;
@@ -647,7 +674,16 @@ export async function writeSchedulerObservation(obs: SchedulerObservation, prove
       if (current.state !== obs.state) {
         throw new SweepEvidenceConflict(`transition ${obs.transition} is already recorded as ${String(current.state)}. A state change needs a higher transition.`);
       }
-      outcome = "refreshed";
+      const stored = ms(iso(current.observed_at));
+      const incoming = ms(obs.observed_at)!;
+      if (stored === null || incoming > stored) outcome = "refreshed";
+      else if (incoming < stored) outcome = "older";
+      else {
+        if (conflictsWithStored(obs, current)) {
+          throw new SweepEvidenceConflict(`transition ${obs.transition} was already reported at ${obs.observed_at} with different fields. A correction needs a later observed_at.`);
+        }
+        outcome = "replay";
+      }
     }
     const id = await audit(tx, "scheduler_job", obs.source, `${obs.source}/${obs.job_id}`, obs.transition, outcome, obs, provenance, now);
     if (outcome === "applied") {
@@ -688,12 +724,13 @@ export async function writeSchedulerObservation(obs: SchedulerObservation, prove
           paused_reason = coalesce(${obs.paused_reason}::text, paused_reason),
           until = coalesce(${obs.until}::timestamptz, until),
           decision = coalesce(${obs.decision}::text, decision),
-          observed_at = greatest(observed_at, ${obs.observed_at}::timestamptz),
+          observed_at = ${obs.observed_at}::timestamptz,
           stale_after_minutes = coalesce(${obs.stale_after_minutes}::integer, stale_after_minutes),
           last_received_at = greatest(last_received_at, ${now}::timestamptz),
           last_observation_id = ${id}::bigint,
           version = version + 1
         where source = ${obs.source} and job_id = ${obs.job_id} and transition = ${obs.transition}
+          and (observed_at is null or observed_at < ${obs.observed_at}::timestamptz)
       `;
     }
     return { outcome, observation_id: id, received_at: now };

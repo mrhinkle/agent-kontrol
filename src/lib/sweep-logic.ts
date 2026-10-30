@@ -288,9 +288,21 @@ export interface PrEvaluation {
  * are unknown. Clearing needs fresh, complete evidence that every term is
  * false or that the PR closed.
  */
+/**
+ * Why a repository's PR evidence cannot be trusted, or null when it is
+ * complete and fresh. A repository with no open PR still has this state:
+ * an empty set is only proven by a healthy source.
+ */
+export function prSourceGap(source: PrSourceFacts | null, nowMs: number): "missing" | "incomplete" | "stale" | null {
+  if (!source) return "missing";
+  if (!source.complete) return "incomplete";
+  if (!isFresh(source.received_at, source.stale_after_minutes, nowMs)) return "stale";
+  return null;
+}
+
 export function evaluatePr(pr: PrFacts | null, source: PrSourceFacts | null, nowMs: number, stuckHours: number): PrEvaluation {
   const none = { age: null, conflicting: null, green_unreviewed: null, draft: null } as PrEvaluation["terms"];
-  if (!source || !source.complete || !isFresh(source.received_at, source.stale_after_minutes, nowMs)) {
+  if (prSourceGap(source, nowMs) !== null) {
     return { verdict: "unknown", reasons: ["pr evidence stale, incomplete, or missing"], terms: none };
   }
   if (!pr) return { verdict: "unknown", reasons: ["pr not in evidence"], terms: none };

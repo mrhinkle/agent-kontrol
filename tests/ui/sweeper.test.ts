@@ -17,6 +17,7 @@ import {
   not3,
   or3,
   pausedSection,
+  prSourceGap,
   queueReady,
   resumeVerdict,
   stepLatch,
@@ -217,6 +218,14 @@ describe("pr-stuck", () => {
     assert.equal(evaluatePr(pr({ opened_at: at(-99 * HOUR) }), { ...freshSource, complete: false }, NOW, 48).verdict, "unknown");
     assert.equal(evaluatePr(pr({ open: false }), { ...freshSource, received_at: at(-31 * MIN) }, NOW, 48).verdict, "unknown");
     assert.equal(evaluatePr(null, freshSource, NOW, 48).verdict, "unknown");
+  });
+
+  it("names a repository's evidence gap independently of any PR", () => {
+    assert.equal(prSourceGap(freshSource, NOW), null, "fresh and complete: an empty open set is measured");
+    assert.equal(prSourceGap({ ...freshSource, complete: false }, NOW), "incomplete");
+    assert.equal(prSourceGap({ ...freshSource, received_at: at(-31 * MIN) }, NOW), "stale");
+    assert.equal(prSourceGap({ ...freshSource, complete: false, received_at: at(-31 * MIN) }, NOW), "incomplete");
+    assert.equal(prSourceGap(null, NOW), "missing");
   });
 });
 

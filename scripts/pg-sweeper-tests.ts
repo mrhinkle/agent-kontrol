@@ -300,7 +300,10 @@ export async function testSweeper(tag: string, applyCanonicalSchema: () => Promi
     // ---------------------------------------------- scheduler pauses
     const job = `${tag}-job`.toLowerCase();
     const jobKey = `job:mini/${job}`;
-    const sched = (over: Json) => observe("sweep.scheduler_job", { source: "mini", job_id: job, observed_at: new Date().toISOString(), ...over });
+    // Same-transition reports are ordered by observed_at, so each report here is a strictly later instant.
+    let observedMs = Date.now();
+    const observedAt = () => new Date(++observedMs).toISOString();
+    const sched = (over: Json) => observe("sweep.scheduler_job", { source: "mini", job_id: job, observed_at: observedAt(), ...over });
     {
       // A held pause suppresses the mapped consumer's alarm.
       const heldConsumer = `${tag}-c4`.toLowerCase();
@@ -380,8 +383,8 @@ export async function testSweeper(tag: string, applyCanonicalSchema: () => Promi
 
       // A refresh that omits stale_after_minutes keeps the stored window.
       const windowJob = `${tag}-window`.toLowerCase();
-      await observe("sweep.scheduler_job", { source: "mini", job_id: windowJob, state: "paused", transition: 1, observed_at: new Date().toISOString(), stale_after_minutes: 5 });
-      assert.equal((await observe("sweep.scheduler_job", { source: "mini", job_id: windowJob, state: "paused", transition: 1, observed_at: new Date().toISOString() })).outcome, "refreshed");
+      await observe("sweep.scheduler_job", { source: "mini", job_id: windowJob, state: "paused", transition: 1, observed_at: observedAt(), stale_after_minutes: 5 });
+      assert.equal((await observe("sweep.scheduler_job", { source: "mini", job_id: windowJob, state: "paused", transition: 1, observed_at: observedAt() })).outcome, "refreshed");
       assert.equal(Number((await sql()`select stale_after_minutes from scheduler_jobs where job_id = ${windowJob}`)[0].stale_after_minutes), 5);
       advance(6 * MIN);
       assert.equal(verdictOf(await runSweep(), "pause-unexplained", `job:mini/${windowJob}`), "unknown", "the five-minute window still applies");
@@ -391,6 +394,71 @@ export async function testSweeper(tag: string, applyCanonicalSchema: () => Promi
       await observe("sweep.scheduler_job", { source: "mini", job_id: lone, state: "active", transition: 5, observed_at: new Date().toISOString() });
       run = await runSweep();
       assert.equal(verdictOf(run, "resume-uncited", `job:mini/${lone}`), "clear");
+    }
+    {
+      // Same-transition ordering: an older or equal report cannot restore an outdated
+      // expiry or renew freshness; a later one corrects; one instant cannot say two things.
+      const orderJob = `${tag}-order`.toLowerCase();
+      const orderKey = `job:mini/${orderJob}`;
+      const t = Date.now();
+      const at = (offsetMs: number) => new Date(t + offsetMs).toISOString();
+      const stored = async () => (await sql()`
+        select until, decision, observed_at, last_received_at::text as last_received_at, version::text as version, stale_after_minutes
+        from scheduler_jobs where source = 'mini' and job_id = ${orderJob}
+      `)[0];
+      const audits = async () => Number((await sql()`select count(*) as n from sweep_observations where subject = ${`mini/${orderJob}`}`)[0].n);
+      const base = { source: "mini", job_id: orderJob, state: "paused", transition: 1, paused_reason: "maintenance", decision: "doc:runbook" };
+      const first = { ...base, observed_at: at(-10_000), paused_at: await isoAgo(HOUR), until: await isoAhead(HOUR) };
+      const correction = { ...base, observed_at: at(0), until: await isoAgo(MIN) };
+      assert.equal((await observe("sweep.scheduler_job", first)).outcome, "applied");
+      assert.equal((await observe("sweep.scheduler_job", correction)).outcome, "refreshed");
+      let run = await runSweep();
+      assert.equal(verdictOf(run, "pause-expired", orderKey), "firing", "the corrected expiry has passed");
+      const afterCorrection = await stored();
+
+      // The older first report replayed exactly: audited as older, nothing changes.
+      assert.equal((await observe("sweep.scheduler_job", first)).outcome, "older");
+      assert.deepEqual(await stored(), afterCorrection, "an older report keeps the corrected until, observed_at, freshness, and version");
+      run = await runSweep();
+      assert.equal(verdictOf(run, "pause-expired", orderKey), "firing");
+      assert.equal((await inbox("pause-expired", orderKey)).map((r) => r.event).join(","), "pause-expired", "no false pause-expired-cleared");
+
+      // A retry after a lost response (equal observed_at, same fields): replay, audit only.
+      const before = await audits();
+      assert.equal((await observe("sweep.scheduler_job", correction)).outcome, "replay");
+      assert.equal(await audits(), before + 1);
+      assert.deepEqual(await stored(), afterCorrection, "a replay renews nothing");
+      // A partial retry of that instant (omitted fields) is the same report.
+      assert.equal((await observe("sweep.scheduler_job", { ...base, observed_at: at(0), decision: undefined })).outcome, "replay");
+
+      // The same instant reported with a different expiry is a conflict: 409, nothing written.
+      const auditsBeforeConflict = await audits();
+      const conflict = await ingest("sweep.scheduler_job", { ...correction, until: await isoAhead(2 * HOUR) });
+      assert.equal(conflict.status, 409);
+      assert.equal(await audits(), auditsBeforeConflict);
+      assert.deepEqual(await stored(), afterCorrection);
+
+      // Replays do not keep the job fresh: past its window it is unknown, and the latch holds.
+      advance(31 * MIN);
+      assert.equal((await observe("sweep.scheduler_job", correction)).outcome, "replay");
+      assert.equal((await observe("sweep.scheduler_job", first)).outcome, "older");
+      run = await runSweep();
+      assert.equal(verdictOf(run, "pause-expired", orderKey), "unknown", "older and equal reports do not renew freshness");
+      assert.equal((await latch("pause-expired", orderKey))?.active, true);
+
+      // A later report is a legitimate correction: it extends the pause and keeps omitted fields.
+      const extended = await isoAhead(2 * HOUR);
+      assert.equal((await observe("sweep.scheduler_job", { source: "mini", job_id: orderJob, state: "paused", transition: 1, observed_at: at(5_000), until: extended })).outcome, "refreshed");
+      const corrected = await stored();
+      assert.equal(new Date(corrected.until).toISOString(), extended);
+      assert.equal(corrected.decision, "doc:runbook", "omission does not delete the citation");
+      assert.equal(new Date(corrected.observed_at).toISOString(), at(5_000));
+      assert.equal(Number(corrected.version), Number(afterCorrection.version) + 1);
+      run = await runSweep();
+      assert.equal(verdictOf(run, "pause-expired", orderKey), "held");
+      assert.equal((await inbox("pause-expired", orderKey)).map((r) => r.event).join(","), "pause-expired,pause-expired-cleared");
+      // A same-transition state change is still a conflict, whatever its observed_at.
+      assert.equal((await ingest("sweep.scheduler_job", { source: "mini", job_id: orderJob, state: "active", transition: 1, observed_at: at(10_000) })).status, 409);
     }
 
     // ------------------------------------------------------------- PRs
@@ -476,6 +544,51 @@ export async function testSweeper(tag: string, applyCanonicalSchema: () => Promi
       run = await runSweep();
       assert.equal(verdictOf(run, "pr-stuck", prKey(4)), "unknown");
     }
+    {
+      // Repository-level completeness: a repository with no PR rows or latches is still measured.
+      await sql()`delete from sweep_prs`;
+      await sql()`delete from sweep_pr_sources`;
+      await sql()`delete from sweep_latches where condition = 'pr-stuck'`;
+      const healthy = `Healthy-${tag.slice(-6)}/Empty`;
+      const failing = `Failing-${tag.slice(-6)}/Unseen`;
+      const seqs = new Map<string, number>();
+      const repoSnap = (name: string, over: Json = {}) => observe("sweep.pr_snapshot", {
+        source: "collector", repo: name, seq: seqs.set(name, (seqs.get(name) ?? 0) + 1).get(name), observed_at: new Date().toISOString(), complete: true, prs: [], ...over,
+      });
+      const repoEntities = (run: SweepRun) => check(run, "pr-stuck").entities.filter((e) => e.entity_key.startsWith("repo:"));
+      const eventsBefore = Number((await sql()`select count(*) as n from gh_events where delivery_id like 'sweep:%'`)[0].n);
+
+      // Healthy and empty: a measured clear.
+      await repoSnap(healthy);
+      let run = await runSweep();
+      assert.equal(check(run, "pr-stuck").state, "clear");
+      assert.equal(repoEntities(run).length, 0);
+
+      // Mixed, with an incomplete first observation for an unseen repository: unknown, never clear.
+      assert.equal((await repoSnap(failing, { complete: false, error: "collector unavailable" })).outcome, "applied");
+      run = await runSweep();
+      let pr = check(run, "pr-stuck");
+      assert.equal(pr.state, "unknown", "an unmeasured repository is not a healthy clear");
+      assert.equal(pr.counts.unknown, 1);
+      assert.deepEqual(repoEntities(run).map((e) => [e.entity_key, e.verdict, (e.detail as Json).reasons]), [[`repo:${failing.toLowerCase()}`, "unknown", ["pr evidence incomplete"]]]);
+      assert.equal(pr.entities.some((e) => e.entity_key.startsWith("pr:")), false, "no PR identity is invented");
+      assert.equal(Number((await sql()`select count(*) as n from sweep_latches where entity_key like 'repo:%'`)[0].n), 0, "repository findings are not latched");
+
+      // Stale after a measured empty set: unknown for that repository only.
+      advance(31 * MIN);
+      await repoSnap(failing);
+      run = await runSweep();
+      pr = check(run, "pr-stuck");
+      assert.equal(pr.state, "unknown");
+      assert.deepEqual(repoEntities(run).map((e) => [e.entity_key, (e.detail as Json).reasons]), [[`repo:${healthy.toLowerCase()}`, ["pr evidence stale"]]]);
+
+      // Both fresh and complete: clear again.
+      await repoSnap(healthy);
+      run = await runSweep();
+      assert.equal(check(run, "pr-stuck").state, "clear");
+      assert.equal(repoEntities(run).length, 0);
+      assert.equal(Number((await sql()`select count(*) as n from gh_events where delivery_id like 'sweep:%'`)[0].n), eventsBefore, "repository findings never emit");
+    }
 
     // -------------------------------------------------- decision-aging
     const decisionKey = `${tag}-dec`;
@@ -509,6 +622,40 @@ export async function testSweeper(tag: string, applyCanonicalSchema: () => Promi
       await sql()`delete from decisions where key = ${fallback}`;
       run = await runSweep();
       assert.equal(verdictOf(run, "decision-aging", `decision:${fallback}`), "clear", "a removed decision clears");
+    }
+    {
+      // A truncated candidate scan is not proof of absence: older rows push a live alarm past it.
+      const live = `${tag}-dec-live`;
+      const liveKey = `decision:${live}`;
+      await sql()`insert into decisions (key, source, title, status, opened_at, first_seen_at) values (${live}, 'manual', 'live', 'open', ${await isoAgo(15 * 24 * HOUR)}::timestamptz, ${await dbNow()}::timestamptz)`;
+      let run = await runSweep();
+      assert.equal(verdictOf(run, "decision-aging", liveKey), "firing");
+      await sql()`
+        insert into decisions (key, source, title, status, opened_at, first_seen_at)
+        select ${`${tag}-dec-bulk-`} || g, 'manual', 'bulk', 'open', ${await isoAgo(30 * 24 * HOUR)}::timestamptz, ${await isoAgo(30 * 24 * HOUR)}::timestamptz
+        from generate_series(1, 1001) g
+      `;
+      run = await runSweep();
+      assert.equal(verdictOf(run, "decision-aging", liveKey), "firing", "the latched key is looked up, not inferred from the scan");
+      assert.equal(check(run, "decision-aging").complete, false);
+      assert.deepEqual({ active: (await latch("decision-aging", liveKey))?.active, state: (await latch("decision-aging", liveKey))?.last_state }, { active: true, state: "firing" });
+      assert.deepEqual((await inbox("decision-aging", liveKey)).map((r) => r.event), ["decision-aging"], "no false decision-aging-cleared");
+      // Still under truncation, an exact lookup that proves deletion clears once.
+      await sql()`delete from decisions where key = ${live}`;
+      run = await runSweep();
+      assert.deepEqual({ active: (await latch("decision-aging", liveKey))?.active, state: (await latch("decision-aging", liveKey))?.last_state }, { active: false, state: "clear" });
+      const cleared = (await inbox("decision-aging", liveKey)).at(-1);
+      assert.equal(cleared?.event, "decision-aging-cleared");
+      assert.equal(((cleared?.payload as Json).evidence as Json).status, "absent");
+      // Resolution of a bulk row (latched by the bounded run) clears it; then the bulk is removed and clears.
+      await sql()`update decisions set status = 'decided', decision = 'ship' where key = ${`${tag}-dec-bulk-1`}`;
+      run = await runSweep();
+      assert.equal((await latch("decision-aging", `decision:${tag}-dec-bulk-1`))?.last_state, "clear", "result entities are capped; the latch records it");
+      assert.equal((await inbox("decision-aging", `decision:${tag}-dec-bulk-1`)).at(-1)?.event, "decision-aging-cleared");
+      await sql()`delete from decisions where key like ${`${tag}-dec-bulk-%`}`;
+      run = await runSweep();
+      assert.equal(check(run, "decision-aging").complete, true);
+      assert.equal(Number((await sql()`select count(*) as n from sweep_latches where condition = 'decision-aging' and active`)[0].n), 0);
     }
 
     // ----------------------------------------------- dispatch-ready-empty
