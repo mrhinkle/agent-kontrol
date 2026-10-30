@@ -331,6 +331,25 @@ if [[ "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_TOKEN:-}" ]]; then
   fi
 fi
 
+# Paused scheduler jobs come from the dashboard's trusted sweeper status
+# (GET /api/sweep, database clock). The script never guesses scheduler state:
+# without that read the section is DATA INCOMPLETE, not "none".
+paused_unmeasured() {
+  jq -cn --arg error "$1" '{measured: false, error: $error, generated_at: null, jobs_total: null, jobs: [], truncated: false, counts: {held: 0, unexplained: 0, expired: 0, unknown: 0}}'
+}
+if [[ "$USE_DASHBOARD" -ne 1 ]]; then
+  paused="$(paused_unmeasured "dashboard not used (--no-dashboard)")"
+elif [[ -n "${MC_URL:-}" && -n "${MC_TOKEN:-}" ]]; then
+  if sweep_body="$(curl -fsS -m 20 -H "Authorization: Bearer $MC_TOKEN" "${MC_URL%/}/api/sweep" 2>/dev/null)" \
+     && echo "$sweep_body" | jq -e '(.paused | type) == "object" and (.paused.measured | type) == "boolean"' >/dev/null 2>&1; then
+    paused="$(jq -c '.paused' <<<"$sweep_body")"
+  else
+    paused="$(paused_unmeasured "dashboard unreachable")"
+  fi
+else
+  paused="$(paused_unmeasured "no dashboard credentials (MC_URL/MC_TOKEN)")"
+fi
+
 # ------------------------------------------------------------------- assemble
 # BEGIN brief-assemble-jq
 BRIEF_ASSEMBLE_JQ='
@@ -369,6 +388,7 @@ brief="$(jq -n --arg at "$NOW_ISO" --argjson window "$WINDOW_H" --arg repo_sourc
             --argjson repos "$repo_results" --argjson coordinator "$coordinator" \
             --argjson stuck_h "$STUCK_PR_HOURS" --argjson stale_d "$STALE_ISSUE_DAYS" \
             "$BRIEF_ASSEMBLE_JQ")"
+brief="$(jq -c --argjson paused "$paused" '. + {paused: $paused}' <<<"$brief")"
 
 n_incomplete="$(jq '.incomplete_repos|length' <<<"$brief")"
 if [[ "$AS_JSON" -eq 1 ]]; then
@@ -482,6 +502,35 @@ decisions_heading "$n_dec" "$n_labels" "$n_known_dec"
 if [[ "$n_known_dec" -gt 0 ]]; then
   jq -r '.decisions[] | "  \(.repo_short) \(if .kind == "pr" then "PR " else "" end)#\(.number)  \(.age_days)d  [\(.labels|join(","))]  \(.title[0:70])\n      \(.url)"' <<<"$brief"
 fi
+echo
+
+# BEGIN paused_lines
+paused_lines() {
+  jq -r '
+    def tenths: (. * 10 | floor) / 10 | tostring;
+    def dash: if . == null or . == "" then "-" else . end;
+    def hrs: if . == null then "-" else "\(. | tenths)h" end;
+    (.paused // {measured: false}) as $p
+    | if $p.measured != true then "PAUSED: DATA INCOMPLETE (\($p.error // "scheduler status unavailable"))."
+      elif $p.jobs_total == 0 then "PAUSED: DATA INCOMPLETE (no scheduler job has reported)."
+      else
+        $p.counts as $c
+        | ($c.held + $c.unexplained + $c.expired) as $n
+        | (if $c.unknown > 0 then "PAUSED: DATA INCOMPLETE \u2014 \($c.unknown) job(s) stale; known rows below"
+           elif $n == 0 then "PAUSED: none."
+           else "PAUSED (\($n)) \u2014 job, age, reason, until, decision" end),
+          ($p.jobs[] | if .classification == "unknown" then
+              "  ?? \(.source)/\(.job_id)  stale: last report \(.report_age_hours | hrs) ago, last state \(.state)"
+            else
+              "  \(.source)/\(.job_id)  \(.age_hours | hrs)  \(if .classification == "held" then "held" elif .classification == "expired" then "EXPIRED" else "UNEXPLAINED" end)  reason: \(.reason | dash)  until: \(.until | dash)  decision: \(.decision | dash)"
+            end),
+          (if $p.truncated then "  (first 50 rows shown)" else empty end),
+          "HELD VERSUS UNEXPLAINED: \($c.held) held, \($c.unexplained) unexplained, \($c.expired) expired\(if $c.unknown > 0 then ", \($c.unknown) unknown" else "" end)"
+      end
+  '
+}
+# END paused_lines
+paused_lines <<<"$brief"
 echo
 
 # A positive merge count with no measured list is not an empty heading.

@@ -11,7 +11,10 @@ import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import { evaluateAlerts, setBeforeClaimForTests, setBriefSettingsForTests } from "../src/lib/brief-alerts";
 import type { BriefSettings } from "../src/lib/progress-config";
-import { sql } from "../src/lib/db";
+import { sql, withTransaction } from "../src/lib/db";
+import { insertGhEvent, signBody } from "../src/lib/gh-events";
+import { testSweeper } from "./pg-sweeper-tests";
+import { EVENT_FIXTURES, PING_PAYLOAD } from "../tests/ui/gh-event-fixtures";
 import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
 import { StaleWrite } from "../src/lib/revision";
 import { readReceipt } from "../src/lib/activity";
@@ -369,6 +372,9 @@ async function main() {
   await testZeroMergeCaseFold(tag);
   await testDecisionWritebackHardening(tag);
   await testRepoCaseIdentity(tag);
+  await testCredentialQuotas(tag);
+  await testGhEvents(tag);
+  await testSweeper(tag, applyCanonicalSchema);
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
 }
@@ -2555,6 +2561,462 @@ async function testRepoSettingsVersionAndReceipt(tag: string): Promise<void> {
     else process.env.MC_DASHBOARD_PASSWORD = savedPassword;
     if (savedToken === undefined) delete process.env.MC_TOKEN;
     else process.env.MC_TOKEN = savedToken;
+  }
+}
+
+/**
+ * Per-credential request quotas (issue #51) against the real row lock and
+ * the database clock. One unit is one authorized request.
+ */
+async function testCredentialQuotas(tag: string) {
+  const { createCredential, updateCredentialLimits, setCredentialClockForTests } = await import("../src/lib/credentials");
+  const { chargeCredentialRequest } = await import("../src/lib/credential-rate-limit");
+  const ids: string[] = [];
+  const savedPassword = process.env.MC_DASHBOARD_PASSWORD;
+  const savedToken = process.env.MC_TOKEN;
+  const realDateNow = Date.now;
+  const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+  const fresh = () => new Request("http://localhost/api/fleet");
+  const make = async (limits: { perMinute?: number; perDay?: number }, scopes: string[] = ["fleet:read"]) => {
+    const created = await createCredential({
+      label: `${tag} quota`,
+      scopes,
+      rate_limit_per_minute: limits.perMinute,
+      rate_limit_per_day: limits.perDay,
+    });
+    if (!created.ok) throw new Error(created.error);
+    ids.push(created.credential.id);
+    return created;
+  };
+  const state = async (id: string) => {
+    const rows = await sql()`
+      select rate_limit_per_minute, rate_limit_per_day, rate_minute_start, rate_minute_count,
+             rate_day_start, rate_day_count, revoked_at, expires_at
+      from agent_credentials where id = ${id}
+    `;
+    const row = rows[0];
+    return {
+      perMinute: Number(row.rate_limit_per_minute),
+      perDay: Number(row.rate_limit_per_day),
+      minuteStart: row.rate_minute_start ? new Date(row.rate_minute_start).toISOString() : null,
+      minuteCount: Number(row.rate_minute_count),
+      dayStart: row.rate_day_start ? new Date(row.rate_day_start).toISOString() : null,
+      dayCount: Number(row.rate_day_count),
+    };
+  };
+  /** Milliseconds until the next window boundary, by the database clock. */
+  const msToBoundary = async (unit: "minute" | "day") => {
+    const rows = unit === "minute"
+      ? await sql()`select extract(epoch from (date_trunc('minute', clock_timestamp() at time zone 'UTC') + interval '1 minute' - (clock_timestamp() at time zone 'UTC')))::float8 * 1000 as ms`
+      : await sql()`select extract(epoch from (date_trunc('day', clock_timestamp() at time zone 'UTC') + interval '1 day' - (clock_timestamp() at time zone 'UTC')))::float8 * 1000 as ms`;
+    return Number(rows[0].ms);
+  };
+  /** Keep a test that must stay inside one window from straddling a boundary. */
+  const awayFromBoundary = async (unit: "minute" | "day", needMs: number) => {
+    const left = await msToBoundary(unit);
+    if (left < needMs) await pause(left + 250);
+  };
+  const lockRow = async (id: string) => {
+    const holder = new Client({ connectionString: process.env.DATABASE_URL });
+    await holder.connect();
+    await holder.query("begin");
+    await holder.query("select id from agent_credentials where id = $1 for update", [id]);
+    return holder;
+  };
+  const settled = async (p: Promise<unknown>) => {
+    let done = false;
+    void p.then(() => { done = true; }, () => { done = true; });
+    await pause(250);
+    return done;
+  };
+
+  delete process.env.MC_DASHBOARD_PASSWORD;
+  delete process.env.MC_TOKEN;
+  try {
+    // Defaults are stored on the row, and new counters start empty.
+    const plain = await make({});
+    const plainState = await state(plain.credential.id);
+    assert.equal(plainState.perMinute, 60);
+    assert.equal(plainState.perDay, 10000);
+    assert.equal(plainState.minuteCount, 0);
+    assert.equal(plainState.dayCount, 0);
+    await assert.rejects(
+      () => sql()`update agent_credentials set rate_limit_per_day = 0 where id = ${plain.credential.id}`,
+      "the database rejects a zero limit",
+    );
+
+    // A concurrent burst of 25 distinct requests, with a limit edit in the
+    // middle, admits exactly the day cap. Both counters match the admitted count.
+    await awayFromBoundary("minute", 10_000);
+    await awayFromBoundary("day", 10_000);
+    const burst = await make({ perMinute: 1_000_000, perDay: 7 });
+    const results = await Promise.all([
+      ...Array.from({ length: 25 }, () => chargeCredentialRequest(fresh(), burst.credential.id)),
+      updateCredentialLimits({ id: burst.credential.id, rate_limit_per_minute: 999_999, rate_limit_per_day: null }).then(() => null),
+    ]);
+    const charged = results.filter((item): item is NonNullable<typeof item> => item !== null);
+    assert.equal(charged.filter((item) => item.status === "ok").length, 7, "exactly the cap succeeds");
+    assert.equal(charged.filter((item) => item.status === "limited").length, 18);
+    const afterBurst = await state(burst.credential.id);
+    assert.equal(afterBurst.dayCount, 7);
+    assert.equal(afterBurst.minuteCount, 7);
+    assert.equal(afterBurst.perMinute, 999_999, "the edit landed");
+    assert.equal(afterBurst.perDay, 7);
+
+    // A rejected request leaves both counters as they were.
+    const denied = await chargeCredentialRequest(fresh(), burst.credential.id);
+    assert.equal(denied.status, "limited");
+    if (denied.status === "limited") {
+      assert.equal(denied.window, "day");
+      assert.ok(denied.retryAfterSec >= 1);
+    }
+    assert.deepEqual(await state(burst.credential.id), afterBurst);
+
+    // Two auth passes over one Request charge once.
+    const once = await make({ perMinute: 5 });
+    const shared = fresh();
+    const pair = await Promise.all([
+      chargeCredentialRequest(shared, once.credential.id),
+      chargeCredentialRequest(shared, once.credential.id),
+    ]);
+    assert.deepEqual(pair.map((item) => item.status), ["ok", "ok"]);
+    assert.equal((await state(once.credential.id)).dayCount, 1);
+
+    // A settings edit keeps the requests already counted.
+    await awayFromBoundary("minute", 10_000);
+    const edited = await make({ perMinute: 3, perDay: 100 });
+    for (let i = 0; i < 3; i++) assert.equal((await chargeCredentialRequest(fresh(), edited.credential.id)).status, "ok");
+    assert.equal((await chargeCredentialRequest(fresh(), edited.credential.id)).status, "limited");
+    const beforeEdit = await state(edited.credential.id);
+    await updateCredentialLimits({ id: edited.credential.id, rate_limit_per_minute: 5, rate_limit_per_day: null });
+    const afterEdit = await state(edited.credential.id);
+    assert.equal(afterEdit.minuteCount, beforeEdit.minuteCount);
+    assert.equal(afterEdit.dayCount, beforeEdit.dayCount);
+    assert.equal(afterEdit.minuteStart, beforeEdit.minuteStart);
+    assert.equal(afterEdit.perDay, 100);
+    assert.equal((await chargeCredentialRequest(fresh(), edited.credential.id)).status, "ok");
+    assert.equal((await chargeCredentialRequest(fresh(), edited.credential.id)).status, "ok");
+    assert.equal((await chargeCredentialRequest(fresh(), edited.credential.id)).status, "limited");
+
+    // Applying the canonical schema twice keeps limits and counters.
+    const kept = await state(edited.credential.id);
+    await applyCanonicalSchema();
+    await applyCanonicalSchema();
+    assert.deepEqual(await state(edited.credential.id), kept);
+
+    // A skewed process clock is ignored: the window comes from the database.
+    const skew = 3 * 86_400_000;
+    const skewed = await make({ perMinute: 1000, perDay: 1000 });
+    setCredentialClockForTests(() => realDateNow() + skew);
+    Date.now = () => realDateNow() + skew;
+    let skewedAt: string;
+    try {
+      const first = await chargeCredentialRequest(fresh(), skewed.credential.id);
+      const second = await chargeCredentialRequest(fresh(), skewed.credential.id);
+      assert.equal(first.status, "ok");
+      assert.equal(second.status, "ok");
+      skewedAt = first.status === "ok" ? first.at : "";
+    } finally {
+      Date.now = realDateNow;
+      setCredentialClockForTests(null);
+    }
+    const dbDay = await sql()`select date_trunc('day', now() at time zone 'UTC') at time zone 'UTC' as day, now() as now`;
+    const skewedState = await state(skewed.credential.id);
+    assert.equal(skewedState.dayStart, new Date(dbDay[0].day).toISOString());
+    assert.equal(skewedState.dayCount, 2, "both requests land in the database's day");
+    assert.ok(Math.abs(Date.parse(skewedAt) - new Date(dbDay[0].now).getTime()) < 60_000, "the charge time is the database clock");
+
+    // A request that waits on the row lock across a minute boundary is
+    // judged by the time after the lock. The minute before is full.
+    const boundary = await make({ perMinute: 1, perDay: 100 });
+    let left = await msToBoundary("minute");
+    if (left < 3_000) {
+      await pause(left + 250);
+      left = await msToBoundary("minute");
+    }
+    await pause(Math.max(0, left - 2_000));
+    assert.equal((await chargeCredentialRequest(fresh(), boundary.credential.id)).status, "ok");
+    const holder = await lockRow(boundary.credential.id);
+    try {
+      const waiting = chargeCredentialRequest(fresh(), boundary.credential.id);
+      assert.equal(await settled(waiting), false, "the charge waits on the row lock");
+      // Still in the full minute: hold the lock until just past its end.
+      const untilNext = await msToBoundary("minute");
+      if (untilNext < 30_000) await pause(untilNext + 300);
+      const releasedMs = Number((await holder.query(
+        "select (extract(epoch from clock_timestamp()) * 1000)::float8 as ms",
+      )).rows[0].ms);
+      await holder.query("commit");
+      const result = await waiting;
+      assert.equal(result.status, "ok", "the post-lock clock is in the next minute");
+      if (result.status === "ok") {
+        assert.ok(Date.parse(result.at) >= Math.floor(releasedMs), "time read after the lock");
+      }
+    } finally {
+      await holder.end().catch(() => {});
+    }
+    const boundaryState = await state(boundary.credential.id);
+    assert.equal(boundaryState.minuteCount, 1, "a new minute window");
+    assert.equal(boundaryState.dayCount, 2);
+
+    // Revoked while the charge waited: 401-class reject, counters unchanged.
+    const revokedRace = await make({});
+    const revokeHolder = await lockRow(revokedRace.credential.id);
+    try {
+      const waiting = chargeCredentialRequest(fresh(), revokedRace.credential.id);
+      assert.equal(await settled(waiting), false);
+      await revokeHolder.query("update agent_credentials set revoked_at = now() where id = $1", [revokedRace.credential.id]);
+      await revokeHolder.query("commit");
+      assert.equal((await waiting).status, "reject");
+    } finally {
+      await revokeHolder.end().catch(() => {});
+    }
+    assert.equal((await state(revokedRace.credential.id)).dayCount, 0);
+
+    // Expired while the charge waited, judged by the database clock after the lock.
+    const expiryRace = await make({});
+    const expiryHolder = await lockRow(expiryRace.credential.id);
+    try {
+      const waiting = chargeCredentialRequest(fresh(), expiryRace.credential.id);
+      assert.equal(await settled(waiting), false);
+      await expiryHolder.query(
+        "update agent_credentials set expires_at = clock_timestamp() + interval '100 milliseconds' where id = $1",
+        [expiryRace.credential.id],
+      );
+      await pause(300);
+      await expiryHolder.query("commit");
+      assert.equal((await waiting).status, "reject");
+    } finally {
+      await expiryHolder.end().catch(() => {});
+    }
+    assert.equal((await state(expiryRace.credential.id)).dayCount, 0);
+
+    // The real routes share one counter per credential: REST, then watch.
+    const routeCred = await make({ perMinute: 1000, perDay: 1 }, ["fleet:read", "watch:read"]);
+    const { GET: getFleet } = await import("../src/app/api/fleet/route");
+    const { GET: getBeats } = await import("../src/app/api/watch/beats/route");
+    const bearer = { authorization: `Bearer ${routeCred.token}` };
+    assert.equal((await getFleet(new Request("http://localhost/api/fleet", { headers: bearer }))).status, 200);
+    const watchLimited = await getBeats(new Request("http://localhost/api/watch/beats", { headers: bearer }));
+    assert.equal(watchLimited.status, 429);
+    assert.ok(Number(watchLimited.headers.get("retry-after")) >= 1);
+    const watchBody = await watchLimited.json();
+    assert.equal(watchBody.code, "rate_limited");
+    assert.equal(watchBody.retryable, true);
+    assert.equal(watchBody.window, "day");
+    const restLimited = await getFleet(new Request("http://localhost/api/fleet", { headers: bearer }));
+    assert.equal(restLimited.status, 429);
+    assert.equal((await restLimited.json()).retry_after, Number(restLimited.headers.get("retry-after")));
+    assert.equal((await state(routeCred.credential.id)).dayCount, 1);
+
+    // MCP: an initialize is one request against the same row.
+    const mcpCred = await make({ perMinute: 1000, perDay: 1 });
+    const { POST: mcp } = await import("../src/app/api/[transport]/route");
+    const initialize = () =>
+      mcp(new Request("http://localhost/api/mcp", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${mcpCred.token}`,
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "pg-quota", version: "0" } },
+        }),
+      }));
+    assert.equal((await initialize()).status, 200);
+    const mcpLimited = await initialize();
+    assert.equal(mcpLimited.status, 429);
+    assert.equal((await mcpLimited.json()).code, "rate_limited");
+    assert.equal((await state(mcpCred.credential.id)).dayCount, 1);
+  } finally {
+    Date.now = realDateNow;
+    setCredentialClockForTests(null);
+    for (const id of ids) await sql()`delete from agent_credentials where id = ${id}`;
+    if (savedPassword === undefined) delete process.env.MC_DASHBOARD_PASSWORD;
+    else process.env.MC_DASHBOARD_PASSWORD = savedPassword;
+    if (savedToken === undefined) delete process.env.MC_TOKEN;
+    else process.env.MC_TOKEN = savedToken;
+  }
+}
+
+/**
+ * #77: the gh_events inbox against real Postgres. Schema and dated migration
+ * apply twice without touching rows; every accepted fixture is stored once;
+ * serial, concurrent, and lost-response replays leave one unchanged row.
+ */
+async function testGhEvents(tag: string): Promise<void> {
+  const { POST } = await import("../src/app/api/webhooks/github/route");
+  const savedSecret = process.env.MC_GITHUB_WEBHOOK_SECRET;
+  const secret = `pg-secret-${tag}`;
+  process.env.MC_GITHUB_WEBHOOK_SECRET = secret;
+  const prefix = randomUUID().slice(0, 8);
+  let seq = 0;
+  const nextDelivery = () => `${prefix}-${randomUUID().slice(9)}-${seq++}`;
+  const sweepPrefix = `sweep:${tag}:`;
+
+  const post = (event: string, body: string, delivery: string) => POST(new Request("http://localhost/api/webhooks/github", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-github-event": event,
+      "x-github-delivery": delivery,
+      "x-hub-signature-256": signBody(secret, body),
+    },
+    body,
+  }));
+  const rowOf = async (delivery: string) => {
+    const rows = await sql()`
+      select id::text as id, delivery_id, event, action, repo, number::int as number, head_sha,
+             payload::text as payload, received_at::text as received_at, processed_at
+      from gh_events where delivery_id = ${delivery}
+    `;
+    return rows[0] ?? null;
+  };
+  const countAll = async () => Number((await sql()`
+    select count(*)::int as n from gh_events where delivery_id like ${prefix + "%"} or delivery_id like ${sweepPrefix + "%"}
+  `)[0].n);
+
+  try {
+    // Canonical schema, then the dated migration, each twice, around a stored row.
+    await applyCanonicalSchema();
+    const keep = nextDelivery();
+    const kept = await insertGhEvent({ delivery_id: keep, event: "push", repo: "acme/widgets", payload: { keep: true } });
+    assert.equal(kept.stored, true);
+    const keptBefore = await rowOf(keep);
+    await applyCanonicalSchema();
+    const migration = fs.readFileSync("supabase/migrations/20261030012111_gh_events.sql", "utf8");
+    const statements = migration
+      .split(";")
+      .map((part) => part.split("\n").filter((line) => !line.trim().startsWith("--")).join("\n").trim())
+      .filter(Boolean);
+    const client = new Client({ connectionString: process.env.DATABASE_URL });
+    await client.connect();
+    try {
+      for (let pass = 0; pass < 2; pass += 1) {
+        for (const statement of statements) await client.query(statement);
+      }
+    } finally {
+      await client.end();
+    }
+    assert.deepEqual(await rowOf(keep), keptBefore, "applying the schema and migration twice leaves the row unchanged");
+
+    const cols = await sql()`
+      select column_name, is_nullable, data_type, column_default
+      from information_schema.columns
+      where table_schema = 'public' and table_name = 'gh_events'
+    `;
+    const col = new Map(cols.map((row) => [String(row.column_name), row]));
+    for (const name of ["id", "delivery_id", "event", "payload", "received_at"]) {
+      assert.equal(col.get(name)?.is_nullable, "NO", name);
+    }
+    for (const name of ["action", "repo", "number", "head_sha", "processed_at"]) {
+      assert.equal(col.get(name)?.is_nullable, "YES", name);
+    }
+    assert.equal(col.get("id")?.data_type, "bigint");
+    assert.equal(col.get("payload")?.data_type, "jsonb");
+    assert.match(String(col.get("received_at")?.column_default), /now\(\)/);
+    const indexes = await sql()`select indexname from pg_indexes where schemaname = 'public' and tablename = 'gh_events'`;
+    const names = indexes.map((row) => String(row.indexname));
+    assert.ok(names.includes("gh_events_received_at_idx"));
+    assert.ok(names.includes("gh_events_pending_idx"));
+    assert.ok(names.includes("gh_events_delivery_id_key"));
+    await assert.rejects(
+      () => sql()`insert into gh_events (delivery_id, event, payload) values (${nextDelivery()}, 'x', '[1]'::jsonb)`,
+      (err: unknown) => pgCode(err) === "23514",
+      "payload must be an object",
+    );
+
+    // Every accepted event is stored once with its metadata.
+    for (const f of EVENT_FIXTURES) {
+      const delivery = nextDelivery();
+      const raw = JSON.stringify(f.payload, null, 1);
+      const res = await post(f.event, raw, delivery);
+      assert.equal(res.status, 200, f.event);
+      const out = await res.json() as { stored: boolean; id: string };
+      assert.equal(out.stored, true);
+      const row = await rowOf(delivery);
+      assert.ok(row, f.event);
+      assert.equal(row.id, out.id);
+      assert.equal(row.event, f.event);
+      assert.equal(row.action, f.expect.action);
+      assert.equal(row.repo, f.expect.repo);
+      assert.equal(row.number, f.expect.number);
+      assert.equal(row.head_sha, f.expect.head_sha);
+      assert.equal(row.processed_at, null);
+      assert.deepEqual(JSON.parse(String(row.payload)), f.payload, f.event);
+    }
+
+    // Quotes, SQL, and shell text in the payload are data.
+    const comment = EVENT_FIXTURES.find((f) => f.event === "issue_comment")!;
+    const nasty = { ...comment.payload, comment: { id: 1, body: "it's \"quoted\" '; delete from gh_events; -- $1 \\ é\n🚀" } };
+    const nastyId = nextDelivery();
+    assert.equal((await post("issue_comment", JSON.stringify(nasty), nastyId)).status, 200);
+    const nastyBody = await sql()`select payload->'comment'->>'body' as body from gh_events where delivery_id = ${nastyId}`;
+    assert.equal(nastyBody[0].body, nasty.comment.body);
+
+    // ping and an unlisted event write nothing.
+    const beforeIgnored = await countAll();
+    assert.equal((await post("ping", JSON.stringify(PING_PAYLOAD), nextDelivery())).status, 200);
+    assert.equal((await post("star", JSON.stringify({ action: "created" }), nextDelivery())).status, 202);
+    assert.equal(await countAll(), beforeIgnored);
+
+    // Serial replay: same id, even with a different signed body, changes nothing.
+    const pr = EVENT_FIXTURES[0];
+    const serial = nextDelivery();
+    assert.equal((await post(pr.event, JSON.stringify(pr.payload), serial)).status, 200);
+    const first = await rowOf(serial);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    for (const body of [JSON.stringify(pr.payload), JSON.stringify({ ...pr.payload, action: "closed" })]) {
+      const again = await post(pr.event, body, serial);
+      assert.equal(again.status, 200);
+      assert.deepEqual(await again.json(), { ok: true, duplicate: true, delivery_id: serial });
+    }
+    assert.deepEqual(await rowOf(serial), first, "a duplicate does not update payload or received_at");
+
+    // Concurrent replay: one insert, the rest duplicates.
+    const racing = nextDelivery();
+    const raced = await Promise.all(Array.from({ length: 12 }, () => post(pr.event, JSON.stringify(pr.payload), racing)));
+    const bodies = await Promise.all(raced.map((res) => res.json() as Promise<{ stored?: boolean; duplicate: boolean }>));
+    assert.ok(raced.every((res) => res.status === 200));
+    assert.equal(bodies.filter((b) => b.stored === true).length, 1);
+    assert.equal(bodies.filter((b) => b.duplicate === true).length, 11);
+    const racedRows = await sql()`select count(*)::int as n from gh_events where delivery_id = ${racing}`;
+    assert.equal(Number(racedRows[0].n), 1);
+
+    // Committed insert whose response was lost: GitHub's redelivery is a no-op.
+    const lost = nextDelivery();
+    await withTransaction(async (tx) => {
+      const row = await insertGhEvent({ delivery_id: lost, event: pr.event, ...pr.expect, payload: pr.payload }, tx);
+      assert.equal(row.stored, true);
+    });
+    const committed = await rowOf(lost);
+    const redelivered = await post(pr.event, JSON.stringify(pr.payload), lost);
+    assert.equal(redelivered.status, 200);
+    assert.equal((await redelivered.json() as { duplicate: boolean }).duplicate, true);
+    assert.deepEqual(await rowOf(lost), committed);
+
+    // Synthetic rows (#79): the helper joins the caller's transaction and
+    // never commits on its own; the route refuses the namespace.
+    const rolled = `${sweepPrefix}rolled`;
+    await assert.rejects(() => withTransaction(async (tx) => {
+      await insertGhEvent({ delivery_id: rolled, event: "sweep_condition", payload: { n: 1 } }, tx);
+      throw new Error("abort after insert");
+    }), /abort after insert/);
+    assert.equal(await rowOf(rolled), null, "a rolled-back transaction leaves no row");
+    const synthetic = `${sweepPrefix}kept`;
+    const out = await withTransaction((tx) => insertGhEvent({ delivery_id: synthetic, event: "sweep_condition", payload: { n: 2 } }, tx));
+    assert.equal(out.stored, true);
+    const viaRoute = await post(pr.event, JSON.stringify(pr.payload), synthetic);
+    assert.equal(viaRoute.status, 400);
+    assert.equal((await rowOf(synthetic))?.event, "sweep_condition");
+  } finally {
+    await sql()`delete from gh_events where delivery_id like ${prefix + "%"} or delivery_id like ${sweepPrefix + "%"}`;
+    if (savedSecret === undefined) delete process.env.MC_GITHUB_WEBHOOK_SECRET;
+    else process.env.MC_GITHUB_WEBHOOK_SECRET = savedSecret;
   }
 }
 

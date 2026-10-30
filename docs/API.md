@@ -6,7 +6,7 @@ Three credentials protect Agent Kontrol:
 
 - The dashboard password (env `MC_DASHBOARD_PASSWORD`) gates the UI and the data routes through a session cookie named `mc_auth`. Callers get the cookie by posting the password to `POST /api/login`. The session can do everything an operator can do, including issuing agent credentials.
 - `MC_TOKEN` is a static bearer token. It has every scope. Data routes accept `Authorization: Bearer <MC_TOKEN>` as an alternative to the cookie, and the ingest routes require a bearer.
-- An agent credential is a token shaped `akc_` plus 32 random bytes, base64url. Settings shows it once. It can call only the MCP tools and REST routes its scopes allow. It cannot call `GET`/`POST`/`DELETE /api/settings/credentials`, and neither can `MC_TOKEN`.
+- An agent credential is a token shaped `akc_` plus 32 random bytes, base64url. Settings shows it once. It can call only the MCP tools and REST routes its scopes allow. It cannot call `GET`/`POST`/`PATCH`/`DELETE /api/settings/credentials`, and neither can `MC_TOKEN`.
 
 Secrets in query strings (`?key=`) are not supported. Send tokens in the `Authorization` header. Agent credentials are not accepted in the query string.
 
@@ -24,8 +24,12 @@ The `agent_credentials` table stores the label, the first 8 characters of the to
 | Ingest routes: `POST /api/v1/traces`, `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, `POST /api/usage/ingest`, `POST /api/brief/alerts/evaluate` | `Authorization: Bearer <MC_TOKEN>`, or an agent credential whose scope covers the route (`status:write` for `POST /api/ingest`, `messages:write` for `POST /api/messages/reply`); the other ingest routes, including alert evaluate, take `MC_TOKEN` only |
 | MCP transport: `/api/mcp` | `Authorization: Bearer <MC_TOKEN>`, an agent credential, or an OAuth access token (JWT) issued by this server |
 | `GET /api/skill-bundles` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `skills:read` or `skills:write` |
-| Credential management: `GET`/`POST`/`DELETE /api/settings/credentials` | Dashboard session only |
+| Credential management: `GET`/`POST`/`PATCH`/`DELETE /api/settings/credentials` | Dashboard session only |
 | `POST /api/watch/beat`, `GET /api/watch/beats` | Verified `akc_` credential only. `watch:write` for the POST, `watch:read` for the GET. `MC_TOKEN`, the dashboard session, an OAuth access token, and a caller allowed only because the dashboard password is unset are `401` |
+| `POST /api/sweep`, `POST /api/sweep/consumers` | `Authorization: Bearer <MC_TOKEN>`, or the dashboard session cookie when `MC_DASHBOARD_PASSWORD` is set. An agent credential, an OAuth token, and a caller allowed only because the password is unset are refused (`403` `trusted_writer_required`, `403` `insufficient_scope`, or `401`) |
+| `GET /api/sweep` | Session cookie, `MC_TOKEN`, or an agent credential with `progress:read`. Read-only |
+| Sweeper observations on `POST /api/ingest` (`kind` `sweep.scheduler_job`, `sweep.queue`, `sweep.pr_snapshot`) | `Authorization: Bearer <MC_TOKEN>` only. An agent credential with `status:write`, an OAuth token, and a dev-open caller are `403` `trusted_writer_required` and nothing is written |
+| `POST /api/webhooks/github` (exact path) | A valid `X-Hub-Signature-256` HMAC under `MC_GITHUB_WEBHOOK_SECRET`, and nothing else. A session cookie, `MC_TOKEN`, an agent credential, or an OAuth token does not stand in for it. Neighboring paths stay behind the dashboard gate |
 | Login, OAuth, and discovery: `/login`, `/api/login`, `/oauth/*`, `/.well-known/*` | No cookie gate; these routes enforce their own auth |
 | Public agent docs: `GET /llms.txt`, `GET /docs/mcp.md`, `GET /docs/api.md`, `GET /docs/agents.md` | None. Any other `/docs` name stays behind the dashboard gate |
 
@@ -34,6 +38,18 @@ Ingest routes answer `401 {"error":"unauthorized"}` without a valid bearer token
 ```json
 { "error": "The credential does not have the tasks:write scope.", "code": "insufficient_scope", "fix": "Use a credential that has the tasks:write scope", "retryable": false }
 ```
+
+### Request limits for agent credentials
+
+Each agent credential has two request limits: requests per minute and requests per day. The defaults are 60 per minute and 10,000 per day. Each limit is a whole number from 1 to 1,000,000; there is no unlimited setting. Credentials created before this feature get the defaults. These are request quotas, not spend or billing limits.
+
+- One unit is one HTTP request that passed authentication and the scope check. A `401` or `403` costs nothing. On `/api/mcp`, an `initialize`, a notification, a POST batch, a `GET` that opens the stream, and a `DELETE` are each one request; tool calls inside a request are not counted separately. A held stream does not count again. A reconnect is a new request.
+- The minute window is the clock minute. The day window is the UTC calendar day and resets at 00:00 UTC. Both are fixed windows, counted by the database clock.
+- A request is allowed only when both windows have room. An allowed request counts against both. A refused request counts against neither.
+- Over a limit, the answer is `429` with a `Retry-After` header in whole seconds (at least 1) and a body of `{ "error", "code": "rate_limited", "fix", "retryable": true, "retry_after", "window": "minute" | "day", "limit" }`. When both windows are full, `Retry-After` waits for the later reset. The same answer comes back from the REST routes, `/api/mcp`, and the watch routes.
+- If the quota cannot be read or written, the answer is `503 {"error":"credential_store_unavailable"}`. There is no in-process fallback when a database is configured.
+- `MC_TOKEN`, the dashboard session, OAuth access tokens, and callers allowed only because the dashboard password is unset are not metered. An `akc_` bearer is checked before the session cookie, so a request that sends both is metered.
+- Change the limits in Settings, or with `PATCH /api/settings/credentials`. Requests already counted in the current minute and day still count after a change.
 
 The scope for each agent route is listed in [MCP.md](MCP.md). A route that is not in that table is denied to agent credentials. `MC_TOKEN` and the dashboard session can still call it, except `POST /api/watch/beat` and `GET /api/watch/beats`: those two accept only a verified `akc_` credential, and the other principals are `401`. OAuth on `/api/mcp` is unchanged: a verified access token can call every mapped tool.
 
@@ -73,7 +89,8 @@ Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI
 | PUT | `/api/settings/owners` | Cookie or bearer | Replace the watched owners. Does not delete tracked repos |
 | POST | `/api/settings/owners/discover` | Cookie or bearer | Apply one collector tick of `gh repo list` results |
 | GET | `/api/settings/credentials` | Session only | List agent credentials. No token and no hash |
-| POST | `/api/settings/credentials` | Session only | Create one. The response includes `token` once |
+| POST | `/api/settings/credentials` | Session only | Create one. The response includes `token` once. Optional `rate_limit_per_minute` and `rate_limit_per_day` (whole numbers from 1 to 1,000,000; omitted or `null` is 60 and 10,000) |
+| PATCH | `/api/settings/credentials` | Session only | Change limits: `{ "id", "rate_limit_per_minute"?, "rate_limit_per_day"? }` with at least one limit. A limit left out keeps its value. Unknown fields, `null`, strings, fractions, zero, negatives, and values over 1,000,000 are `400`. Unknown id is `404`. Counted requests are kept |
 | DELETE | `/api/settings/credentials` | Session only | Revoke by `{ "id" }` |
 | GET | `/api/tasks` | Cookie or bearer | List tasks |
 | POST | `/api/tasks` | Cookie or bearer | Create a task |
@@ -88,6 +105,7 @@ Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI
 | POST | `/api/login` | Own (rate-limited) | Dashboard password login |
 | POST | `/api/watch/beat` | `akc_` `watch:write` | Store one host liveness beat. The credential must be bound to `source` |
 | GET | `/api/watch/beats` | `akc_` `watch:read` | Every host beat, with `age_s` from the database clock. `Cache-Control: no-store` |
+| POST | `/api/webhooks/github` | GitHub HMAC signature | Store one signed GitHub delivery in `gh_events`, once per `X-GitHub-Delivery`. See [EVENTS.md](EVENTS.md) |
 
 ### OAuth and discovery routes
 
@@ -127,6 +145,34 @@ Body:
 | `status` | string | no | Explicit session status override. |
 
 Invalid JSON answers `400`.
+
+Each stored event records who sent it in `events.principal_kind` and `events.principal_id`, taken from the verified credential: `legacy`/`mc-token`, `agent`/the credential id, `oauth`/the client id (MCP), or `session`/`operator`. Fields with those names in the body are ignored. A caller allowed only because `MC_TOKEN` is unset in development stores null, and so does every event written before this column existed: those rows are unmeasured for the sweeper's consumer liveness. Nothing else about ordinary telemetry changes.
+
+#### Sweeper observations
+
+Three reserved kinds carry trusted evidence for the absence sweeper (see [VELOCITY.md](VELOCITY.md#absence-sweeper)). Only `MC_TOKEN` may send them; `/api/ingest` has no credential bound to a collector yet. The body is `{ "agent_id": "<reporter label>", "kind": "<kind>", "observation": { ... } }`. `agent_id` is an audit label, not provenance.
+
+| `kind` | `observation` |
+| --- | --- |
+| `sweep.scheduler_job` | `source`, `job_id`, `state` (`active` or `paused`), `transition` (the source's monotonic transition id for the job), `observed_at`, and for a pause `paused_at`, `paused_reason` (500 max), `until`; `decision` is the citation for this transition. Optional `stale_after_minutes` (5 to 1440): default 30 on a new transition; omitted on a refresh of the same transition, the stored window is kept. |
+| `sweep.queue` | `source`, `queue` (stored lowercase), `classification` (`issue_dispatch` or `pr_review`), `repo`, `seq`, `observed_at`, `complete`, `error`, `ready {count, refs}`, `raw {count, refs}` (50 refs max). A complete observation needs both counts. |
+| `sweep.pr_snapshot` | `source`, `repo`, `seq`, `observed_at`, `complete`, `error`, and `prs`: every open PR (200 max) with `number`, `draft`, `opened_at`, `mergeable` (`mergeable`, `conflicting`, `unknown`), `head_sha`, `required_checks {state, head_sha}`, `review {started, head_sha}`, and optional `title`, `url`. |
+
+Every field is validated before any write and unknown fields are `400` `validation_failed`. A citation is `decision:<id>`, `owner/name#<n>`, an `https` URL, or `doc:<path>`, at most 300 characters; the syntax check does not prove an approval. The audit row (`sweep_observations`) and the projection commit in one transaction, stamped with the database receipt time. The answer names the outcome:
+
+- `applied`: newer than what is stored.
+- `refreshed`: the same scheduler transition with a later `observed_at` than the stored one. A non-null field adds or replaces; an omitted or null field keeps the stored value, so a refresh cannot drop a citation. Only a refresh renews the job's freshness. A different `state` on the same transition is `409` `conflict` and writes nothing.
+- `older` or `replay`: a lower or equal `transition`/`seq`, or for a scheduler job the same transition with an earlier (`older`) or equal (`replay`) `observed_at`. Audited; the projection keeps the newer state, including a newer failure, a corrected `until`, and its freshness. Retrying after a lost response is a `replay`. Two reports of one transition at the same `observed_at` whose non-null fields differ are `409` `conflict`; a correction needs a later `observed_at`.
+
+`complete: false` is stored as unknown, never as zero, and an older success does not replace it. Any other kind starting with `sweep.`, or named after a synthetic sweeper event (`consumer-silent`, `pr-stuck-cleared`, ...), is reserved: `403` for those callers and `400` for `MC_TOKEN`.
+
+### Sweeper
+
+`POST /api/sweep` runs the absence sweeper once and returns `{ ok, checks, retention }`. The body is ignored; there is no caller clock. Each entry in `checks` has `check`, `state` (`firing`, `clear`, `held`, `unknown`, `not_configured`), `evaluated_at` (the database instant), `counts`, `emitted` (delivery ids written), `entities` (100 max), `complete`, `unvisited`, and `error`. A check that failed is `unknown` with an error and does not stop the others. The status is `200` whenever the run finished; read each check. `retention` reports `deleted`, `batches`, `complete`, and `error`.
+
+`POST /api/sweep/consumers` registers or updates one consumer: `id`, `agent_ids`, `reporters` (`[{ "kind": "agent", "id": "<credential id>" }]`), `queue` (`{ "type": "tasks", "platform": "codex" }` or `{ "type": "collector", "queue": "issues:owner/name" }`), optional `scheduler { source, job_id }`, `enabled`, `max_silence_hours` (default 3). There are no implicit registrations. `registered_at` is set once.
+
+`GET /api/sweep` is read-only status: `consumers` (200 max), active `latches` (500 max), and `paused` (the brief's Paused section, by database time), plus `errors` for any part that could not be read. `consumers_truncated` and `latches_truncated` say when a list is partial. More than 1,000 scheduler jobs makes `paused` unmeasured (DATA INCOMPLETE), never a partial count.
 
 ### Memory
 
@@ -258,6 +304,23 @@ A successful POST is `200` `{ "ok": true }`.
 
 `scripts/watch-beat.sh` reads one JSON object from stdin and POSTs it. Set `WATCH_API_URL` to the full `https://` URL (loopback `http://` is only for `localhost`, `127.0.0.1`, and `::1`) and `WATCH_CREDENTIAL` to the `akc_` token. The script always exits 0. A missing setting, bad stdin, DNS or TLS failure, timeout, refused connection, non-2xx response, or a 2xx body that is not `{ "ok": true }` prints one short line and does not print the credential, the Authorization header, the response body, or the curl command. It does not queue or replay.
 
+### GitHub webhooks
+
+`POST /api/webhooks/github` receives GitHub App or repository webhook deliveries and stores the accepted ones in `gh_events`. The full contract, the stored columns, and the per-event field map are in [EVENTS.md](EVENTS.md).
+
+The signature is the credential. The route checks, in this order, and stops at the first failure:
+
+1. `MC_GITHUB_WEBHOOK_SECRET` unset or blank: `503` `not_configured`. An unsigned delivery is never accepted.
+2. `X-Hub-Signature-256` missing, or not `sha256=` plus 64 lowercase hex: `401` `unauthorized`.
+3. The body is read from the stream and counted. Above 1,048,576 bytes it is `413` `payload_too_large`. `Content-Length` is not trusted. Exactly 1,048,576 bytes is accepted.
+4. HMAC SHA-256 of the raw body bytes, compared in constant time. A mismatch, including a valid signature over a different body, is `401`.
+5. `X-GitHub-Event` must be 1 to 64 lowercase letters or underscores, and `X-GitHub-Delivery` 1 to 128 letters, digits, or hyphens. Otherwise `400` `validation_failed`. Ids starting with `sweep:` are reserved for synthetic rows and are rejected.
+6. A body that is not UTF-8 JSON is `400` `invalid_json` (a webhook set to `application/x-www-form-urlencoded` lands here).
+
+None of these steps runs SQL. After them, `ping` is `200` `{ "ok": true, "event": "ping", "delivery_id" }`. An event outside `pull_request`, `check_suite`, `status`, `issue_comment`, `issues`, `push`, `pull_request_review`, `workflow_run` is `202` `{ "ok": true, "ignored": true, "event", "delivery_id" }` and is not stored. For an accepted event, a payload that is not a JSON object or lacks the fields GitHub always sends for it is `400` `validation_failed` with `fields`.
+
+A new delivery is `200` `{ "ok": true, "stored": true, "duplicate": false, "id", "delivery_id" }`. A delivery id already stored is `200` `{ "ok": true, "duplicate": true, "delivery_id" }` and the stored row, including `received_at`, is not changed. That covers GitHub redelivering after an insert committed and the response was lost. With no `DATABASE_URL` the answer is `503` `setup_required`; a failed insert is `503` `internal_error`. Both are `retryable: true`, and neither is a stored receipt. Every response sends `Cache-Control: no-store`.
+
 ### Decisions
 
 The morning brief's decisions list comes from this table when every brief-eligible row for that repo has `kind`, `labels`, `opened_at`, and `repo_short`. Those rows are `source` `github-label`, `status` not `withdrawn`, and `github_present` not `false` (a null `github_present` still counts as present). `repo` is `owner/name`. `repo_short` is the config short name and is display only. The brief joins a row onto a watched repo by `owner/name`, so two repos that share a short name do not both receive the row. `age_hours` drops fractional seconds before `Z`, subtracts the unix times, and divides by 3600. `age_days` is `floor(age_hours / 24)` from `opened_at` (GitHub `createdAt`). GitHub `createdAt` is stored as `opened_at` and, on insert only, as `first_seen_at`.
@@ -376,8 +439,8 @@ OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this sha
 | `validation_failed` | 400 | no | A field is present but not usable: a bad `before` on `GET /api/traces`, a bad `limit`, `cursor`, or `fields` on `GET /api/tasks`, `GET /api/memory`, `GET /api/traces`, or `GET /api/activity` (and on MCP `recall`, `get_task_queue`, and `list_activity`), a bad `since`, `until`, `actor`, or `kind` on `GET /api/activity` (a `since` later than `until` is rejected; a bad timestamp is rejected), a bad `since` and `until` pair on `GET /api/usage` (a `since` without `until` is ignored), a bad `collected_at` on usage or progress ingest, a bad task, trace, or decision id, a decision body or `status` the parser rejected, a privacy refusal, an OTLP body the parser rejected, an idempotency key longer than 200 characters or containing a control character, or MCP `set_watched_repos` when `expected_version` is missing on a real write or `dry_run` is not a boolean. |
 | `invalid_json` | 400 | no | The body is not JSON. On `POST /api/login` the `error` string stays `invalid request`. On `POST /api/mcp` an empty or non-JSON body uses this code and `error` `invalid JSON`. A missing bearer on that route is still `401` with `WWW-Authenticate`. |
 | `missing_field` | 400 | no | A required field is absent. `fields` names it. |
-| `rate_limited` | 429 | yes | More than 5 `POST /api/login` attempts in 10 minutes from one client IP. `Retry-After` is seconds. The OAuth consent form shares this limiter and answers with HTML, not this JSON. |
-| `conflict` | 409 | no | `PUT /api/settings/repos` and MCP `set_watched_repos` when no database is connected. A short name that is already used is the same code. |
+| `rate_limited` | 429 | yes | More than 5 `POST /api/login` attempts in 10 minutes from one client IP. `Retry-After` is seconds. The OAuth consent form shares this limiter and answers with HTML, not this JSON. Also an agent credential over its per-minute or per-day request limit, on any route it can call (see Request limits for agent credentials). That body adds `retry_after` seconds, `window` (`minute` or `day`), and `limit`. |
+| `conflict` | 409 | no | `PUT /api/settings/repos` and MCP `set_watched_repos` when no database is connected. A short name that is already used is the same code. Also a `sweep.scheduler_job` observation that changes `state` without a higher `transition`. |
 | `idempotency_conflict` | 409 | no | `POST /api/tasks`, `POST /api/messages`, or `POST /api/messages/reply` reused an `Idempotency-Key` with different arguments, or the first request with that key is still inside its 30 second lease. MCP `create_task` and `reply_to_operator` (and its `reply_to_mark` alias) return the same code. The same key, the same actor, the same route, and the same arguments return the original result for 24 hours. Different arguments stay `retryable: false`. While the first request is inside its 30 second lease, the same arguments are `retryable: true` and the response carries `Retry-After` in seconds plus `retry_after` in the body. After that lease, the same key and the same arguments take over a claim that never stored a result and run the write once. A claim insert whose result is lost is re-read, and the write runs once when this attempt owns the claim. The resource insert and the stored response commit in one statement, and that insert runs only while this attempt's claim token still matches. A committed write therefore has a stored response. A retry returns that response and does not insert another row while the claim is inside its 24 hour window. A caller that dies before reading the response gets the same row on retry. After that window the same key starts a new write. The key is scoped by actor and route. |
 | `stale` | 409 | no | `PUT /api/settings/repos` when `version` does not match the list currently stored, and MCP `set_watched_repos` when `expected_version` does not match. Also `PATCH /api/decisions/:id` and `POST /api/decisions/:id/writeback` when `expected_revision` does not match the row. |
 | `writeback_in_progress` | 409 | yes | `PATCH /api/decisions/:id` with `status` `open`, or `POST /api/decisions` with `force: true`, while an unexpired write-back claim holds the row. The claim expires after 180 seconds. |
@@ -386,9 +449,11 @@ OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this sha
 | `task_not_claimable` | 409 | no | Defined, not returned. See above. |
 | `memory_key_invalid` | 400 | no | MCP `remember` or `recall` when `key` is empty, longer than 200 characters, or contains a control character. |
 | `repo_list_invalid` | 400 | no | `PUT /api/settings/repos` and MCP `set_watched_repos` when the list fails validation. `errors` is unchanged. |
-| `payload_too_large` | 413 | no | `POST /api/v1/traces` over 2 MB, or `POST /api/watch/beat` over 8 KiB. |
+| `payload_too_large` | 413 | no | `POST /api/v1/traces` over 2 MB, `POST /api/watch/beat` over 8 KiB, or `POST /api/webhooks/github` over 1 MiB. |
 | `unsupported_media_type` | 415 | no | `POST /api/v1/traces` or `POST /api/watch/beat` when the body is not `application/json`. |
 | `setup_required` | 503 | no | Messaging routes or `POST /api/usage/ingest` when those tables are missing, or a production `/api/*` request when a database is set and `MC_DASHBOARD_PASSWORD` is not (other pages are `text/plain`). `GET /api/usage` stays HTTP 200 with `setup_required: true` and no `code`. Messaging and usage-ingest bodies keep `setup_required` and `message`. |
+| `trusted_writer_required` | 403 | no | A sweeper write from a caller that is not `MC_TOKEN` (or, for `POST /api/sweep` and `POST /api/sweep/consumers`, the signed-in dashboard): an agent credential with `status:write` sending a reserved `sweep.` kind to `POST /api/ingest`, or an OAuth or dev-open caller. Nothing is written. |
+| `not_configured` | 503 | no | `POST /api/webhooks/github` when `MC_GITHUB_WEBHOOK_SECRET` is unset or blank. Nothing is read or stored. Set the secret, redeploy, then redeliver from GitHub. |
 | `internal_error` | 500 | yes | Anything else that failed while handling the request. `GET /api/progress/digest` uses this JSON body too. Success from that route stays `text/plain`. |
 
 `fix` tells the caller what to change. It is a sentence, specific to the code, and overridable per response when the default would be the wrong instruction (a wrong dashboard password does not ask for `MC_TOKEN`).

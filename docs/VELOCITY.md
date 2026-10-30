@@ -265,3 +265,88 @@ and a resolve path, so those come before any page.
    re-send, behind `brief.alerts.enabled` (default false) until the owner's first backlog clear.
    Shipped as `GET /api/brief/alerts` and `POST /api/brief/alerts/evaluate`. Review-SLA alerts
    are not sent. No other pushes.
+
+## Absence sweeper
+
+Issue #79, Gibson doc 33 (draft, non-normative). A stuck PR, a silent consumer, an aging decision, and an unexplained pause are things that did not happen, so no webhook delivers them. The sweeper writes them to the `gh_events` inbox as synthetic events ([EVENTS.md](EVENTS.md#synthetic-rows)). It sends no message, invokes no Spec Writer, and queues no work.
+
+### What is shipped and what is not
+
+Shipped: `POST /api/sweep` (one run), `GET /api/sweep` (read-only status), `POST /api/sweep/consumers` (registrations), the three sweeper observation kinds on `POST /api/ingest`, the brief's Paused section, the manual runner `scripts/sweep-once.sh`, and an inert five-minute example in `docs/examples/absence-sweep.cron.example`, and the queue and PR producer `scripts/sweep-producer.sh` (off by default; see [Producer](#producer)).
+
+Not performed: no `vercel.json` cron, no launchd job, no Mini change, no collector scheduling, no producer config installed or enabled, no live GitHub collection, no consumer registration, and no live migration. The five-minute cadence and its operational acceptance are left for the owner. Until registrations and observations exist, the checks report `not_configured` or `unknown`, never `clear`.
+
+### Conditions
+
+All thresholds, ages, freshness, repeats, and retention use database time. Each check reads one instant (`clock_timestamp()`) after taking its lock; the host clock and any caller "now" are never used. Source timestamps (`observed_at`, `opened_at`, `paused_at`, `until`) are facts compared against that clock.
+
+| Condition | Fires when | Clears when | Unknown when |
+| --- | --- | --- | --- |
+| `consumer-silent` | An enabled consumer has ready work and no `session_end`, `milestone`, or `status` from one of its registered reporters within `max_silence_hours` (default 3). A never-seen consumer gets that grace from `registered_at`. | The queue is measured empty, a matching work event lands, the consumer is disabled, or its mapped scheduler job is validly held (reported as `held`). | The collector queue is stale, incomplete, or missing, or the mapped scheduler job is unknown. |
+| `pr-stuck` | A non-draft open PR is older than `brief.stuckPrHours` (default 48), is conflicting, or has its required checks green at the exact head for 30 minutes with no review started at that head. A proven age or conflict term fires even when the green or review facts are unknown. | A fresh complete snapshot shows it closed (absent) or every term false. | The repository's newest snapshot is stale, incomplete, or missing. A repository with no known PR is still reported unknown as `repo:<owner/name>` (not latched, never emitted), so an unmeasured repository is never a clear. |
+| `pause-unexplained` | A fresh paused job is neither held nor expired: no citation, or no future `until`. | The job is active, held, or expired (expired wins for the same pause). | The job record is stale. |
+| `pause-expired` | A fresh paused job's explicit `until` is at or before database time. Expiry is never inferred from `paused_at`; the draft's 72 hour maximum is advisory. | The job is active, or `until` moves into the future with a citation (held). | The job record is stale. |
+| `resume-uncited` | The current transition is an observed paused-to-active change with no citation of its own. A first active observation is not a resume. The pause's citation never covers the resume. | A citation is added to that same transition, or a later transition replaces it. | Never; it is a recorded transition. |
+| `decision-aging` | An open decision (or a deferral whose `defer_until` has passed) is 14 days old by `opened_at`, otherwise `first_seen_at`. The decisions table is authoritative. | It is decided, withdrawn, removed, or validly deferred (`held`). Removal is proven by looking up the latched key itself, never by its absence from the bounded scan of aging candidates. | The row has neither timestamp. |
+| `dispatch-ready-empty` | A fresh complete `issue_dispatch` queue shows raw unspecced issues and zero dispatch-ready ones, continuously for one hour. | Ready work appears or the raw backlog disappears. | The queue is stale or incomplete. |
+
+`held` is the non-alerting verdict for a cited, unexpired pause, a held consumer, and a valid deferral. It clears an active latch like `clear` does.
+
+Combined predicates use three-valued logic: one true term makes an OR true, one false term makes an AND false, anything else undecided is unknown.
+
+### Latches and repeats
+
+`sweep_latches` holds one row per condition and entity, independent of inbox retention. First firing writes one event at once. While it keeps firing, it writes again only 12 hours after its last emission (this repeat rule applies to every condition, including `decision-aging`). Active to clear writes exactly one `<condition>-cleared`. Already clear writes nothing; a new proven episode writes at once. Unknown never writes and never clears, and leaves `active`, `episode`, `seq`, and `last_emitted_at` alone.
+
+Every domain runs in its own transaction: `pg_advisory_xact_lock` on the domain, one database instant, evidence read with `for share` row locks, latch rows locked `for update`, inbox insert, latch update, commit. A concurrent run waits on the lock and then sees the committed latches. A latch already evaluated at a later instant is not overwritten. Delivery ids are deterministic per episode and sequence, so a retry after a committed run whose response was lost writes nothing new. There are no wall-clock buckets. A failed statement aborts only its own domain, which reports `unknown` with an error; the other domains still run. Each domain visits at most 500 entities per run (active latches first); `complete: false` and `unvisited` say so, and unvisited entities are not clear.
+
+### Evidence
+
+Only trusted writers create evidence. Scheduler, queue, and PR observations need `MC_TOKEN` on `POST /api/ingest`; registrations and runs need `MC_TOKEN` or the signed-in dashboard. A generic `status:write` credential, OAuth, or an open dashboard cannot alter these facts, spoof the reserved kinds, manufacture an empty queue, or clear an alarm. Every observation is validated and bounded before any write, and its audit row and projection commit together. The sweeper never reads `events.detail`.
+
+- Scheduler jobs (`sweep.scheduler_job`): one row per `source`/`job_id` in `scheduler_jobs`, ordered by the source's monotonic `transition`. See [API.md](API.md#sweeper-observations) for replay rules.
+- Queues (`sweep.queue`): `issue_dispatch` ready is open issues labelled `dispatch-ready` and not blocked; raw is open issues with neither label (unspecced). `pr_review` ready is open non-draft PRs at their current head waiting on a reviewer; raw is every open PR. Open counts minus blocked counts are not a classification. A consumer's own claim that nothing is ready is not evidence. Local task queues use the task table directly: queued, this platform or `any`, unpinned or pinned to the registered machine.
+- PRs (`sweep.pr_snapshot`): every open PR in one repository at one instant. `green_since` is the database receipt time of the first observation with required checks green at that head; a head or check-state change, or a gap longer than the freshness window, resets it.
+- The existing `repo_snapshots` ages and stuck lists are not used as the sweeper clock: they lack raw timestamps and review-start facts.
+
+Freshness defaults to 30 minutes, twice the 15 minute collector tick. A source may send `stale_after_minutes` (5 to 1440) with each observation. Stale, failed, or truncated evidence is unknown, never zero, and an older success never replaces a newer failure.
+
+### Producer
+
+`scripts/sweep-producer.sh --repo owner/name` measures one repository and POSTs `sweep.queue` (`issue_dispatch`) and `sweep.pr_snapshot` with `MC_TOKEN`. `--dry-run` prints both envelopes and posts nothing. `scripts/collect-progress.sh` runs it per repo on each tick, as a child process whose failure never stops the progress tick; `--backfill` never runs it, so no historical tick carries current queue or PR state. The installer copies the script beside the collector and changes nothing else.
+
+It is off until `sweep-producer.config.json` (beside the script, or `MC_SWEEP_PRODUCER_CONFIG`) sets `"enabled": true`. That file is separate from `progress.config.json` and from the dashboard's repo list, which carry no readiness policy. It names the `source` id and, per repo, the `queue` id, `ready_labels`, `blocked_labels` (may be `[]`, must be stated), optional `raw_exclude_labels`, `required_checks` (context names), and an optional `review_start.status_context`. `scripts/sweep-producer.config.example.json` is an inert example. A repo with no entry is unconfigured: nothing is emitted and readiness is never guessed. Label and context names compare case-insensitively.
+
+- Queue: every open issue with its labels, paged to at most 1,000, then read a second time; the set is complete only when both reads have the same issues and labels and every issue's whole label set is present on both reads (an issue with more than 50 labels on either read makes the queue `complete: false`). Ready has a ready label and no blocked label; raw has no ready, blocked, or excluded label. Counts are the whole set; refs are the 50 lowest numbers.
+- PRs: every open PR (at most 200) with raw `createdAt`, draft, mergeability, head, the required contexts on the head commit, and reviews. A second pass re-reads every head; a moved head or a changed open set makes the snapshot incomplete. A missing, truncated, or unconfigured required context is `unknown`, never green, and a rollup not at the head is `unknown`. A published review counts only at the current head. `started: false` is sent only when the configured review-start status context is absent from a complete context list at the head; otherwise `review` is omitted.
+- Any GitHub failure, rate limit, timeout, malformed page, cap overflow, or a set that changed while paging is a newer `complete: false` observation with a short error, never a zero or an empty list. Each repo and each subject is independent.
+- Sequence numbers are persisted per subject in `MC_SWEEP_STATE_DIR` under a lock held for the whole pending replay, collect, `seq` allocation, persist, and post, so a later collection always has the higher `seq`. The lock is a kernel `flock(2)` (taken through `perl`) on `<subject>.flock` held by the producer's own process, so the kernel releases it whenever the process exits or is killed; there is no owner PID file or stale-lock recovery, and lock files are never removed. A run waits up to `MC_SWEEP_LOCK_WAIT` seconds (default 300, `0` tries once) and otherwise skips that subject with no collection or post. The body is stored before the POST; an unacknowledged POST (transport failure, `429`, `5xx`) is retried first on the next run with the same `seq` and the same bytes. A `4xx` rejection or a `replay`/`older` answer to a new `seq` is logged as `REJECTED` or `STALE` and the run exits non-zero. State never holds a token, and response bodies are not printed.
+
+### Consumer liveness and provenance
+
+`events.principal_kind` and `events.principal_id` record the verified caller of `POST /api/ingest` and MCP reporting (`report_status`, `update_task`). A consumer registration lists the reporters whose work events count. Only a matching authenticated work event proves liveness; an `agent_id` in a body is not enough, and heartbeats and errors never count. Events stored before these columns existed, dev-open writes, and the task REST routes carry no provenance and are unmeasured. That is the baseline: a consumer registered today is measured from its registration, not from history.
+
+A validly held scheduler job mapped to a consumer suppresses that consumer's silence alarm. It does not change the brief's coordinator verdict: the `COORDINATOR` line and its `NOT WORKING` / `FAILING` wording are unchanged.
+
+### Brief: Paused
+
+The brief (route and `scripts/morning-brief.sh`) gains a Paused section after the decisions:
+
+```
+PAUSED (2) — job, age, reason, until, decision
+  mini/carmack-review  64.0h  UNEXPLAINED  reason: -  until: -  decision: -
+  mini/nightly  3.0h  held  reason: owner travel  until: 2026-10-31T00:00:00.000Z  decision: mrhinkle/agent-kontrol#79
+HELD VERSUS UNEXPLAINED: 1 held, 1 unexplained, 0 expired
+```
+
+A stale job is listed as `??` with its last report age, and the heading becomes `PAUSED: DATA INCOMPLETE — n job(s) stale; known rows below`. A failed read, no database, or no job ever reported is `PAUSED: DATA INCOMPLETE (...)`, never `none`. The script reads `GET /api/sweep`; it never guesses scheduler state. Brief alert switches and outbound messages are unchanged: the sweeper does not notify.
+
+### Retention
+
+Each run deletes inbox rows older than 30 days by database time in indexed batches (1,000 per batch, 10 per run). See [EVENTS.md](EVENTS.md#retention).
+
+### Running it
+
+`scripts/sweep-once.sh` posts one run with `MC_URL` and `MC_TOKEN` from the environment and prints the result. `docs/examples/absence-sweep.cron.example` is an inert five-minute line for that script; nothing installs it.
+
+Rollback: revert the change. The new tables and columns are additive and inert without the routes; events stop.

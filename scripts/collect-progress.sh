@@ -530,6 +530,20 @@ collect_repo() {
     }'
 }
 
+# Sweeper evidence (#79): scripts/sweep-producer.sh, installed beside this
+# script. It is off unless its own config (not this one, and not the dashboard
+# repo list) sets enabled true and maps the repo. It runs as a child process,
+# so its failure never stops this tick. Backfill never calls it.
+SWEEP_PRODUCER="${MC_SWEEP_PRODUCER_SCRIPT:-$SCRIPT_DIR/sweep-producer.sh}"
+
+run_sweep_producer() {
+  local repo="$1"
+  [[ -f "$SWEEP_PRODUCER" ]] || return 0
+  local args=(--repo "$repo")
+  if [[ $DRY_RUN -eq 1 ]]; then args+=(--dry-run); fi
+  MC_URL="${MC_URL:-}" MC_TOKEN="${MC_TOKEN:-}" MC_ENV_FILE=/dev/null bash "$SWEEP_PRODUCER" "${args[@]}" </dev/null >&2
+}
+
 run_tick() {
   local now since payloads=()
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -539,6 +553,7 @@ run_tick() {
     IFS='|' read -r repo label blocked_label short <<<"$entry"
     payloads+=("$(collect_repo "$repo" "$label" "$blocked_label" "$since" "$short")")
     sync_repo_decisions "$repo" "$short" || log "decisions: sync failed for $repo"
+    run_sweep_producer "$repo" || log "sweep producer: failed for $repo; the progress tick continues"
   done
 
   local body

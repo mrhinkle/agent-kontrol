@@ -1,10 +1,11 @@
-import { createMcpHandler, withMcpAuth } from "mcp-handler";
+import { createMcpHandler, getPublicOrigin, withMcpAuth } from "mcp-handler";
 import { z } from "zod";
-import { actorFromPrincipal, currentActor, runWithActor } from "@/lib/actor";
+import { currentActor, runWithPrincipal } from "@/lib/actor";
 import { activityDetail, readReceipt, withReceipt } from "@/lib/activity";
 import { apiError, memoryKeyError, toolResultFromCaught, type McpToolResult } from "@/lib/api-error";
 import { secretsMatch, verifyAccessToken } from "@/lib/authcrypto";
 import { resolveAgentCredential } from "@/lib/credentials";
+import { chargeCredentialRequest, rateLimitedResponse } from "@/lib/credential-rate-limit";
 import { isConfigured } from "@/lib/db";
 import {
   demoClaimTaskTool,
@@ -791,18 +792,53 @@ async function enforceMcpScope(req: Request): Promise<Response | null> {
   return scopeDenied(decision.body);
 }
 
+const RESOURCE_METADATA_PATH = "/.well-known/oauth-protected-resource";
+
+/**
+ * One charge per HTTP request to /api/mcp made with an agent credential:
+ * an initialize, a notification, a POST batch, a GET that opens the stream,
+ * and a DELETE each count once. Tool calls are not counted separately, and a
+ * held stream does not tick. Runs after enforceMcpScope, so a 403 costs
+ * nothing, and here rather than in verifyToken, so a 429 is not reported as
+ * 401. A credential revoked or expired while this request waited is 401 with
+ * WWW-Authenticate. MC_TOKEN and OAuth are not metered.
+ */
+async function meterMcpRequest(req: Request, principal: ReturnType<typeof principalFromMcpAuth>): Promise<Response | null> {
+  if (principal?.kind !== "agent") return null;
+  const charged = await chargeCredentialRequest(req, principal.id);
+  if (charged.status === "ok") return null;
+  if (charged.status === "limited") return rateLimitedResponse(charged);
+  if (charged.status === "reject") {
+    // Same body and header mcp-handler sends for a bad bearer.
+    const metadata = `${getPublicOrigin(req)}${RESOURCE_METADATA_PATH}`;
+    return new Response(JSON.stringify({ error: "invalid_token", error_description: "Invalid token" }), {
+      status: 401,
+      headers: {
+        "WWW-Authenticate": `Bearer error="invalid_token", error_description="Invalid token", resource_metadata="${metadata}"`,
+        "content-type": "application/json",
+      },
+    });
+  }
+  return new Response(JSON.stringify({ error: "credential_store_unavailable" }), {
+    status: 503,
+    headers: { "content-type": "application/json" },
+  });
+}
+
 const authed = withMcpAuth(
   async (req) => {
     const denied = await enforceMcpScope(req);
     if (denied) return denied;
     const principal = principalFromMcpAuth(req.auth);
+    const metered = await meterMcpRequest(req, principal);
+    if (metered) return metered;
     if (!principal) return handler(req);
-    return runWithActor(actorFromPrincipal(principal), () => handler(req));
+    return runWithPrincipal(principal, () => handler(req));
   },
   verifyToken,
   {
     required: true,
-    resourceMetadataPath: "/.well-known/oauth-protected-resource",
+    resourceMetadataPath: RESOURCE_METADATA_PATH,
   },
 );
 

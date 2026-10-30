@@ -1,6 +1,12 @@
 import packageJson from "../../package.json";
 import { API_ERRORS } from "@/lib/api-error";
 import { LABEL_MAX } from "@/lib/credentials";
+import {
+  DEFAULT_REQUESTS_PER_DAY,
+  DEFAULT_REQUESTS_PER_MINUTE,
+  RATE_LIMIT_MAX,
+  RATE_LIMIT_MIN,
+} from "@/lib/credential-limits";
 import { DECISION_STATUSES, LIST_SHAPES, LIST_STATUSES } from "@/lib/decisions";
 import { PROGRESS_INGEST_KINDS } from "@/lib/progress-store";
 import { WINDOWS } from "@/lib/progress-config";
@@ -15,6 +21,9 @@ import { ACTIVITY_LIST, LIST_MAX } from "./list-params";
 import { RUNTIMES } from "./skills/types";
 import { WATCH_STATUSES } from "./watch";
 import { WATCH_SOURCES } from "./watch-sources";
+import { GH_ACCEPTED_EVENTS, GH_WEBHOOK_BODY_MAX_BYTES } from "./gh-events";
+import { CITATION_MAX, PRINCIPAL_KINDS, PRS_MAX, QUEUE_CLASSIFICATIONS, REASON_MAX, REFS_MAX, SWEEP_OBSERVATION_KINDS } from "./sweep-evidence";
+import { DEFAULT_SILENCE_HOURS, DEFAULT_STALE_MINUTES, RETENTION_DAYS, SWEEP_CONDITIONS } from "./sweep-logic";
 
 /**
  * OpenAPI 3.1 for the documented REST routes.
@@ -223,6 +232,8 @@ export function openApiDocument(): Json {
       { name: "auth" },
       { name: "mcp" },
       { name: "watch" },
+      { name: "webhooks" },
+      { name: "sweep" },
     ],
     components: {
       securitySchemes: {
@@ -230,7 +241,8 @@ export function openApiDocument(): Json {
         bearerAuth: {
           type: "http",
           scheme: "bearer",
-          description: "MC_TOKEN, an akc_ agent credential, or an OAuth access token on the MCP transport.",
+          description:
+            "MC_TOKEN, an akc_ agent credential, or an OAuth access token on the MCP transport. An akc_ credential has a request quota: requests per minute and per UTC day (defaults 60 and 10000). Each authorized request counts once. Over a limit is 429 rate_limited with retryable true, a Retry-After header in seconds, and retry_after, window, and limit in the body. MC_TOKEN, OAuth, and the dashboard session are not metered.",
         },
         mcToken: {
           type: "http",
@@ -238,12 +250,19 @@ export function openApiDocument(): Json {
           bearerFormat: "MC_TOKEN",
           description: "Operator MC_TOKEN. An agent credential and an OAuth access token are not accepted on operations that use this scheme.",
         },
+        githubWebhookSignature: {
+          type: "apiKey",
+          in: "header",
+          name: "X-Hub-Signature-256",
+          description:
+            "sha256= followed by 64 lowercase hex characters: the HMAC SHA-256 of the exact request body bytes, keyed with MC_GITHUB_WEBHOOK_SECRET. Compared in constant time. A session cookie, MC_TOKEN, an agent credential, and an OAuth token are not accepted in its place.",
+        },
         agentCredential: {
           type: "http",
           scheme: "bearer",
           bearerFormat: "akc_",
           description:
-            "Per-agent akc_ credential. MC_TOKEN, the dashboard session, an OAuth access token, and a dev-open caller are not accepted on operations that use this scheme.",
+            "Per-agent akc_ credential. MC_TOKEN, the dashboard session, an OAuth access token, and a dev-open caller are not accepted on operations that use this scheme. Each authorized request counts against the credential's per-minute and per-UTC-day quota; over a limit is 429 rate_limited with Retry-After.",
         },
       },
       schemas: {
@@ -322,6 +341,236 @@ export function openApiDocument(): Json {
             project: { type: "string" },
             summary: { type: "string" },
             status: { type: "string" },
+          },
+        },
+        SweepIngest: {
+          type: "object",
+          required: ["agent_id", "kind", "observation"],
+          description: "A trusted sweeper observation on POST /api/ingest. Only the legacy MC_TOKEN may send one. principal_kind and principal_id come from authentication, never from the body.",
+          properties: {
+            agent_id: { type: "string", description: "Reporter label for the audit trail. Not a credential and not provenance." },
+            kind: { type: "string", enum: [...SWEEP_OBSERVATION_KINDS] },
+            observation: {
+              oneOf: [ref("SweepSchedulerObservation"), ref("SweepQueueObservation"), ref("SweepPrSnapshotObservation")],
+            },
+          },
+        },
+        SweepSchedulerObservation: {
+          type: "object",
+          additionalProperties: false,
+          required: ["source", "job_id", "state", "transition", "observed_at"],
+          description: "kind sweep.scheduler_job. transition is the source's monotonic transition id for this job. A lower transition is audited and ignored. The same transition refreshes: a non-null field adds or replaces, an omitted or null field keeps the stored value, and a different state is 409. A higher transition starts fresh fields; a paused-to-active one is a resume whose decision must be its own citation.",
+          properties: {
+            source: { type: "string", pattern: "^[a-z0-9][a-z0-9._-]{0,63}$" },
+            job_id: { type: "string", pattern: "^[a-z0-9][a-z0-9._-]{0,63}$" },
+            state: { type: "string", enum: ["active", "paused"] },
+            transition: { type: "integer", minimum: 1 },
+            paused_at: { type: ["string", "null"], format: "date-time", description: "Paused observations only." },
+            paused_reason: { type: ["string", "null"], maxLength: REASON_MAX, description: "Paused observations only." },
+            until: { type: ["string", "null"], format: "date-time", description: "Paused observations only. Expiry is never inferred from paused_at." },
+            decision: { type: ["string", "null"], maxLength: CITATION_MAX, description: "Citation for this transition: decision:<id>, owner/name#<n>, an https URL, or doc:<path>. Syntax only; not proof of approval." },
+            observed_at: { type: "string", format: "date-time", description: "Source instant. Stored as a fact; the database clock decides freshness and expiry." },
+            stale_after_minutes: { type: "integer", minimum: 5, maximum: 1440, default: DEFAULT_STALE_MINUTES },
+          },
+        },
+        SweepQueueObservation: {
+          type: "object",
+          additionalProperties: false,
+          required: ["source", "queue", "classification", "seq", "observed_at", "complete"],
+          description: "kind sweep.queue. issue_dispatch: ready is open issues labelled dispatch-ready and not blocked; raw is open issues with neither label. pr_review: ready is open non-draft PRs waiting on review; raw is every open PR. complete false is unknown, never zero. A seq at or below the stored one is audited and ignored.",
+          properties: {
+            source: { type: "string", pattern: "^[a-z0-9][a-z0-9._-]{0,63}$" },
+            queue: { type: "string", maxLength: 128, description: "Stored lowercase, e.g. issues:owner/name." },
+            classification: { type: "string", enum: [...QUEUE_CLASSIFICATIONS] },
+            repo: { type: ["string", "null"] },
+            seq: { type: "integer", minimum: 1 },
+            observed_at: { type: "string", format: "date-time" },
+            complete: { type: "boolean" },
+            error: { type: ["string", "null"], maxLength: 300 },
+            ready: ref("SweepQueueCount"),
+            raw: ref("SweepQueueCount"),
+            stale_after_minutes: { type: "integer", minimum: 5, maximum: 1440, default: DEFAULT_STALE_MINUTES },
+          },
+        },
+        SweepQueueCount: {
+          type: "object",
+          additionalProperties: false,
+          required: ["count"],
+          properties: {
+            count: { type: "integer", minimum: 0 },
+            refs: { type: "array", maxItems: REFS_MAX, items: { type: "string", maxLength: 200 } },
+          },
+        },
+        SweepPrSnapshotObservation: {
+          type: "object",
+          additionalProperties: false,
+          required: ["source", "repo", "seq", "observed_at", "complete"],
+          description: `kind sweep.pr_snapshot. Every open PR in one repository. complete true means the list is the whole open set (at most ${PRS_MAX}); an open PR it omits is closed. complete false records the failure and makes every PR in the repository unknown.`,
+          properties: {
+            source: { type: "string", pattern: "^[a-z0-9][a-z0-9._-]{0,63}$" },
+            repo: { type: "string", description: "owner/name. Compared case-insensitively." },
+            seq: { type: "integer", minimum: 1 },
+            observed_at: { type: "string", format: "date-time" },
+            complete: { type: "boolean" },
+            error: { type: ["string", "null"], maxLength: 300 },
+            stale_after_minutes: { type: "integer", minimum: 5, maximum: 1440, default: DEFAULT_STALE_MINUTES },
+            prs: {
+              type: "array",
+              maxItems: PRS_MAX,
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["number", "draft", "opened_at", "mergeable", "head_sha"],
+                properties: {
+                  number: { type: "integer", minimum: 1 },
+                  title: { type: "string", maxLength: 200 },
+                  url: { type: "string", maxLength: 300 },
+                  draft: { type: "boolean" },
+                  opened_at: { type: "string", format: "date-time" },
+                  mergeable: { type: "string", enum: ["mergeable", "conflicting", "unknown"] },
+                  head_sha: { type: "string", pattern: "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+                  required_checks: {
+                    type: ["object", "null"],
+                    additionalProperties: false,
+                    required: ["state"],
+                    description: "Rollup of the required checks at head_sha. unknown when the required set is not known.",
+                    properties: {
+                      state: { type: "string", enum: ["success", "pending", "failure", "unknown"] },
+                      head_sha: { type: "string" },
+                    },
+                  },
+                  review: {
+                    type: ["object", "null"],
+                    additionalProperties: false,
+                    required: ["started"],
+                    properties: {
+                      started: { type: "boolean" },
+                      head_sha: { type: "string", description: "The head the latest review started on. Counts only when it equals head_sha." },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        SweepConsumer: {
+          type: "object",
+          additionalProperties: false,
+          required: ["id", "agent_ids", "reporters", "queue"],
+          properties: {
+            id: { type: "string", pattern: "^[a-z0-9][a-z0-9._-]{0,63}$" },
+            agent_ids: { type: "array", minItems: 1, maxItems: 20, items: { type: "string" }, description: "Agent id slugs as report() stores them." },
+            reporters: {
+              type: "array",
+              minItems: 1,
+              maxItems: 20,
+              description: "Authenticated principals whose session_end, milestone, or status events prove liveness. An agent_id alone proves nothing; events with no recorded principal are unmeasured.",
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["kind", "id"],
+                properties: {
+                  kind: { type: "string", enum: [...PRINCIPAL_KINDS] },
+                  id: { type: "string", description: "mc-token, an akc_ credential id, an OAuth client id, or operator." },
+                },
+              },
+            },
+            queue: {
+              oneOf: [
+                {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["type", "platform"],
+                  properties: { type: { const: "tasks" }, platform: { type: "string" }, machine: { type: ["string", "null"] } },
+                  description: "Queued tasks for this platform or any, unpinned or pinned to machine: what claimNextTask would hand out.",
+                },
+                {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["type", "queue"],
+                  properties: { type: { const: "collector" }, queue: { type: "string" } },
+                  description: "A sweep.queue queue id. Unknown unless the newest observation is complete and fresh.",
+                },
+              ],
+            },
+            scheduler: {
+              type: ["object", "null"],
+              additionalProperties: false,
+              required: ["source", "job_id"],
+              properties: { source: { type: "string" }, job_id: { type: "string" } },
+              description: "A held pause of this job suppresses consumer-silent. It does not change the brief's coordinator verdict.",
+            },
+            enabled: { type: "boolean", default: true },
+            max_silence_hours: { type: "number", exclusiveMinimum: 0, maximum: 168, default: DEFAULT_SILENCE_HOURS },
+          },
+        },
+        SweepCheck: {
+          type: "object",
+          required: ["check", "state", "evaluated_at", "complete", "unvisited", "counts", "emitted", "entities", "entities_truncated", "error"],
+          properties: {
+            check: { type: "string", enum: [...SWEEP_CONDITIONS] },
+            state: { type: "string", enum: ["firing", "clear", "held", "unknown", "not_configured"] },
+            evaluated_at: { type: ["string", "null"], format: "date-time", description: "Database instant read after the check's lock." },
+            complete: { type: "boolean", description: "False when entities were left unvisited. Unvisited entities are not clear." },
+            unvisited: { type: "integer" },
+            counts: { type: "object", properties: { firing: { type: "integer" }, clear: { type: "integer" }, held: { type: "integer" }, unknown: { type: "integer" } } },
+            emitted: { type: "array", items: { type: "string" }, description: "gh_events delivery ids written by this run (sweep: namespace)." },
+            entities: { type: "array", maxItems: 100, items: { type: "object", additionalProperties: true } },
+            entities_truncated: { type: "boolean" },
+            error: { type: ["string", "null"], description: "Why the check is unknown. Never the exception text." },
+            note: { type: "string" },
+          },
+        },
+        SweepRun: {
+          type: "object",
+          required: ["ok", "checks", "retention"],
+          properties: {
+            ok: { type: "boolean", const: true },
+            checks: { type: "array", items: ref("SweepCheck") },
+            retention: {
+              type: "object",
+              required: ["state", "deleted", "batches", "complete", "horizon_days", "error"],
+              properties: {
+                state: { type: "string", enum: ["ok", "unknown"] },
+                evaluated_at: { type: ["string", "null"], format: "date-time" },
+                deleted: { type: "integer" },
+                batches: { type: "integer" },
+                complete: { type: "boolean", description: "False when the batch cap stopped before every expired row was deleted." },
+                horizon_days: { type: "integer", const: RETENTION_DAYS },
+                error: { type: ["string", "null"] },
+              },
+            },
+          },
+        },
+        PausedSection: {
+          type: "object",
+          required: ["measured", "error", "jobs_total", "jobs", "truncated", "counts"],
+          description: "measured false, or jobs_total 0, is DATA INCOMPLETE in the brief, never none.",
+          properties: {
+            measured: { type: "boolean" },
+            error: { type: ["string", "null"] },
+            generated_at: { type: ["string", "null"], format: "date-time" },
+            jobs_total: { type: ["integer", "null"] },
+            truncated: { type: "boolean" },
+            counts: { type: "object", properties: { held: { type: "integer" }, unexplained: { type: "integer" }, expired: { type: "integer" }, unknown: { type: "integer" } } },
+            jobs: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  source: { type: "string" },
+                  job_id: { type: "string" },
+                  classification: { type: "string", enum: ["held", "unexplained", "expired", "unknown"] },
+                  state: { type: "string", enum: ["active", "paused"] },
+                  age_hours: { type: ["number", "null"] },
+                  report_age_hours: { type: ["number", "null"] },
+                  paused_at: { type: ["string", "null"] },
+                  reason: { type: ["string", "null"] },
+                  until: { type: ["string", "null"] },
+                  decision: { type: ["string", "null"] },
+                },
+              },
+            },
           },
         },
         RepoInput: {
@@ -969,6 +1218,29 @@ export function openApiDocument(): Json {
               items: { type: "string", enum: [...SCOPES] },
             },
             expires_at: { type: ["string", "null"], format: "date-time" },
+            rate_limit_per_minute: {
+              type: ["integer", "null"],
+              minimum: RATE_LIMIT_MIN,
+              maximum: RATE_LIMIT_MAX,
+              description: `Requests per clock minute. Omitted or null is ${DEFAULT_REQUESTS_PER_MINUTE}.`,
+            },
+            rate_limit_per_day: {
+              type: ["integer", "null"],
+              minimum: RATE_LIMIT_MIN,
+              maximum: RATE_LIMIT_MAX,
+              description: `Requests per UTC day, reset at 00:00 UTC. Omitted or null is ${DEFAULT_REQUESTS_PER_DAY}.`,
+            },
+          },
+        },
+        UpdateCredentialLimits: {
+          type: "object",
+          additionalProperties: false,
+          required: ["id"],
+          minProperties: 2,
+          properties: {
+            id: { type: "string" },
+            rate_limit_per_minute: { type: "integer", minimum: RATE_LIMIT_MIN, maximum: RATE_LIMIT_MAX },
+            rate_limit_per_day: { type: "integer", minimum: RATE_LIMIT_MIN, maximum: RATE_LIMIT_MAX },
           },
         },
         WatchBeatWrite: {
@@ -1058,12 +1330,26 @@ export function openApiDocument(): Json {
         post: operation({
           operationId: "ingestStatus",
           tags: ["fleet"],
-          summary: "Record liveness from a hook, watcher, or daemon.",
+          summary: "Record liveness from a hook, watcher, or daemon, or a trusted sweeper observation.",
+          description:
+            "A ReportInput event stores the verified caller as principal_kind and principal_id (legacy, agent, oauth, or session). Fields of that name in the body are ignored, and a dev-open write stores null provenance. A SweepIngest body (kind sweep.scheduler_job, sweep.queue, or sweep.pr_snapshot) needs the legacy MC_TOKEN: an agent credential with status:write, an OAuth token, or a dev-open caller is 403 trusted_writer_required and nothing is written. Any other kind that starts with sweep. or names a synthetic sweeper event is reserved: 403 for those callers, 400 for MC_TOKEN. An observation is validated before any write; an invalid one is 400 validation_failed with fields. A valid one writes its audit row and its projection in one transaction and answers outcome applied, refreshed, older, or replay. A scheduler observation that changes state without a higher transition is 409 conflict.",
           security: bearerOnly,
-          requestBody: body(ref("ReportInput")),
+          requestBody: body({ oneOf: [ref("ReportInput"), ref("SweepIngest")] }),
           responses: {
-            "200": jsonResponse("Stored, or dropped in demo mode.", { type: "object", properties: { ok: { type: "boolean" } } }),
+            "200": jsonResponse("Stored, or dropped in demo mode. For an observation: what it did to the projection.", {
+              type: "object",
+              properties: {
+                ok: { type: "boolean" },
+                kind: { type: "string" },
+                outcome: { type: "string", enum: ["applied", "refreshed", "older", "replay"] },
+                observation_id: { type: "string" },
+                received_at: { type: "string", format: "date-time", description: "Database receipt instant." },
+              },
+            }),
             ...flatErrors,
+            "403": jsonResponse("An agent credential lacks status:write, or a non-MC_TOKEN caller sent a reserved sweeper kind (trusted_writer_required).", ref("Error")),
+            "409": jsonResponse("A scheduler observation changed state without a higher transition. Nothing was written.", ref("Error")),
+            "503": jsonResponse("The database clock could not be read. Nothing was written. Retry.", ref("Error")),
           },
         }),
       },
@@ -1775,8 +2061,24 @@ export function openApiDocument(): Json {
           requestBody: body(ref("CreateCredential")),
           responses: {
             "200": jsonResponse("The new credential, including token once.", { type: "object" }),
-            "400": jsonResponse("The label, scopes, or expiry was rejected.", ref("ErrorMessage")),
+            "400": jsonResponse("The label, scopes, expiry, or a limit was rejected.", ref("ErrorMessage")),
             "401": jsonResponse("No dashboard session, or an Authorization header was sent.", ref("ErrorMessage")),
+            "500": jsonResponse("The store failed.", ref("ErrorMessage")),
+          },
+        }),
+        patch: operation({
+          operationId: "updateCredentialLimits",
+          tags: ["settings"],
+          summary: "Change a credential's request limits. Counted requests are kept.",
+          description:
+            "Dashboard session only. A request that sends Authorization is 401. Send id and one or both limits. A limit left out keeps its value. Unknown fields, null, strings, fractions, zero, negatives, and values over 1000000 are 400. The requests already counted in the current minute and UTC day still count.",
+          security: sessionOnly,
+          requestBody: body(ref("UpdateCredentialLimits")),
+          responses: {
+            "200": jsonResponse("The credential with its new limits.", { type: "object" }),
+            "400": jsonResponse("The body is not JSON, or a field was rejected.", ref("ErrorMessage")),
+            "401": jsonResponse("No dashboard session, or an Authorization header was sent.", ref("ErrorMessage")),
+            "404": jsonResponse("No credential has this id.", ref("ErrorMessage")),
             "500": jsonResponse("The store failed.", ref("ErrorMessage")),
           },
         }),
@@ -2124,6 +2426,7 @@ export function openApiDocument(): Json {
             ...flatErrors,
             "413": jsonResponse("The body is larger than 8 KiB.", ref("Error")),
             "415": jsonResponse("Content-Type is not application/json.", ref("Error")),
+            "429": jsonResponse("The credential's per-minute or per-UTC-day request quota is used. rate_limited, retryable true, with Retry-After seconds.", ref("Error")),
             "503": jsonResponse(
               "The credential store is unreachable, source binding is not configured, or the beat table is unavailable.",
               ref("Error"),
@@ -2146,7 +2449,135 @@ export function openApiDocument(): Json {
               properties: { beats: { type: "array", items: ref("WatchBeat") } },
             }),
             ...flatErrors,
+            "429": jsonResponse("The credential's per-minute or per-UTC-day request quota is used. rate_limited, retryable true, with Retry-After seconds.", ref("Error")),
             "503": jsonResponse("The credential store or the beat table is unavailable.", ref("Error")),
+          },
+        }),
+      },
+      "/api/sweep": {
+        get: operation({
+          operationId: "getSweepStatus",
+          tags: ["sweep"],
+          summary: "Read-only sweeper status: registrations, active latches, and the Paused section.",
+          description:
+            "Never writes. Every list is bounded and says when it is partial; more than 1000 scheduler jobs makes paused unmeasured rather than a partial count. Same access as the brief: the dashboard session, MC_TOKEN, or an agent credential with progress:read. Each part fails on its own: consumers or latches null with a line in errors, and paused.measured false. scripts/morning-brief.sh prints paused from this route when it cannot use GET /api/brief.",
+          security: cookieOrBearer,
+          responses: {
+            "200": jsonResponse("Status at one database instant.", {
+              type: "object",
+              required: ["generated_at", "consumers", "consumers_truncated", "latches", "latches_truncated", "paused", "errors"],
+              properties: {
+                generated_at: { type: "string", format: "date-time" },
+                consumers: { type: ["array", "null"], items: { type: "object", additionalProperties: true }, description: "At most 200." },
+                consumers_truncated: { type: "boolean", description: "True when more consumers exist; the list is partial and errors says so." },
+                latches: { type: ["array", "null"], items: { type: "object", additionalProperties: true }, description: "Active latches, at most 500." },
+                latches_truncated: { type: "boolean", description: "True when more active latches exist; the list is partial and errors says so." },
+                paused: ref("PausedSection"),
+                errors: { type: "array", items: { type: "string" } },
+              },
+            }),
+            "401": jsonResponse("The credential is missing or not valid.", ref("Error")),
+            "403": jsonResponse("An agent credential does not have progress:read.", ref("Error")),
+            "500": jsonResponse("The status read failed. internal_error, without the exception text.", ref("Error")),
+            "503": jsonResponse("setup_required: no database.", ref("Error")),
+          },
+        }),
+        post: operation({
+          operationId: "runSweep",
+          tags: ["sweep"],
+          summary: "Run the absence sweeper once.",
+          description:
+            `Only MC_TOKEN or the signed-in dashboard. An agent credential, an OAuth token, and a dev-open caller are refused. The body is ignored: there is no caller clock. Each check (${SWEEP_CONDITIONS.join(", ")}) runs in its own transaction with its own lock and one database instant, and reports firing, clear, held, unknown, or not_configured. A failed check is unknown with an error and does not stop the others. A firing condition writes one gh_events row at once and again only 12 hours after its last emission while it holds; a clear writes one <condition>-cleared row; unknown writes nothing and leaves the latch as it was. Delivery ids are sweep:<condition>:<entity digest>:e<episode>:s<seq> (cleared: sweep:<condition>-cleared:<digest>:e<episode>), so a retried or concurrent run cannot write a row twice. Retention then deletes inbox rows received more than ${RETENTION_DAYS} days ago in bounded batches. No notification is sent and no work is queued.`,
+          security: operatorSessionOrMcToken,
+          responses: {
+            "200": jsonResponse("The run completed. Read each check's state.", ref("SweepRun")),
+            "401": jsonResponse("No valid credential, including a dev-open caller with no credential.", ref("Error")),
+            "403": jsonResponse("trusted_writer_required, or insufficient_scope for an agent credential.", ref("Error")),
+            "500": jsonResponse("internal_error, without the exception text.", ref("Error")),
+            "503": jsonResponse("setup_required: no database.", ref("Error")),
+          },
+        }),
+      },
+      "/api/sweep/consumers": {
+        post: operation({
+          operationId: "registerSweepConsumer",
+          tags: ["sweep"],
+          summary: "Register or update one consumer for consumer-silent.",
+          description:
+            "Only MC_TOKEN or the signed-in dashboard. There are no implicit registrations; an empty registry makes consumer-silent not_configured. Validated before any write; unknown fields are rejected. registered_at is set on the first registration and never moved: a never-seen consumer gets max_silence_hours of grace from it. Send enabled false to retire a consumer. The registration and its audit row commit together.",
+          security: operatorSessionOrMcToken,
+          requestBody: body(ref("SweepConsumer")),
+          responses: {
+            "200": jsonResponse("Stored.", {
+              type: "object",
+              properties: {
+                ok: { type: "boolean", const: true },
+                id: { type: "string" },
+                registered_at: { type: "string", format: "date-time" },
+                created: { type: "boolean" },
+                consumer: ref("SweepConsumer"),
+              },
+            }),
+            "400": jsonResponse("invalid_json, or validation_failed with fields.", ref("Error")),
+            "401": jsonResponse("No valid credential, including a dev-open caller with no credential.", ref("Error")),
+            "403": jsonResponse("trusted_writer_required, or insufficient_scope for an agent credential.", ref("Error")),
+            "500": jsonResponse("internal_error, without the exception text.", ref("Error")),
+            "503": jsonResponse("setup_required: no database.", ref("Error")),
+          },
+        }),
+      },
+      "/api/webhooks/github": {
+        post: operation({
+          operationId: "postGithubWebhook",
+          tags: ["webhooks"],
+          summary: "Store one signed GitHub webhook delivery in gh_events.",
+          description:
+            `The signature is the only credential. Checks run in this order: MC_GITHUB_WEBHOOK_SECRET unset or blank is 503 not_configured; a missing or malformed X-Hub-Signature-256 is 401; the body is read from the stream and is 413 above ${GH_WEBHOOK_BODY_MAX_BYTES} bytes (Content-Length is not trusted); an HMAC that does not match the raw body bytes is 401; a bad X-GitHub-Event or X-GitHub-Delivery header is 400 validation_failed; a body that is not UTF-8 JSON is 400 invalid_json. Every one of those writes nothing and runs no SQL. A signed ping is 200. A signed event outside the accepted list is 202 and is not stored. An accepted event whose payload is not an object or lacks its required fields is 400 validation_failed. A new delivery is 200 with stored true and the row id. A delivery id already stored is 200 with duplicate true and the row is not changed. No database is 503 setup_required; a failed insert is 503 internal_error. Both are retryable and neither is a stored receipt. Delivery ids starting with sweep: are reserved and rejected.`,
+          security: [{ githubWebhookSignature: [] }],
+          parameters: [
+            {
+              name: "X-GitHub-Event",
+              in: "header",
+              required: true,
+              schema: { type: "string", pattern: "^[a-z][a-z_]{0,63}$" },
+              description: `Stored when one of ${GH_ACCEPTED_EVENTS.join(", ")}. ping is 200. Others are 202.`,
+            },
+            {
+              name: "X-GitHub-Delivery",
+              in: "header",
+              required: true,
+              schema: { type: "string", pattern: "^[A-Za-z0-9-]{1,128}$" },
+              description: "GitHub's delivery GUID. The dedupe key.",
+            },
+          ],
+          requestBody: body({ type: "object", additionalProperties: true, description: "The GitHub webhook payload, signed as sent." }),
+          responses: {
+            "200": jsonResponse("ping, a stored delivery, or a duplicate.", {
+              type: "object",
+              required: ["ok", "delivery_id"],
+              properties: {
+                ok: { type: "boolean", const: true },
+                stored: { type: "boolean" },
+                duplicate: { type: "boolean" },
+                id: { type: "string", description: "gh_events.id as a decimal string. Present when stored is true." },
+                event: { type: "string" },
+                delivery_id: { type: "string" },
+              },
+            }),
+            "202": jsonResponse("A signed event that is not in the accepted list. Not stored.", {
+              type: "object",
+              required: ["ok", "ignored", "event", "delivery_id"],
+              properties: {
+                ok: { type: "boolean", const: true },
+                ignored: { type: "boolean", const: true },
+                event: { type: "string" },
+                delivery_id: { type: "string" },
+              },
+            }),
+            "400": jsonResponse("invalid_json, or validation_failed for a header or payload field.", ref("Error")),
+            "401": jsonResponse("X-Hub-Signature-256 is missing, malformed, or does not match the body.", ref("Error")),
+            "413": jsonResponse(`The body is larger than ${GH_WEBHOOK_BODY_MAX_BYTES} bytes.`, ref("Error")),
+            "503": jsonResponse("not_configured (no secret), setup_required (no database), or internal_error (the insert failed). Redeliver.", ref("Error")),
           },
         }),
       },
