@@ -4,7 +4,10 @@
  * observation also passes the intake validators in sweep-evidence.ts.
  */
 import assert from "node:assert/strict";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { checkPrSnapshotObservation, checkQueueObservation } from "../src/lib/sweep-evidence";
@@ -42,6 +45,47 @@ function noSecret(...texts: string[]): void {
 function stateText(fx: Fixture): string {
   if (!fs.existsSync(fx.state)) return "";
   return fs.readdirSync(fx.state).filter((f) => f.endsWith(".json")).map((f) => fs.readFileSync(path.join(fx.state, f), "utf8")).join("\n");
+}
+
+// The producer's subject lock file: <state>/<sha256(kind|subject)[:32]>.flock.
+function lockFile(fx: Fixture, kindSubject: string): string {
+  return path.join(fx.state, crypto.createHash("sha256").update(kindSubject).digest("hex").slice(0, 32) + ".flock");
+}
+const QUEUE_SUBJECT = "sweep.queue|queue:issues:acme/widgets";
+
+/** Another process holding flock(2) on the file until killed. Resolves once it holds it. */
+function holdLock(file: string): Promise<ChildProcess> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("perl", ["-MFcntl=:flock", "-e",
+      'open(my $fh, ">>", $ARGV[0]) or die; flock($fh, LOCK_EX) or die; $| = 1; print "held\n"; sleep 600', file],
+      { stdio: ["ignore", "pipe", "inherit"] });
+    child.stdout!.once("data", () => resolve(child));
+    child.once("exit", (code) => reject(new Error(`lock holder exited ${code}`)));
+  });
+}
+
+/** True when no process holds the lock (taken and released at once). */
+function lockFree(file: string): boolean {
+  const r = spawnSync("perl", ["-MFcntl=:flock", "-e",
+    'open(my $fh, ">>", $ARGV[0]) or exit 2; exit(flock($fh, LOCK_EX | LOCK_NB) ? 0 : 1)', file]);
+  return r.status === 0;
+}
+
+async function until(what: string, test: () => boolean, ms = 10000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!test()) {
+    if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
+/** Start the producer and return the child, so a test can SIGKILL it mid-run. */
+function startProducer(fx: Fixture, args: string[], env: Record<string, string | undefined>): ChildProcess {
+  return spawn("bash", [path.join(__dirname, "sweep-producer.sh"), ...args], { env: fx.env(env), stdio: "ignore" });
+}
+
+function kill9(child: ChildProcess): Promise<void> {
+  return new Promise((resolve) => { child.once("exit", () => resolve()); child.kill("SIGKILL"); });
 }
 
 const ok = (name: string): PrFixture["contexts"] => [{ kind: "check", name }];
@@ -203,6 +247,10 @@ async function main() {
       ["labels changed while paging", (fx) => fx.issues(REPO, [{ number: 1, labels: [] }], { verify: [{ number: 1, labels: ["dispatch-ready"] }] }), /changed during collection/],
       ["verify read fails", (fx) => { fx.issues(REPO, [{ number: 1, labels: [] }]); fx.raw(REPO, "SweepIssuesVerify", "first", "", { exit: 1 }); }, /GitHub API request failed/],
       ["label overflow", (fx) => fx.issues(REPO, [{ number: 1, labels: ["x"], labelTotal: 51 }]), /more than 50 labels/],
+      ["label overflow only on the verification read, visible names unchanged", (fx) => {
+        const labels = ["dispatch-ready", ...Array.from({ length: 49 }, (_, i) => `other-${i}`)];
+        fx.issues(REPO, [{ number: 1, labels, labelTotal: 50 }], { verify: [{ number: 1, labels, labelTotal: 51 }] });
+      }, /more than 50 labels/],
       ["page 2 fails", (fx) => { fx.issues(REPO, Array.from({ length: 150 }, (_, i) => ({ number: i + 1, labels: ["dispatch-ready"] }))); fx.raw(REPO, "SweepIssues", "c1", null, { exit: 1 }); }, /GitHub API request failed/],
       ["rate limit", (fx) => fx.raw(REPO, "SweepIssues", "first", "", { exit: 1, stderr: "gh: API rate limit exceeded for user" }), /rate limited/],
       ["graphql rate limit", (fx) => fx.raw(REPO, "SweepIssues", "first", JSON.stringify({ errors: [{ type: "RATE_LIMITED", message: "x" }] })), /rate limited/],
@@ -349,7 +397,106 @@ async function main() {
       const times = obs.map((o) => o.observed_at);
       assert.deepEqual([...times].sort(), times, `${kind}: observed_at never goes backwards as seq rises`);
     }
-    assert.ok(!fs.readdirSync(fx.state).some((f) => f.endsWith(".lock")), "locks released");
+    const locks = fs.readdirSync(fx.state).filter((f) => f.endsWith(".flock"));
+    assert.equal(locks.length, 2, "one lock file per subject, kept");
+    for (const f of locks) assert.ok(lockFree(path.join(fx.state, f)), "locks released");
+  });
+
+  await check("subject lock: a live holder times the run out with no POST and keeps its lock", async () => {
+    reset();
+    const fx = new Fixture(root);
+    standard(fx);
+    fx.config(baseConfig({ [REPO]: repoConfig(REPO) }));
+    fs.mkdirSync(fx.state, { recursive: true, mode: 0o700 });
+    const file = lockFile(fx, QUEUE_SUBJECT);
+    const holder = await holdLock(file);
+    const inode = fs.statSync(file).ino;
+    try {
+      const started = Date.now();
+      const r = await runProducer(fx, ["--repo", REPO], { ...live, MC_SWEEP_LOCK_WAIT: "1" });
+      assert.equal(r.code, 1);
+      assert.match(r.stderr, /sweep\.queue queue:issues:acme\/widgets: another producer holds the lock; skipped/);
+      assert.ok(Date.now() - started >= 900, "waited the configured time");
+      assert.equal(server.of("sweep.queue").length, 0, "no queue POST while another owner is live");
+      assert.ok(!fx.calls().some((c) => c.includes("SweepIssues")), "no queue collection without the lock");
+      assert.deepEqual(server.of("sweep.pr_snapshot").map((o) => o.seq), [1], "the PR subject is independent");
+      assert.equal(fs.statSync(file).ino, inode, "the live owner's lock file is not unlinked or replaced");
+      assert.ok(!lockFree(file), "the live owner still holds its lock after the timed-out run exits");
+    } finally {
+      await kill9(holder);
+    }
+    assert.ok(lockFree(file), "the kernel released the holder's lock on its death");
+    next();
+    const r = await runProducer(fx, ["--repo", REPO], { ...live, MC_SWEEP_LOCK_WAIT: "0" });
+    assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual(server.of("sweep.queue").map((o) => o.seq), [1]);
+    assert.equal(fs.statSync(file).ino, inode, "the run kept the lock file");
+  });
+
+  await check("subject lock: competing recovery after a killed holder; an unlocked leftover never strands", async () => {
+    reset();
+    const fx = new Fixture(root);
+    standard(fx);
+    fx.config(baseConfig({ [REPO]: repoConfig(REPO) }));
+    fs.mkdirSync(fx.state, { recursive: true, mode: 0o700 });
+    // Leftovers of an interrupted acquisition: an unlocked lock file, and an
+    // old-style lock directory with no pid. Neither is a lock.
+    fs.writeFileSync(lockFile(fx, QUEUE_SUBJECT), "");
+    fs.mkdirSync(lockFile(fx, QUEUE_SUBJECT).replace(/\.flock$/, ".lock"));
+    let r = await runProducer(fx, ["--repo", REPO], { ...live, MC_SWEEP_LOCK_WAIT: "0" });
+    assert.equal(r.code, 0, r.stderr);
+    r = await runProducer(fx, ["--repo", REPO], { ...live, MC_SWEEP_LOCK_WAIT: "0" });
+    assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual(server.of("sweep.queue").map((o) => o.seq), [1, 2]);
+
+    // A real holder dies by SIGKILL mid-collection; its gh child is orphaned and still running.
+    next();
+    fx.raw(REPO, "SweepIssues", "first", null, { sleep: 3 });
+    const a = startProducer(fx, ["--repo", REPO], live);
+    await until("the holder to be collecting", () => fx.calls().filter((c) => c.endsWith("SweepIssues first")).length >= 3);
+    assert.ok(!lockFree(lockFile(fx, QUEUE_SUBJECT)), "the holder holds the lock");
+    await kill9(a);
+    assert.ok(lockFree(lockFile(fx, QUEUE_SUBJECT)), "released on death, before the orphaned gh finishes");
+    fx.raw(REPO, "SweepIssues", "first", null, { sleep: 1 });
+    const runs = await Promise.all([1, 2].map(() => runProducer(fx, ["--repo", REPO], { ...live, MC_SWEEP_LOCK_WAIT: "20" })));
+    for (const run of runs) {
+      assert.equal(run.code, 0, run.stderr);
+      assert.doesNotMatch(run.stderr, /STALE|REJECTED/);
+    }
+    assert.deepEqual(server.of("sweep.queue").map((o) => o.seq), [3, 4], "unique, strictly increasing queue seq");
+    assert.deepEqual(server.of("sweep.pr_snapshot").map((o) => o.seq), [3, 4]);
+    for (const o of server.got) assert.equal((o.body as Json).observation.seq > 0, true);
+  });
+
+  await check("subject lock: a holder killed after persisting a body is recovered by exactly one replay", async () => {
+    reset();
+    const fx = new Fixture(root);
+    standard(fx);
+    fx.config(baseConfig({ [REPO]: repoConfig(REPO) }));
+    // An ingest endpoint that accepts and never answers: the holder dies mid-POST.
+    const sockets: net.Socket[] = [];
+    const black = net.createServer((s) => sockets.push(s));
+    await new Promise<void>((res) => black.listen(0, "127.0.0.1", () => res()));
+    const blackUrl = `http://127.0.0.1:${(black.address() as net.AddressInfo).port}`;
+    const a = startProducer(fx, ["--repo", REPO], { MC_URL: blackUrl, MC_TOKEN: FAKE_TOKEN, MC_SWEEP_HTTP_TIMEOUT: "30" });
+    await until("the pending body to be durable", () => /"pending"/.test(stateText(fx)) && sockets.length > 0);
+    const pending = JSON.parse(stateText(fx)).pending;
+    assert.equal(pending.seq, 1);
+    await kill9(a);
+    assert.ok(lockFree(lockFile(fx, QUEUE_SUBJECT)), "released on death, before the orphaned curl times out");
+    for (const s of sockets) s.destroy();
+    await new Promise<void>((res) => black.close(() => res()));
+
+    fx.raw(REPO, "SweepIssues", "first", null, { sleep: 1 });
+    const runs = await Promise.all([1, 2].map(() => runProducer(fx, ["--repo", REPO], { ...live, MC_SWEEP_LOCK_WAIT: "20" })));
+    for (const run of runs) {
+      assert.equal(run.code, 0, run.stderr);
+      assert.doesNotMatch(run.stderr, /STALE|REJECTED/);
+    }
+    const queue = server.got.filter((g) => g.body.kind === "sweep.queue");
+    assert.deepEqual(queue.map((g) => g.body.observation.seq), [1, 2, 3], "one replay, then unique strictly increasing seq");
+    assert.equal(queue[0].raw, pending.body, "the replay is the persisted bytes");
+    assert.deepEqual(server.of("sweep.pr_snapshot").map((o) => o.seq), [1, 2], "the PR subject was never reached by the killed run");
   });
 
   await check("exact replay: an unacknowledged POST is retried with the same seq and bytes first", async () => {

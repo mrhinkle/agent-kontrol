@@ -16,8 +16,9 @@
 # Config: MC_SWEEP_PRODUCER_CONFIG, else sweep-producer.config.json beside this
 # script. See sweep-producer.config.example.json; the example is not installed policy.
 # Credentials: MC_URL and MC_TOKEN from the environment or MC_ENV_FILE.
-# State: MC_SWEEP_STATE_DIR (per-subject sequence numbers; never a token).
-# Requires: gh (authenticated), jq, curl, perl (for bounded timeouts).
+# State: MC_SWEEP_STATE_DIR (per-subject sequence numbers and lock files; never a token).
+# MC_SWEEP_LOCK_WAIT: seconds to wait for a subject held by another run (default 300).
+# Requires: gh (authenticated), jq, curl, perl (bounded timeouts and the flock(2) subject lock).
 #
 # Every failure is a newer complete:false observation, never a zero. An unacked
 # POST is retried later with the same seq and the exact same bytes.
@@ -128,18 +129,16 @@ for bin in gh jq curl perl; do
 done
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/sweep-producer.XXXXXX")"
-HELD_LOCKS=()
-cleanup() {
-  local l
-  for l in ${HELD_LOCKS[@]+"${HELD_LOCKS[@]}"}; do rm -rf "$l"; done
-  rm -rf "$TMP_DIR"
-}
+# The subject lock is a kernel lock on fd 9 (see lock_subject). Exit closes the
+# fd and releases it; cleanup never removes a lock file.
+cleanup() { rm -rf "$TMP_DIR"; }
 trap cleanup EXIT
 
 # bounded <seconds> <cmd...> — SIGALRM survives exec, so the command is killed at the limit.
+# fd 9 is closed for the child so an orphaned gh never holds the subject lock.
 bounded() {
   local secs="$1"; shift
-  perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "$secs" "$@"
+  perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "$secs" "$@" 9>&-
 }
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -268,6 +267,10 @@ page_issues() {
     out="$TMP_DIR/issues-$page.json"
     if ! gh_graphql "$query" "$after" "$out"; then ISSUE_ERR="$GH_ERR"; return 1; fi
     if ! jq -e "$ISSUES_PAGE_OK" "$out" >/dev/null 2>&1; then ISSUE_ERR="malformed GitHub response"; return 1; fi
+    # Every read, the verification read included, must carry each issue's whole label set.
+    if jq -e 'any(.data.repository.issues.nodes[]; .labels.totalCount != (.labels.nodes | length))' "$out" >/dev/null 2>&1; then
+      ISSUE_ERR="an issue has more than 50 labels"; return 1
+    fi
     ISSUE_LAST="$(jq '.data.repository.issues.totalCount' "$out")"
     [[ -z "$ISSUE_FIRST" ]] && ISSUE_FIRST="$ISSUE_LAST"
     if (( ISSUE_LAST > ISSUE_CAP )); then ISSUE_ERR="more than $ISSUE_CAP open issues"; return 1; fi
@@ -277,8 +280,8 @@ page_issues() {
   done
 }
 
-# Issue numbers and lower-cased label names, sorted: what classification reads.
-ISSUE_KEY='map([.number, ([.labels.nodes[].name | ascii_downcase] | sort)]) | sort'
+# Issue numbers, label totals, and lower-cased label names, sorted: what classification reads.
+ISSUE_KEY='map([.number, .labels.totalCount, ([.labels.nodes[].name | ascii_downcase] | sort)]) | sort'
 
 # collect_queue <outfile> — writes the observation body without seq. The set
 # is read twice; it is complete only when both reads match exactly, so an
@@ -449,27 +452,31 @@ subject_id() {
 }
 
 # lock_subject <id> — one producer per subject at a time, for the whole
-# collect-and-post, so a later collection always gets the higher seq.
+# collect-and-post, so a later collection always gets the higher seq. This
+# shell opens <id>.flock on fd 9 and perl takes flock(2) on that shared open
+# file description, which stays locked after perl exits until this shell closes
+# fd 9 or dies. The kernel releases it on any exit, so there is no owner file,
+# no stale-owner recovery, and no window that strands the lock. The file is
+# never removed: removing it would let two holders lock different inodes.
+# Waits up to MC_SWEEP_LOCK_WAIT seconds (0 tries once). One lock at a time.
 lock_subject() {
-  local dir="$STATE_DIR/$1.lock" waited=0 pid
-  while ! mkdir "$dir" 2>/dev/null; do
-    pid="$(cat "$dir/pid" 2>/dev/null || true)"
-    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
-      rm -rf "$dir"; continue
-    fi
-    if (( waited >= LOCK_WAIT * 5 )); then return 1; fi
-    sleep 0.2; waited=$((waited + 1))
-  done
-  printf '%s' "$$" >"$dir/pid"
-  HELD_LOCKS+=("$dir")
+  exec 9>>"$STATE_DIR/$1.flock" || return 1
+  if ! perl -MFcntl=:flock -MTime::HiRes=time -e '
+      my $wait = shift @ARGV;
+      exit 2 unless defined $wait && $wait =~ /^\d+$/;
+      open(my $fh, ">>&=9") or exit 2;
+      my $deadline = time + $wait;
+      until (flock($fh, LOCK_EX | LOCK_NB)) {
+        exit 1 if time >= $deadline;
+        select(undef, undef, undef, 0.2);
+      }
+      exit 0' "$LOCK_WAIT"; then
+    exec 9>&-
+    return 1
+  fi
 }
 
-unlock_subject() {
-  rm -rf "$STATE_DIR/$1.lock"
-  local kept=() l
-  for l in ${HELD_LOCKS[@]+"${HELD_LOCKS[@]}"}; do [[ "$l" == "$STATE_DIR/$1.lock" ]] || kept+=("$l"); done
-  HELD_LOCKS=(${kept[@]+"${kept[@]}"})
-}
+unlock_subject() { exec 9>&-; }
 
 write_state() {  # write_state <file> <json> — atomic replace
   local tmp
@@ -482,7 +489,9 @@ POST_RESULT=""
 post_body() {
   local body="$1" resp code
   resp="$(mktemp "$TMP_DIR/resp.XXXXXX")"
-  code="$(printf 'header = "Authorization: Bearer %s"\n' "$MC_TOKEN" |
+  # The substitution's subshell drops fd 9 first, so a run killed mid-POST
+  # releases the subject lock without waiting for an orphaned curl.
+  code="$(exec 9>&-; printf 'header = "Authorization: Bearer %s"\n' "$MC_TOKEN" |
     curl -sS -K - -o "$resp" -w '%{http_code}' --connect-timeout 5 --max-time "$HTTP_TIMEOUT" \
       -X POST "${MC_URL%/}/api/ingest" -H "Content-Type: application/json" --data-binary "@$body" 2>/dev/null)" || code="000"
   case "$code" in
