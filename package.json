@@ -51,6 +51,7 @@
     "typescript": "5.8.2"
   },
   "license": "Apache-2.0",
+  "author": "Mark Hinkle",
   "overrides": {
     "@modelcontextprotocol/sdk": "1.32.2",
     "postcss": "^8.5.23"
