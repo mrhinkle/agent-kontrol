@@ -1,7 +1,11 @@
 # Absence detection (#79): run the sweeper every five minutes.
 # INERT EXAMPLE. Nothing installs this file. Activation is the owner's decision
 # and needs consumer registrations and collector observations to be useful.
-# Install by hand with `crontab -e` only after that decision. MC_URL and
-# MC_TOKEN must come from the host's own secret store, not from this file.
+# Install by hand with `crontab -e` only after that decision. Create the private
+# wrapper documented in docs/VELOCITY.md#running-it first: each invocation must
+# load and export MC_URL and MC_TOKEN from the host's approved secret store.
+# Cron does not inherit exports from an interactive shell. Keep credentials
+# out of this file and the crontab, and verify unattended secret-store access
+# under the scheduler's account before separately approved activation.
 #
-# */5 * * * * /path/to/agent-kontrol/scripts/sweep-once.sh >>"$HOME/Library/Logs/agent-kontrol-sweep.log" 2>&1
+# */5 * * * * /absolute/path/to/private/agent-kontrol-sweep-cron >>"$HOME/Library/Logs/agent-kontrol-sweep.log" 2>&1
