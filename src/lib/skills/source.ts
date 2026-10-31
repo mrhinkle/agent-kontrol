@@ -56,6 +56,16 @@ export function createGitHubFetcher(opts: { fetchImpl?: FetchLike; token?: strin
       try {
         return await fetchSnapshot(fetchImpl, token, source);
       } catch (err) {
+        // A token that GitHub refuses (org policy, expiry, scope) also blocks public
+        // repositories. Retry once without it; a private repo then fails with its
+        // own error and the token error below is the one reported.
+        if (token && err instanceof GitHubFetchError && (err.status === 401 || err.status === 403)) {
+          try {
+            return await fetchSnapshot(fetchImpl, null, source);
+          } catch {
+            // fall through and report the authenticated failure
+          }
+        }
         const message = err instanceof Error ? err.message : "GitHub request failed";
         throw new Error(redactToken(message, token));
       }
