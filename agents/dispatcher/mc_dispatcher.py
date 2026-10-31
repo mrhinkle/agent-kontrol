@@ -738,7 +738,10 @@ class EventStreamWake:
                 # Do not print headers, credentials, response bodies or payloads.
                 print(f"[mc] event stream unavailable ({type(error).__name__}); polling remains active", file=sys.stderr)
             finally:
+                was_connected = self.connected
                 self.connected = False
+                if was_connected:
+                    self.wake.signal("reconcile")
             if self._had_progress:
                 backoff = 0.25
             if self._stop.wait(max(backoff, retry_after)):

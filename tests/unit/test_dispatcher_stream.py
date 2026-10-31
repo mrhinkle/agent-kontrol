@@ -1,5 +1,6 @@
 """Outbound notification transport; no agent CLI or production service is run."""
 import contextlib
+from email.message import Message
 import io
 import json
 from pathlib import Path
@@ -79,6 +80,31 @@ class DispatcherStreamTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 dispatcher.run_task_and_wake({}, "codex", threading.Semaphore(1), wake)
         self.assertEqual(wake.wait(0), {"capacity"})
+
+    def test_established_disconnect_wakes_polling_on_eof_and_parse_error(self):
+        for data in (b"", b"\xff\n"):
+            with self.subTest(data=data):
+                client, wake = self.client()
+                response = io.BytesIO(data)
+                response.status = 200
+                response.headers = Message()
+                response.headers["Content-Type"] = "text/event-stream"
+                with patch.object(client._opener, "open", return_value=response), \
+                        patch.object(client._stop, "wait", return_value=True), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    client._run()
+                self.assertFalse(client.connected)
+                self.assertEqual(wake.wait(0), {"reconcile"})
+
+    def test_failed_connection_preserves_polling_without_reconcile_loop(self):
+        client, wake = self.client()
+        with patch.object(client._opener, "open", side_effect=OSError("offline")), \
+                patch.object(client._stop, "wait", return_value=True) as backoff, \
+                contextlib.redirect_stderr(io.StringIO()):
+            client._run()
+        self.assertFalse(client.connected)
+        self.assertEqual(wake.wait(0), {"fallback"})
+        backoff.assert_called_once_with(0.25)
 
     def test_real_connection_resumes_and_superseded_stops_it(self):
         requests = []
