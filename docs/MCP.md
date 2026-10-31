@@ -546,7 +546,7 @@ curl -s -X POST https://YOUR-DEPLOY.vercel.app/api/skills/sync \
   -d '{"trigger":"scheduled"}'
 ```
 
-The GitHub token is `GH_TOKEN`, otherwise `GITHUB_TOKEN`. Those are the names the `gh` CLI already uses. A public repository can be read with no token. HTTP 401, 403, 404, a truncated tree, or any other fetch failure keeps that source's rows. The body `status` is `failed`. It is not a removal.
+The GitHub token is `GH_TOKEN`, otherwise `GITHUB_TOKEN`. Those are the names the `gh` CLI already uses. A public repository can be read with no token. If GitHub answers 401 or 403 to the token (an org that blocks fine-grained tokens, an expired token), the sync retries that source once without it, so public sources still read; a private source then fails with the original status. HTTP 401, 403, 404, a truncated tree, or any other fetch failure keeps that source's rows. The body `status` is `failed`. It is not a removal.
 
 One sync at a time. The lease is a `skill_sync_runs` row with `status` `running`, guarded by a partial unique index. A second sync returns `status: "busy"` and does not fetch. A running row older than 10 minutes is marked failed so a crashed sync does not wedge the mirror. The old process can still be alive. Every skill write and the finish update run only while that sync's row is still `status` `running`. If a newer sync has taken the lease, the old one stops, returns `status: "busy"` with error `sync lease lost`, and its writes do not land. When nothing changed, `added`, `changed`, and `removed` are empty and no skill row is written. The sync run still records the commit that was fetched.
 
