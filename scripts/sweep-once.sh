@@ -15,7 +15,15 @@ if [[ -z "${MC_URL:-}" || -z "${MC_TOKEN:-}" ]]; then
   exit 1
 fi
 
-if ! body="$(curl -fsS -m 60 -X POST -H "Authorization: Bearer $MC_TOKEN" "${MC_URL%/}/api/sweep")"; then
+if [[ "$MC_TOKEN" == *$'\n'* || "$MC_TOKEN" == *$'\r'* ]]; then
+  echo "sweep-once: MC_TOKEN must be a single line" >&2
+  exit 1
+fi
+AUTH_HEADER="$(umask 077; mktemp)"
+trap 'rm -f "$AUTH_HEADER"' EXIT
+printf 'Authorization: Bearer %s\n' "$MC_TOKEN" >"$AUTH_HEADER"
+
+if ! body="$(curl -fsS -m 60 -X POST -H "@$AUTH_HEADER" "${MC_URL%/}/api/sweep")"; then
   echo "sweep-once: POST /api/sweep failed" >&2
   exit 1
 fi
