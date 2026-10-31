@@ -32,6 +32,7 @@ export const SCOPES = [
   "skills:write",
   "watch:read",
   "watch:write",
+  "events:read",
 ] as const;
 
 export type Scope = (typeof SCOPES)[number];
@@ -74,6 +75,7 @@ export const TOOL_SCOPES: Record<string, Scope> = {
  * The legacy token and the dashboard session still can.
  */
 const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
+  { method: "GET", path: /^\/api\/events\/stream$/, scope: "events:read" },
   { method: "GET", path: /^\/api\/fleet$/, scope: "fleet:read" },
   // GET /api/activity stays off this table, same as GET /api/traces.
   // An agent credential cannot read the activity stream. MC_TOKEN and the

@@ -101,3 +101,19 @@ await withTransaction(async (tx) => {
 ```
 
 `input.payload` must be a plain object. `delivery_id` is 1 to 200 characters and `event` 1 to 64, with no control characters; anything else throws `GhEventInputError` before any SQL runs.
+
+## Outbound consumer delivery (#78)
+
+The authenticated stream and explicit operator registration are documented in
+[API.md](API.md#consumer-scoped-outbound-event-stream-78); dispatcher opt-in and
+truthful fallback counters are in [AGENTS.md](AGENTS.md#dispatcher-event-wakeups-78).
+The shared inbox remains immutable. Per-consumer credential/filter bindings and
+connection generations live in `event_stream_consumers`; they do not reuse the
+sweeper's liveness registry or turn a read into a processing acknowledgement.
+
+The replay regression includes a lower allocated inbox id whose transaction is
+still open while a higher id commits. The reader waits for the outstanding write,
+then delivers both in order. Generation fencing, cross-consumer/cursor denial,
+credential expiry/revocation, explicit retention reconciliation, backpressure and
+connection expiry are separately verified. Those are local source tests, not
+production proof that the webhook bridge or the reviewer is activated.
