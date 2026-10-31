@@ -423,6 +423,22 @@ alter table agent_credentials add column if not exists expires_at timestamptz;
 alter table agent_credentials add column if not exists revoked_at timestamptz;
 alter table agent_credentials add column if not exists last_used_at timestamptz;
 create unique index if not exists agent_credentials_token_hash_idx on agent_credentials (token_hash);
+-- Per-credential request quotas (issue #51). One unit is one authorized
+-- HTTP request made with the credential. The minute window is the clock
+-- minute, the day window is the UTC day; both are fixed windows. Existing
+-- rows get the defaults (60 per minute, 10000 per day). Limits are 1 to
+-- 1000000; there is no unlimited value. The *_start and *_count columns hold
+-- only the current window start and how many requests it has counted.
+alter table agent_credentials add column if not exists rate_limit_per_minute integer not null default 60
+  constraint agent_credentials_rate_limit_per_minute_range check (rate_limit_per_minute between 1 and 1000000);
+alter table agent_credentials add column if not exists rate_limit_per_day integer not null default 10000
+  constraint agent_credentials_rate_limit_per_day_range check (rate_limit_per_day between 1 and 1000000);
+alter table agent_credentials add column if not exists rate_minute_start timestamptz;
+alter table agent_credentials add column if not exists rate_minute_count integer not null default 0
+  constraint agent_credentials_rate_minute_count_nonneg check (rate_minute_count >= 0);
+alter table agent_credentials add column if not exists rate_day_start timestamptz;
+alter table agent_credentials add column if not exists rate_day_count integer not null default 0
+  constraint agent_credentials_rate_day_count_nonneg check (rate_day_count >= 0);
 
 -- Decisions queue (see supabase/migrations/20261025_decisions.sql and docs/VELOCITY.md).
 -- kind, labels, opened_at, repo_short and github_present are nullable additions

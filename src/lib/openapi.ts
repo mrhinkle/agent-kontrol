@@ -1,6 +1,12 @@
 import packageJson from "../../package.json";
 import { API_ERRORS } from "@/lib/api-error";
 import { LABEL_MAX } from "@/lib/credentials";
+import {
+  DEFAULT_REQUESTS_PER_DAY,
+  DEFAULT_REQUESTS_PER_MINUTE,
+  RATE_LIMIT_MAX,
+  RATE_LIMIT_MIN,
+} from "@/lib/credential-limits";
 import { DECISION_STATUSES, LIST_SHAPES, LIST_STATUSES } from "@/lib/decisions";
 import { PROGRESS_INGEST_KINDS } from "@/lib/progress-store";
 import { WINDOWS } from "@/lib/progress-config";
@@ -232,7 +238,8 @@ export function openApiDocument(): Json {
         bearerAuth: {
           type: "http",
           scheme: "bearer",
-          description: "MC_TOKEN, an akc_ agent credential, or an OAuth access token on the MCP transport.",
+          description:
+            "MC_TOKEN, an akc_ agent credential, or an OAuth access token on the MCP transport. An akc_ credential has a request quota: requests per minute and per UTC day (defaults 60 and 10000). Each authorized request counts once. Over a limit is 429 rate_limited with retryable true, a Retry-After header in seconds, and retry_after, window, and limit in the body. MC_TOKEN, OAuth, and the dashboard session are not metered.",
         },
         mcToken: {
           type: "http",
@@ -252,7 +259,7 @@ export function openApiDocument(): Json {
           scheme: "bearer",
           bearerFormat: "akc_",
           description:
-            "Per-agent akc_ credential. MC_TOKEN, the dashboard session, an OAuth access token, and a dev-open caller are not accepted on operations that use this scheme.",
+            "Per-agent akc_ credential. MC_TOKEN, the dashboard session, an OAuth access token, and a dev-open caller are not accepted on operations that use this scheme. Each authorized request counts against the credential's per-minute and per-UTC-day quota; over a limit is 429 rate_limited with Retry-After.",
         },
       },
       schemas: {
@@ -978,6 +985,29 @@ export function openApiDocument(): Json {
               items: { type: "string", enum: [...SCOPES] },
             },
             expires_at: { type: ["string", "null"], format: "date-time" },
+            rate_limit_per_minute: {
+              type: ["integer", "null"],
+              minimum: RATE_LIMIT_MIN,
+              maximum: RATE_LIMIT_MAX,
+              description: `Requests per clock minute. Omitted or null is ${DEFAULT_REQUESTS_PER_MINUTE}.`,
+            },
+            rate_limit_per_day: {
+              type: ["integer", "null"],
+              minimum: RATE_LIMIT_MIN,
+              maximum: RATE_LIMIT_MAX,
+              description: `Requests per UTC day, reset at 00:00 UTC. Omitted or null is ${DEFAULT_REQUESTS_PER_DAY}.`,
+            },
+          },
+        },
+        UpdateCredentialLimits: {
+          type: "object",
+          additionalProperties: false,
+          required: ["id"],
+          minProperties: 2,
+          properties: {
+            id: { type: "string" },
+            rate_limit_per_minute: { type: "integer", minimum: RATE_LIMIT_MIN, maximum: RATE_LIMIT_MAX },
+            rate_limit_per_day: { type: "integer", minimum: RATE_LIMIT_MIN, maximum: RATE_LIMIT_MAX },
           },
         },
         WatchBeatWrite: {
@@ -1784,8 +1814,24 @@ export function openApiDocument(): Json {
           requestBody: body(ref("CreateCredential")),
           responses: {
             "200": jsonResponse("The new credential, including token once.", { type: "object" }),
-            "400": jsonResponse("The label, scopes, or expiry was rejected.", ref("ErrorMessage")),
+            "400": jsonResponse("The label, scopes, expiry, or a limit was rejected.", ref("ErrorMessage")),
             "401": jsonResponse("No dashboard session, or an Authorization header was sent.", ref("ErrorMessage")),
+            "500": jsonResponse("The store failed.", ref("ErrorMessage")),
+          },
+        }),
+        patch: operation({
+          operationId: "updateCredentialLimits",
+          tags: ["settings"],
+          summary: "Change a credential's request limits. Counted requests are kept.",
+          description:
+            "Dashboard session only. A request that sends Authorization is 401. Send id and one or both limits. A limit left out keeps its value. Unknown fields, null, strings, fractions, zero, negatives, and values over 1000000 are 400. The requests already counted in the current minute and UTC day still count.",
+          security: sessionOnly,
+          requestBody: body(ref("UpdateCredentialLimits")),
+          responses: {
+            "200": jsonResponse("The credential with its new limits.", { type: "object" }),
+            "400": jsonResponse("The body is not JSON, or a field was rejected.", ref("ErrorMessage")),
+            "401": jsonResponse("No dashboard session, or an Authorization header was sent.", ref("ErrorMessage")),
+            "404": jsonResponse("No credential has this id.", ref("ErrorMessage")),
             "500": jsonResponse("The store failed.", ref("ErrorMessage")),
           },
         }),
@@ -2133,6 +2179,7 @@ export function openApiDocument(): Json {
             ...flatErrors,
             "413": jsonResponse("The body is larger than 8 KiB.", ref("Error")),
             "415": jsonResponse("Content-Type is not application/json.", ref("Error")),
+            "429": jsonResponse("The credential's per-minute or per-UTC-day request quota is used. rate_limited, retryable true, with Retry-After seconds.", ref("Error")),
             "503": jsonResponse(
               "The credential store is unreachable, source binding is not configured, or the beat table is unavailable.",
               ref("Error"),
@@ -2155,6 +2202,7 @@ export function openApiDocument(): Json {
               properties: { beats: { type: "array", items: ref("WatchBeat") } },
             }),
             ...flatErrors,
+            "429": jsonResponse("The credential's per-minute or per-UTC-day request quota is used. rate_limited, retryable true, with Retry-After seconds.", ref("Error")),
             "503": jsonResponse("The credential store or the beat table is unavailable.", ref("Error")),
           },
         }),

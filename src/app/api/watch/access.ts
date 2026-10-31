@@ -7,6 +7,7 @@
 import { NextResponse } from "next/server";
 import { apiError, errorBody, type ApiErrorOverrides, type ErrorCode } from "@/lib/api-error";
 import { resolveAgentCredential } from "@/lib/credentials";
+import { chargeCredentialRequest, rateLimitedResponse } from "@/lib/credential-rate-limit";
 import { requireScope, type Principal, type Scope } from "@/lib/scopes";
 
 export const NO_STORE = { "cache-control": "no-store" } as const;
@@ -93,6 +94,8 @@ export type WatchAccess =
  * Verify the bearer as an agent credential and require `scope`.
  * Anything that is not a verified akc_ token is 401, including a bearer
  * that would be MC_TOKEN or an OAuth JWT on another route. A cookie is ignored.
+ * An allowed request is charged to the credential's quota: over a limit is
+ * 429 `rate_limited` with Retry-After, a quota store error is 503.
  */
 export async function requireWatchAgent(req: Request, scope: Scope): Promise<WatchAccess> {
   const header = req.headers.get("authorization");
@@ -130,6 +133,13 @@ export async function requireWatchAgent(req: Request, scope: Scope): Promise<Wat
       ok: false,
       response: NextResponse.json(decision.body, { status: decision.status, headers: NO_STORE }),
     };
+  }
+  const charged = await chargeCredentialRequest(req, principal.id);
+  if (charged.status === "unavailable") return { ok: false, response: storeUnavailable() };
+  if (charged.status === "reject") return { ok: false, response: unauthorized() };
+  if (charged.status === "limited") {
+    const limited = rateLimitedResponse(charged, NO_STORE);
+    return { ok: false, response: new NextResponse(limited.body, limited) };
   }
   return { ok: true, principal };
 }

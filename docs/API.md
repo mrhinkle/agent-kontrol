@@ -6,7 +6,7 @@ Three credentials protect Agent Kontrol:
 
 - The dashboard password (env `MC_DASHBOARD_PASSWORD`) gates the UI and the data routes through a session cookie named `mc_auth`. Callers get the cookie by posting the password to `POST /api/login`. The session can do everything an operator can do, including issuing agent credentials.
 - `MC_TOKEN` is a static bearer token. It has every scope. Data routes accept `Authorization: Bearer <MC_TOKEN>` as an alternative to the cookie, and the ingest routes require a bearer.
-- An agent credential is a token shaped `akc_` plus 32 random bytes, base64url. Settings shows it once. It can call only the MCP tools and REST routes its scopes allow. It cannot call `GET`/`POST`/`DELETE /api/settings/credentials`, and neither can `MC_TOKEN`.
+- An agent credential is a token shaped `akc_` plus 32 random bytes, base64url. Settings shows it once. It can call only the MCP tools and REST routes its scopes allow. It cannot call `GET`/`POST`/`PATCH`/`DELETE /api/settings/credentials`, and neither can `MC_TOKEN`.
 
 Secrets in query strings (`?key=`) are not supported. Send tokens in the `Authorization` header. Agent credentials are not accepted in the query string.
 
@@ -24,7 +24,7 @@ The `agent_credentials` table stores the label, the first 8 characters of the to
 | Ingest routes: `POST /api/v1/traces`, `POST /api/ingest`, `POST /api/messages/reply`, `POST /api/progress/ingest`, `POST /api/usage/ingest`, `POST /api/brief/alerts/evaluate` | `Authorization: Bearer <MC_TOKEN>`, or an agent credential whose scope covers the route (`status:write` for `POST /api/ingest`, `messages:write` for `POST /api/messages/reply`); the other ingest routes, including alert evaluate, take `MC_TOKEN` only |
 | MCP transport: `/api/mcp` | `Authorization: Bearer <MC_TOKEN>`, an agent credential, or an OAuth access token (JWT) issued by this server |
 | `GET /api/skill-bundles` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `skills:read` or `skills:write` |
-| Credential management: `GET`/`POST`/`DELETE /api/settings/credentials` | Dashboard session only |
+| Credential management: `GET`/`POST`/`PATCH`/`DELETE /api/settings/credentials` | Dashboard session only |
 | `POST /api/watch/beat`, `GET /api/watch/beats` | Verified `akc_` credential only. `watch:write` for the POST, `watch:read` for the GET. `MC_TOKEN`, the dashboard session, an OAuth access token, and a caller allowed only because the dashboard password is unset are `401` |
 | `POST /api/webhooks/github` (exact path) | A valid `X-Hub-Signature-256` HMAC under `MC_GITHUB_WEBHOOK_SECRET`, and nothing else. A session cookie, `MC_TOKEN`, an agent credential, or an OAuth token does not stand in for it. Neighboring paths stay behind the dashboard gate |
 | Login, OAuth, and discovery: `/login`, `/api/login`, `/oauth/*`, `/.well-known/*` | No cookie gate; these routes enforce their own auth |
@@ -35,6 +35,18 @@ Ingest routes answer `401 {"error":"unauthorized"}` without a valid bearer token
 ```json
 { "error": "The credential does not have the tasks:write scope.", "code": "insufficient_scope", "fix": "Use a credential that has the tasks:write scope", "retryable": false }
 ```
+
+### Request limits for agent credentials
+
+Each agent credential has two request limits: requests per minute and requests per day. The defaults are 60 per minute and 10,000 per day. Each limit is a whole number from 1 to 1,000,000; there is no unlimited setting. Credentials created before this feature get the defaults. These are request quotas, not spend or billing limits.
+
+- One unit is one HTTP request that passed authentication and the scope check. A `401` or `403` costs nothing. On `/api/mcp`, an `initialize`, a notification, a POST batch, a `GET` that opens the stream, and a `DELETE` are each one request; tool calls inside a request are not counted separately. A held stream does not count again. A reconnect is a new request.
+- The minute window is the clock minute. The day window is the UTC calendar day and resets at 00:00 UTC. Both are fixed windows, counted by the database clock.
+- A request is allowed only when both windows have room. An allowed request counts against both. A refused request counts against neither.
+- Over a limit, the answer is `429` with a `Retry-After` header in whole seconds (at least 1) and a body of `{ "error", "code": "rate_limited", "fix", "retryable": true, "retry_after", "window": "minute" | "day", "limit" }`. When both windows are full, `Retry-After` waits for the later reset. The same answer comes back from the REST routes, `/api/mcp`, and the watch routes.
+- If the quota cannot be read or written, the answer is `503 {"error":"credential_store_unavailable"}`. There is no in-process fallback when a database is configured.
+- `MC_TOKEN`, the dashboard session, OAuth access tokens, and callers allowed only because the dashboard password is unset are not metered. An `akc_` bearer is checked before the session cookie, so a request that sends both is metered.
+- Change the limits in Settings, or with `PATCH /api/settings/credentials`. Requests already counted in the current minute and day still count after a change.
 
 The scope for each agent route is listed in [MCP.md](MCP.md). A route that is not in that table is denied to agent credentials. `MC_TOKEN` and the dashboard session can still call it, except `POST /api/watch/beat` and `GET /api/watch/beats`: those two accept only a verified `akc_` credential, and the other principals are `401`. OAuth on `/api/mcp` is unchanged: a verified access token can call every mapped tool.
 
@@ -74,7 +86,8 @@ Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI
 | PUT | `/api/settings/owners` | Cookie or bearer | Replace the watched owners. Does not delete tracked repos |
 | POST | `/api/settings/owners/discover` | Cookie or bearer | Apply one collector tick of `gh repo list` results |
 | GET | `/api/settings/credentials` | Session only | List agent credentials. No token and no hash |
-| POST | `/api/settings/credentials` | Session only | Create one. The response includes `token` once |
+| POST | `/api/settings/credentials` | Session only | Create one. The response includes `token` once. Optional `rate_limit_per_minute` and `rate_limit_per_day` (whole numbers from 1 to 1,000,000; omitted or `null` is 60 and 10,000) |
+| PATCH | `/api/settings/credentials` | Session only | Change limits: `{ "id", "rate_limit_per_minute"?, "rate_limit_per_day"? }` with at least one limit. A limit left out keeps its value. Unknown fields, `null`, strings, fractions, zero, negatives, and values over 1,000,000 are `400`. Unknown id is `404`. Counted requests are kept |
 | DELETE | `/api/settings/credentials` | Session only | Revoke by `{ "id" }` |
 | GET | `/api/tasks` | Cookie or bearer | List tasks |
 | POST | `/api/tasks` | Cookie or bearer | Create a task |
@@ -395,7 +408,7 @@ OAuth routes (`/oauth/*`) keep the OAuth RFC error format. They are not this sha
 | `validation_failed` | 400 | no | A field is present but not usable: a bad `before` on `GET /api/traces`, a bad `limit`, `cursor`, or `fields` on `GET /api/tasks`, `GET /api/memory`, `GET /api/traces`, or `GET /api/activity` (and on MCP `recall`, `get_task_queue`, and `list_activity`), a bad `since`, `until`, `actor`, or `kind` on `GET /api/activity` (a `since` later than `until` is rejected; a bad timestamp is rejected), a bad `since` and `until` pair on `GET /api/usage` (a `since` without `until` is ignored), a bad `collected_at` on usage or progress ingest, a bad task, trace, or decision id, a decision body or `status` the parser rejected, a privacy refusal, an OTLP body the parser rejected, an idempotency key longer than 200 characters or containing a control character, or MCP `set_watched_repos` when `expected_version` is missing on a real write or `dry_run` is not a boolean. |
 | `invalid_json` | 400 | no | The body is not JSON. On `POST /api/login` the `error` string stays `invalid request`. On `POST /api/mcp` an empty or non-JSON body uses this code and `error` `invalid JSON`. A missing bearer on that route is still `401` with `WWW-Authenticate`. |
 | `missing_field` | 400 | no | A required field is absent. `fields` names it. |
-| `rate_limited` | 429 | yes | More than 5 `POST /api/login` attempts in 10 minutes from one client IP. `Retry-After` is seconds. The OAuth consent form shares this limiter and answers with HTML, not this JSON. |
+| `rate_limited` | 429 | yes | More than 5 `POST /api/login` attempts in 10 minutes from one client IP. `Retry-After` is seconds. The OAuth consent form shares this limiter and answers with HTML, not this JSON. Also an agent credential over its per-minute or per-day request limit, on any route it can call (see Request limits for agent credentials). That body adds `retry_after` seconds, `window` (`minute` or `day`), and `limit`. |
 | `conflict` | 409 | no | `PUT /api/settings/repos` and MCP `set_watched_repos` when no database is connected. A short name that is already used is the same code. |
 | `idempotency_conflict` | 409 | no | `POST /api/tasks`, `POST /api/messages`, or `POST /api/messages/reply` reused an `Idempotency-Key` with different arguments, or the first request with that key is still inside its 30 second lease. MCP `create_task` and `reply_to_operator` (and its `reply_to_mark` alias) return the same code. The same key, the same actor, the same route, and the same arguments return the original result for 24 hours. Different arguments stay `retryable: false`. While the first request is inside its 30 second lease, the same arguments are `retryable: true` and the response carries `Retry-After` in seconds plus `retry_after` in the body. After that lease, the same key and the same arguments take over a claim that never stored a result and run the write once. A claim insert whose result is lost is re-read, and the write runs once when this attempt owns the claim. The resource insert and the stored response commit in one statement, and that insert runs only while this attempt's claim token still matches. A committed write therefore has a stored response. A retry returns that response and does not insert another row while the claim is inside its 24 hour window. A caller that dies before reading the response gets the same row on retry. After that window the same key starts a new write. The key is scoped by actor and route. |
 | `stale` | 409 | no | `PUT /api/settings/repos` when `version` does not match the list currently stored, and MCP `set_watched_repos` when `expected_version` does not match. Also `PATCH /api/decisions/:id` and `POST /api/decisions/:id/writeback` when `expected_revision` does not match the row. |
