@@ -23,6 +23,12 @@ export const API_ERRORS = {
     fix: "This caller cannot perform that action. Use a resource that belongs to this agent.",
     retryable: false,
   },
+  trusted_writer_required: {
+    status: 403,
+    message: "This write needs the MC_TOKEN bearer or the signed-in dashboard.",
+    fix: "Send Authorization: Bearer <MC_TOKEN>, or sign in to the dashboard where that route allows it. Agent credentials, OAuth tokens, and an open dashboard cannot write sweeper evidence.",
+    retryable: false,
+  },
   identity_mismatch: {
     status: 403,
     message: "agent_id does not match the authenticated caller",

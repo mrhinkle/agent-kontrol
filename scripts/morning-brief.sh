@@ -67,6 +67,20 @@ if [[ -z "${MC_URL:-}" && -f "$HOME/.claude/mission-control.env" ]]; then
   set -a; source "$HOME/.claude/mission-control.env"; set +a
 fi
 
+# Keep bearer values out of every curl argv. One cleanup owns both files,
+# including exits before the GitHub sweep creates its error accumulator.
+AUTH_HEADER=""
+ERR_FILE=""
+trap 'rm -f "$AUTH_HEADER" "$ERR_FILE"' EXIT
+if [[ "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_TOKEN:-}" ]]; then
+  if [[ "$MC_TOKEN" == *$'\n'* || "$MC_TOKEN" == *$'\r'* ]]; then
+    echo "morning-brief: MC_TOKEN must be a single line" >&2
+    exit 1
+  fi
+  AUTH_HEADER="$(umask 077; mktemp)"
+  printf 'Authorization: Bearer %s\n' "$MC_TOKEN" >"$AUTH_HEADER"
+fi
+
 # ------------------------------------------------------------------ thresholds
 cfg() { jq -r "$1 // empty" "$CONFIG_FILE"; }
 STUCK_PR_HOURS="$(cfg '.brief.stuckPrHours')";      STUCK_PR_HOURS="${STUCK_PR_HOURS:-48}"
@@ -139,7 +153,7 @@ elif [[ "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_TOKEN:-}" ]]; the
   # A reachable dashboard is authoritative, including when its list is empty:
   # an operator who cleared Settings meant it. Only an unreachable or malformed
   # response falls back to the local file.
-  if body="$(curl -fsS -m 20 -H "Authorization: Bearer $MC_TOKEN" "${MC_URL%/}/api/settings/repos" 2>/dev/null)" \
+  if body="$(curl -fsS -m 20 -H "@$AUTH_HEADER" "${MC_URL%/}/api/settings/repos" 2>/dev/null)" \
      && echo "$body" | jq -e '.repos|type=="array"' >/dev/null 2>&1; then
     REPOS_JSON="$(echo "$body" | jq -c '[.repos[] | select(.shown != false) | {repo, label, short, blockedLabel}]')"
     REPO_SOURCE="dashboard"
@@ -168,8 +182,7 @@ gh_retry() {
 # truncated page in REPO_ERRORS instead of returning a comforting empty list.
 # A brief with a hole says so and exits 2; it never prints a zero it did not measure.
 # fetch is called inside $(...), so it records errors in a file, not a shell array.
-ERR_FILE="$(mktemp -t morning-brief-errors)"
-trap 'rm -f "$ERR_FILE"' EXIT
+ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/morning-brief-errors.XXXXXX")"
 fetch() {
   local limit="$1"; shift
   local out what
@@ -278,7 +291,7 @@ done < <(jq -c '.[]' <<<"$REPOS_JSON")
 # maxSilenceHours. Telemetry-only is reported as exactly that.
 coordinator="$(jq -n --arg id "${COORD_ID:-}" '{configured: ($id != ""), agent_id: (if $id == "" then null else $id end)}')"
 if [[ -n "$COORD_ID" && "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_TOKEN:-}" ]]; then
-  if fleet="$(curl -fsS -m 20 -H "Authorization: Bearer $MC_TOKEN" "${MC_URL%/}/api/fleet" 2>/dev/null)"; then
+  if fleet="$(curl -fsS -m 20 -H "@$AUTH_HEADER" "${MC_URL%/}/api/fleet" 2>/dev/null)"; then
     coordinator="$(jq -c --arg id "$COORD_ID" --arg now "$NOW_ISO" --argjson max_h "$COORD_MAX_H" --arg kinds "$COORD_WORK_KINDS" '
       def ts: sub("\\.[0-9]+(?=Z$)"; "") | fromdateiso8601;
     def hours(a; b): ((b|ts) - (a|ts)) / 3600;
@@ -316,7 +329,7 @@ fi
 # demo:false is authoritative, including an empty list. A failed call, or
 # demo mode, keeps the GitHub sweep already stored on each repo.
 if [[ "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_TOKEN:-}" ]]; then
-  if table_body="$(curl -fsS -m 20 -H "Authorization: Bearer $MC_TOKEN" \
+  if table_body="$(curl -fsS -m 20 -H "@$AUTH_HEADER" \
       "${MC_URL%/}/api/decisions?shape=brief&limit=1000" 2>/dev/null)" \
      && echo "$table_body" | jq -e '.demo == false and (.decisions | type == "array")' >/dev/null 2>&1; then
     table_decisions="$(echo "$table_body" | jq -c '.decisions')"
@@ -329,6 +342,25 @@ if [[ "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_TOKEN:-}" ]]; then
     # END table-decisions-jq
     repo_results="$(jq -c --argjson table "$table_decisions" --argjson incomplete "$incomplete_repos" "$TABLE_DECISIONS_JQ" <<<"$repo_results")"
   fi
+fi
+
+# Paused scheduler jobs come from the dashboard's trusted sweeper status
+# (GET /api/sweep, database clock). The script never guesses scheduler state:
+# without that read the section is DATA INCOMPLETE, not "none".
+paused_unmeasured() {
+  jq -cn --arg error "$1" '{measured: false, error: $error, generated_at: null, jobs_total: null, jobs: [], truncated: false, counts: {held: 0, unexplained: 0, expired: 0, unknown: 0}}'
+}
+if [[ "$USE_DASHBOARD" -ne 1 ]]; then
+  paused="$(paused_unmeasured "dashboard not used (--no-dashboard)")"
+elif [[ -n "${MC_URL:-}" && -n "${MC_TOKEN:-}" ]]; then
+  if sweep_body="$(curl -fsS -m 20 -H "@$AUTH_HEADER" "${MC_URL%/}/api/sweep" 2>/dev/null)" \
+     && echo "$sweep_body" | jq -e '(.paused | type) == "object" and (.paused.measured | type) == "boolean"' >/dev/null 2>&1; then
+    paused="$(jq -c '.paused' <<<"$sweep_body")"
+  else
+    paused="$(paused_unmeasured "dashboard unreachable")"
+  fi
+else
+  paused="$(paused_unmeasured "no dashboard credentials (MC_URL/MC_TOKEN)")"
 fi
 
 # ------------------------------------------------------------------- assemble
@@ -369,6 +401,7 @@ brief="$(jq -n --arg at "$NOW_ISO" --argjson window "$WINDOW_H" --arg repo_sourc
             --argjson repos "$repo_results" --argjson coordinator "$coordinator" \
             --argjson stuck_h "$STUCK_PR_HOURS" --argjson stale_d "$STALE_ISSUE_DAYS" \
             "$BRIEF_ASSEMBLE_JQ")"
+brief="$(jq -c --argjson paused "$paused" '. + {paused: $paused}' <<<"$brief")"
 
 n_incomplete="$(jq '.incomplete_repos|length' <<<"$brief")"
 if [[ "$AS_JSON" -eq 1 ]]; then
@@ -482,6 +515,35 @@ decisions_heading "$n_dec" "$n_labels" "$n_known_dec"
 if [[ "$n_known_dec" -gt 0 ]]; then
   jq -r '.decisions[] | "  \(.repo_short) \(if .kind == "pr" then "PR " else "" end)#\(.number)  \(.age_days)d  [\(.labels|join(","))]  \(.title[0:70])\n      \(.url)"' <<<"$brief"
 fi
+echo
+
+# BEGIN paused_lines
+paused_lines() {
+  jq -r '
+    def tenths: (. * 10 | floor) / 10 | tostring;
+    def dash: if . == null or . == "" then "-" else . end;
+    def hrs: if . == null then "-" else "\(. | tenths)h" end;
+    (.paused // {measured: false}) as $p
+    | if $p.measured != true then "PAUSED: DATA INCOMPLETE (\($p.error // "scheduler status unavailable"))."
+      elif $p.jobs_total == 0 then "PAUSED: DATA INCOMPLETE (no scheduler job has reported)."
+      else
+        $p.counts as $c
+        | ($c.held + $c.unexplained + $c.expired) as $n
+        | (if $c.unknown > 0 then "PAUSED: DATA INCOMPLETE \u2014 \($c.unknown) job(s) stale; known rows below"
+           elif $n == 0 then "PAUSED: none."
+           else "PAUSED (\($n)) \u2014 job, age, reason, until, decision" end),
+          ($p.jobs[] | if .classification == "unknown" then
+              "  ?? \(.source)/\(.job_id)  stale: last report \(.report_age_hours | hrs) ago, last state \(.state)"
+            else
+              "  \(.source)/\(.job_id)  \(.age_hours | hrs)  \(if .classification == "held" then "held" elif .classification == "expired" then "EXPIRED" else "UNEXPLAINED" end)  reason: \(.reason | dash)  until: \(.until | dash)  decision: \(.decision | dash)"
+            end),
+          (if $p.truncated then "  (first 50 rows shown)" else empty end),
+          "HELD VERSUS UNEXPLAINED: \($c.held) held, \($c.unexplained) unexplained, \($c.expired) expired\(if $c.unknown > 0 then ", \($c.unknown) unknown" else "" end)"
+      end
+  '
+}
+# END paused_lines
+paused_lines <<<"$brief"
 echo
 
 # A positive merge count with no measured list is not an empty heading.

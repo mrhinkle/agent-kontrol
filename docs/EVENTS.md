@@ -69,6 +69,17 @@ create index if not exists gh_events_pending_idx on gh_events (id) where process
 
 Delivery ids that start with `sweep:` are reserved for rows written by Agent Kontrol itself, such as the sweeper (#79). The webhook route rejects that namespace (`400`), and real GitHub ids are GUIDs, so the two never collide.
 
+The absence sweeper (#79, [VELOCITY.md](VELOCITY.md#absence-sweeper)) writes these `event` names: `consumer-silent`, `pr-stuck`, `pause-unexplained`, `pause-expired`, `resume-uncited`, `decision-aging`, `dispatch-ready-empty`, and each with `-cleared`. Delivery ids:
+
+- firing: `sweep:<condition>:<entity digest>:e<episode>:s<seq>`
+- cleared: `sweep:<condition>-cleared:<entity digest>:e<episode>`
+
+The digest is the first 24 hex characters of the SHA-256 of the entity key (`consumer:<id>`, `pr:<owner/name lowercased>#<n>`, `job:<source>/<job>`, `decision:<key>`, `queue:<id>`). `repo`, `number`, and `head_sha` are filled where the condition has them. The payload is `{ condition, entity_key, state, verdict, episode, sequence, source: "agent-kontrol-sweeper", evaluated_at, evidence }`: bounded references (observation ids, counts, timestamps), never a prompt or a secret. The row and the latch change commit in one transaction.
+
+### Retention
+
+Each sweep deletes rows whose `received_at` is more than 30 days before the database clock, oldest first, in batches of 1,000 and at most 10 batches per run (`retention.complete` is false when more remain). This is an age horizon, not processing completion: GitHub rows and synthetic rows are removed alike, whether or not a consumer set `processed_at`. The sweeper's latches live in `sweep_latches` and are not affected.
+
 ## Writing from code
 
 `src/lib/gh-events.ts` exports `insertGhEvent(input, db?)`. It runs one statement:
