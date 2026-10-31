@@ -10,6 +10,8 @@ import { authCookieValue, secretsMatch } from "@/lib/authcrypto";
  * - Agent endpoints (/api/ingest, the watch beat routes, and the MCP transport
  *   routes) are excluded here. Ingest and MCP accept MC_TOKEN or an agent
  *   credential. The watch routes accept only a verified akc_ credential.
+ *   /api/webhooks/github (exact path) accepts only a valid GitHub HMAC
+ *   signature; no session, bearer, or OAuth token stands in for it.
  * - Data endpoints (/api/fleet, /api/memory) accept either the session
  *   cookie or the MC_TOKEN bearer header.
  */
@@ -23,6 +25,7 @@ const PUBLIC_PATHS: RegExp[] = [
   /^\/api\/messages\/reply$/, // agent replies (token-authed in route)
   /^\/api\/progress\/ingest$/, // collector cron (token-authed in route)
   /^\/api\/usage\/ingest$/, // usage collector (token-authed in route)
+  /^\/api\/webhooks\/github$/, // GitHub webhook (X-Hub-Signature-256 verified in route)
   /^\/api\/(mcp|sse|message)(\/.*)?$/, // MCP transports (token-authed in route)
   /^\/\.well-known\//, // OAuth AS + protected-resource metadata
   /^\/oauth\//, // OAuth authorize / token / register
