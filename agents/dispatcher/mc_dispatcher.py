@@ -731,6 +731,10 @@ class EventStreamWake:
                     self.connected = True
                     self._consume(response)
             except Exception as error:
+                if isinstance(error, urllib.error.HTTPError) and error.code == 403 and self.cursor:
+                    # Registered filters may no longer include the saved cursor.
+                    self.cursor = None
+                    self.wake.signal("reconcile")
                 if isinstance(error, urllib.error.HTTPError) and error.code == 429:
                     raw_retry = error.headers.get("Retry-After", "")
                     if raw_retry.isascii() and raw_retry.isdigit():

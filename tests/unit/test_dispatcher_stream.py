@@ -106,6 +106,78 @@ class DispatcherStreamTests(unittest.TestCase):
         self.assertEqual(wake.wait(0), {"fallback"})
         backoff.assert_called_once_with(0.25)
 
+    def test_http_errors_reset_only_a_rejected_cursor_and_preserve_retry_after(self):
+        cases = (
+            (403, "reviewer:1", None, 0.25, None, {"reconcile"}),
+            (403, None, None, 0.25, None, {"fallback"}),
+            (401, "reviewer:1", None, 0.25, "reviewer:1", {"fallback"}),
+            (429, "reviewer:1", "120", 120, "reviewer:1", {"fallback"}),
+        )
+        for code, cursor, retry, delay, expected_cursor, reasons in cases:
+            with self.subTest(code=code, cursor=cursor):
+                client, wake = self.client()
+                client.cursor = cursor
+                headers = Message()
+                if retry is not None:
+                    headers["Retry-After"] = retry
+                error = dispatcher.urllib.error.HTTPError(client.url, code, "refused", headers, None)
+                with patch.object(client._opener, "open", side_effect=error), \
+                        patch.object(client._stop, "wait", return_value=True) as backoff, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    client._run()
+                self.assertFalse(client.connected)
+                self.assertEqual(client.cursor, expected_cursor)
+                self.assertEqual(wake.wait(0), reasons)
+                backoff.assert_called_once_with(delay)
+
+    def test_real_foreign_cursor_reconnects_without_stale_header(self):
+        requests = []
+        before_replay = []
+        finished = threading.Event()
+        wake = dispatcher.DispatchWake()
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                requests.append(self.headers.get("Last-Event-ID"))
+                if len(requests) == 1:
+                    self.send_response(403)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"error":"foreign_cursor"}')
+                    return
+                before_replay.append(wake.wait(0))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(b"event: superseded\ndata: {}\n\n")
+                finished.set()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        client = dispatcher.EventStreamWake(f"http://127.0.0.1:{server.server_port}", "reviewer", "akc_test", wake)
+        client.cursor = "reviewer:1"
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as errors:
+                client.start()
+                self.assertTrue(finished.wait(3), "client did not retry the rejected cursor")
+                client._thread.join(timeout=2)
+            self.assertFalse(client._thread.is_alive())
+            self.assertEqual(requests, ["reviewer:1", None])
+            self.assertEqual(before_replay, [{"reconcile"}])
+            self.assertIsNone(client.cursor)
+            self.assertTrue(client._stop.is_set())
+            self.assertNotIn("akc_test", errors.getvalue())
+            self.assertNotIn("foreign_cursor", errors.getvalue())
+        finally:
+            client.stop()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_real_connection_resumes_and_superseded_stops_it(self):
         requests = []
         finished = threading.Event()
