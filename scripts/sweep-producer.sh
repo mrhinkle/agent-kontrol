@@ -119,7 +119,7 @@ if [[ $DRY_RUN -eq 0 ]]; then
   if [[ ! "$MC_URL" =~ ^https?:// ]]; then
     log "MC_URL must be an http(s) URL; nothing emitted"; exit 3
   fi
-  if [[ "$MC_TOKEN" == *'"'* || "$MC_TOKEN" == *\\* ]]; then
+  if [[ "$MC_TOKEN" == *'"'* || "$MC_TOKEN" == *\\* || "$MC_TOKEN" == *[[:cntrl:]]* ]]; then
     log "MC_TOKEN has a character this script cannot send; nothing emitted"; exit 3
   fi
 fi

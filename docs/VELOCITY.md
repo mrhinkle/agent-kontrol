@@ -347,6 +347,22 @@ Each run deletes inbox rows older than 30 days by database time in indexed batch
 
 ### Running it
 
-`scripts/sweep-once.sh` posts one run with `MC_URL` and `MC_TOKEN` from the environment and prints the result. `docs/examples/absence-sweep.cron.example` is an inert five-minute line for that script; nothing installs it.
+`scripts/sweep-once.sh` posts one run with `MC_URL` and `MC_TOKEN` from the environment and prints the result. Cron does not inherit credentials exported in an interactive shell. Its job must invoke a private operator-owned wrapper that reads the host's approved secret store and exports both variables on every invocation.
+
+For example, on macOS, create `/absolute/path/to/private/agent-kontrol-sweep-cron` outside the checkout. The Keychain service names and repository path below are placeholders for the operator's existing approved items and installation; use the approved lookup commands for a different secret store. This example does not create credentials or change Keychain access.
+
+```sh
+#!/bin/sh
+set +x
+set -eu
+MC_URL=$(/usr/bin/security find-generic-password -s 'agent-kontrol/MC_URL' -w)
+MC_TOKEN=$(/usr/bin/security find-generic-password -s 'agent-kontrol/MC_TOKEN' -w)
+export MC_URL MC_TOKEN
+exec /absolute/path/to/agent-kontrol/scripts/sweep-once.sh
+```
+
+Keep the wrapper private and executable by the scheduler account. A failed lookup exits before the sweep; never enable shell tracing or put a token in a crontab or log. Before scheduling, separately approve the live setup and verify non-interactive secret-store access under that same account. `docs/examples/absence-sweep.cron.example` calls this wrapper in a commented five-minute line; nothing creates the wrapper or installs a job.
+
+Two nonblocking review follow-ups remain part of the held activation work: define bounded retention or a manual archive procedure for append-only `sweep_observations` (the inbox prune does not cover it), and create `events_work_principal_idx` concurrently in a separately approved deployment step before applying the canonical schema to a large live `events` table. Source integration does not perform either operation or authorize activation.
 
 Rollback: revert the change. The new tables and columns are additive and inert without the routes; events stop.

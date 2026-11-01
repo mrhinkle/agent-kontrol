@@ -184,6 +184,31 @@ async function main() {
     assert.ok(!fs.existsSync(fx.state));
   });
 
+  await check("credentials: control and curl-config characters stop before collection or transport", async () => {
+    // NUL cannot occur in an environment value. Exercise every other ASCII
+    // control, including CR/LF/TAB/DEL, and retain the quote/backslash refusals.
+    const forbidden = [...Array.from({ length: 31 }, (_, i) => String.fromCharCode(i + 1)), "\x7f", '"', "\\"];
+    for (const char of forbidden) {
+      reset();
+      const fx = new Fixture(root);
+      standard(fx);
+      fx.config(baseConfig({ [REPO]: repoConfig(REPO) }));
+      const curlCalls = path.join(fx.dir, "curl-calls.log");
+      fs.writeFileSync(path.join(fx.bin, "curl"),
+        '#!/usr/bin/env bash\nprintf "called\\n" >> "$SWEEP_FIX_DIR/curl-calls.log"\nexit 97\n', { mode: 0o755 });
+      const r = await runProducer(fx, ["--repo", REPO], { ...live, MC_TOKEN: `${FAKE_TOKEN}${char}suffix` });
+      const label = `character code ${char.charCodeAt(0)}`;
+      assert.deepEqual(fx.calls(), [], `${label}: refuse before GitHub collection`);
+      assert.equal(fs.existsSync(curlCalls), false, `${label}: curl must not start`);
+      assert.equal(server.got.length, 0, `${label}: no request`);
+      assert.equal(fs.existsSync(fx.state), false, `${label}: no state or pending replay`);
+      assert.equal(r.code, 3, label);
+      assert.match(r.stderr, /MC_TOKEN has a character this script cannot send; nothing emitted/, label);
+      assert.equal(r.stdout, "", label);
+      noSecret(r.stdout, r.stderr);
+    }
+  });
+
   await check("queue: label rules, case normalization, raw excludes", async () => {
     reset();
     const fx = new Fixture(root);
