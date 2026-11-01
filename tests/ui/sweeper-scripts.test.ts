@@ -115,13 +115,22 @@ describe("sweeper shell credential transport", () => {
     assert.equal(offline.calls.length, 0);
   });
 
-  it("rejects multiline bearer values without making any request", () => {
+  it("keeps printable opaque bearer characters unchanged", () => {
     for (const script of ["sweep-once.sh", "morning-brief.sh"]) {
-      for (const newline of ["\r", "\n"]) {
-        const r = run(script, "ok", `${TOKEN}${newline}Injected: header`);
-        assert.equal(r.status, 1);
+      const r = run(script, "ok", `${TOKEN}_quote\"_slash\\_plus+/=`);
+      assert.equal(r.status, 0, r.err);
+      assert.equal(r.calls.length, script === "sweep-once.sh" ? 1 : 4);
+    }
+  });
+
+  it("rejects every environment-representable ASCII control before making a request", () => {
+    const controls = [...Array.from({ length: 31 }, (_, i) => String.fromCharCode(i + 1)), "\x7f"];
+    for (const script of ["sweep-once.sh", "morning-brief.sh"]) {
+      for (const control of controls) {
+        const r = run(script, "ok", `${TOKEN}${control}suffix`);
+        assert.equal(r.status, 1, `${script}: character code ${control.charCodeAt(0)}`);
         assert.equal(r.calls.length, 0);
-        assert.match(r.err, /MC_TOKEN must be a single line/);
+        assert.match(r.err, /MC_TOKEN must not contain control characters/);
       }
     }
   });

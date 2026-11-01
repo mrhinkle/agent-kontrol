@@ -73,8 +73,8 @@ AUTH_HEADER=""
 ERR_FILE=""
 trap 'rm -f "$AUTH_HEADER" "$ERR_FILE"' EXIT
 if [[ "$USE_DASHBOARD" -eq 1 && -n "${MC_URL:-}" && -n "${MC_TOKEN:-}" ]]; then
-  if [[ "$MC_TOKEN" == *$'\n'* || "$MC_TOKEN" == *$'\r'* ]]; then
-    echo "morning-brief: MC_TOKEN must be a single line" >&2
+  if [[ "$MC_TOKEN" == *[[:cntrl:]]* ]]; then
+    echo "morning-brief: MC_TOKEN must not contain control characters" >&2
     exit 1
   fi
   AUTH_HEADER="$(umask 077; mktemp)"

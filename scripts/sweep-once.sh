@@ -15,8 +15,8 @@ if [[ -z "${MC_URL:-}" || -z "${MC_TOKEN:-}" ]]; then
   exit 1
 fi
 
-if [[ "$MC_TOKEN" == *$'\n'* || "$MC_TOKEN" == *$'\r'* ]]; then
-  echo "sweep-once: MC_TOKEN must be a single line" >&2
+if [[ "$MC_TOKEN" == *[[:cntrl:]]* ]]; then
+  echo "sweep-once: MC_TOKEN must not contain control characters" >&2
   exit 1
 fi
 AUTH_HEADER="$(umask 077; mktemp)"
