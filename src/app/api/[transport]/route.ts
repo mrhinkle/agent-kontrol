@@ -1,6 +1,6 @@
 import { createMcpHandler, getPublicOrigin, withMcpAuth } from "mcp-handler";
 import { z } from "zod";
-import { actorFromPrincipal, currentActor, runWithActor } from "@/lib/actor";
+import { currentActor, runWithPrincipal } from "@/lib/actor";
 import { activityDetail, readReceipt, withReceipt } from "@/lib/activity";
 import { apiError, memoryKeyError, toolResultFromCaught, type McpToolResult } from "@/lib/api-error";
 import { secretsMatch, verifyAccessToken } from "@/lib/authcrypto";
@@ -833,7 +833,7 @@ const authed = withMcpAuth(
     const metered = await meterMcpRequest(req, principal);
     if (metered) return metered;
     if (!principal) return handler(req);
-    return runWithActor(actorFromPrincipal(principal), () => handler(req));
+    return runWithPrincipal(principal, () => handler(req));
   },
   verifyToken,
   {

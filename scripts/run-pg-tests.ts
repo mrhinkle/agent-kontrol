@@ -13,6 +13,7 @@ import { evaluateAlerts, setBeforeClaimForTests, setBriefSettingsForTests } from
 import type { BriefSettings } from "../src/lib/progress-config";
 import { sql, withTransaction } from "../src/lib/db";
 import { insertGhEvent, signBody } from "../src/lib/gh-events";
+import { testSweeper } from "./pg-sweeper-tests";
 import { EVENT_FIXTURES, PING_PAYLOAD } from "../tests/ui/gh-event-fixtures";
 import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
 import { StaleWrite } from "../src/lib/revision";
@@ -373,6 +374,7 @@ async function main() {
   await testRepoCaseIdentity(tag);
   await testCredentialQuotas(tag);
   await testGhEvents(tag);
+  await testSweeper(tag, applyCanonicalSchema);
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
 }

@@ -243,7 +243,7 @@ describe("scope table", { concurrency: false }, () => {
       }
       assert.match(
         src,
-        /enforceApi|enforceBearer|requireDashboardSession|resolveApiAccess|resolveBearerAccess/,
+        /enforceApi|enforceBearer|requireDashboardSession|resolveApiAccess|resolveBearerAccess|requireTrustedWriter/,
         `${file} does not enforce credentials`,
       );
       if (/resolveApiAccess|resolveBearerAccess/.test(src)) {
