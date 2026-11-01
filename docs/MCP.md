@@ -43,6 +43,7 @@ A tool name that is not registered is denied for every caller, including `MC_TOK
 | `skills:write` | `run_skill` | — (no REST route; the agent calls `run_skill`) |
 | `watch:read` | — (no MCP tool) | `GET /api/watch/beats` |
 | `watch:write` | — (no MCP tool) | `POST /api/watch/beat` |
+| `events:read` | — (no MCP tool) | `GET /api/events/stream` |
 
 `reply_to_mark` is the deprecated alias of `reply_to_operator` and requires the same scope.
 

@@ -22,6 +22,7 @@ import { RUNTIMES } from "./skills/types";
 import { WATCH_STATUSES } from "./watch";
 import { WATCH_SOURCES } from "./watch-sources";
 import { GH_ACCEPTED_EVENTS, GH_WEBHOOK_BODY_MAX_BYTES } from "./gh-events";
+import { CONSUMER_ID, STREAM_FRAME_MAX, STREAM_HEARTBEAT_MS, STREAM_LIFETIME_MS } from "./events-stream";
 import { CITATION_MAX, PRINCIPAL_KINDS, PRS_MAX, QUEUE_CLASSIFICATIONS, REASON_MAX, REFS_MAX, SWEEP_OBSERVATION_KINDS } from "./sweep-evidence";
 import { DEFAULT_SILENCE_HOURS, DEFAULT_STALE_MINUTES, RETENTION_DAYS, SWEEP_CONDITIONS } from "./sweep-logic";
 
@@ -233,6 +234,7 @@ export function openApiDocument(): Json {
       { name: "mcp" },
       { name: "watch" },
       { name: "webhooks" },
+      { name: "events" },
       { name: "sweep" },
     ],
     components: {
@@ -266,6 +268,12 @@ export function openApiDocument(): Json {
         },
       },
       schemas: {
+        StreamError: {
+          type: "object",
+          required: ["error"],
+          properties: { error: { type: "string" } },
+          description: "Stream-specific failures contain error. Authentication and quota failures may include the standard error fields too.",
+        },
         Error: {
           type: "object",
           required: ["error", "code", "fix", "retryable"],
@@ -2523,6 +2531,61 @@ export function openApiDocument(): Json {
             "403": jsonResponse("trusted_writer_required, or insufficient_scope for an agent credential.", ref("Error")),
             "500": jsonResponse("internal_error, without the exception text.", ref("Error")),
             "503": jsonResponse("setup_required: no database.", ref("Error")),
+          },
+        }),
+      },
+      "/api/events/consumers": {
+        post: operation({
+          operationId: "registerEventConsumer",
+          tags: ["events"],
+          summary: "Bind a stream consumer to one credential and explicit filters.",
+          description: "Operator-only registration or reconfiguration. The credential must be active and have events:read. Reconfiguration fences existing connections by incrementing the durable generation. No agent credential, OAuth token, or dev-open caller may register or widen a binding. The body is at most 16 KiB of UTF-8 JSON; unknown fields are refused.",
+          security: [{ mcToken: [] }, { cookieAuth: [] }],
+          requestBody: body({
+            type: "object", additionalProperties: false,
+            required: ["id", "credential_id", "repos", "event_types"],
+            properties: {
+              id: { type: "string", pattern: CONSUMER_ID.source, maxLength: 64 },
+              credential_id: { type: "string", pattern: "^[A-Za-z0-9_-]+(?![\\s\\S])", maxLength: 100 },
+              repos: { type: "array", minItems: 1, maxItems: 50, items: { type: "string", pattern: "^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}(?![\\s\\S])" } },
+              event_types: { type: "array", minItems: 1, maxItems: 32, items: { type: "string", pattern: "^[a-z][a-z0-9_.-]{0,63}(?![\\s\\S])" } },
+              enabled: { type: "boolean", default: true },
+            },
+          }),
+          responses: {
+            "200": jsonResponse("Binding stored. Duplicate filter values are collapsed.", {
+              type: "object", required: ["ok", "consumer"],
+              properties: { ok: { const: true }, consumer: { type: "object", additionalProperties: true } },
+            }),
+            "400": jsonResponse("Invalid JSON, registration, or ineligible credential.", ref("StreamError")),
+            "401": jsonResponse("A valid operator credential is required.", ref("StreamError")),
+            "403": jsonResponse("Only MC_TOKEN or the dashboard session may register a consumer.", ref("StreamError")),
+            "409": jsonResponse("credential_already_bound: another consumer already uses this credential, including concurrent registrations.", ref("StreamError")),
+            "413": jsonResponse("The body is larger than 16 KiB.", ref("StreamError")),
+            "503": jsonResponse("The database is not configured or the binding could not be stored.", ref("StreamError")),
+          },
+        }),
+      },
+      "/api/events/stream": {
+        get: operation({
+          operationId: "streamConsumerEvents",
+          tags: ["events"],
+          summary: "Replay and tail the registered consumer's inbox events over SSE.",
+          description: `Requires an active akc_ credential with events:read bound to the named consumer. MC_TOKEN, sessions, OAuth, query credentials and open-demo access are refused. Every database batch rechecks credential, enabled binding, filters and generation. Events have event: github and JSON {id,event,payload}; id is consumer:decimal-bigint. Ordering uses the bigint column, not its text representation. A short bounded SHARE lock prevents a late-committing low sequence id being skipped. Delivery is at least once; consumers deduplicate and reconcile. A new connection fences the previous generation. Missing retained cursors emit cursor_expired without an id; stale generations emit superseded; sanitized failures emit stream_error. Heartbeat comments arrive every ${STREAM_HEARTBEAT_MS / 1000}s when the reader is making progress. The server closes at ${STREAM_LIFETIME_MS / 1000}s; reconnect with the last complete event id. Frames are bounded to ${STREAM_FRAME_MAX} bytes. Scope-authorized requests count against the credential quota before binding/cursor validation; stream polls and heartbeats do not each consume another request.`,
+          security: [{ agentCredential: [] }],
+          parameters: [
+            query("consumer", { type: "string", pattern: CONSUMER_ID.source, maxLength: 64 }, "Exactly one registered consumer id.", { required: true }),
+            query("since", { type: "string", maxLength: 85 }, "Optional consumer:decimal-id cursor, no larger than PostgreSQL's signed bigint maximum. Starts at zero when absent. Must agree with Last-Event-ID when both are nonempty."),
+            { name: "Last-Event-ID", in: "header", required: false, schema: { type: "string", maxLength: 85 }, description: "Reconnect cursor. Ignored only when since is explicitly provided; conflicting nonempty values are refused." },
+          ],
+          responses: {
+            "200": { description: "Bounded event stream. Cache-Control: no-store, no-transform. Control frames require reconciliation; they do not invent a cursor.", content: { "text/event-stream": { schema: { type: "string" } } } },
+            "400": jsonResponse("Malformed consumer/cursor, duplicate parameters, or conflicting cursors.", ref("StreamError")),
+            "401": jsonResponse("Missing or invalid akc_ bearer credential.", ref("StreamError")),
+            "403": jsonResponse("Missing scope, mismatched/disabled binding, or foreign cursor.", ref("StreamError")),
+            "409": jsonResponse("This generation was superseded before headers were sent.", ref("StreamError")),
+            "429": jsonResponse("Credential request quota used. Honor Retry-After before reconnecting.", ref("StreamError")),
+            "503": jsonResponse("The stream store is not configured or unavailable. No healthy empty stream is invented.", ref("StreamError")),
           },
         }),
       },
