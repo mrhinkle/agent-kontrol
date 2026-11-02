@@ -92,6 +92,11 @@ gh auth status >/dev/null 2>&1 || {
 mkdir -p "$INSTALL_DIR" "${HOME}/Library/LaunchAgents" "${HOME}/Library/Logs" "$(dirname "$ENV_FILE")"
 cp "${REPO_ROOT}/scripts/collect-progress.sh" "$INSTALLED_SH"
 chmod 755 "$INSTALLED_SH"
+# The sweeper evidence helper (#79). It stays off until a separate
+# sweep-producer.config.json with enabled true is placed beside it; this
+# installer does not create or copy that config.
+cp "${REPO_ROOT}/scripts/sweep-producer.sh" "${INSTALL_DIR}/sweep-producer.sh"
+chmod 755 "${INSTALL_DIR}/sweep-producer.sh"
 # The installed script runs outside the repo, so it gets its own copy of the
 # watched-repo list. Edit progress.config.json in the repo, then re-run this installer.
 cp "${REPO_ROOT}/progress.config.json" "$INSTALLED_CONFIG"

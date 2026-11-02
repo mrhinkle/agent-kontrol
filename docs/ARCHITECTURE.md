@@ -64,7 +64,7 @@ The page never calls GitHub. The collector owns the API budget and writes snapsh
 
 - Data routes: dashboard password cookie (`mc_auth`, 30 days), `MC_TOKEN` bearer, or an agent credential whose scopes allow the route.
 - Agent routes and MCP: `MC_TOKEN` (every scope), an agent credential (its scopes), or OAuth (all mapped tools; verification unchanged).
-- `GET`/`POST`/`DELETE /api/settings/credentials`: dashboard session only.
+- `GET`/`POST`/`PATCH`/`DELETE /api/settings/credentials`: dashboard session only.
 - Scope table and the single check: `src/lib/scopes.ts`. Credential store: `src/lib/credentials.ts`.
 
 See [API.md](API.md). Demo mode: no `DATABASE_URL` means the dashboard and REST reads stay on sample data. The MCP write tools (`report_status`, `remember`, `create_task`, `claim_task`, `update_task`, `send_message`, `requeue_task`, `delete_note`) keep an in-memory store for the life of the process. `get_fleet_status`, `recall`, `get_task_queue`, and `list_activity` read that store. `GET /api/activity` reads the same in-memory event log and does not use a static sample. A successful response from it is labeled demo. The store is cleared when the process restarts. REST writes are still dropped. Skills, inbox, replies, and the progress digest stay on their sample behaviour.

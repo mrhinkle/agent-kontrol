@@ -5,6 +5,8 @@ import { hoursBetween, listDecisions, partitionBrief, type BriefDecision } from 
 import { isConfigured, sql } from "@/lib/db";
 import type { RepoSnapshot, SnapshotDetail } from "@/lib/progress-types";
 import { getWatchedRepos } from "@/lib/watched-repos";
+import { formatPausedLines, unmeasuredPaused, type PausedSection } from "@/lib/sweep-logic";
+import { readPaused } from "@/lib/sweeper";
 
 /**
  * The morning brief, read from Postgres.
@@ -108,6 +110,11 @@ export interface MorningBrief {
   stuck_prs: BriefStuckPr[] | null;
   /** Null when the total is unmeasured and no row is known: an empty list would read as "none". */
   decisions: BriefDecision[] | null;
+  /**
+   * Scheduler pauses (#79): held, unexplained, expired, and stale jobs.
+   * measured false is DATA INCOMPLETE, never "none".
+   */
+  paused: PausedSection;
 }
 
 export interface CoordinatorEvent {
@@ -541,6 +548,7 @@ export function assembleBrief(input: {
   staleIssueDays: number;
   coordinator: BriefCoordinator;
   repos: readonly BriefRepo[];
+  paused?: PausedSection;
 }): MorningBrief {
   const repos = input.repos.map((repo) => {
     if (repo.incomplete || repo.decisions !== null) return repo;
@@ -586,6 +594,7 @@ export function assembleBrief(input: {
     repos,
     stuck_prs: stuckTotal === null && stuck.length === 0 ? null : stuck,
     decisions: decisionTotal === null && decisions.length === 0 ? null : decisions,
+    paused: input.paused ?? unmeasuredPaused("scheduler status not loaded"),
   };
 }
 
@@ -717,6 +726,8 @@ export function formatBriefText(
   } else {
     lines.push("DECISIONS FOR YOU: none open.");
   }
+  lines.push("");
+  lines.push(...formatPausedLines(brief.paused ?? unmeasuredPaused("scheduler status not loaded")));
   lines.push("");
   for (const repo of brief.repos) {
     if (repo.merged_prs == null || repo.merged_prs <= 0) continue;
@@ -928,6 +939,7 @@ export async function loadBrief(
       staleIssueDays: settings.staleIssueDays,
       coordinator,
       repos: sections,
+      paused: unmeasuredPaused("no dashboard database"),
     });
   }
 
@@ -982,6 +994,8 @@ export async function loadBrief(
     decisionsMeasured,
   );
   const coordinator = await coordinatorFromDb(settings, nowIso);
+  // Held, unexplained, and expired use the database clock, like the sweeper.
+  const paused = await readPaused();
   return assembleBrief({
     generatedAt: nowIso,
     windowHours: hours,
@@ -990,6 +1004,7 @@ export async function loadBrief(
     staleIssueDays: settings.staleIssueDays,
     coordinator,
     repos: sections,
+    paused,
   });
 }
 

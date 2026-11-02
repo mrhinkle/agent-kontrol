@@ -7,6 +7,7 @@ import { runWithActor } from "../../src/lib/actor";
 import { signAccessToken } from "../../src/lib/authcrypto";
 import { createCredential, resetCredentialsForTests } from "../../src/lib/credentials";
 import { setSqlForTests, sql, type Row, type SqlTag } from "../../src/lib/db";
+import { fakeQuotaSql } from "./quota-fake";
 import { setSkillNowForTests } from "../../src/lib/skills/clock";
 import { skillsDigest } from "../../src/lib/skills/digest";
 import { runSkillTool } from "../../src/lib/skills/mcp";
@@ -103,6 +104,8 @@ function rememberCredential(token: string, id: string, label: string) {
 }
 
 function credentialSql(text: string, values: unknown[]): Row[] {
+  const quota = fakeQuotaSql(text, values);
+  if (quota) return quota;
   if (text.includes("token_hash")) {
     const hash = String(values[0]);
     const row = credRows.find((item) => item.token_hash === hash);
@@ -206,6 +209,8 @@ describe("run_skill identity", { concurrency: false }, () => {
     const inner: SqlTag = sql();
     setSqlForTests(async (strings, ...values) => {
       const text = strings.join(" ");
+      // The request-quota charge runs in a transaction on the credential row.
+      if (/^\s*(begin|commit|rollback)\s*$/i.test(text)) return [];
       if (text.includes("agent_credentials")) return credentialSql(text, values);
       return inner(strings, ...values);
     });
