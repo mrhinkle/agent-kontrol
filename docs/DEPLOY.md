@@ -18,7 +18,7 @@ The script:
 
 Flags:
 
-- `--local` — no Docker; runs `npm ci` then `npm run dev` in demo mode with no database.
+- `--local` — no Docker; runs `pnpm install --frozen-lockfile` then `npm run dev` in demo mode with no database.
 - `--dir <path>` — clone location.
 - `--no-start` — prepare but do not start.
 
@@ -44,8 +44,8 @@ The Neon integration injects `DATABASE_URL`. `npm run build` applies the schema 
 | Vercel + another Postgres | Any Postgres 13+ | Set `DATABASE_URL` | Supported |
 | Docker Compose (self-hosted) | Postgres 16, included | Two env vars in `.env` | Same code, less exercised |
 | Fly.io | Fly Managed Postgres or Neon | `fly launch` + three secrets | Same image as Compose; CI builds and smoke-tests it |
-| Any Node host | Any Postgres | `npm ci && npm run build && npm start` | Same code, less exercised |
-| Local demo | None | `npm ci && npm run dev` | Sample dashboard data. MCP writes stay in memory and are cleared when the process restarts |
+| Any Node host | Any Postgres | `pnpm install --frozen-lockfile && npm run build && npm start` | Same code, less exercised |
+| Local demo | None | `pnpm install --frozen-lockfile && npm run dev` | Sample dashboard data. MCP writes stay in memory and are cleared when the process restarts |
 
 Only Vercel + Neon is used in the author's production. CI runs the data layer tests against Postgres 16 (schema applied twice). The Docker, Fly.io and generic-Node paths follow the same code but are less exercised; CI does build the Docker image and check that it serves `/login`. Not supported: serverless platforms that cannot run Node 22, and plain HTTP without TLS for anything but localhost.
 
@@ -120,7 +120,7 @@ Notes:
 Requirements: Node 22 and a Postgres.
 
 ```bash
-npm ci && npm run build && npm start
+pnpm install --frozen-lockfile && npm run build && npm start
 ```
 
 `npm run migrate` applies the schema on demand. The app listens on `PORT` (default 3000) via `next start`. Put TLS in front of it.
@@ -128,7 +128,7 @@ npm ci && npm run build && npm start
 ### Local demo
 
 ```bash
-npm ci && npm run dev
+pnpm install --frozen-lockfile && npm run dev
 ```
 
 With no `DATABASE_URL`, the dashboard shows sample data. MCP writes for `report_status`, `remember`, `create_task`, `claim_task`, and `update_task` are kept in an in-memory store for this process, labeled demo, and cleared when the process restarts. REST writes are still dropped.

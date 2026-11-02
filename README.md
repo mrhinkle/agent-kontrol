@@ -88,7 +88,7 @@ The same docs are available inside the app under **Help**.
 ## Develop
 
 ```bash
-npm ci
+pnpm install --frozen-lockfile
 npm run dev        # demo mode, no database needed
 npm run typecheck && npm run test:ui && npm test && npm run build
 ```

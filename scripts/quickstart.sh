@@ -124,8 +124,8 @@ if [ "$MC_MODE" = "docker" ]; then
   echo "Install the agent hook with:"
   echo "  MC_URL=http://localhost:${MC_PORT} MC_TOKEN=\$(grep '^MC_TOKEN=' $MC_DIR/.env | cut -d= -f2) ./agents/claude-code/install.sh"
 else
-  set_step "npm ci"
-  (cd "$MC_DIR" && npm ci)
+  set_step "pnpm install"
+  (cd "$MC_DIR" && if command -v pnpm >/dev/null 2>&1; then pnpm install --frozen-lockfile; else npx --yes pnpm@10.33.0 install --frozen-lockfile; fi)
   echo ""
   echo "No DATABASE_URL set: the app will run in demo mode with sample data (no database)."
   if [ "$MC_START" = "1" ]; then

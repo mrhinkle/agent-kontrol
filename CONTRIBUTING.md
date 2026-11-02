@@ -3,7 +3,7 @@
 ## Development setup
 
 - Node 22
-- `npm ci`
+- `pnpm install --frozen-lockfile`
 - `npm run dev` — runs in demo mode when `DATABASE_URL` is unset.
 
 ## Where to start
