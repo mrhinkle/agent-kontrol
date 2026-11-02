@@ -446,3 +446,89 @@ describe("MCP client against demo mode", { concurrency: 1 }, () => {
     assert.equal(/invalid_type/.test(text), false);
   });
 });
+
+/**
+ * Issue #51: an akc_ credential's request quota, driven by the official
+ * client. Demo mode keeps the credential in memory. The cap is per UTC day so
+ * a minute boundary during the run cannot change the count. Every HTTP
+ * request the client sends after authentication counts once, so exactly
+ * `cap` requests succeed before the first 429.
+ */
+describe("MCP client with an akc_ credential over its request limit", { concurrency: 1 }, () => {
+  const cap = 4;
+  const origin = new URL(baseUrl as string).origin;
+
+  it("lets exactly the daily cap through, then answers 429 rate_limited with Retry-After", async () => {
+    const created = await fetch(`${origin}/api/settings/credentials`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        label: `${probe}-quota`,
+        scopes: ["fleet:read"],
+        rate_limit_per_minute: 1000,
+        rate_limit_per_day: cap,
+      }),
+    });
+    assert.equal(created.status, 200, await created.clone().text());
+    const issued = (await created.json()) as { credential: { token: string; rate_limit_per_day: number } };
+    assert.equal(issued.credential.rate_limit_per_day, cap);
+    const akc = issued.credential.token;
+    assert.match(akc, /^akc_/);
+
+    const statuses: number[] = [];
+    const counting: typeof fetch = async (input, init) => {
+      const res = await fetch(input, init);
+      statuses.push(res.status);
+      return res;
+    };
+    const quotaTransport = new StreamableHTTPClientTransport(new URL(baseUrl as string), {
+      requestInit: { headers: { Authorization: `Bearer ${akc}` } },
+      fetch: counting,
+    });
+    const quotaClient = new Client({ name: "agent-kontrol-mcp-quota", version: "0.0.0" });
+    let limitedError: unknown = null;
+    try {
+      await quotaClient.connect(quotaTransport);
+      for (let i = 0; i < cap + 2 && !statuses.includes(429); i++) {
+        await quotaClient.callTool({ name: "get_fleet_status", arguments: {} });
+      }
+    } catch (e) {
+      limitedError = e;
+    } finally {
+      await quotaClient.close().catch(() => {});
+    }
+    const firstLimited = statuses.indexOf(429);
+    assert.ok(firstLimited !== -1, `no 429 in ${JSON.stringify(statuses)}`);
+    assert.equal(firstLimited, cap, `exactly ${cap} requests before the 429: ${JSON.stringify(statuses)}`);
+    assert.ok(limitedError, "the client surfaced the 429");
+    assert.equal((limitedError as { code?: unknown }).code, 429);
+    assert.match(String((limitedError as Error).message), /"code":"rate_limited"/);
+
+    const raw = await fetch(baseUrl as string, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${akc}`,
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: INITIALIZE_BODY,
+    });
+    assert.equal(raw.status, 429);
+    const retryAfter = Number(raw.headers.get("retry-after"));
+    assert.ok(Number.isInteger(retryAfter) && retryAfter >= 1);
+    const body = (await raw.json()) as Record<string, unknown>;
+    assert.equal(body.code, "rate_limited");
+    assert.equal(body.retryable, true);
+    assert.equal(body.retry_after, retryAfter);
+    assert.equal(body.window, "day");
+    assert.equal(body.limit, cap);
+  });
+
+  it("does not meter MC_TOKEN", async () => {
+    for (let i = 0; i < cap + 2; i++) {
+      const res = await postInitialize(`Bearer ${token}`);
+      assert.equal(res.status, 200);
+      await res.body?.cancel();
+    }
+  });
+});
