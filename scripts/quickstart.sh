@@ -3,9 +3,55 @@ set -euo pipefail
 
 MC_REPO="https://github.com/mrhinkle/agent-kontrol.git"
 MC_DIR="./agent-kontrol"
+MC_ROOT="$PWD"
 MC_MODE=""
 MC_START=1
 MC_STEP="init"
+
+# package.json "packageManager" is the only pin. An older pnpm already on PATH
+# must not install: a pnpm 10 lockfile fails under pnpm 8/9 with --frozen-lockfile.
+pnpm_package_json() {
+  if [ -f "$MC_DIR/package.json" ]; then
+    printf '%s\n' "$MC_DIR/package.json"
+    return
+  fi
+  # run_pnpm is called after cd "$MC_DIR", so a relative MC_DIR no longer resolves.
+  if [ -f "$MC_ROOT/$MC_DIR/package.json" ]; then
+    printf '%s\n' "$MC_ROOT/$MC_DIR/package.json"
+    return
+  fi
+  echo "quickstart: cannot find package.json for $MC_DIR" >&2
+  exit 1
+}
+
+pnpm_pin() {
+  local spec pkg
+  pkg="$(pnpm_package_json)"
+  spec="$(grep -E '"packageManager"[[:space:]]*:[[:space:]]*"pnpm@[^"]+"' "$pkg" | head -1 || true)"
+  spec="${spec#*pnpm@}"
+  spec="${spec%%\"*}"
+  if [ -z "$spec" ]; then
+    echo "quickstart: $pkg is missing packageManager pnpm@<version>" >&2
+    exit 1
+  fi
+  printf '%s\n' "$spec"
+}
+
+# Run argv with the pinned pnpm. Use a matching binary when one is installed;
+# otherwise fetch the pin with npx. Never run a different version silently.
+run_pnpm() {
+  local pin installed
+  pin="$(pnpm_pin)"
+  if command -v pnpm >/dev/null 2>&1; then
+    installed="$(pnpm --version 2>/dev/null || true)"
+    if [ "$installed" = "$pin" ]; then
+      pnpm "$@"
+      return
+    fi
+    echo "quickstart: found pnpm ${installed:-unknown}; using pnpm@${pin}" >&2
+  fi
+  npx --yes "pnpm@${pin}" "$@"
+}
 
 fail() {
   echo "quickstart: failed during step [$MC_STEP]: $*" >&2
@@ -125,14 +171,14 @@ if [ "$MC_MODE" = "docker" ]; then
   echo "  MC_URL=http://localhost:${MC_PORT} MC_TOKEN=\$(grep '^MC_TOKEN=' $MC_DIR/.env | cut -d= -f2) ./agents/claude-code/install.sh"
 else
   set_step "pnpm install"
-  (cd "$MC_DIR" && if command -v pnpm >/dev/null 2>&1; then pnpm install --frozen-lockfile; else npx --yes pnpm@10.33.0 install --frozen-lockfile; fi)
+  (cd "$MC_DIR" && run_pnpm install --frozen-lockfile)
   echo ""
   echo "No DATABASE_URL set: the app will run in demo mode with sample data (no database)."
   if [ "$MC_START" = "1" ]; then
-    set_step "npm run dev"
+    set_step "pnpm run dev"
     cd "$MC_DIR"
-    exec npm run dev
+    run_pnpm run dev
   else
-    echo "Skipped starting (--no-start). Run 'npm run dev' inside $MC_DIR when ready."
+    echo "Skipped starting (--no-start). Run 'pnpm run dev' inside $MC_DIR when ready."
   fi
 fi

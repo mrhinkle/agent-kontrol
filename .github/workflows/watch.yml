@@ -42,7 +42,7 @@ jobs:
 
       - name: Restore watch state
         if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && vars.WATCH_ENABLED == 'true' }}
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .watch-state
           key: watch-state-v1-${{ github.run_id }}-${{ github.run_attempt }}
@@ -66,7 +66,7 @@ jobs:
       - name: Save watch state
         if: ${{ always() && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && vars.WATCH_ENABLED == 'true' && hashFiles('.watch-state/state.json') != '' }}
         continue-on-error: true
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .watch-state
           key: watch-state-v1-${{ github.run_id }}-${{ github.run_attempt }}

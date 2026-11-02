@@ -89,8 +89,8 @@ The same docs are available inside the app under **Help**.
 
 ```bash
 pnpm install --frozen-lockfile
-npm run dev        # demo mode, no database needed
-npm run typecheck && npm run test:ui && npm test && npm run build
+pnpm run dev        # demo mode, no database needed
+pnpm run typecheck && pnpm run test:ui && pnpm test && pnpm run build
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Changes are listed in [CHANGELOG.md](CHANGELOG.md).

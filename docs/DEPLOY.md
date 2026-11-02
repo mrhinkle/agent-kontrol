@@ -18,7 +18,7 @@ The script:
 
 Flags:
 
-- `--local` — no Docker; runs `pnpm install --frozen-lockfile` then `npm run dev` in demo mode with no database.
+- `--local` — no Docker; runs `pnpm install --frozen-lockfile` then `pnpm run dev` in demo mode with no database.
 - `--dir <path>` — clone location.
 - `--no-start` — prepare but do not start.
 
@@ -34,7 +34,7 @@ cd agent-kontrol
 
 [![Deploy to Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fmrhinkle%2Fagent-kontrol&project-name=agent-kontrol&repository-name=agent-kontrol&env=MC_TOKEN%2CMC_DASHBOARD_PASSWORD&envDescription=MC_TOKEN%20is%20the%20shared%20secret%20agents%20use.%20MC_DASHBOARD_PASSWORD%20protects%20the%20dashboard.%20Generate%20each%20with%20openssl%20rand%20-hex%2024.&envLink=https%3A%2F%2Fgithub.com%2Fmrhinkle%2Fagent-kontrol%2Fblob%2Fmain%2Fdocs%2FDEPLOY.md&stores=%5B%7B%22type%22%3A%22integration%22%2C%22integrationSlug%22%3A%22neon%22%2C%22productSlug%22%3A%22neon%22%2C%22protocol%22%3A%22storage%22%7D%5D)
 
-The Neon integration injects `DATABASE_URL`. `npm run build` applies the schema automatically when `DATABASE_URL` is present (script `scripts/apply-schema.mjs`; idempotent), so a new deploy works on first load. This is the path the author runs in production.
+The Neon integration injects `DATABASE_URL`. `pnpm run build` applies the schema automatically when `DATABASE_URL` is present (script `scripts/apply-schema.mjs`; idempotent), so a new deploy works on first load. This is the path the author runs in production.
 
 ## Targets
 
@@ -44,14 +44,14 @@ The Neon integration injects `DATABASE_URL`. `npm run build` applies the schema 
 | Vercel + another Postgres | Any Postgres 13+ | Set `DATABASE_URL` | Supported |
 | Docker Compose (self-hosted) | Postgres 16, included | Two env vars in `.env` | Same code, less exercised |
 | Fly.io | Fly Managed Postgres or Neon | `fly launch` + three secrets | Same image as Compose; CI builds and smoke-tests it |
-| Any Node host | Any Postgres | `pnpm install --frozen-lockfile && npm run build && npm start` | Same code, less exercised |
-| Local demo | None | `pnpm install --frozen-lockfile && npm run dev` | Sample dashboard data. MCP writes stay in memory and are cleared when the process restarts |
+| Any Node host | Any Postgres | `pnpm install --frozen-lockfile && pnpm run build && pnpm start` | Same code, less exercised |
+| Local demo | None | `pnpm install --frozen-lockfile && pnpm run dev` | Sample dashboard data. MCP writes stay in memory and are cleared when the process restarts |
 
 Only Vercel + Neon is used in the author's production. CI runs the data layer tests against Postgres 16 (schema applied twice). The Docker, Fly.io and generic-Node paths follow the same code but are less exercised; CI does build the Docker image and check that it serves `/login`. Not supported: serverless platforms that cannot run Node 22, and plain HTTP without TLS for anything but localhost.
 
 ### Vercel + Neon
 
-Use the Deploy button above. The Neon integration injects `DATABASE_URL`; set `MC_TOKEN` and `MC_DASHBOARD_PASSWORD` when prompted (generate each with `openssl rand -hex 24`). `npm run build` applies the schema automatically when `DATABASE_URL` is present (`scripts/apply-schema.mjs`; idempotent), so a new deploy works on first load.
+Use the Deploy button above. The Neon integration injects `DATABASE_URL`; set `MC_TOKEN` and `MC_DASHBOARD_PASSWORD` when prompted (generate each with `openssl rand -hex 24`). `pnpm run build` applies the schema automatically when `DATABASE_URL` is present (`scripts/apply-schema.mjs`; idempotent), so a new deploy works on first load.
 
 ### Vercel + another Postgres
 
@@ -120,15 +120,15 @@ Notes:
 Requirements: Node 22 and a Postgres.
 
 ```bash
-pnpm install --frozen-lockfile && npm run build && npm start
+pnpm install --frozen-lockfile && pnpm run build && pnpm start
 ```
 
-`npm run migrate` applies the schema on demand. The app listens on `PORT` (default 3000) via `next start`. Put TLS in front of it.
+`pnpm run migrate` applies the schema on demand. The app listens on `PORT` (default 3000) via `next start`. Put TLS in front of it.
 
 ### Local demo
 
 ```bash
-pnpm install --frozen-lockfile && npm run dev
+pnpm install --frozen-lockfile && pnpm run dev
 ```
 
 With no `DATABASE_URL`, the dashboard shows sample data. MCP writes for `report_status`, `remember`, `create_task`, `claim_task`, and `update_task` are kept in an in-memory store for this process, labeled demo, and cleared when the process restarts. REST writes are still dropped.
