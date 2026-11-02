@@ -80,3 +80,29 @@ Adapters can keep sending `MC_TOKEN`. That token has every scope. Settings can a
 - [API.md](API.md) — the ingest routes.
 - [DEPLOY.md](DEPLOY.md) — environment variables and deployment targets.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — data flow and schema.
+
+## Dispatcher event wakeups (#78)
+
+The dispatcher can opt into the outbound stream after an operator registers a
+consumer and provisions an `events:read` credential. Set `MC_EVENT_CONSUMER` and
+`MC_EVENT_TOKEN` alongside its existing `MC_URL`/task credential configuration.
+Do not put the event credential in the URL. No listener is started when these
+variables are absent; invalid configuration logs a bounded error and preserves
+polling. HTTPS is required except for loopback development. Redirects are refused.
+
+The listener validates bounded SSE frames, resumes using `Last-Event-ID`, obeys
+quota Retry-After, and uses capped reconnect backoff. A complete event only wakes
+the existing atomic claim API. It never launches work from webhook payload text.
+Superseded listeners stop competing and leave polling active; expired cursors
+request reconciliation before replay. Capacity becoming available also wakes the
+claim loop, without being mislabeled as an external event.
+
+While connected, fallback polling is no more frequent than every 60 seconds
+(`max(MC_POLL_SECONDS, 60)`). While unavailable it keeps the existing poll interval.
+Claim logs distinguish event/capacity/fallback/reconciliation and count raw
+`fallback_claims` with stream health. These counts are not proof of causally missed
+events: task producers/reducers may not yet emit an inbox notification. Do not
+claim production event coverage from this counter or from synthetic tests.
+
+This source change does not activate any dispatcher, reviewer, scheduler or
+Carmack job. Follow the API consumer setup and existing owner deployment holds.
