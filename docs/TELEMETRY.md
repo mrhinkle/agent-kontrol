@@ -20,7 +20,7 @@ The Claude Code hook already installed for the Fleet view now emits traces too. 
 | `turn N` | each prompt, to the next `Stop` |
 | the tool name, for example `Bash` | `PreToolUse` to `PostToolUse` |
 
-A tool call whose response reports an error is marked as an error. The hook keeps a tiny state file per session under `~/.claude/mission-control-trace/` to pair a tool's start with its end, and deletes it when the session ends (leftovers older than 7 days are cleaned up). Tool traces are sent from a detached child process, so the agent never waits on the network (on Windows, where fork is unavailable, the send is synchronous with a short timeout). After a failed send the hook skips tracing for 30 seconds, so a down server cannot slow every tool call. Set `MC_TRACES=0` to turn tracing off while keeping the Fleet events.
+A tool call whose response reports an error is marked as an error. The hook keeps a tiny state file per session under `~/.claude/mission-control-trace/` to pair a tool's start with its end, and deletes it when the session ends (leftovers older than 7 days are cleaned up). Tool traces are sent from a separate, freshly started Python process, so the agent never waits on the network (if that process cannot be started, the send is synchronous with a short timeout). The hook never uses a bare `os.fork()`: on macOS a forked child crashes in urllib's system-proxy lookup. After a failed send the hook skips tracing for 30 seconds, so a down server cannot slow every tool call. Set `MC_TRACES=0` to turn tracing off while keeping the Fleet events.
 
 ## Any other agent or tool: send OTLP
 
