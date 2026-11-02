@@ -1,4 +1,5 @@
-import { currentActor, type Actor } from "./actor";
+import { currentActor, currentPrincipal, provenanceFromPrincipal, type Actor } from "./actor";
+import type { Principal } from "./scopes";
 import { activityRow, attachReceipt, receiptFromParts, type ActivityRow, type Receipt } from "./activity";
 import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } from "./idempotency";
 import { StaleWrite, absentRevision } from "./revision";
@@ -70,8 +71,16 @@ function rethrowStore(e: unknown): never {
   throw new Error(errMsg(e));
 }
 
-export async function report(input: ReportInput): Promise<Receipt | null> {
+/**
+ * `opts.principal` is the verified caller. It is never read from `input`.
+ * Without it, an MCP handler's principal is used. dev-open and unauthenticated
+ * writes store null provenance, which consumer liveness does not count.
+ */
+export async function report(input: ReportInput, opts?: { principal?: Principal | null }): Promise<Receipt | null> {
   const db = sql();
+  const provenance = provenanceFromPrincipal(opts && "principal" in opts ? opts.principal : currentPrincipal());
+  const principalKind = provenance?.principal_kind ?? null;
+  const principalId = provenance?.principal_id ?? null;
   const now = new Date().toISOString();
   const agentId = slugify(input.agent_id);
 
@@ -158,13 +167,15 @@ export async function report(input: ReportInput): Promise<Receipt | null> {
         returning s.id
       ),
       event_row as (
-        insert into events (agent_id, session_id, kind, title, detail)
+        insert into events (agent_id, session_id, kind, title, detail, principal_kind, principal_id)
         select
           agent_row.id,
           ${sessionId}::text,
           ${input.kind},
           ${title}::text,
-          ${detail}::jsonb
+          ${detail}::jsonb,
+          ${principalKind}::text,
+          ${principalId}::text
         from agent_row
         where (select count(*) from session_insert) >= 0
           and (select count(*) from session_update) >= 0
