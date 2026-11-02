@@ -1,0 +1,15 @@
+{
+  "enabled": false,
+  "source": "collector-example",
+  "stale_after_minutes": 30,
+  "repos": {
+    "example-owner/example-repo": {
+      "queue": "issues:example-owner/example-repo",
+      "ready_labels": ["dispatch-ready"],
+      "blocked_labels": ["blocked"],
+      "raw_exclude_labels": ["decision"],
+      "required_checks": ["ci", "postgres", "docker"],
+      "review_start": { "status_context": "review/started" }
+    }
+  }
+}

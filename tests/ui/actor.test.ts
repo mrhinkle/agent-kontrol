@@ -7,6 +7,7 @@ import { actorFromPrincipal, currentActor, DASHBOARD_ACTOR_ID, LEGACY_ACTOR_ID, 
 import { authCookieValue } from "../../src/lib/authcrypto";
 import { createCredential, resetCredentialsForTests } from "../../src/lib/credentials";
 import { setSqlForTests, type Row } from "../../src/lib/db";
+import { fakeQuotaSql } from "./quota-fake";
 import { principalFromMcpAuth } from "../../src/lib/scopes";
 import { claimNextTask, listTasks } from "../../src/lib/store";
 
@@ -75,6 +76,8 @@ function installFake() {
   setSqlForTests(async (strings, ...values) => {
     const text = strings.join(" ").replace(/\s+/g, " ").trim();
     const lower = text.toLowerCase();
+    const quota = fakeQuotaSql(text, values);
+    if (quota) return quota;
     if (lower.includes("insert into agent_credentials")) {
       creds.push(rowFrom(strings, values));
       return [];

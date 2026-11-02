@@ -23,6 +23,12 @@ export const API_ERRORS = {
     fix: "This caller cannot perform that action. Use a resource that belongs to this agent.",
     retryable: false,
   },
+  trusted_writer_required: {
+    status: 403,
+    message: "This write needs the MC_TOKEN bearer or the signed-in dashboard.",
+    fix: "Send Authorization: Bearer <MC_TOKEN>, or sign in to the dashboard where that route allows it. Agent credentials, OAuth tokens, and an open dashboard cannot write sweeper evidence.",
+    retryable: false,
+  },
   identity_mismatch: {
     status: 403,
     message: "agent_id does not match the authenticated caller",
@@ -129,6 +135,12 @@ export const API_ERRORS = {
     status: 503,
     message: "This feature is not set up yet.",
     fix: "Finish the setup step named in error, then retry.",
+    retryable: false,
+  },
+  not_configured: {
+    status: 503,
+    message: "not configured",
+    fix: "Set MC_GITHUB_WEBHOOK_SECRET to the GitHub webhook secret, redeploy, then redeliver.",
     retryable: false,
   },
   internal_error: {
