@@ -828,8 +828,8 @@ describe("watch workflow", () => {
     const steps = doc.jobs.watch.steps;
     const setup = steps.find((step) => step.uses === "actions/setup-node@v7");
     assert.equal(setup?.with?.["node-version"], "22");
-    const restore = steps.find((step) => step.uses === "actions/cache/restore@v4");
-    const save = steps.find((step) => step.uses === "actions/cache/save@v4");
+    const restore = steps.find((step) => step.uses === "actions/cache/restore@v6");
+    const save = steps.find((step) => step.uses === "actions/cache/save@v6");
     assert.equal(restore?.with?.key, "watch-state-v1-${{ github.run_id }}-${{ github.run_attempt }}");
     assert.equal(restore?.with?.["restore-keys"], "watch-state-v1-");
     assert.equal(save?.with?.key, "watch-state-v1-${{ github.run_id }}-${{ github.run_attempt }}");
