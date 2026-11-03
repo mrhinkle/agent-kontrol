@@ -1637,7 +1637,7 @@ export function openApiDocument(): Json {
           tags: ["decisions"],
           summary: "Decision queue, oldest first.",
           description:
-            "Dashboard session or MC_TOKEN. An agent credential is denied, including one that holds decisions:write, with 403 and code insufficient_scope. status defaults to open and also returns deferred rows whose defer_until has passed. shape defaults to row. shape=brief ignores status and source: decisions is the morning-brief list from complete github-label rows, and incomplete_repos names owner/name repos whose brief-eligible rows are missing kind, labels, opened_at, or repo_short. A rejected status, shape, repo, source, or limit is 400 validation_failed.",
+            "Dashboard session, MC_TOKEN, or an agent credential with decisions:read. An agent credential without decisions:read, including one that holds only decisions:write, is 403 insufficient_scope. status defaults to open and also returns deferred rows whose defer_until has passed. shape defaults to row. shape=brief ignores status and source: decisions is the morning-brief list from complete github-label rows, and incomplete_repos names owner/name repos whose brief-eligible rows are missing kind, labels, opened_at, or repo_short. A rejected status, shape, repo, source, or limit is 400 validation_failed.",
           security: cookieOrBearer,
           parameters: [
             query(
@@ -1704,7 +1704,7 @@ export function openApiDocument(): Json {
           tags: ["decisions"],
           summary: "Upsert one decision, or reconcile a collector sweep.",
           description:
-            "Dashboard session or MC_TOKEN. An agent credential is denied, including one that holds decisions:write, with 403 and code insufficient_scope. Send either a decision (key, source, title) or { reconcile }, not both. A non-JSON body is 400 invalid_json. A missing key, source, or title is 400 missing_field. Any other rejected field is 400 validation_failed. force true while an unexpired write-back claim holds a decided or deferred row is 409 writeback_in_progress and does not change the row. With no database the response is ok, demo, and note, and the row is dropped.",
+            "Dashboard session or MC_TOKEN. An agent credential is denied, including one that holds decisions:read or decisions:write, with 403 and code insufficient_scope. Send either a decision (key, source, title) or { reconcile }, not both. A non-JSON body is 400 invalid_json. A missing key, source, or title is 400 missing_field. Any other rejected field is 400 validation_failed. force true while an unexpired write-back claim holds a decided or deferred row is 409 writeback_in_progress and does not change the row. With no database the response is ok, demo, and note, and the row is dropped.",
           security: cookieOrBearer,
           requestBody: body({ oneOf: [ref("DecisionUpsert"), ref("DecisionReconcile")] }),
           responses: {
@@ -2114,6 +2114,8 @@ export function openApiDocument(): Json {
           operationId: "getUsage",
           tags: ["usage"],
           summary: "Usage ledger.",
+          description:
+            "Dashboard session, MC_TOKEN, or an agent credential with usage:read. An agent credential without usage:read is 403 insufficient_scope. window is 24h, 7d, or 30d. The default is a rolling 7 days.",
           security: cookieOrBearer,
           parameters: [
             query("window", { type: "string", enum: [...USAGE_WINDOWS] }, "Rolling window. Default 7d. Ignored when since and until are both set."),
@@ -2131,6 +2133,8 @@ export function openApiDocument(): Json {
           operationId: "ingestUsage",
           tags: ["usage"],
           summary: "Ingest usage facts. Separate from liveness ingest.",
+          description:
+            "Bearer MC_TOKEN. An agent credential is denied with 403 insufficient_scope. The usage read scope does not grant this route.",
           security: bearerOnly,
           requestBody: body(ref("UsageIngest")),
           responses: {

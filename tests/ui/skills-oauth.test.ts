@@ -156,9 +156,14 @@ describe("skills OAuth principals", { concurrency: false }, () => {
       assert.equal(authorizeRoute(legacy, call.method, call.path).ok, true, call.label);
     }
     assert.equal(scopeForRoute("POST", "/api/decisions"), null);
-    assert.equal(scopeForRoute("GET", "/api/decisions"), null);
+    assert.equal(scopeForRoute("GET", "/api/decisions"), "decisions:read");
     assert.equal(authorizeRoute(oauth, "POST", "/api/decisions").ok, true);
+    assert.equal(authorizeRoute(oauth, "GET", "/api/decisions").ok, true);
     assert.equal(authorizeRoute(legacy, "GET", "/api/decisions").ok, true);
+    assert.equal(authorizeRoute(legacy, "POST", "/api/decisions").ok, true);
+    assert.equal(authorizeRoute({ kind: "session" }, "GET", "/api/decisions").ok, true);
+    assert.equal(authorizeRoute({ kind: "dev-open" }, "GET", "/api/decisions").ok, true);
+    assert.equal(authorizeRoute({ kind: "dev-open" }, "POST", "/api/decisions").ok, true);
   });
 
   it("denies a signed OAuth access token on the operator routes", async () => {
