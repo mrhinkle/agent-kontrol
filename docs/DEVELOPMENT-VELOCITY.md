@@ -52,4 +52,12 @@ The ordinary build otherwise invokes the existing schema applicator. Do not use 
 
 The dashboard does not schedule GitHub collection or spend GitHub API quota. An authorized external collector produces immutable daily artifacts and publishes each compact capture after successful validation. Reuse its existing authentication; no new credential is needed. Preserve the same source artifact and retry the same file after a delivery failure so ingest remains idempotent. Verify the returned receipt and read the saved capture back before claiming delivery.
 
+The delivery helper uses the existing `MC_URL` and `MC_TOKEN` environment values, or parses those two literal values from an explicitly supplied existing collector configuration. It never executes the file, changes credentials, follows redirects, or prints request headers. `--url` asserts the expected origin; it cannot redirect an existing credential to a different destination.
+
+```sh
+python3 scripts/import-velocity.py /private/capture.json --config /private/existing-collector.env --url https://dashboard.example
+```
+
+It makes one bounded request and prints only a validated receipt. A failure is not delivery confirmation; retain the capture for an identical retry. The server remains the authority for full measurement validation.
+
 Weekly summaries should recompute complete-week cohorts from source evidence, compare like-for-like windows and identify coverage changes. They must not sum overlapping 30-day captures. Reconstructed earlier periods must be labeled `captureKind: reconstructed` and must use historical cutoff evidence, not today's final workflow state.
