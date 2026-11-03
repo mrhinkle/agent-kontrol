@@ -2,7 +2,7 @@ import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { setSqlForTests, type Row } from "../../src/lib/db";
-import { MS_PER_DAY, planDiscovery, type GhListedRepo, type OwnerRule, type TrackedRepo } from "../../src/lib/owner-discovery";
+import { MS_PER_DAY, briefShown, planDiscovery, type GhListedRepo, type OwnerRule, type TrackedRepo } from "../../src/lib/owner-discovery";
 import { POST as postDiscover } from "../../src/app/api/settings/owners/discover/route";
 import { PATCH as patchRepos, PUT as putRepos } from "../../src/app/api/settings/repos/route";
 import { groupDuplicateShorts, formatDuplicateShortReport, DUPLICATE_SHORTS_SQL } from "../../scripts/report-duplicate-shorts.mjs";
@@ -232,13 +232,16 @@ describe("owner discovery follow-ups", () => {
             { name: "App", pushedAt: "2026-01-15T00:00:00.000Z", isFork: false, isArchived: false },
             { name: "Edge", pushedAt: "2026-01-01T00:00:00.000Z", isFork: false, isArchived: false },
             { name: "Old", pushedAt: "2025-12-31T23:59:59.999Z", isFork: false, isArchived: false },
+            { name: "Empty", pushedAt: null, isFork: false, isArchived: false },
           ],
         }],
       }),
     }));
     assert.equal(discover.status, 200, JSON.stringify(await discover.clone().json()));
     const names = store.rows.map((row) => row.repo).sort();
-    assert.deepEqual(names, ["acme/Edge", "acme/app"]);
+    assert.deepEqual(names, ["acme/Edge", "acme/Empty", "acme/Old", "acme/app"]);
+    assert.equal(store.rows.find((row) => row.repo === "acme/Empty")?.last_activity_at, null);
+    assert.equal(store.rows.find((row) => row.repo === "acme/Old")?.last_activity_at, "2025-12-31T23:59:59.999Z");
     assert.equal(store.rows.filter((row) => row.repo.toLowerCase() === "acme/app").length, 1);
     assert.equal(store.rows.find((row) => row.repo.toLowerCase() === "acme/app")?.repo, "acme/app");
 
@@ -305,12 +308,12 @@ describe("owner discovery follow-ups", () => {
     assert.equal(store.rows.length, 2);
   });
 
-  it("uses swept_at for the activity boundary, not the server clock", () => {
+  it("keeps discovery independent of activity clocks and filters only the active view", () => {
     const swept = new Date("2026-01-31T00:00:00.000Z");
     const serverNow = new Date("2026-10-29T00:00:00.000Z");
     const exact = new Date(swept.getTime() - 30 * MS_PER_DAY).toISOString();
     const older = new Date(swept.getTime() - 30 * MS_PER_DAY - 1).toISOString();
-    const listed = (name: string, pushedAt: string): GhListedRepo => ({
+    const listed = (name: string, pushedAt: string | null): GhListedRepo => ({
       name,
       pushedAt,
       isFork: false,
@@ -319,10 +322,12 @@ describe("owner discovery follow-ups", () => {
     const outcome = planDiscovery(
       [],
       owner(),
-      { repos: [listed("Edge", exact), listed("Old", older), listed("App", exact)], error: null, sweptAt: swept.toISOString() },
+      { repos: [listed("Edge", exact), listed("Old", older), listed("App", exact), listed("Empty", null)], error: null, sweptAt: swept.toISOString() },
       serverNow,
     );
-    assert.deepEqual(outcome.added.sort(), ["acme/App", "acme/Edge"]);
+    assert.deepEqual(outcome.added.sort(), ["acme/App", "acme/Edge", "acme/Empty", "acme/Old"]);
+    assert.deepEqual(outcome.repos.filter((row) => briefShown(row, owner(), swept)).map((row) => row.repo), ["acme/App", "acme/Edge"]);
+    assert.deepEqual(outcome.repos.filter((row) => briefShown(row, owner(), serverNow)), []);
     assert.equal(outcome.repos.find((row) => row.repo.endsWith("/App"))?.repo, "acme/App");
     const stored: TrackedRepo = {
       repo: "acme/app",
