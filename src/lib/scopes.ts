@@ -28,6 +28,7 @@ export const SCOPES = [
   "decisions:read",
   "decisions:request",
   "decisions:write",
+  "usage:read",
   "skills:read",
   "skills:write",
   "watch:read",
@@ -100,11 +101,15 @@ const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   { method: "POST", path: /^\/api\/tasks$/, scope: "tasks:write" },
   { method: "POST", path: /^\/api\/tasks\/claim$/, scope: "tasks:write" },
   { method: "PATCH", path: /^\/api\/tasks\/[^/]+$/, scope: "tasks:write" },
-  // GET and POST stay off this table: the collector uses MC_TOKEN and the
-  // dashboard uses the session. An agent credential can change a decision
-  // only when it holds decisions:write.
+  // GET is the queue. POST stays off this table: the collector uses MC_TOKEN
+  // and the dashboard uses the session. The id read is not a route.
+  // An agent credential can change a decision only when it holds decisions:write.
+  { method: "GET", path: /^\/api\/decisions$/, scope: "decisions:read" },
   { method: "PATCH", path: /^\/api\/decisions\/[^/]+$/, scope: "decisions:write" },
   { method: "POST", path: /^\/api\/decisions\/[^/]+\/writeback$/, scope: "decisions:write" },
+  // GET only. POST /api/usage/ingest stays off this table: the collector uses
+  // MC_TOKEN. GET /api/usage/ingest is not a route.
+  { method: "GET", path: /^\/api\/usage$/, scope: "usage:read" },
   // GET only. PATCH, POST /api/skills/sync, POST /api/skills/drift, and
   // GET /api/skill-bundles are operator routes: an agent must not be able to
   // turn a skill on, sync, file a drift report, or download the skill tree.

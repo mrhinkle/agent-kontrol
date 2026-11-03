@@ -20,6 +20,7 @@ import {
   TOOL_SCOPES,
   authorizeRoute,
   authorizeTool,
+  scopeForRoute,
   evaluateMcpMessages,
   principalFromMcpAuth,
   type Principal,
@@ -141,16 +142,20 @@ describe("scope table", { concurrency: false }, () => {
   });
 
   it("denies an agent credential on a route that is not in the table, and still allows the legacy token", () => {
-    const principal = agent(["fleet:read"]);
-    const missing = authorizeRoute(principal, "GET", "/api/usage");
+    const principal = agent(["fleet:read", "tasks:read", "decisions:read", "usage:read"]);
+    const missing = authorizeRoute(principal, "GET", "/api/activity");
     assert.equal(missing.ok, false);
     if (!missing.ok) {
       assert.equal(missing.status, 403);
       assert.equal(missing.body.code, "insufficient_scope");
+      assert.equal(missing.body.fix, "This route is not granted by any agent scope.");
       assert.equal(missing.body.retryable, false);
     }
-    assert.equal(authorizeRoute({ kind: "legacy" }, "GET", "/api/usage").ok, true);
+    assert.equal(authorizeRoute({ kind: "legacy" }, "GET", "/api/activity").ok, true);
     assert.equal(authorizeRoute({ kind: "session" }, "POST", "/api/settings/credentials").ok, true);
+    assert.equal(scopeForRoute("GET", "/api/usage"), "usage:read");
+    assert.equal(scopeForRoute("GET", "/api/usage/ingest"), null);
+    assert.equal(scopeForRoute("POST", "/api/usage/ingest"), null);
   });
 
   it("requires tasks:write for create_task and status:write for report_status", () => {
@@ -321,6 +326,52 @@ describe("credential store", { concurrency: false }, () => {
       expires_at: new Date(Date.now() - 60_000).toISOString(),
     });
     assert.equal(badExpiry.ok, false);
+  });
+
+  it("accepts usage:read and serves GET /api/usage only with that scope", async () => {
+    const created = await createCredential({ label: "usage reader", scopes: ["usage:read"] });
+    assert.equal(created.ok, true);
+    if (!created.ok) throw new Error("unreachable");
+    assert.deepEqual(created.credential.scopes, ["usage:read"]);
+    const unknown = await createCredential({ label: "x", scopes: ["usage:own"] });
+    assert.equal(unknown.ok, false);
+
+    const { GET } = await import("../../src/app/api/usage/route");
+    const { POST } = await import("../../src/app/api/usage/ingest/route");
+    const { GET: getDecisions } = await import("../../src/app/api/decisions/route");
+    delete env.MC_TOKEN;
+    delete env.MC_DASHBOARD_PASSWORD;
+
+    const allowed = await GET(new Request("http://localhost/api/usage", {
+      headers: { authorization: `Bearer ${created.token}` },
+    }));
+    assert.equal(allowed.status, 200);
+    assert.equal((await allowed.json()).demo, true);
+
+    const decisionsOnly = await issue(["decisions:read"]);
+    const deniedUsage = await GET(new Request("http://localhost/api/usage", {
+      headers: { authorization: `Bearer ${decisionsOnly.token}` },
+    }));
+    assert.equal(deniedUsage.status, 403);
+    assert.equal((await deniedUsage.json()).code, "insufficient_scope");
+
+    const deniedDecisions = await getDecisions(new Request("http://localhost/api/decisions", {
+      headers: { authorization: `Bearer ${created.token}` },
+    }));
+    assert.equal(deniedDecisions.status, 403);
+    const deniedDecisionsBody = await deniedDecisions.json() as { code: string; fix: string };
+    assert.equal(deniedDecisionsBody.code, "insufficient_scope");
+    assert.match(deniedDecisionsBody.fix, /decisions:read/);
+
+    const ingest = await POST(new Request("http://localhost/api/usage/ingest", {
+      method: "POST",
+      headers: { authorization: `Bearer ${created.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ facts: [] }),
+    }));
+    assert.equal(ingest.status, 403);
+    const ingestBody = await ingest.json() as { code: string; fix: string };
+    assert.equal(ingestBody.code, "insufficient_scope");
+    assert.equal(ingestBody.fix, "This route is not granted by any agent scope.");
   });
 });
 
