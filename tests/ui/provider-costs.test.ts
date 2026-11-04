@@ -174,6 +174,26 @@ describe("cost summaries and visible evidence", () => {
 });
 
 describe("safe collection and publication", () => {
+  it("rejects malformed snapshots before starting any database write", async () => {
+    const { POST } = await import("../../src/app/api/usage/ingest/route");
+    process.env.MC_TOKEN = "snapshot-test-token"; process.env.DATABASE_URL = "postgres://fixture";
+    let calls = 0; setSqlForTests(async () => { calls++; return []; });
+    for (const snapshot of [null, {}, [], true, "bad", { account_id: " " }, { account_id: 4 },
+      { account_id: "openrouter-shared", collected_at: "invalid" }, { account_id: "openrouter-shared", credits_remaining: "4" },
+      { account_id: "openrouter-shared", detail: [] }]) {
+      const result = await POST(new Request("http://localhost/api/usage/ingest", { method: "POST", headers: { Authorization: "Bearer snapshot-test-token", "Content-Type": "application/json" }, body: JSON.stringify({ facts: [fact()], snapshot }) }));
+      assert.equal(result.status, 400); assert.equal((await result.json()).code, "validation_failed");
+    }
+    assert.equal(calls, 0);
+  });
+  it("discards invalid report freshness and keeps the rendered dashboard available", () => {
+    const data = aggregateUsageFacts([fact()], { ...period, snapshots: [receipt({ data_refreshed_at: "not-a-date" })] });
+    assert.equal(data.providers![0].data_refreshed_at, null);
+    assert.doesNotThrow(() => renderToStaticMarkup(createElement(UsageCostPanels, { data })));
+    data.providers![0].data_refreshed_at = "not-a-date";
+    const html = renderToStaticMarkup(createElement(UsageCostPanels, { data }));
+    assert.match(html, /Unavailable/);
+  });
   it("rejects unsafe destinations and treats env files literally", async () => {
     const { fleetOrigin, literalConfig } = await import("../../src/lib/providers/collector");
     for (const url of ["http://fleet.peripety.com", "https://u:p@fleet.peripety.com", "https://fleet.peripety.com/path", "https://fleet.peripety.com?token=secret", "https://fleet.peripety.com/#secret", "file:///tmp/x", "http://127.0.0.1"]) assert.throws(() => fleetOrigin(url));

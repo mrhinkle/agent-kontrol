@@ -31,7 +31,7 @@ export async function POST(req: Request) {
   } catch {
     return apiError("invalid_json");
   }
-  if (!Array.isArray(body.facts)) {
+  if (!body || typeof body !== "object" || !Array.isArray(body.facts)) {
     return apiError("missing_field", { message: "facts[] is required", fields: { facts: "facts[] is required" } });
   }
   if (body.collected_at && Number.isNaN(Date.parse(body.collected_at))) {
@@ -39,6 +39,22 @@ export async function POST(req: Request) {
       message: "collected_at must be ISO 8601",
       fields: { collected_at: "collected_at must be ISO 8601" },
     });
+  }
+
+  if (body.snapshot !== undefined) {
+    const snapshot = body.snapshot;
+    const objectOrNull = (value: unknown) => value == null || (typeof value === "object" && !Array.isArray(value));
+    const validAmount = (value: unknown) => value == null || (typeof value === "number" && Number.isFinite(value));
+    if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot) ||
+        typeof snapshot.account_id !== "string" || !snapshot.account_id.trim() ||
+        (snapshot.collected_at !== undefined && (typeof snapshot.collected_at !== "string" || !Number.isFinite(Date.parse(snapshot.collected_at)))) ||
+        !validAmount(snapshot.balance_usd) || !validAmount(snapshot.credits_remaining) ||
+        !objectOrNull(snapshot.detail) || !objectOrNull(snapshot.quota_detail)) {
+      return apiError("validation_failed", {
+        message: "snapshot requires an account_id, a valid optional collected_at, numeric balances and object metadata",
+        fields: { snapshot: "invalid snapshot" },
+      });
+    }
   }
 
   try {

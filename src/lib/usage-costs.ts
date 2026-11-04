@@ -54,7 +54,7 @@ export function providerCosts(facts: UsageFact[], snapshots: AccountSnapshot[], 
       account_id: account.id, label: account.label, coverage: status,
       cost_usd: known.length || status === "complete" ? money(known) : null,
       collected_at: snapshot?.collected_at ?? null,
-      data_refreshed_at: typeof receipt?.data_refreshed_at === "string" ? receipt.data_refreshed_at : null,
+      data_refreshed_at: typeof receipt?.data_refreshed_at === "string" && Number.isFinite(Date.parse(receipt.data_refreshed_at)) ? new Date(receipt.data_refreshed_at).toISOString() : null,
       credits_remaining: snapshot?.credits_remaining ?? null,
       rows: selected.length, note: account.note + (dayWindow ? "" : " Only daily buckets are available for this partial-day query."), daily,
     };

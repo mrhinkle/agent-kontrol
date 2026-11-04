@@ -2,7 +2,8 @@ import React from "react";
 import type { UsageSummary } from "@/lib/usage-types";
 
 const dollars = (value: number | null) => value === null ? "Not available" : `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-const timestamp = (value: string | null) => value ? `${new Date(value).toISOString().slice(0, 16).replace("T", " ")} UTC` : "Never collected";
+const timestamp = (value: string | null) => !value ? "Never collected" : Number.isFinite(Date.parse(value))
+  ? `${new Date(value).toISOString().slice(0, 16).replace("T", " ")} UTC` : "Unavailable";
 const format = (n: number) => n.toLocaleString("en-US");
 
 export function UsageCostPanels({ data }: { data: UsageSummary }) {
