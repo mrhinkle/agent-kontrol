@@ -59,6 +59,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - What "blocked" means (a label you choose, not something detected), the release-branch workflow on Vercel, an adapter capability table, a Status section in the README, and release and dependency policy in CONTRIBUTING.
 
+## [1.0.0-beta.2] - 2026-11-03
+
+### Added
+
+- Private development-velocity dashboard at `/velocity`, with per-repository CI revisions to observed green, first-pass rate, merge time, dated PR throughput, and separate production and preview deployment measurements. Fleet statistics pool individual observations and keep incomplete coverage visible.
+- Immutable benchmark captures through authenticated read and ingest routes. Compatible reporting periods share a baseline and trend history; changed evidence creates a new revision and identical imports return the original receipt.
+- Local evidence conversion and collector delivery tools that reconcile source counts, preserve source hashes, bind existing authentication to its configured origin, and return bounded import receipts.
+- Additive `velocity_benchmarks` storage with row-level security and a dated migration. The existing schema applicator includes the table; preview builds continue to use the documented migration-skip setting.
+
+### Fixed
+
+- Owner discovery retains eligible inactive and never-pushed repositories in its inventory, while existing activity rules continue to govern active views.
+
 ## [1.0.0-beta.1] - 2026-10-09
 
 First public beta. Feature-complete for 1.0; the API, MCP tool surface and schema are stable unless beta feedback shows a defect. Please report issues on GitHub.
