@@ -2477,6 +2477,94 @@ describe("GET /api/brief", { concurrency: false }, () => {
     }
   });
 
+  it("loadBrief filters retained inventory while preserving active and pinned views", async () => {
+    env.DATABASE_URL = "postgres://brief:brief@127.0.0.1:9/brief_test";
+    const now = new Date();
+    const day = 86_400_000;
+    const activeAt = new Date(now.getTime() - day).toISOString();
+    const oldAt = new Date(now.getTime() - 90 * day).toISOString();
+    const latestAt = new Date(now.getTime() - 3_600_000).toISOString();
+    const baselineAt = new Date(now.getTime() - 4 * day).toISOString();
+    const inventory = [
+      { name: "active", last_activity_at: activeAt, pinned: false },
+      { name: "inactive", last_activity_at: oldAt, pinned: false },
+      { name: "never-pushed", last_activity_at: null, pinned: false },
+      { name: "pinned", last_activity_at: oldAt, pinned: true },
+    ].map(({ name, ...activity }, position) => ({
+      repo: `acme/${name}`, label: name, short: name, color: "#000000", blocked_label: null,
+      position, origin: "auto", hidden: false, gone: false, is_fork: false, is_archived: false,
+      ...activity,
+    }));
+    const snapshots = [
+      ["acme/active", 1], ["acme/pinned", 2], ["acme/inactive", 900],
+    ].flatMap(([repo, count]) => [
+      snapshotRow({ repo, collected_at: baselineAt }),
+      snapshotRow({
+        repo, collected_at: latestAt, total_prs_merged: count, merged_prs_24h: count,
+        open_issues: count, detail: { stuck_prs: [], merged: [] },
+      }),
+    ]);
+    const decisions = [
+      legacyDecision({ id: 1, repo: "acme/active", title: "Active decision" }),
+      legacyDecision({ id: 2, repo: "acme/inactive", title: "Inactive decision", labels: null }),
+      legacyDecision({ id: 3, repo: "acme/pinned", title: "Pinned decision" }),
+    ];
+
+    for (const window of ["24h", "72h"] as const) {
+      for (const fullDecisionPage of [false, true]) {
+        for (const allHidden of [false, true]) {
+          const snapshotReads: string[][] = [];
+          let decisionReads = 0;
+          let schedulerReads = 0;
+          setSqlForTests(async (strings, ...values) => {
+            const text = strings.join(" ");
+            if (text.includes("from watched_repos")) return inventory.map((row) => ({ ...row, hidden: allHidden }));
+            if (text.includes("from watched_owners")) {
+              return [{ owner: "acme", activity_days: 30, include_forks: true, include_archived: true }];
+            }
+            if (text.includes("from decisions")) {
+              decisionReads++;
+              let limit = 1000;
+              for (let i = 0; i < strings.length - 1; i++) {
+                if (/\blimit\s*$/.test(strings[i])) limit = Number(values[i]);
+              }
+              return decisions.slice(0, limit);
+            }
+            if (text.includes("from agents") || text.includes("from events")) return [];
+            if (text.includes("from scheduler_jobs")) schedulerReads++;
+            const scheduler = schedulerSql(text);
+            if (scheduler) return scheduler;
+            if (!text.includes("from repo_snapshots")) throw new Error(`unexpected sql: ${text}`);
+            snapshotReads.push([...(values[0] as string[])]);
+            const pool = text.includes("collected_at <=")
+              ? snapshots.filter((row) => String(row.collected_at) <= String(values[1]))
+              : snapshots;
+            return newestSnapshots(text, values, pool);
+          });
+
+          const brief = await loadBrief(window, now, { decisionLimit: fullDecisionPage ? 2 : 1000 });
+          const expected = allHidden ? [] : ["acme/active", "acme/pinned"];
+          const context = `${window}, full decision page=${fullDecisionPage}, all hidden=${allHidden}`;
+          assert.deepEqual(brief.repos.map((row) => row.repo), expected, context);
+          assert.equal(brief.totals.repos_total, expected.length, context);
+          assert.equal(brief.totals.repos_counted, expected.length, context);
+          assert.equal(brief.totals.merged_prs, allHidden ? 0 : 3, context);
+          assert.equal(brief.totals.open_issues, allHidden ? 0 : 3, context);
+          assert.deepEqual(brief.incomplete_repos.map((row) => row.repo), fullDecisionPage ? expected : [], context);
+          assert.equal(brief.totals.decisions, allHidden ? 0 : fullDecisionPage ? null : 2, context);
+          assert.equal(brief.repo_source, "dashboard", context);
+          assert.equal(brief.window_hours, window === "72h" ? 72 : 24, context);
+          assert.equal(Date.parse(brief.generated_at), Math.floor(now.getTime() / 1000) * 1000, context);
+          assert.equal(brief.paused.measured, true, context);
+          assert.equal(decisionReads, 1, context);
+          assert.equal(schedulerReads, 1, "an empty active view still reads scheduler status");
+          assert.equal(snapshotReads.length, allHidden ? 0 : window === "72h" ? 2 : 1, context);
+          for (const names of snapshotReads) assert.deepEqual(names, expected, context);
+        }
+      }
+    }
+  });
+
   it("a snapshot stored under another casing still fills the watched repo", async () => {
     env.DATABASE_URL = "postgres://brief:brief@127.0.0.1:9/brief_test";
     const watched = "acme/app";

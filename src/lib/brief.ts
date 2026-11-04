@@ -4,7 +4,7 @@ import type { RepoConfig } from "@/lib/progress-config";
 import { hoursBetween, listDecisions, partitionBrief, type BriefDecision } from "@/lib/decisions";
 import { isConfigured, sql } from "@/lib/db";
 import type { RepoSnapshot, SnapshotDetail } from "@/lib/progress-types";
-import { getWatchedRepos } from "@/lib/watched-repos";
+import { getWatchedRepos, visibleOnBoard } from "@/lib/watched-repos";
 import { formatPausedLines, unmeasuredPaused, type PausedSection } from "@/lib/sweep-logic";
 import { readPaused } from "@/lib/sweeper";
 
@@ -944,7 +944,8 @@ export async function loadBrief(
   }
 
   const watched = await getWatchedRepos(REPOS);
-  const names = watched.repos.map((repo) => repo.repo);
+  const repos = watched.repos.filter(visibleOnBoard);
+  const names = repos.map((repo) => repo.repo);
   const baselineIso = new Date(now.getTime() - hours * 3_600_000).toISOString();
   let latest = new Map<string, RepoSnapshot>();
   let baseline = new Map<string, RepoSnapshot>();
@@ -969,7 +970,7 @@ export async function loadBrief(
       // A full page can hide another row. The set is unmeasured, so the page
       // stays out of the list and the total stays null.
       table = [];
-      incompleteRepos = watched.repos.map((repo) => repo.repo);
+      incompleteRepos = names;
       decisionsMeasured = true;
     } else {
       const part = partitionBrief(rows, nowIso);
@@ -982,7 +983,7 @@ export async function loadBrief(
   }
 
   const sections = applyTableDecisions(
-    watched.repos.map((cfg) => repoSection({
+    repos.map((cfg) => repoSection({
       cfg,
       snap: latest.get(cfg.repo.toLowerCase()) ?? null,
       baseline: baseline.get(cfg.repo.toLowerCase()) ?? null,
