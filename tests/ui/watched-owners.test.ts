@@ -563,13 +563,11 @@ describe("watched owners discovery", () => {
     assert.equal(outcome.repos.some((row) => row.repo === "acme/fork"), false);
 
     const collector = fs.readFileSync("scripts/collect-progress.sh", "utf8");
-    const discoverAt = collector.indexOf("\ndiscover_watched_owners\n");
+    const discoverAt = collector.indexOf("\nif ! discover_watched_owners; then\n");
     const refreshAt = collector.lastIndexOf("\nrefresh_repos_from_dashboard\n");
     const backfillAt = collector.indexOf('if [[ "$MODE" == "backfill" ]]; then\n  run_backfill');
     assert.ok(discoverAt > 0 && refreshAt > discoverAt && backfillAt > refreshAt);
-    assert.match(collector, /gh repo list "\$owner"/);
-    assert.match(collector, /if listing="\$\(gh repo list/);
-    assert.match(collector, /gh repo list returned no repos/);
+    assert.match(collector, /collect-progress-activity\.py/);
     assert.match(collector, /select\(\.gone != true\)/);
     assert.doesNotMatch(collector, /select\(\.shown/);
     assert.match(collector, /\/api\/settings\/owners\/discover/);
@@ -1011,12 +1009,11 @@ describe("watched owners discovery", () => {
     const end = collector.indexOf("refresh_repos_from_dashboard() {");
     assert.ok(start > 0 && end > start);
     const fn = collector.slice(start, end);
-    const unwritable = fn.search(/owner store is not writable/);
-    const none = fn.indexOf("owners: none configured");
-    assert.ok(unwritable > 0, "writable:false must not use the empty-list log line");
-    assert.ok(none > unwritable, "none configured remains the message for an empty owner list");
-    assert.match(fn, /swept_at/);
-    assert.match(fn, /discovery skipped stale sweep/);
+    assert.match(fn, /\.writable == true/, "unavailable settings must stop before collection or writes");
+    assert.match(fn, /settings store unavailable/);
+    assert.match(fn, /\.skipped != "stale"/, "stale publication is not reported as a successful fresh discovery");
+    // Pagination and failure behavior execute against fixtures in test_progress_activity.py.
+    // The shell's read/write behavior executes in progress-collector.test.ts.
   });
 
   it("the collector sweeps nothing when the dashboard's database repo list is empty", () => {
