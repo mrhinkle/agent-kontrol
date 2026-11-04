@@ -1,10 +1,11 @@
-/** Run with npx tsx scripts/collect-provider-usage.ts --provider openrouter|anthropic|all|claude-fee. */
+/** Run with npx tsx scripts/collect-provider-usage.ts --provider openrouter|anthropic|xai|all|claude-fee|grok-fee. */
 import { parseArgs } from "node:util";
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { getAccount } from "../src/lib/usage-accounts";
 import { openRouterAdapter } from "../src/lib/providers/openrouter";
 import { anthropicAdminAdapter } from "../src/lib/providers/anthropic";
+import { xaiManagementAdapter } from "../src/lib/providers/xai";
 import { DAY_MS, utcMidnight, validatePeriod } from "../src/lib/providers/transport";
 import { fleetOrigin, loadConfig, privateOutput, publishBatch, subscriptionFee } from "../src/lib/providers/collector";
 import type { ProviderUsageBatch } from "../src/lib/providers/types";
@@ -15,18 +16,18 @@ export async function collectProviderUsage(args = process.argv.slice(2)) {
     "env-file": { type: "string" }, output: { type: "string" }, publish: { type: "boolean", default: false },
     "allow-loopback": { type: "boolean", default: false }, "fee-file": { type: "string" },
   } });
-  if (!["openrouter", "anthropic", "all", "claude-fee"].includes(values.provider ?? "")) throw new Error("Choose --provider openrouter, anthropic, all or claude-fee");
+  if (!["openrouter", "anthropic", "xai", "all", "claude-fee", "grok-fee"].includes(values.provider ?? "")) throw new Error("Choose --provider openrouter, anthropic, xai, all, claude-fee or grok-fee");
   const config = loadConfig(values["env-file"]);
   // Adapters use only these explicitly allowlisted names, never inference keys.
   for (const [name, value] of Object.entries(config)) if (name !== "MC_TOKEN" && name !== "MC_URL") process.env[name] = value;
   const origin = config.MC_URL ? fleetOrigin(config.MC_URL, values["allow-loopback"]) : null;
   if (values.publish && (!origin || !config.MC_TOKEN)) throw new Error("MC_URL and MC_TOKEN are required to publish");
   const batches: ProviderUsageBatch[] = [];
-  if (values.provider === "claude-fee") {
-    if (!values["fee-file"]) throw new Error("--fee-file is required for a recorded Claude fee");
-    batches.push(subscriptionFee(JSON.parse(readFileSync(values["fee-file"], "utf8"))));
+  if (values.provider === "claude-fee" || values.provider === "grok-fee") {
+    if (!values["fee-file"]) throw new Error("--fee-file is required for a recorded subscription payment");
+    batches.push(subscriptionFee(JSON.parse(readFileSync(values["fee-file"], "utf8")), new Date(), values.provider === "grok-fee" ? "grok" : "claude"));
   } else {
-    if (values["fee-file"]) throw new Error("--fee-file only applies to claude-fee");
+    if (values["fee-file"]) throw new Error("--fee-file only applies to claude-fee or grok-fee");
     const days = Number(values.days);
     if (!Number.isInteger(days) || days < 1 || days > 30) throw new Error("--days must be 1 to 30");
     const until = values.until ? new Date(values.until) : utcMidnight();
@@ -34,6 +35,7 @@ export async function collectProviderUsage(args = process.argv.slice(2)) {
     validatePeriod(since, until);
     if (values.provider === "openrouter" || values.provider === "all") batches.push(await openRouterAdapter.fetchUsage(getAccount("openrouter-shared")!, since, until));
     if (values.provider === "anthropic" || values.provider === "all") batches.push(await anthropicAdminAdapter.fetchUsage(getAccount("anthropic-api-org")!, since, until));
+    if (values.provider === "xai" || values.provider === "all") batches.push(await xaiManagementAdapter.fetchUsage(getAccount("xai-api-team")!, since, until));
   }
   // All provider requests and validation finish before the first publish.
   if (values.output) privateOutput(values.output, { version: 1, batches });

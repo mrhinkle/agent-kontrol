@@ -1,11 +1,12 @@
 /** Provider invoices and local Claude observations never enter Hermes attribution. */
 import type { AccountSnapshot } from "./providers/types";
-import type { ClaudeUsageSummary, ProviderCostSummary, UsageFact } from "./usage-types";
+import type { ClaudeUsageSummary, GrokUsageSummary, ProviderCostSummary, UsageFact } from "./usage-types";
 
 const DAY = 86_400_000;
 const accounts = [
   { id: "openrouter-shared", provider: "openrouter", label: "OpenRouter", note: "Provider-reported inference charges. External BYOK costs are excluded." },
   { id: "anthropic-api-org", provider: "anthropic", label: "Claude API", note: "After discounts, before credits. Separate Priority Tier commitment fees are not included." },
+  { id: "xai-api-team", provider: "xai", label: "Grok API (xAI)", note: "All billed resources for the configured xAI team. Separate from Grok subscriptions and OpenRouter charges." },
 ];
 
 type Coverage = { since: string; until: string; status: "complete" | "partial"; report_id?: string; fact_count?: number; data_refreshed_at?: string | null };
@@ -81,4 +82,14 @@ export function claudeUsage(facts: UsageFact[], snapshots: AccountSnapshot[], wi
       return { account_id: s.account_id, collected_at: s.collected_at, status: c?.status ?? "unverified", since: c?.since ?? null, until: c?.until ?? null };
     }),
   };
+}
+
+/** A subset of OpenRouter charges, not another provider charge or a synthetic fact. */
+export function grokUsage(facts: UsageFact[], snapshots: AccountSnapshot[], window: { since: string; until: string }, providerWindow: { since: string; until: string }, openrouter: ProviderCostSummary): GrokUsageSummary {
+  const fees = facts.filter((f) => f.source === "subscription_fee" && f.account_id === "supergrok-subscription" && within(f, window.since, window.until));
+  const routed = currentProviderFacts(facts, snapshots).filter((f) => f.source === "provider_api" && f.account_id === "openrouter-shared" &&
+    /^x-ai\/grok(?:[-.:/]|$)/.test(f.model) && f.cost_status !== "provider_usage_only" && within(f, providerWindow.since, providerWindow.until));
+  return { subscription_fees_usd: fees.length ? money(fees) : null, fee_records: fees.length,
+    openrouter_cost_usd: routed.length || openrouter.coverage === "complete" ? money(routed) : null,
+    openrouter_coverage: openrouter.coverage, local_usage_status: "unavailable" };
 }

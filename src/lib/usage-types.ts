@@ -93,6 +93,7 @@ export interface UsageSummary {
   providers?: ProviderCostSummary[];
   provider_window?: { since: string; until: string };
   claude?: ClaudeUsageSummary;
+  grok?: GrokUsageSummary;
   collected_at: string | null;
   /** True only when DATABASE_URL is unset — never in production Neon reads. */
   demo?: boolean;
@@ -129,4 +130,12 @@ export interface ClaudeUsageSummary {
   fee_records: number;
   billing_modes: { subscription: number; api: number; unknown: number };
   machines: { account_id: string; collected_at: string; status: "complete" | "partial" | "unverified"; since: string | null; until: string | null }[];
+}
+
+export interface GrokUsageSummary {
+  subscription_fees_usd: number | null;
+  fee_records: number;
+  openrouter_cost_usd: number | null;
+  openrouter_coverage: ProviderCostSummary["coverage"];
+  local_usage_status: "unavailable";
 }
