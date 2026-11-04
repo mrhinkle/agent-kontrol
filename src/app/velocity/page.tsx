@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { SortableTable } from "@/components/SortableTable";
 import { distribution, localDate, parseVelocity, summarizeVelocity, VELOCITY_MAX_BYTES, type VelocityPoint, type VelocityRepo, type VelocityResponse, type VelocitySnapshot, type VelocitySummary } from "@/lib/velocity";
 
 const number = (v: number | null | undefined, digits = 0) => v == null ? "—" : v.toLocaleString("en-US", { maximumFractionDigits: digits, minimumFractionDigits: digits });
@@ -35,7 +36,13 @@ function Throughput({ summary }: { summary: VelocitySummary }) {
         {(i === 0 || i === days.length - 1 || (i % Math.max(1, Math.floor(days.length / 5)) === 0 && i < days.length - 2)) && <text x={i * step + step / 2} y={height + 23} fill="#9ca3af" fontSize="11" textAnchor={i === 0 ? "start" : i === days.length - 1 ? "end" : "middle"}>{dateLabel(d.date)}</text>}
       </g>)}
     </svg>
-    <details className="mt-3 text-xs text-gray-400"><summary className="cursor-pointer hover:text-white">View exact daily counts</summary><div className="mt-3 max-h-64 overflow-auto"><table className="w-full text-left"><thead><tr><th>Date</th><th>Opened</th><th>Merged</th></tr></thead><tbody>{days.map((d) => <tr key={d.date}><td className="py-1">{d.date}</td><td>{d.opened}</td><td>{d.merged}</td></tr>)}</tbody></table></div></details>
+    <details className="mt-3 text-xs text-gray-400"><summary className="cursor-pointer hover:text-white">View exact daily counts</summary><div className="mt-3">
+      <SortableTable caption="Exact daily counts" rows={days} rowKey={(d) => d.date} initialSort={{ column: "date", direction: "ascending" }} columns={[
+        { id: "date", label: "Date", value: (d) => Date.parse(d.date), render: (d) => d.date, width: "50%" },
+        { id: "opened", label: "Opened", value: (d) => d.opened, render: (d) => d.opened, defaultDirection: "descending" },
+        { id: "merged", label: "Merged", value: (d) => d.merged, render: (d) => d.merged, defaultDirection: "descending" },
+      ]} />
+    </div></details>
   </>;
 }
 
@@ -67,31 +74,47 @@ function BenchmarkTrend({ points, baseline, latest, preview }: { points: Velocit
         <text x="32" y="12" fill="#9ca3af" fontSize="11">{format(max)}</text>
       </svg>}
     {!preview && baseline && latest && <div className="mt-3 flex flex-wrap gap-x-6 gap-y-2 text-xs text-gray-400"><span>Baseline {format(value(baseline))}</span><span>Latest {format(value(latest))}</span><span>{baseline.id === latest.id ? "First capture" : !sameCoverage ? "Coverage changed · delta withheld" : delta == null ? "Delta unavailable" : `Change ${delta > 0 ? "+" : ""}${metric === "firstPass" ? `${number(delta * 100, 1)} percentage points` : number(delta, 2)}`}</span></div>}
-    {points.length > 1 && <details className="mt-4 text-xs text-gray-400"><summary className="cursor-pointer">Capture history and sample sizes</summary><div className="mt-3 overflow-auto"><table className="w-full min-w-[540px] text-left"><thead><tr><th>Window end (exclusive)</th><th>Value</th><th>CI green / covered</th><th>Repos</th><th>Source</th></tr></thead><tbody>{points.map((p) => <tr key={p.id}><td className="py-2">{p.windowEnd}</td><td>{format(value(p))}</td><td>{p.summary.ci?.green ?? "—"} / {p.summary.ci?.covered ?? "—"}</td><td>{p.summary.repositories}</td><td>{p.captureKind}</td></tr>)}</tbody></table></div></details>}
+    {points.length > 1 && <details className="mt-4 text-xs text-gray-400"><summary className="cursor-pointer">Capture history and sample sizes</summary><div className="mt-3">
+      <SortableTable caption="Capture history and sample sizes" rows={points} rowKey={(p) => p.id} initialSort={{ column: "date", direction: "ascending" }} columns={[
+        { id: "date", label: "Window end (exclusive)", value: (p) => Date.parse(p.windowEnd), render: (p) => p.windowEnd, width: "30%" },
+        { id: "value", label: "Value", value, render: (p) => format(value(p)), defaultDirection: "descending", width: "16%" },
+        { id: "ci", label: "CI green / covered", value: (p) => p.summary.ci ? [p.summary.ci.green, p.summary.ci.covered] : null, render: (p) => `${p.summary.ci?.green ?? "—"} / ${p.summary.ci?.covered ?? "—"}`, defaultDirection: "descending", describedBy: "history-ci-sort", width: "22%" },
+        { id: "repos", label: "Repos", value: (p) => p.summary.repositories, render: (p) => p.summary.repositories, defaultDirection: "descending", width: "12%" },
+        { id: "source", label: "Source", value: (p) => p.captureKind, render: (p) => p.captureKind, width: "20%" },
+      ]} />
+      <p id="history-ci-sort" className="mt-3">CI green / covered sorts by observed-green PRs, then by PRs with CI evidence.</p>
+    </div></details>}
   </>;
 }
 
 function RepositoryTable({ rows }: { rows: VelocityRepo[] }) {
-  const [query, setQuery] = useState(""), [owner, setOwner] = useState("all"), [view, setView] = useState("all"), [sort, setSort] = useState("merged");
+  const [query, setQuery] = useState(""), [owner, setOwner] = useState("all"), [view, setView] = useState("all");
   const owners = [...new Set(rows.map((r) => r.repo.split("/")[0]))].sort();
-  const shown = useMemo(() => rows.filter((r) => r.repo.includes(query.toLowerCase()) && (owner === "all" || r.repo.startsWith(`${owner}/`)) && (view === "all" || (view === "active" && r.prs && (r.prs.opened + r.prs.merged > 0)) || (view === "archived" && r.archived) || (view === "forks" && r.fork)))
-    .sort((a, b) => sort === "name" ? a.repo.localeCompare(b.repo) : sort === "revisions" ? (distribution(b.ci?.revisionSamples ?? []).mean ?? -1) - (distribution(a.ci?.revisionSamples ?? []).mean ?? -1) : (b.prs?.merged ?? -1) - (a.prs?.merged ?? -1)), [rows, query, owner, view, sort]);
+  const prepared = useMemo(() => rows.map((r) => ({ ...r,
+    revisions: distribution(r.ci?.revisionSamples ?? []).mean,
+    mergeHours: distribution(r.prs?.mergeHours ?? []).median,
+    evidence: Object.values(r.coverage).some((c) => c !== "complete") ? "Partial / missing" : r.ci?.covered ? "CI observed" : r.prs?.opened ? "No PR CI" : "No new PRs",
+  })), [rows]);
+  const shown = useMemo(() => prepared.filter((r) => r.repo.includes(query.toLowerCase()) && (owner === "all" || r.repo.startsWith(`${owner}/`)) && (view === "all" || (view === "active" && r.prs && (r.prs.opened + r.prs.merged > 0)) || (view === "archived" && r.archived) || (view === "forks" && r.fork))), [prepared, query, owner, view]);
   return <>
-    <div className="mb-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+    <div className="mb-4 grid gap-3 sm:grid-cols-3">
       <input className={control} aria-label="Search repositories" placeholder="Search repositories…" value={query} onChange={(e) => setQuery(e.target.value)} />
       <select className={control} aria-label="Repository owner" value={owner} onChange={(e) => setOwner(e.target.value)}><option value="all">All owners</option>{owners.map((o) => <option key={o}>{o}</option>)}</select>
       <select className={control} aria-label="Repository activity" value={view} onChange={(e) => setView(e.target.value)}><option value="all">All repositories</option><option value="active">PR activity in window</option><option value="archived">Archived</option><option value="forks">Forks</option></select>
-      <select className={control} aria-label="Sort repositories" value={sort} onChange={(e) => setSort(e.target.value)}><option value="merged">Most PRs merged</option><option value="revisions">Most CI revisions</option><option value="name">Repository name</option></select>
     </div>
     <p className="mb-3 text-xs text-gray-400">{shown.length} of {rows.length} repositories · filters affect this table; fleet totals above keep the full scope.</p>
-    <div className="max-h-[650px] overflow-auto rounded-lg border border-white/10"><table className="w-full min-w-[850px] text-left text-sm"><thead className="sticky top-0 bg-[#162132] text-xs text-gray-300"><tr>{["Repository", "Opened", "Merged", "CI revisions¹", "Green / CI", "Merge hours²", "Evidence"].map((s) => <th key={s} className="px-3 py-3 font-medium">{s}</th>)}</tr></thead>
-      <tbody className="divide-y divide-white/5">{shown.map((r) => <tr key={r.repo} className="hover:bg-white/[.025]">
-        <td className="max-w-[260px] px-3 py-3"><a className="break-words font-medium text-gray-100 hover:text-cyan-300" href={`https://github.com/${r.repo}`} target="_blank" rel="noreferrer">{r.repo}</a><div className="mt-1 flex gap-2 text-[10px] uppercase tracking-wide text-gray-400">{r.archived && <span>Archived</span>}{r.fork && <span>Fork</span>}</div></td>
-        <td className="px-3 py-3 tabular-nums">{number(r.prs?.opened)}</td><td className="px-3 py-3 tabular-nums">{number(r.prs?.merged)}</td><td className="px-3 py-3 tabular-nums">{number(distribution(r.ci?.revisionSamples ?? []).mean, 2)}</td><td className="px-3 py-3 tabular-nums">{r.ci ? `${r.ci.revisionSamples.length} / ${r.ci.covered}` : "—"}</td><td className="px-3 py-3 tabular-nums">{number(distribution(r.prs?.mergeHours ?? []).median, 2)}</td>
-        <td className="px-3 py-3"><span className={Object.values(r.coverage).every((c) => c === "complete") ? "text-gray-400" : "text-orange-300"}>{Object.values(r.coverage).some((c) => c !== "complete") ? "Partial / missing" : r.ci?.covered ? "CI observed" : r.prs?.opened ? "No PR CI" : "No new PRs"}</span></td>
-      </tr>)}</tbody></table></div>
+    <div className="rounded-lg border border-white/10"><SortableTable caption="All repositories" rows={shown} rowKey={(r) => r.repo} initialSort={{ column: "merged", direction: "descending" }} columns={[
+      { id: "repo", label: "Repository", value: (r) => r.repo, width: "28%", render: (r) => <><a className="font-medium text-gray-100 hover:text-cyan-300" href={`https://github.com/${r.repo}`} target="_blank" rel="noreferrer">{r.repo}</a><div className="mt-1 flex flex-wrap gap-2 text-[10px] uppercase tracking-wide text-gray-400">{r.archived && <span>Archived</span>}{r.fork && <span>Fork</span>}</div></> },
+      { id: "opened", label: "Opened", value: (r) => r.prs?.opened, render: (r) => number(r.prs?.opened), defaultDirection: "descending", width: "9%" },
+      { id: "merged", label: "Merged", value: (r) => r.prs?.merged, render: (r) => number(r.prs?.merged), defaultDirection: "descending", width: "9%" },
+      { id: "revisions", label: "CI revisions¹", value: (r) => r.revisions, render: (r) => number(r.revisions, 2), defaultDirection: "descending", width: "12%" },
+      { id: "ci", label: "Green / CI", value: (r) => r.ci ? [r.ci.revisionSamples.length, r.ci.covered] : null, render: (r) => r.ci ? `${r.ci.revisionSamples.length} / ${r.ci.covered}` : "—", defaultDirection: "descending", describedBy: "repository-ci-sort", width: "12%" },
+      { id: "hours", label: "Merge hours²", value: (r) => r.mergeHours, render: (r) => number(r.mergeHours, 2), defaultDirection: "descending", width: "12%" },
+      { id: "evidence", label: "Evidence", value: (r) => r.evidence, render: (r) => <span className={r.evidence === "Partial / missing" ? "text-orange-300" : "text-gray-400"}>{r.evidence}</span>, width: "18%" },
+    ]} /></div>
     {shown.length === 0 && <p className="py-6 text-center text-gray-400">No repositories match these filters.</p>}
     <p className="mt-3 text-xs leading-relaxed text-gray-400">¹ Mean CI-submitted revisions among PRs with observed green. ² Median hours from PR creation to merge. A dash means no measured sample, not zero effort.</p>
+    <p id="repository-ci-sort" className="mt-2 text-xs text-gray-400">Green / CI sorts by observed-green PRs, then by PRs with CI evidence. Click any header to sort; click it again to reverse. Missing values stay last.</p>
   </>;
 }
 
