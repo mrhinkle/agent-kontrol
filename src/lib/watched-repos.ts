@@ -31,11 +31,13 @@ export interface WatchedRepo extends RepoConfig {
    * when discovery still owns those fields.
    */
   fieldsOverridden?: boolean | null;
-  /** False drops the repo off the brief and the board. Omitted means show. */
+  /** Brief visibility. Progress uses its own open-PR/24h activity policy. */
   shown?: boolean;
+  /** Owner fork/archive preferences, independent of Brief's activity window. */
+  ownerExcluded?: boolean;
 }
 
-/** The board and the morning brief skip a repo only when this is false. */
+/** Legacy name: the morning brief and its alerts use this visibility policy. */
 export function visibleOnBoard(repo: { shown?: boolean }): boolean {
   return repo.shown !== false;
 }
@@ -90,6 +92,7 @@ export function toWatchedRepo(row: TrackedRepo, owners: OwnerRule[], now: Date):
     lastActivityAt: row.lastActivityAt,
     fieldsOverridden: row.fieldsOverridden ?? null,
     shown: briefShown(row, owner, now),
+    ownerExcluded: Boolean(owner && ((!owner.includeForks && row.isFork) || (!owner.includeArchived && row.isArchived))),
   };
 }
 
@@ -165,15 +168,20 @@ export async function getWatchedRepos(fallback: RepoConfig[]): Promise<{
    * file list is only a fallback, this is the empty stored list.
    */
   storedVersion: string | null;
+  discoveryErrors?: string[];
 }> {
   if (!isConfigured()) return { source: "file", repos: fallback, storedVersion: null };
   try {
     const rows = await loadTrackedRepos();
-    const owners = (await loadOwners()).map(ruleOf);
+    const storedOwners = await loadOwners();
+    const owners = storedOwners.map(ruleOf);
     const storedVersion = versionOf(rows);
     if (rows.length === 0 && owners.length === 0) return { source: "file", repos: fallback, storedVersion };
     const now = new Date();
-    return { source: "database", repos: rows.map((row) => toWatchedRepo(row, owners, now)), storedVersion };
+    return {
+      source: "database", repos: rows.map((row) => toWatchedRepo(row, owners, now)), storedVersion,
+      discoveryErrors: storedOwners.filter((owner) => owner.lastError !== null).map((owner) => owner.owner),
+    };
   } catch (e) {
     if (missingReposRelation(e)) return { source: "file", repos: fallback, storedVersion: versionOf([]) };
     throw e;

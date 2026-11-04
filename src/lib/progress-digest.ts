@@ -13,7 +13,8 @@ function pad(s: string, n: number): string {
   return s.length >= n ? s : s + " ".repeat(n - s.length);
 }
 
-function signed(n: number): string {
+function signed(n: number | null): string {
+  if (n === null) return "n/a";
   return n > 0 ? `+${n}` : String(n);
 }
 
@@ -24,34 +25,40 @@ export function formatDigest(data: ProgressResponse): string {
   lines.push(`Fleet progress — last ${data.window} (as of ${when})`);
   if (data.demo) lines.push("[demo mode — no database connected]");
   if (!data.window_complete) {
-    lines.push(`[history doesn't reach back a full ${data.window} yet; totals cover less than the label claims]`);
+    lines.push(`[partial totals: metrics are missing, stale, or don't cover the full ${data.window}]`);
+  }
+  if (data.coverage) {
+    lines.push(`${data.coverage.shown_repos} repositories shown: open PRs or activity in the past 24h (plus pins). ${data.coverage.checked_repos}/${data.coverage.eligible_repos} freshly checked; ${data.coverage.tracked_repos} retained.`);
+    if (data.coverage.incomplete.length) lines.push(`Activity coverage incomplete: ${data.coverage.incomplete.map((r) => `${r.repo} (${r.status})`).join(", ")}. Additional active repos may be missing.`);
+    if (data.coverage.discovery_errors.length) lines.push(`Discovery unavailable: ${data.coverage.discovery_errors.join(", ")}.`);
   }
   lines.push("");
 
   const t = data.totals;
   const verdict =
-    t.net_backlog > 0
+    t.net_backlog === null ? "backlog change unavailable" : t.net_backlog > 0
       ? `the queue grew by ${t.net_backlog}`
       : t.net_backlog < 0
         ? `the queue shrank by ${Math.abs(t.net_backlog)}`
         : "the queue held level";
-  lines.push(`${t.merged_prs} PRs merged, ${t.issues_closed} issues closed, ${t.issues_opened} opened — ${verdict}.`);
+  lines.push(`${t.merged_prs ?? "n/a"} PRs merged, ${t.issues_closed ?? "n/a"} issues closed, ${t.issues_opened ?? "n/a"} opened — ${verdict}.`);
   lines.push("");
 
-  const nameWidth = Math.max(...data.repos.map((r) => r.label.length), 12);
+  const nameWidth = Math.max(...data.repos.map((r) => `${r.label} (${r.repo})`.length), 12);
   for (const r of data.repos) {
     const blocked = r.blocked_ratio === null ? "blocked n/a" : `blocked ${Math.round(r.blocked_ratio * 100)}%`;
     lines.push(
-      `  ${pad(r.label, nameWidth)}  ${pad(String(r.merged_prs) + " merged", 10)}` +
-        `  closed ${r.issues_closed} / opened ${r.issues_opened}` +
+      `  ${pad(`${r.label} (${r.repo})`, nameWidth)}  ${pad(String(r.merged_prs ?? "n/a") + " merged", 10)}` +
+        `  closed ${r.issues_closed ?? "n/a"} / opened ${r.issues_opened ?? "n/a"}` +
         `  net ${pad(signed(r.net_backlog), 4)}` +
-        `  queue ${r.open_issues}i ${r.open_prs}pr  ${blocked}`
+        `  queue ${r.open_issues ?? "n/a"}i ${r.open_prs ?? "n/a"}pr  ${blocked}` +
+        (r.activity && r.activity.status !== "fresh" ? `  activity ${r.activity.status}` : "")
     );
   }
   lines.push("");
 
   if (data.alerts.length === 0) {
-    lines.push("Needs you: nothing. No threshold breaches, no stalled PRs.");
+    lines.push("Needs you: no alerts from the available metrics. Check coverage for unmeasured repositories.");
   } else {
     lines.push(`Needs you (${data.alerts.length}):`);
     for (const a of data.alerts) {

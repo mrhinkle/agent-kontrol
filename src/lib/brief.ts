@@ -818,6 +818,7 @@ async function snapshotsAt(repos: string[], beforeIso: string | null): Promise<M
         select distinct on (lower(repo)) *
         from repo_snapshots
         where lower(repo) = any(${names}::text[])
+          and kind <> 'activity'
           and collected_at <= ${beforeIso}
         order by lower(repo), collected_at desc, id desc
       `
@@ -825,6 +826,7 @@ async function snapshotsAt(repos: string[], beforeIso: string | null): Promise<M
         select distinct on (lower(repo)) *
         from repo_snapshots
         where lower(repo) = any(${names}::text[])
+          and kind <> 'activity'
         order by lower(repo), collected_at desc, id desc
       `;
   return new Map((rows as Row[]).map((row) => [String(row.repo).toLowerCase(), toSnapshot(row)]));
