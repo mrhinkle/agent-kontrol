@@ -128,6 +128,10 @@ describe("cost summaries and visible evidence", () => {
     // A correction removed the previously nonzero model: do not carry it into the new complete empty report.
     const corrected = providerCosts([fact({ detail: { report_id: "b".repeat(64) }, paid_cost_usd: 99 })], [receipt({ fact_count: 0 })], period)[0];
     assert.equal(corrected.cost_usd, 0); assert.equal(corrected.coverage, "complete");
+    const removed = aggregateUsageFacts([fact({ detail: { report_id: "b".repeat(64) }, paid_cost_usd: 99 })], { ...period, snapshots: [receipt({ fact_count: 0 })] });
+    assert.deepEqual(removed.by_account, [], "removed report rows cannot survive in the legacy account breakdown");
+    const partialDay = providerCosts([fact()], [receipt()], { since: "2026-11-03T12:00:00Z", until: period.until })[0];
+    assert.notEqual(partialDay.coverage, "complete"); assert.match(partialDay.note, /partial-day query/);
   });
   it("keeps ALL Hermes attribution unchanged and never turns local estimates into provider charges", () => {
     const hermes = fact({ source: "hermes_state", account_id: "hermes-mac-mini", profile: "same", cron_job_id: "cron", paid_cost_usd: 10, shadow_cost_usd: 100 });

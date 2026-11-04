@@ -20,6 +20,17 @@ const within = (f: UsageFact, since: string, until: string) => Date.parse(f.last
 const sum = (facts: UsageFact[], field: keyof UsageFact) => facts.reduce((total, f) => total + Number(f[field] ?? 0), 0);
 const money = (facts: UsageFact[]) => Math.round(sum(facts, "paid_cost_usd") * 1e10) / 1e10;
 
+/** Keep the legacy account breakdown aligned with authoritative report corrections too. */
+export function currentProviderFacts(facts: UsageFact[], snapshots: AccountSnapshot[]): UsageFact[] {
+  const reportIds = new Map<string, string>();
+  for (const account of accounts) {
+    const snapshot = snapshots.filter((s) => s.account_id === account.id).sort((a, b) => b.collected_at.localeCompare(a.collected_at))[0];
+    const receipt = coverage(snapshot, account.provider);
+    if (receipt?.report_id) reportIds.set(account.id, receipt.report_id);
+  }
+  return facts.filter((f) => f.source !== "provider_api" || !reportIds.has(f.account_id) || f.detail?.report_id === reportIds.get(f.account_id));
+}
+
 export function providerCosts(facts: UsageFact[], snapshots: AccountSnapshot[], window: { since: string; until: string }): ProviderCostSummary[] {
   return accounts.map((account) => {
     const snapshot = snapshots.filter((s) => s.account_id === account.id).sort((a, b) => b.collected_at.localeCompare(a.collected_at))[0];
@@ -30,7 +41,8 @@ export function providerCosts(facts: UsageFact[], snapshots: AccountSnapshot[], 
       Number.isSafeInteger(receipt.fact_count) && receipt.fact_count === report.length;
     const selected = report.filter((f) => within(f, window.since, window.until));
     const known = selected.filter((f) => f.cost_status !== "provider_usage_only");
-    const covers = (start: string, end: string) => validReceipt && Date.parse(receipt!.since) <= Date.parse(start) && Date.parse(receipt!.until) >= Date.parse(end);
+    const dayWindow = Date.parse(window.since) % DAY === 0 && Date.parse(window.until) % DAY === 0 && Date.parse(window.until) > Date.parse(window.since);
+    const covers = (start: string, end: string) => dayWindow && validReceipt && Date.parse(receipt!.since) <= Date.parse(start) && Date.parse(receipt!.until) >= Date.parse(end);
     const status = covers(window.since, window.until) ? "complete" : validReceipt ? "partial" : all.length || snapshot ? "unverified" : "missing";
     const daily: ProviderCostSummary["daily"] = [];
     for (let t = Date.parse(window.since); t < Date.parse(window.until) && daily.length < 31; t += DAY) {
@@ -44,7 +56,7 @@ export function providerCosts(facts: UsageFact[], snapshots: AccountSnapshot[], 
       collected_at: snapshot?.collected_at ?? null,
       data_refreshed_at: typeof receipt?.data_refreshed_at === "string" ? receipt.data_refreshed_at : null,
       credits_remaining: snapshot?.credits_remaining ?? null,
-      rows: selected.length, note: account.note, daily,
+      rows: selected.length, note: account.note + (dayWindow ? "" : " Only daily buckets are available for this partial-day query."), daily,
     };
   });
 }

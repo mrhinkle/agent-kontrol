@@ -2,7 +2,7 @@
  * Pure aggregation helpers — used by the Neon store and by regression tests
  * that prove provider_api rows cannot inflate fleet headlines.
  */
-import { providerCosts, claudeUsage } from "./usage-costs";
+import { providerCosts, claudeUsage, currentProviderFacts } from "./usage-costs";
 import type { AccountSnapshot } from "./providers/types";
 import type { TopSession, UsageBucket, UsageFact, UsageSummary } from "./usage-types";
 
@@ -135,7 +135,7 @@ export function aggregateUsageFacts(
       (key, f) => (f.cron_job_name ? `${f.cron_job_name} (${key})` : key),
     ),
     by_model: bucketize(agentFacts, (f) => f.model),
-    by_account: bucketize(facts.filter(inWindow), (f) => `${f.account_id}:${f.source}`),
+    by_account: bucketize(currentProviderFacts(facts, opts.snapshots ?? []).filter(inWindow), (f) => `${f.account_id}:${f.source}`),
     top_sessions: Array.from(sessionMap.values())
       .sort((a, b) => b.paid_cost_usd + b.shadow_cost_usd - (a.paid_cost_usd + a.shadow_cost_usd))
       .slice(0, 15),
