@@ -36,6 +36,12 @@ export async function testVelocityStore() {
     assert.equal(rls[0].relrowsecurity, true);
     const policies = await sql()`select policyname from pg_policies where tablename = 'velocity_benchmarks'`;
     assert.equal(policies.length, 0, "no Data API policy grants access to private captures");
+    const attribution = await sql()`select column_name, is_nullable from information_schema.columns
+      where table_schema = current_schema() and table_name = 'velocity_benchmarks'
+        and column_name in ('actor_type', 'actor_id') order by column_name`;
+    assert.deepEqual(attribution.map((r) => [r.column_name, r.is_nullable]), [
+      ["actor_id", "NO"], ["actor_type", "NO"],
+    ], "every private capture requires authenticated attribution in storage");
 
     // Server record order, not the client capture clock, selects revisions.
     const revision = structuredClone(base);
