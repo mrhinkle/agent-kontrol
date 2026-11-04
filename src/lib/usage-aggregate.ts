@@ -2,7 +2,7 @@
  * Pure aggregation helpers — used by the Neon store and by regression tests
  * that prove provider_api rows cannot inflate fleet headlines.
  */
-import { providerCosts, claudeUsage, currentProviderFacts } from "./usage-costs";
+import { providerCosts, claudeUsage, grokUsage, currentProviderFacts } from "./usage-costs";
 import type { AccountSnapshot } from "./providers/types";
 import type { TopSession, UsageBucket, UsageFact, UsageSummary } from "./usage-types";
 
@@ -67,6 +67,7 @@ export function aggregateUsageFacts(
   const provider_window = opts.provider_window ?? { since: opts.since, until: opts.until };
   const providers = providerCosts(facts, opts.snapshots ?? [], provider_window);
   const claude = claudeUsage(facts, opts.snapshots ?? [], opts);
+  const grok = grokUsage(facts, opts.snapshots ?? [], opts, provider_window, providers[0]);
   const fees = facts.filter((f) => f.source === "subscription_fee" && inWindow(f));
   const paid = agentFacts.reduce((s, f) => s + Number(f.paid_cost_usd ?? 0), 0);
   const shadow = agentFacts.reduce((s, f) => s + Number(f.shadow_cost_usd ?? 0), 0);
@@ -143,6 +144,7 @@ export function aggregateUsageFacts(
     provider_window,
     providers,
     claude,
+    grok,
     collected_at: opts.collected_at ?? null,
   };
 }

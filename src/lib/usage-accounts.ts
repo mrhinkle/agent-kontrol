@@ -99,8 +99,8 @@ export const USAGE_ACCOUNTS: AccountRecord[] = [
     currency: "usd",
     secret_env: "MC_XAI_MANAGEMENT_KEY",
     secret_kind: "management",
-    notes: "Phase 2 Management API.",
-    active: false,
+    notes: "Management billing analytics for the configured team; requires a management key and team ID. No inference key fallback.",
+    active: true,
   },
   {
     id: "supergrok-subscription",
@@ -109,7 +109,7 @@ export const USAGE_ACCOUNTS: AccountRecord[] = [
     billing_type: "subscription",
     monthly_fee_usd: null,
     currency: "usd",
-    notes: "Phase 2/3. Consumer entitlement ≠ API team billing.",
+    notes: "Verified recorded Grok subscription payments, separate from API team billing. No assumed recurring price or local CLI total.",
     active: true,
   },
   {

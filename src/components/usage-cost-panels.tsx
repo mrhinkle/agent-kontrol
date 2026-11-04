@@ -18,7 +18,7 @@ export function UsageCostPanels({ data }: { data: UsageSummary }) {
             Provider costs may overlap agent-attributed usage below; they are separate views of the same activity.
           </p>
         </div>
-        <div className="grid gap-4 md:grid-cols-2">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
           {(data.providers ?? []).map((provider) => (
             <article key={provider.account_id} className="rounded-xl border border-white/10 bg-[#101828] p-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
@@ -52,6 +52,17 @@ export function UsageCostPanels({ data }: { data: UsageSummary }) {
           </details>
         )}
       </section>
+      {data.grok && (
+        <section aria-labelledby="grok-cost-heading" className="rounded-xl border border-white/10 bg-[#101828] p-4">
+          <h2 id="grok-cost-heading" className="text-base font-semibold">Grok subscription and routed usage</h2>
+          <div className="mt-4 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
+            <div><p className="text-xs text-gray-400">Recorded subscription fees</p><p className="mt-1 text-2xl font-semibold tabular-nums">{dollars(data.grok.subscription_fees_usd)}</p><p className="mt-1 text-xs text-gray-400">{data.grok.fee_records ? `${data.grok.fee_records} verified payment record(s) in the selected rolling window` : "No verified fee records in this window"}</p></div>
+            <div><p className="text-xs text-gray-400">Grok through OpenRouter</p><p className="mt-1 text-2xl font-semibold tabular-nums">{dollars(data.grok.openrouter_cost_usd)}</p><p className="mt-1 text-xs text-gray-400">Included in OpenRouter above for the completed UTC days.{data.grok.openrouter_coverage !== "complete" && " Observed charges only; period total is not verified."}</p></div>
+            <div><p className="text-xs text-gray-400">Local Grok usage</p><p className="mt-1 text-2xl font-semibold">Unavailable</p><p className="mt-1 text-xs text-gray-400">Local records may include inherited or rolled-up usage, so they cannot establish a reliable total.</p></div>
+          </div>
+          <p className="mt-4 text-xs text-gray-400">Grok API billing, subscription payments and OpenRouter charges remain separate. No subscription price is assumed.</p>
+        </section>
+      )}
       {local && (
         <section aria-labelledby="claude-usage-heading" className="rounded-xl border border-white/10 bg-[#101828] p-4">
           <h2 id="claude-usage-heading" className="text-base font-semibold">Claude subscription and local usage</h2>

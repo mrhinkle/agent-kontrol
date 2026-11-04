@@ -31,7 +31,6 @@ async function main() {
 
   for (const [name, a] of [
     ["openai", openAIAdminAdapter],
-    ["xai", xaiManagementAdapter],
   ] as const) {
     let ok = false;
     try {
@@ -45,6 +44,11 @@ async function main() {
   try { await anthropicAdminAdapter.fetchUsage(getAccount("anthropic-api-org")!, new Date()); }
   catch (e: any) { missingAdmin = String(e.message).includes("MC_ANTHROPIC_ADMIN_KEY"); }
   if (!missingAdmin) throw new Error("expected missing Anthropic admin key");
+  let missingXai = false;
+  try { await xaiManagementAdapter.fetchUsage(getAccount("xai-api-team")!, new Date()); }
+  catch (e: any) { missingXai = String(e.message).includes("MC_XAI_MANAGEMENT_KEY"); }
+  if (!missingXai) throw new Error("expected missing xAI management key");
+  console.log("xai_missing_management_ok");
   console.log("anthropic_missing_admin_ok");
   console.log("phase2_stubs_ok");
 }

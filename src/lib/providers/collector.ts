@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import type { ProviderUsageBatch } from "./types";
 import { jsonRequest, nonnegative, record } from "./transport";
 
-const CONFIG_NAMES = new Set(["MC_URL", "MC_TOKEN", "MC_OPENROUTER_MANAGEMENT_KEY", "OPENROUTER_MANAGEMENT_KEY", "MC_ANTHROPIC_ADMIN_KEY", "ANTHROPIC_ADMIN_KEY"]);
+const CONFIG_NAMES = new Set(["MC_URL", "MC_TOKEN", "MC_OPENROUTER_MANAGEMENT_KEY", "OPENROUTER_MANAGEMENT_KEY", "MC_ANTHROPIC_ADMIN_KEY", "ANTHROPIC_ADMIN_KEY", "MC_XAI_MANAGEMENT_KEY", "XAI_MANAGEMENT_KEY", "MC_XAI_TEAM_ID", "XAI_TEAM_ID"]);
 export function literalConfig(text: string): Record<string, string> {
   const values: Record<string, string> = {};
   for (let line of text.split(/\r?\n/)) {
@@ -55,7 +55,8 @@ export function privateOutput(path: string, payload: unknown): void {
   writeFileSync(path, JSON.stringify(payload, null, 2) + "\n", { mode: 0o600, flag: "wx" });
 }
 
-export function subscriptionFee(value: unknown, now = new Date()): ProviderUsageBatch {
+export function subscriptionFee(value: unknown, now = new Date(), family: "claude" | "grok" = "claude"): ProviderUsageBatch {
+  if (family !== "claude" && family !== "grok") throw new Error("Unsupported subscription provider");
   const row = record(value);
   const keys = ["invoice_id", "paid_at", "amount_usd", "currency"];
   if (Object.keys(row).some((key) => !keys.includes(key)) || keys.some((key) => !(key in row))) throw new Error("Fee requires only invoice_id, paid_at, amount_usd and currency");
@@ -63,8 +64,8 @@ export function subscriptionFee(value: unknown, now = new Date()): ProviderUsage
       typeof row.paid_at !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/.test(row.paid_at) || !Number.isFinite(Date.parse(row.paid_at)) || Date.parse(row.paid_at) > now.getTime()) throw new Error("Invalid USD fee identity or payment date");
   const amount = nonnegative(row.amount_usd);
   const paidAt = new Date(row.paid_at).toISOString();
-  return { facts: [{ source: "subscription_fee", account_id: "claude-subscription", model: "subscription", billing_provider: "anthropic", billing_mode: "subscription",
-    session_id: `claude-fee:${createHash("sha256").update(row.invoice_id).digest("hex")}`,
+  return { facts: [{ source: "subscription_fee", account_id: family === "grok" ? "supergrok-subscription" : "claude-subscription", model: "subscription", billing_provider: family === "grok" ? "xai" : "anthropic", billing_mode: "subscription",
+    session_id: `${family}-fee:${createHash("sha256").update(row.invoice_id).digest("hex")}`,
     paid_cost_usd: amount, shadow_cost_usd: 0, cost_status: "recorded_fee", first_seen_at: paidAt, last_seen_at: paidAt,
     detail: { currency: "USD", basis: "operator_recorded_payment" },
   }] };
