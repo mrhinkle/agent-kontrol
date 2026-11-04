@@ -1,6 +1,6 @@
 # Claude Code local usage collector
 
-This separate Python 3.9+ collector reads Claude Code JSONL files and sends only validated usage metadata to Agent Kontrol. It does not modify the lifecycle hook, install a service, change a subscription, or activate a schedule. It uses the existing usage-ingest endpoint and schema.
+This separate Python 3.9+ collector runs on POSIX systems (macOS/Linux), reads Claude Code JSONL files and sends only validated usage metadata to Agent Kontrol. It does not modify the lifecycle hook, install a service, change a subscription, or activate a schedule. It uses the existing usage-ingest endpoint and schema.
 
 The default command is a read-only dry run. It prints a summary, writes no artifact, does not read credentials, and makes no network request:
 
@@ -40,6 +40,8 @@ A snapshot accompanies the facts with `detail.coverage.version=1`, provider `cla
 
 Discovery continues up to the directory-entry bound before choosing files to read. The newest modification times are processed first, up to the file limit, so a large archive does not repeatedly consume the budget before recent files. Modification time is only a priority hint: actual response timestamps determine the observation window, and omitted files always leave coverage partial. An unreadable file stat also makes coverage partial.
 
+Each input file is opened with `O_NOFOLLOW` and `O_NONBLOCK`, then its descriptor is checked for regular-file type and size before a reader is created. A leaf replaced by a symlink or FIFO after discovery is rejected without reading it or blocking, and leaves coverage partial. Read-time byte bounds still apply if a regular file grows. Systems without the required POSIX primitives fail closed with `safe_file_open_unavailable`; Windows is unsupported.
+
 Malformed JSON, missing or invalid required usage metadata, unreadable files, symlinks, conflicting requests or any scan bound make coverage partial. Valid observations from a partial scan may still be published with that partial snapshot; the command then exits **2**, even if the POST succeeds. Complete collection/publication exits **0**. Invalid options, transport, output or receipt failure exits **1** with a fixed safe error code. Never treat file existence or a partial snapshot as a successful complete capture.
 
 Bounds: 2,000 JSONL files; 100,000 enumerated directory entries; 64 MiB per file; 256 MiB total input; 1 MiB per record; 250,000 records; 100,000 request observations; 20 MiB output/POST; 64 KiB receipt; 256 KiB config. Unsupported future transcript shapes require an explicit parser update; the collector does not guess fields or silently price unknown models.
@@ -50,4 +52,4 @@ Run the synthetic regression tests through the existing Python test discovery:
 python3 -m unittest discover -s tests/unit -p 'test_claude_usage_collector.py' -v
 ```
 
-They are also included in the repository's existing `npm run test:unit:py` command. Tests cover duplicate chunks/files, separate process ID stability, billing corrections, windows, malformed metadata, privacy canaries, private output, literal config, destination validation, exact receipts and partial publication.
+They are also included in the repository's existing `npm run test:unit:py` command. Tests cover duplicate chunks/files, separate process ID stability, billing corrections, windows, malformed metadata, privacy canaries, symlink/FIFO replacement races, read-time size validation, private output, literal config, destination validation, exact receipts and partial publication.

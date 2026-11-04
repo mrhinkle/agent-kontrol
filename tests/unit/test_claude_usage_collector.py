@@ -166,7 +166,7 @@ class CollectorTests(unittest.TestCase):
     def test_no_files_unreadable_and_limits_are_partial(self):
         self.assertEqual(self.collect()["snapshot"]["detail"]["coverage"]["status"], "partial")
         self.write([record()])
-        with mock.patch.object(Path, "open", side_effect=PermissionError(CANARY)):
+        with mock.patch.object(collector.os, "open", side_effect=PermissionError(CANARY)):
             result = self.collect()
         self.assertEqual(result["snapshot"]["detail"]["coverage"]["unreadable_files"], 1)
         with mock.patch.object(collector, "MAX_LINE_BYTES", 10):
@@ -232,6 +232,107 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(payload["snapshot"]["detail"]["coverage"]["unreadable_files"], 1)
         self.assertEqual(payload["snapshot"]["detail"]["coverage"]["status"], "partial")
         self.assertNotIn(CANARY, json.dumps(payload))
+
+    def run_leaf_swap(self, kind):
+        leaf = self.write([record(request="inside-request")])
+        outside = self.root / "outside.jsonl"
+        outside.write_text(json.dumps(record(request="outside-request")) + "\n")
+        program = r'''
+import importlib.util, json, os, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("race_collector", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+root, leaf, outside, kind = Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]), sys.argv[5]
+original_open, original_path_open, original_fdopen = os.open, Path.open, os.fdopen
+swapped = False
+outside_opened = False
+buffered_opens = 0
+outside_stat = outside.stat()
+
+def swap(path):
+    global swapped
+    if not swapped and Path(path) == leaf:
+        swapped = True
+        leaf.unlink()
+        if kind == "symlink":
+            leaf.symlink_to(outside)
+        else:
+            os.mkfifo(leaf)
+
+def inspect(fd):
+    global outside_opened
+    info = os.fstat(fd)
+    outside_opened |= (info.st_dev, info.st_ino) == (outside_stat.st_dev, outside_stat.st_ino)
+
+def open_fd(path, flags, *args, **kwargs):
+    swap(path)
+    fd = original_open(path, flags, *args, **kwargs)
+    inspect(fd)
+    return fd
+
+def open_path(path, *args, **kwargs):
+    swap(path)
+    handle = original_path_open(path, *args, **kwargs)
+    inspect(handle.fileno())
+    return handle
+
+def buffer_fd(fd, *args, **kwargs):
+    global buffered_opens
+    buffered_opens += 1
+    return original_fdopen(fd, *args, **kwargs)
+
+os.open, Path.open, os.fdopen = open_fd, open_path, buffer_fd
+payload = m.collect([root], "test-machine", "unknown", m.instant("2026-11-01T00:00:00Z"), m.instant("2026-11-04T00:00:00Z"))
+print(json.dumps({"payload":payload,"swapped":swapped,"outside_opened":outside_opened,"buffered_opens":buffered_opens}))
+'''
+        try:
+            run = subprocess.run([sys.executable, "-c", program, str(SCRIPT), str(self.logs), str(leaf), str(outside), kind], capture_output=True, text=True, timeout=3, check=True)
+        except subprocess.TimeoutExpired:
+            self.fail("collector blocked while opening a replaced leaf")
+        result = json.loads(run.stdout)
+        self.assertTrue(result["swapped"])
+        self.assertFalse(result["outside_opened"])
+        self.assertEqual(result["buffered_opens"], 0)
+        self.assertEqual(result["payload"]["facts"], [])
+        coverage = result["payload"]["snapshot"]["detail"]["coverage"]
+        self.assertEqual(coverage["status"], "partial")
+        self.assertEqual(coverage["unreadable_files"], 1)
+        self.assertEqual(coverage["bytes_read"], 0)
+
+    def test_discovered_leaf_swapped_to_symlink_is_never_read(self):
+        self.run_leaf_swap("symlink")
+
+    def test_discovered_leaf_swapped_to_fifo_does_not_block_or_read(self):
+        self.run_leaf_swap("fifo")
+
+    def test_opened_file_size_is_checked_again_before_reading(self):
+        leaf = self.write([record()])
+        limit = leaf.stat().st_size
+        original_open = os.open
+
+        def grow_then_open(path, flags, *args, **kwargs):
+            with leaf.open("ab") as handle:
+                handle.write(b"x")
+            return original_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(collector, "MAX_FILE_BYTES", limit), \
+                mock.patch.object(collector.os, "open", grow_then_open), \
+                mock.patch.object(collector.os, "fdopen", side_effect=AssertionError("must validate size before reading")):
+            result = self.collect()
+        self.assertEqual(result["facts"], [])
+        coverage = result["snapshot"]["detail"]["coverage"]
+        self.assertEqual(coverage["status"], "partial")
+        self.assertEqual(coverage["limits_reached"], 1)
+        self.assertEqual(coverage["bytes_read"], 0)
+        self.assertEqual(coverage["files_read"], 0)
+
+    def test_missing_safe_file_primitives_fail_closed(self):
+        self.write([record()])
+        for unavailable in ({"O_NOFOLLOW": None}, {"O_NONBLOCK": 0}, {"name": "nt"}):
+            with self.subTest(unavailable=unavailable), mock.patch.multiple(collector.os, **unavailable), \
+                    mock.patch.object(collector.os, "open", side_effect=AssertionError("unsupported read")):
+                with self.assertRaisesRegex(collector.CollectorError, "^safe_file_open_unavailable$"):
+                    self.collect()
 
     def test_default_dry_run_has_no_facts_files_or_credential_reads(self):
         self.write([record()])

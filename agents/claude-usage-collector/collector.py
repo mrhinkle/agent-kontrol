@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import ipaddress
 import json
@@ -11,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import stat
 import sys
 from datetime import datetime, timedelta, timezone
 import urllib.error
@@ -42,6 +44,36 @@ COUNTERS = {
 
 class CollectorError(Exception):
     """Only fixed, non-sensitive error codes may be supplied."""
+
+
+class InputFileLimitError(Exception):
+    """The opened regular file exceeds the input size bound."""
+
+
+def safe_read_flags():
+    required = (getattr(os, name, None) for name in ("O_NOFOLLOW", "O_NONBLOCK"))
+    if os.name != "posix" or any(type(flag) is not int or not flag for flag in required):
+        raise CollectorError("safe_file_open_unavailable")
+    return os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+
+
+@contextmanager
+def open_regular_file(path):
+    # Discovery is only a hint: the leaf may have been replaced before this open.
+    descriptor = os.open(path, safe_read_flags())
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError("not_regular_file")
+        if info.st_size > MAX_FILE_BYTES:
+            raise InputFileLimitError()
+        handle = os.fdopen(descriptor, "rb")
+        descriptor = None  # The validated reader now owns the descriptor.
+        with handle:
+            yield handle
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def strict_json(raw):
@@ -132,6 +164,7 @@ def collect(roots, machine, billing_mode, since, until, collected_at=None):
         raise CollectorError("invalid_collection_options")
     if since >= until:
         raise CollectorError("invalid_window")
+    safe_read_flags()  # Fail closed before discovery on unsupported platforms.
     collected_at = collected_at or datetime.now(timezone.utc)
     counts = {key: 0 for key in (
         "files", "files_read", "records", "duplicates", "malformed_records",
@@ -210,7 +243,7 @@ def collect(roots, machine, billing_mode, since, until, collected_at=None):
             if size > MAX_FILE_BYTES:
                 counts["limits_reached"] += 1
                 continue
-            with path.open("rb") as handle:
+            with open_regular_file(path) as handle:
                 counts["files_read"] += 1
                 file_bytes = 0
                 while True:
@@ -259,6 +292,8 @@ def collect(roots, machine, billing_mode, since, until, collected_at=None):
                         break
                     else:
                         observations[key] = item
+        except InputFileLimitError:
+            counts["limits_reached"] += 1
         except (OSError, ValueError):
             counts["unreadable_files"] += 1
 
