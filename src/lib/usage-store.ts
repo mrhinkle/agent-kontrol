@@ -3,11 +3,13 @@
  * Agents push via POST /api/usage/ingest; the dashboard only reads aggregates.
  * Fleet headlines are always source=hermes_state (see usage-aggregate.ts).
  */
-import { isConfigured, sql } from "./db";
+import { isConfigured, sql, withTransaction, type SqlTag } from "./db";
 import { aggregateUsageFacts } from "./usage-aggregate";
 import { usageIdempotentKey } from "./usage-key";
 import { assertNoContent } from "./usage-privacy";
 import type { UsageFact, UsageIngestInput, UsageSummary } from "./usage-types";
+import type { AccountSnapshot } from "./providers/types";
+import { providerWindowRange, type UsageTimeWindow } from "./usage-window";
 import { demoUsageSummary } from "./demo-usage";
 
 function num(v: unknown): number {
@@ -20,13 +22,13 @@ function strOrNull(v: unknown): string | null {
   return String(v);
 }
 
-export async function ingestUsageFacts(input: UsageIngestInput): Promise<number> {
+export async function ingestUsageFacts(input: UsageIngestInput, tx?: SqlTag): Promise<number> {
   if (!Array.isArray(input.facts)) throw new Error("facts[] required");
   if (!isConfigured()) {
     // Match progress ingest: accept and drop when DATABASE_URL unset (local demo).
     return 0;
   }
-  const db = sql();
+  const db = tx ?? sql();
   const collectedAt = input.collected_at ?? new Date().toISOString();
   let written = 0;
 
@@ -103,11 +105,11 @@ export async function ingestAccountSnapshot(snap: {
   credits_remaining?: number | null;
   quota_detail?: unknown;
   detail?: unknown;
-}): Promise<void> {
+}, tx?: SqlTag): Promise<void> {
   if (!isConfigured()) return;
   assertNoContent(snap.detail);
   assertNoContent(snap.quota_detail);
-  const db = sql();
+  const db = tx ?? sql();
   const collected_at = snap.collected_at ?? new Date().toISOString();
   await db`
     insert into account_snapshots (
@@ -158,55 +160,50 @@ function rowToFact(row: Record<string, unknown>): UsageFact {
   };
 }
 
+/** Facts and coverage commit together; a failed import cannot certify a partial report. */
+export async function ingestUsageBatch(input: UsageIngestInput & { snapshot?: AccountSnapshot }): Promise<number> {
+  if (!isConfigured()) return 0;
+  return withTransaction(async (tx) => {
+    const written = await ingestUsageFacts(input, tx);
+    if (written !== input.facts.length) throw new Error("Incomplete usage batch");
+    if (input.snapshot) await ingestAccountSnapshot(input.snapshot, tx);
+    return written;
+  });
+}
+
 export async function getUsageSummary(opts: {
   since: string;
   until: string;
+  window?: UsageTimeWindow | null;
 }): Promise<UsageSummary> {
-  if (!isConfigured()) {
-    return demoUsageSummary(opts);
-  }
-  const db = sql();
-  const rows = (await db`
-    select *
-    from usage_facts
-    where last_seen_at >= ${opts.since}::timestamptz
-      and last_seen_at < ${opts.until}::timestamptz
-  `) as Record<string, unknown>[];
-
-  const facts = rows.map(rowToFact);
-
-  const snaps = (await db`
-    select account_id, collected_at, balance_usd, credits_remaining
-    from account_snapshots
-    where account_id = 'openrouter-shared'
-    order by collected_at desc
-    limit 1
-  `) as Record<string, unknown>[];
-  const latestOr = snaps[0];
-
-  const collectedRows = (await db`
-    select max(collected_at) as collected_at from usage_facts
-    where last_seen_at >= ${opts.since}::timestamptz
-      and last_seen_at < ${opts.until}::timestamptz
-  `) as Record<string, unknown>[];
-
-  const summary = aggregateUsageFacts(facts, {
-    since: opts.since,
-    until: opts.until,
-    collected_at: collectedRows[0]?.collected_at
-      ? new Date(collectedRows[0].collected_at as string).toISOString()
-      : null,
+  if (!isConfigured()) return demoUsageSummary(opts);
+  const provider_window = opts.window ? providerWindowRange(opts.window, new Date(opts.until)) : { since: opts.since, until: opts.until };
+  return withTransaction(async (db) => {
+    // Snapshot and fact reads must see the same committed report during refreshes.
+    await db`set transaction isolation level repeatable read read only`;
+    const snaps = (await db`
+      select distinct on (account_id) account_id, collected_at, credits_remaining, detail
+      from account_snapshots
+      where account_id in ('openrouter-shared', 'anthropic-api-org') or account_id like 'claude-code:%'
+      order by account_id, collected_at desc
+    `) as Record<string, unknown>[];
+    const snapshots: AccountSnapshot[] = snaps.map((s) => ({
+      account_id: String(s.account_id), collected_at: new Date(s.collected_at as string).toISOString(),
+      credits_remaining: s.credits_remaining == null ? null : num(s.credits_remaining),
+      detail: (s.detail as Record<string, unknown>) ?? {},
+    }));
+    const reports = snapshots.map((s) => (s.detail?.coverage as { report_id?: string } | undefined)?.report_id).filter((v): v is string => typeof v === "string");
+    const rows = (await db`
+      select * from usage_facts
+      where (source <> 'provider_api' and last_seen_at >= ${opts.since}::timestamptz and last_seen_at < ${opts.until}::timestamptz)
+        or (source = 'provider_api' and ((last_seen_at >= ${provider_window.since}::timestamptz and last_seen_at < ${provider_window.until}::timestamptz)
+          or detail->>'report_id' = any(${reports}::text[])))
+    `) as Record<string, unknown>[];
+    const collected = [...rows.map((r) => new Date(r.collected_at as string).toISOString()), ...snapshots.map((s) => s.collected_at)].sort();
+    const summary = aggregateUsageFacts(rows.map(rowToFact), { ...opts, provider_window, snapshots, collected_at: collected.at(-1) ?? null });
+    summary.demo = false;
+    return summary;
   });
-
-  summary.demo = false;
-  if (latestOr) {
-    summary.openrouter = {
-      ...summary.openrouter!,
-      credits_remaining:
-        latestOr.credits_remaining != null ? num(latestOr.credits_remaining) : summary.openrouter?.credits_remaining ?? null,
-    };
-  }
-  return summary;
 }
 
 export { usageIdempotentKey } from "./usage-key";

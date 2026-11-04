@@ -55,3 +55,9 @@ export function resolveUsageWindow(params: {
   const r = usageWindowRange(DEFAULT_USAGE_WINDOW, now);
   return { since: r.since, until: r.until, window: r.window };
 }
+
+/** Provider invoices use completed UTC days, independent of rolling agent windows. */
+export function providerWindowRange(window: UsageTimeWindow = DEFAULT_USAGE_WINDOW, now = new Date()) {
+  const end = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  return { since: new Date(end - MS[window]).toISOString(), until: new Date(end).toISOString() };
+}
