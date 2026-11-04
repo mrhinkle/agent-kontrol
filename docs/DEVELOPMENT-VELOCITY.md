@@ -38,15 +38,15 @@ Coverage fingerprints include the sorted repository identities, stream coverage 
 
 ## Storage and release
 
-The draft requires one additive `velocity_benchmarks` table and a trend index. Until the schema is explicitly approved, the proposal stays outside `supabase/schema.sql`; no migration is applied by this feature. Missing storage returns 503, and import never reports a successful dropped capture. After approval, incorporate the reviewed SQL into the idempotent schema and a dated migration, verify against disposable Postgres, and release through the normal review/deployment gates.
+One additive `velocity_benchmarks` table and trend index are included in `supabase/schema.sql` and the dated `20261103_velocity_benchmarks.sql` migration record. No existing rows change. Row-level security is enabled with no anonymous/public policies; the authenticated server uses its existing database access. Missing storage returns 503, and import never reports a successful dropped capture.
 
-Build-only checks while approval is pending:
+Build-only checks that must not apply schema:
 
 ```sh
 MC_SKIP_MIGRATE=1 npm run build
 ```
 
-The ordinary build otherwise invokes the existing schema applicator. Do not use a production database for tests. A skipped database test is not database validation.
+The ordinary build otherwise invokes the existing schema applicator. Preview deployments must set `MC_SKIP_MIGRATE=1` as documented in the deployment guide. Validate the canonical schema twice and run `npm run test:pg` against disposable Postgres before release. That suite checks concurrent first insertion, immutable replay receipts, revision selection, original-baseline retention, older backfill, coverage fingerprints and scope isolation. Do not use a production database for tests. A skipped database test is not database validation.
 
 ## Daily capture and weekly summary
 
