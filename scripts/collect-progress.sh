@@ -12,6 +12,7 @@
 #                                         # (not required: the board's history
 #                                         #  takes the last tick of each UTC day)
 #   ./collect-progress.sh --backfill 90   # seed 90 days of history, once
+#   ./collect-progress.sh --activity-only # discovery + activity, no other producers
 #   ./collect-progress.sh --dry-run       # print the payload, post nothing
 #
 # Config: MC_URL and MC_TOKEN, from the environment or ~/.claude/mission-control.env.
@@ -101,6 +102,7 @@ DRY_RUN=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --daily)    MODE="daily"; shift ;;
+    --activity-only) MODE="activity"; shift ;;
     --backfill) MODE="backfill"; BACKFILL_DAYS="${2:?--backfill needs a day count}"; shift 2 ;;
     --dry-run)  DRY_RUN=1; shift ;;
     -h|--help)  sed -n '2,21p' "$0"; exit 0 ;;
@@ -608,88 +610,63 @@ run_backfill() {
 
 # ------------------------------------------------------------ owner discovery
 
-# Ask the dashboard which GitHub owners to discover, run `gh repo list` for
-# each, and post the raw lists. A failed, rate-limited, or empty list is
-# reported as ok:false so the dashboard records last_error and leaves
-# tracked repos alone. This never deletes a repo. Hide wins over pin is
-# applied when the dashboard is read, not here. writable:false is an
-# unavailable store, not an empty list. swept_at is taken before gh so a
-# delayed older tick cannot overwrite a newer one.
+# A cheap paginated overview of every owner precedes detailed collection. Its
+# kind=activity rows never replace detailed metric ticks. The standalone mode
+# does not run decision sync, sweeps, or the slow search-based metric collector.
 discover_watched_owners() {
-  local body owners owner listing errfile count truncated results status resp
-  local err swept writable
   if [[ "${MC_REPOS_FROM_DASHBOARD:-1}" == "0" ]]; then
-    log "owners: discovery skipped (dashboard list disabled)"; return 0
+    log "activity: dashboard list disabled"; return 1
   fi
   if [[ -z "${MC_URL:-}" || -z "${MC_TOKEN:-}" ]]; then
-    log "owners: discovery skipped (no MC_URL or MC_TOKEN)"; return 0
+    log "activity: no MC_URL or MC_TOKEN"; return 1
   fi
-  if ! body="$(curl -fsS --max-time 15 -H "Authorization: Bearer $MC_TOKEN" "${MC_URL%/}/api/settings/owners" 2>/dev/null)"; then
-    log "owners: dashboard unreachable, leaving tracked repos unchanged"; return 0
+  local tmp status expected failed=0
+  tmp="$(mktemp -d)"
+  chmod 700 "$tmp"
+  if ! command -v python3 >/dev/null ||
+     ! curl -fsS --max-time 30 -H "Authorization: Bearer $MC_TOKEN" "${MC_URL%/}/api/settings/owners" >"$tmp/owners" ||
+     ! curl -fsS --max-time 30 -H "Authorization: Bearer $MC_TOKEN" "${MC_URL%/}/api/settings/repos" >"$tmp/repos"; then
+    log "activity: settings unavailable; previous observations retained"
+    rm -rf "$tmp"; return 1
   fi
-  writable="$(jq -r 'if has("writable") then (.writable|tostring) else "missing" end' <<<"$body" 2>/dev/null || echo missing)"
-  if [[ "$writable" == "false" ]]; then
-    log "owners: owner store is not writable; discovery skipped and tracked repos unchanged"
-    return 0
+  if ! jq -e '.writable == true and (.owners | type == "array")' "$tmp/owners" >/dev/null ||
+     ! jq -e '.repos | type == "array"' "$tmp/repos" >/dev/null; then
+    log "activity: settings store unavailable; previous observations retained"
+    rm -rf "$tmp"; return 1
   fi
-  owners="$(jq -r '.owners[]?.owner // empty' <<<"$body" 2>/dev/null || true)"
-  if [[ -z "$owners" ]]; then
-    log "owners: none configured"; return 0
+  if ! python3 "$SCRIPT_DIR/collect-progress-activity.py" --owners "$tmp/owners" --repos "$tmp/repos" >"$tmp/scan"; then
+    log "activity: scan failed; previous observations retained"
+    rm -rf "$tmp"; return 1
   fi
-  results="[]"
-  errfile="$(mktemp)"
-  resp="$(mktemp)"
-  while IFS= read -r owner; do
-    [[ -n "$owner" ]] || continue
-    swept="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    if [[ ! "$owner" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]]; then
-      results="$(jq -c --arg owner "$owner" --arg swept "$swept" '. + [{owner:$owner, ok:false, error:"owner is not a safe GitHub login", swept_at:$swept}]' <<<"$results")" || true
-      continue
-    fi
-    : >"$errfile"
-    if listing="$(gh repo list "$owner" --limit 1000 --json name,pushedAt,isArchived,isFork 2>"$errfile")"; then
-      if ! printf '%s\n' "$listing" | jq -e 'type=="array"' >/dev/null 2>&1; then
-        err="$(tr '\n' ' ' <"$errfile" | head -c 400)"
-        results="$(jq -c --arg owner "$owner" --arg err "${err:-gh repo list returned JSON that was not an array}" --arg swept "$swept" '. + [{owner:$owner, ok:false, error:$err, swept_at:$swept}]' <<<"$results")" || true
-        continue
-      fi
-      count="$(jq 'length' <<<"$listing" 2>/dev/null || echo 0)"
-      if [[ "${count:-0}" -eq 0 ]]; then
-        err="$(tr '\n' ' ' <"$errfile" | head -c 400)"
-        results="$(jq -c --arg owner "$owner" --arg err "${err:-gh repo list returned no repos}" --arg swept "$swept" '. + [{owner:$owner, ok:false, error:$err, swept_at:$swept}]' <<<"$results")" || true
-        continue
-      fi
-      truncated=false
-      if [[ "$count" -ge 1000 ]]; then truncated=true; fi
-      results="$(jq -c --arg owner "$owner" --argjson repos "$listing" --argjson truncated "$truncated" --arg swept "$swept" '. + [{owner:$owner, ok:true, repos:$repos, truncated:$truncated, swept_at:$swept}]' <<<"$results")" || true
-    else
-      err="$(tr '\n' ' ' <"$errfile" | head -c 400)"
-      results="$(jq -c --arg owner "$owner" --arg err "${err:-gh repo list failed}" --arg swept "$swept" '. + [{owner:$owner, ok:false, error:$err, swept_at:$swept}]' <<<"$results")" || true
-    fi
-  done <<<"$owners"
-  rm -f "$errfile"
-  if ! status="$(curl -sS -o "$resp" -w '%{http_code}' --max-time 30 \
-      -H "Authorization: Bearer $MC_TOKEN" -H "Content-Type: application/json" \
-      -d "$(jq -c -n --argjson results "$results" '{results:$results}')" \
-      "${MC_URL%/}/api/settings/owners/discover")"; then
-    log "owners: discovery post failed; tracked repos unchanged"
-    rm -f "$resp"
-    return 0
+  jq '.snapshot' "$tmp/scan" >"$tmp/snapshot"
+  jq '.discovery' "$tmp/scan" >"$tmp/discovery"
+  expected="$(jq '.snapshot.repos | length' "$tmp/scan")"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    if [[ "$MODE" == "activity" ]]; then cat "$tmp/scan"; fi
+    log "activity: dry run; no discovery or snapshots posted"
+    rm -rf "$tmp"; return 0
   fi
-  if [[ "$status" != "200" ]]; then
-    log "owners: discovery post returned $status; tracked repos unchanged"
-  else
-    local stale_owners applied
-    stale_owners="$(jq -r '[.results[]? | select(.skipped == "stale") | .owner] | join(" ")' <"$resp" 2>/dev/null || true)"
-    if [[ -n "$stale_owners" ]]; then
-      log "owners: discovery skipped stale sweep for ${stale_owners}"
-    fi
-    applied="$(jq -r '[.results[]? | select(.skipped != "stale")] | length' <"$resp" 2>/dev/null || echo '?')"
-    if [[ "$applied" != "0" ]]; then
-      log "owners: discovery posted (${applied} results)"
+  if [[ "$(jq '.results | length' "$tmp/discovery")" -gt 0 ]]; then
+    if ! curl -fsS --max-time 60 -H "Authorization: Bearer $MC_TOKEN" -H "Content-Type: application/json" \
+         --data-binary @"$tmp/discovery" "${MC_URL%/}/api/settings/owners/discover" >"$tmp/receipt" ||
+       ! jq -e '.results | type == "array" and all(.[]; .ok == true and .skipped != "stale")' "$tmp/receipt" >/dev/null; then
+      log "activity: discovery incomplete; check owner coverage"; failed=1
     fi
   fi
-  rm -f "$resp"
+  if [[ "$expected" -gt 0 ]]; then
+    if ! curl -fsS --max-time 60 -H "Authorization: Bearer $MC_TOKEN" -H "Content-Type: application/json" \
+         --data-binary @"$tmp/snapshot" "${MC_URL%/}/api/progress/ingest" >"$tmp/receipt" ||
+       ! jq -e --argjson expected "$expected" '.ok == true and .demo != true and .written == $expected' "$tmp/receipt" >/dev/null; then
+      log "activity: snapshot publication unconfirmed"; failed=1
+    fi
+  fi
+  if ! jq -e 'all(.snapshot.repos[]; .detail.activity.status == "complete") and all(.discovery.results[]; .ok == true)' "$tmp/scan" >/dev/null; then
+    log "activity: GitHub coverage incomplete; unavailable observations recorded"; failed=1
+  fi
+  log "activity: $expected repositories observed; publication status=$failed"
+  if [[ "$MODE" == "activity" ]]; then jq '.summary' "$tmp/scan"; fi
+  rm -rf "$tmp"
+  return "$failed"
 }
 
 # ------------------------------------------------------------ repo list from the dashboard
@@ -737,7 +714,11 @@ refresh_repos_from_dashboard() {
 
 # ------------------------------------------------------------------- dispatch
 
-discover_watched_owners
+if ! discover_watched_owners; then
+  if [[ "$MODE" == "activity" ]]; then exit 1; fi
+  log "activity: detailed collection continues independently"
+fi
+if [[ "$MODE" == "activity" ]]; then exit 0; fi
 refresh_repos_from_dashboard
 
 if [[ "$MODE" == "backfill" ]]; then

@@ -73,7 +73,7 @@ MC_URL="${MC_URL%/}"
 [[ -n "$MC_URL" && -n "$MC_TOKEN" ]] || { echo "MC_URL and MC_TOKEN are required." >&2; exit 1; }
 case "$MC_URL" in http://*|https://*) ;; *) echo "MC_URL must start with http:// or https://" >&2; exit 1 ;; esac
 
-for bin in gh jq curl; do
+for bin in gh jq curl python3; do
   command -v "$bin" >/dev/null || { echo "missing required command: $bin" >&2; exit 1; }
 done
 gh auth status >/dev/null 2>&1 || {
@@ -92,6 +92,8 @@ gh auth status >/dev/null 2>&1 || {
 mkdir -p "$INSTALL_DIR" "${HOME}/Library/LaunchAgents" "${HOME}/Library/Logs" "$(dirname "$ENV_FILE")"
 cp "${REPO_ROOT}/scripts/collect-progress.sh" "$INSTALLED_SH"
 chmod 755 "$INSTALLED_SH"
+cp "${REPO_ROOT}/scripts/collect-progress-activity.py" "${INSTALL_DIR}/collect-progress-activity.py"
+chmod 755 "${INSTALL_DIR}/collect-progress-activity.py"
 # The sweeper evidence helper (#79). It stays off until a separate
 # sweep-producer.config.json with enabled true is placed beside it; this
 # installer does not create or copy that config.
