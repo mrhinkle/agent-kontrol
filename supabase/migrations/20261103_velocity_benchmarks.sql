@@ -1,4 +1,4 @@
--- PROPOSAL ONLY — not applied. Explicit operator approval is required.
+-- Development-velocity history, approved by the operator on 2026-11-03.
 -- Additive storage for development-velocity captures. No existing rows change.
 -- Application exposes INSERT/SELECT only. Database administrators retain SQL access.
 create table if not exists velocity_benchmarks (
