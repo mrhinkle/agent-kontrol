@@ -143,6 +143,10 @@ def collect(roots, machine, billing_mode, since, until, collected_at=None):
         counts["scan_errors"] += 1
 
     for root in roots:
+        counts["scan_entries"] += 1
+        if counts["scan_entries"] > MAX_SCAN_ENTRIES:
+            counts["limits_reached"] += 1
+            break
         root = Path(root)
         if root.is_symlink():
             scan_error()
@@ -175,27 +179,35 @@ def collect(roots, machine, billing_mode, since, until, collected_at=None):
                                         scan_error()
                             except OSError:
                                 scan_error()
-                            if len(paths) > MAX_FILES:
-                                break
                 except OSError:
                     scan_error()
-                if len(paths) > MAX_FILES or counts["scan_entries"] > MAX_SCAN_ENTRIES:
+                if counts["scan_entries"] > MAX_SCAN_ENTRIES:
                     break
         else:
             scan_error()
-        if len(paths) > MAX_FILES or counts["scan_entries"] > MAX_SCAN_ENTRIES:
-            if len(paths) > MAX_FILES:
-                counts["limits_reached"] += 1
+        if counts["scan_entries"] > MAX_SCAN_ENTRIES:
             break
     counts["files"] = len(paths)
+    if len(paths) > MAX_FILES:
+        counts["limits_reached"] += 1
+    prioritized = []
+    for path in paths:
+        try:
+            info = path.stat()
+            prioritized.append((-info.st_mtime_ns, str(path), path, info.st_size))
+        except (OSError, ValueError):
+            counts["unreadable_files"] += 1
+    # mtime chooses processing order only. Omitted files always leave coverage partial;
+    # actual response timestamps below still determine observation window membership.
+    prioritized.sort()
     observations = {}
     invalid_requests = set()
     stopped = False
-    for path in sorted(paths)[:MAX_FILES]:
+    for _, _, path, size in prioritized[:MAX_FILES]:
         if stopped:
             break
         try:
-            if path.stat().st_size > MAX_FILE_BYTES:
+            if size > MAX_FILE_BYTES:
                 counts["limits_reached"] += 1
                 continue
             with path.open("rb") as handle:

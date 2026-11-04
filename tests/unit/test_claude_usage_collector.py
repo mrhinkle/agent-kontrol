@@ -190,6 +190,49 @@ class CollectorTests(unittest.TestCase):
         self.assertRegex(fact["session_id"], r"^cc:[0-9a-f]{64}$")
         self.assertEqual(set(fact["detail"]), {"version", "machine", "billing_mode", "cost_basis", "session_hash", "request_hash"})
 
+    def test_bounded_scan_prioritizes_newest_files_and_stays_partial(self):
+        older = self.write([record(request="old-request")], "a-old.jsonl")
+        middle = self.write([record(request="middle-request")], "b-middle.jsonl")
+        newest_record = record(request="new-request")
+        newest = self.write([newest_record], "z-new.jsonl")
+        for path, timestamp in [(older, 10), (middle, 20), (newest, 30)]:
+            os.utime(path, (timestamp, timestamp))
+        expected = "cc:" + collector.observation(newest_record)["key"]
+        for bounds in [{"MAX_FILES": 1}, {"MAX_TOTAL_BYTES": newest.stat().st_size + 1}]:
+            with self.subTest(bounds=bounds), mock.patch.multiple(collector, **bounds):
+                payload = self.collect()
+            self.assertEqual([f["session_id"] for f in payload["facts"]], [expected])
+            coverage = payload["snapshot"]["detail"]["coverage"]
+            self.assertEqual(coverage["files"], 3)
+            self.assertEqual(coverage["status"], "partial")
+            self.assertGreater(coverage["limits_reached"], 0)
+
+    def test_mtime_does_not_establish_window_coverage(self):
+        older = self.write([record()], "a-old.jsonl")
+        newest = self.write([record(request="outside", timestamp="2020-01-01T00:00:00Z")], "z-new.jsonl")
+        os.utime(older, (10, 10)); os.utime(newest, (20, 20))
+        with mock.patch.object(collector, "MAX_FILES", 1):
+            payload = self.collect()
+        self.assertEqual(payload["facts"], [])
+        self.assertEqual(payload["snapshot"]["detail"]["coverage"]["status"], "partial")
+
+    def test_unreadable_priority_stat_keeps_partial_coverage(self):
+        unreadable = self.write([record(request="unreadable")], "a-unreadable.jsonl")
+        self.write([record(request="readable")], "z-readable.jsonl")
+        original_stat = Path.stat
+
+        def stat_file(path, *args, **kwargs):
+            if path == unreadable:
+                raise PermissionError(CANARY)
+            return original_stat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "stat", stat_file):
+            payload = self.collect()
+        self.assertEqual(len(payload["facts"]), 1)
+        self.assertEqual(payload["snapshot"]["detail"]["coverage"]["unreadable_files"], 1)
+        self.assertEqual(payload["snapshot"]["detail"]["coverage"]["status"], "partial")
+        self.assertNotIn(CANARY, json.dumps(payload))
+
     def test_default_dry_run_has_no_facts_files_or_credential_reads(self):
         self.write([record()])
         output = io.StringIO()
