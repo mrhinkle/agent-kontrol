@@ -46,7 +46,7 @@ export const USAGE_ACCOUNTS: AccountRecord[] = [
     secret_env: "MC_OPENROUTER_MANAGEMENT_KEY",
     secret_kind: "management",
     reconcile_with: ["hermes-mac-mini"],
-    notes: "Phase 1 provider adapter. One key across ~11 profiles.",
+    notes: "Daily provider charges and latest credit balance. Requires a management key.",
     active: true,
   },
   {
@@ -78,8 +78,8 @@ export const USAGE_ACCOUNTS: AccountRecord[] = [
     currency: "usd",
     secret_env: "MC_ANTHROPIC_ADMIN_KEY",
     secret_kind: "admin",
-    notes: "Phase 2. Skip gracefully if no org Admin access.",
-    active: false,
+    notes: "Usage and Cost Analytics; costs after discounts, before credits. Requires a Console admin key.",
+    active: true,
   },
   {
     id: "claude-subscription",
@@ -88,7 +88,7 @@ export const USAGE_ACCOUNTS: AccountRecord[] = [
     billing_type: "subscription",
     monthly_fee_usd: null,
     currency: "usd",
-    notes: "Phase 2/3. Consumer seat — no Admin Usage API.",
+    notes: "Recorded subscription fees and separately observed local Claude Code usage. No consumer account billing API.",
     active: true,
   },
   {

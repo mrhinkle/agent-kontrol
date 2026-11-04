@@ -32,6 +32,7 @@ export async function GET(req: Request) {
     const summary = await getUsageSummary({
       since: resolved.since,
       until: resolved.until,
+      window: resolved.window,
     });
     summary.window_label = resolved.window;
     return NextResponse.json(summary);
@@ -47,7 +48,7 @@ export async function GET(req: Request) {
         fleet: {
           paid_cost_usd: 0,
           shadow_cost_usd: 0,
-          subscription_fees_usd: 0,
+          subscription_fees_usd: null,
           input_tokens: 0,
           output_tokens: 0,
           cache_read_tokens: 0,
