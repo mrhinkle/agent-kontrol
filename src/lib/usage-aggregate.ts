@@ -2,6 +2,8 @@
  * Pure aggregation helpers — used by the Neon store and by regression tests
  * that prove provider_api rows cannot inflate fleet headlines.
  */
+import { providerCosts, claudeUsage } from "./usage-costs";
+import type { AccountSnapshot } from "./providers/types";
 import type { TopSession, UsageBucket, UsageFact, UsageSummary } from "./usage-types";
 
 export function isHermesState(f: Pick<UsageFact, "source">): boolean {
@@ -56,9 +58,16 @@ export function aggregateUsageFacts(
     until: string;
     collected_at?: string | null;
     openrouter?: UsageSummary["openrouter"];
+    provider_window?: { since: string; until: string };
+    snapshots?: AccountSnapshot[];
   },
 ): UsageSummary {
-  const agentFacts = facts.filter(isHermesState);
+  const inWindow = (f: UsageFact) => Date.parse(f.last_seen_at) >= Date.parse(opts.since) && Date.parse(f.last_seen_at) < Date.parse(opts.until);
+  const agentFacts = facts.filter((f) => isHermesState(f) && inWindow(f));
+  const provider_window = opts.provider_window ?? { since: opts.since, until: opts.until };
+  const providers = providerCosts(facts, opts.snapshots ?? [], provider_window);
+  const claude = claudeUsage(facts, opts.snapshots ?? [], opts);
+  const fees = facts.filter((f) => f.source === "subscription_fee" && inWindow(f));
   const paid = agentFacts.reduce((s, f) => s + Number(f.paid_cost_usd ?? 0), 0);
   const shadow = agentFacts.reduce((s, f) => s + Number(f.shadow_cost_usd ?? 0), 0);
   const input = agentFacts.reduce((s, f) => s + Number(f.input_tokens ?? 0), 0);
@@ -97,26 +106,13 @@ export function aggregateUsageFacts(
     if (f.cron_job_name) s.cron_job_name = f.cron_job_name;
   }
 
-  const hermesOpenrouterPaid = agentFacts
-    .filter((f) => isOpenRouterProvider(f.billing_provider))
-    .reduce((s, f) => s + Number(f.paid_cost_usd ?? 0), 0);
-  const providerPaid = facts
-    .filter((f) => f.source === "provider_api" && f.account_id === "openrouter-shared")
-    .reduce((s, f) => s + Number(f.paid_cost_usd ?? 0), 0);
-
-  let reconcile_delta_pct: number | null = null;
-  if (providerPaid > 0) {
-    reconcile_delta_pct = ((hermesOpenrouterPaid - providerPaid) / providerPaid) * 100;
-  }
-
   const openrouter = opts.openrouter ?? {
-    activity_paid_usd: providerPaid > 0 ? providerPaid : null,
-    credits_remaining: null,
-    reconcile_delta_pct,
-    note:
-      providerPaid > 0
-        ? "Hermes openrouter-attributed paid vs OpenRouter /activity"
-        : "OpenRouter adapter not yet ingested",
+    activity_paid_usd: providers[0].cost_usd,
+    credits_remaining: providers[0].credits_remaining,
+    // Agent attribution is rolling/session-based, invoices use complete UTC days.
+    // A percentage would imply comparable scopes that we cannot establish.
+    reconcile_delta_pct: null,
+    note: "Provider reports and Hermes attribution have different scopes; no reconciliation percentage is claimed.",
   };
 
   return {
@@ -124,7 +120,7 @@ export function aggregateUsageFacts(
     fleet: {
       paid_cost_usd: paid,
       shadow_cost_usd: shadow,
-      subscription_fees_usd: 0,
+      subscription_fees_usd: fees.length ? fees.reduce((total, f) => total + Number(f.paid_cost_usd ?? 0), 0) : null,
       input_tokens: input,
       output_tokens: output,
       cache_read_tokens: cache,
@@ -139,11 +135,14 @@ export function aggregateUsageFacts(
       (key, f) => (f.cron_job_name ? `${f.cron_job_name} (${key})` : key),
     ),
     by_model: bucketize(agentFacts, (f) => f.model),
-    by_account: bucketize(facts, (f) => `${f.account_id}:${f.source}`),
+    by_account: bucketize(facts.filter(inWindow), (f) => `${f.account_id}:${f.source}`),
     top_sessions: Array.from(sessionMap.values())
       .sort((a, b) => b.paid_cost_usd + b.shadow_cost_usd - (a.paid_cost_usd + a.shadow_cost_usd))
       .slice(0, 15),
     openrouter,
+    provider_window,
+    providers,
+    claude,
     collected_at: opts.collected_at ?? null,
   };
 }

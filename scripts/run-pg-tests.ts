@@ -15,6 +15,7 @@ import type { BriefSettings } from "../src/lib/progress-config";
 import { sql, withTransaction } from "../src/lib/db";
 import { insertGhEvent, signBody } from "../src/lib/gh-events";
 import { testSweeper } from "./pg-sweeper-tests";
+import { testProviderCosts } from "./pg-provider-costs-tests";
 import { testVelocityStore } from "./pg-velocity-tests";
 import { EVENT_FIXTURES, PING_PAYLOAD } from "../tests/ui/gh-event-fixtures";
 import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
@@ -379,6 +380,7 @@ async function main() {
   await testGhEvents(tag);
   await testSweeper(tag, applyCanonicalSchema);
   await testVelocityStore();
+  await testProviderCosts();
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
 }

@@ -3,7 +3,8 @@ import { enforceBearer } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { isUndefinedTableError, USAGE_SETUP_MESSAGE } from "@/lib/usage-errors";
-import { ingestAccountSnapshot, ingestUsageFacts } from "@/lib/usage-store";
+import { ingestUsageBatch } from "@/lib/usage-store";
+import type { AccountSnapshot } from "@/lib/providers/types";
 import type { UsageIngestInput } from "@/lib/usage-types";
 
 export const maxDuration = 60;
@@ -24,16 +25,7 @@ export async function POST(req: Request) {
     });
   }
 
-  let body: UsageIngestInput & {
-    snapshot?: {
-      account_id: string;
-      collected_at?: string;
-      balance_usd?: number | null;
-      credits_remaining?: number | null;
-      quota_detail?: unknown;
-      detail?: unknown;
-    };
-  };
+  let body: UsageIngestInput & { snapshot?: AccountSnapshot };
   try {
     body = await req.json();
   } catch {
@@ -50,10 +42,7 @@ export async function POST(req: Request) {
   }
 
   try {
-    const written = await ingestUsageFacts(body);
-    if (body.snapshot?.account_id) {
-      await ingestAccountSnapshot(body.snapshot);
-    }
+    const written = await ingestUsageBatch(body);
     return NextResponse.json({ ok: true, written });
   } catch (e) {
     if (isUndefinedTableError(e)) {

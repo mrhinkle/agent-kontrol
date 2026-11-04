@@ -1,6 +1,6 @@
 "use client";
 
-import Link from "next/link";
+import { UsageCostPanels } from "@/components/usage-cost-panels";
 import { useEffect, useState } from "react";
 import {
   DEFAULT_USAGE_WINDOW,
@@ -28,7 +28,7 @@ function Panel({
         </h2>
         {right}
       </header>
-      <div className="p-4">{children}</div>
+      <div className="overflow-x-auto p-4">{children}</div>
     </section>
   );
 }
@@ -108,14 +108,14 @@ export default function UsagePage() {
         <div>
           <h1 className="text-xl font-semibold tracking-wide">Usage and Costs</h1>
           <p className="mt-1 text-sm text-gray-500">
-            Paid (card/credits) vs shadow (Codex list-price). Agents push; this page never opens Hermes DBs.
+            Provider costs, subscription fees, and agent usage in one place.
           </p>
         </div>
-        <div className="flex items-center gap-4">
+        <div className="flex flex-wrap items-center gap-4">
           <span className="mono text-[11px] text-gray-500">
             {data?.window && (
               <>
-                {data.window.since.slice(0, 10)} → {data.window.until.slice(0, 10)} UTC
+                Agent window: {data.window.since.slice(0, 16).replace("T", " ")} → {data.window.until.slice(0, 16).replace("T", " ")} UTC
               </>
             )}
             {data?.collected_at && (
@@ -168,11 +168,13 @@ export default function UsagePage() {
         </div>
       )}
 
+      {data && !setupRequired && <UsageCostPanels data={data} />}
+
       {empty && (
         <div className="rounded-xl border border-white/10 bg-[#101828] px-5 py-8 text-center text-sm text-gray-400">
-          <p className="text-base font-medium text-gray-200">No usage collected yet</p>
+          <p className="text-base font-medium text-gray-200">No Hermes usage in this window</p>
           <p className="mt-2 max-w-lg mx-auto">
-            Tables are ready. Install the usage collector on the machine that runs Hermes so its sessions start landing in this window.
+            Provider and Claude observations appear above. Hermes attribution will appear here when observations are collected.
           </p>
         </div>
       )}
@@ -185,7 +187,7 @@ export default function UsagePage() {
               <Stat
                 label="Agent-attributed paid"
                 value={usd(data.fleet.paid_cost_usd)}
-                sub="Hermes-attributed card/credits (excludes provider_api rows)"
+                sub="Hermes attribution only; may overlap provider billing"
                 tone="text-[#ff9a3c]"
               />
             </div>
@@ -210,8 +212,8 @@ export default function UsagePage() {
               <span className="absolute inset-y-0 left-0 w-[3px] bg-violet-500" aria-hidden />
               <Stat
                 label="Subscription fees"
-                value={usd(data.fleet.subscription_fees_usd)}
-                sub="Phase 2 calendar recognition — placeholders now"
+                value={data.fleet.subscription_fees_usd === null ? "Not available" : usd(data.fleet.subscription_fees_usd)}
+                sub="Recorded fees by payment date; no assumed plan prices"
               />
             </div>
           </div>
@@ -291,35 +293,7 @@ export default function UsagePage() {
               )}
             </Panel>
 
-            <Panel title="OpenRouter account">
-              <div className="space-y-3 text-sm">
-                <Stat
-                  label="Activity paid (provider_api)"
-                  value={
-                    data.openrouter?.activity_paid_usd != null
-                      ? usd(data.openrouter.activity_paid_usd)
-                      : "—"
-                  }
-                />
-                <Stat
-                  label="Credits remaining"
-                  value={
-                    data.openrouter?.credits_remaining != null
-                      ? usd(data.openrouter.credits_remaining)
-                      : "—"
-                  }
-                />
-                <Stat
-                  label="Reconcile Δ vs Hermes OR rows"
-                  value={
-                    data.openrouter?.reconcile_delta_pct != null
-                      ? `${data.openrouter.reconcile_delta_pct.toFixed(2)}%`
-                      : "—"
-                  }
-                  sub={data.openrouter?.note}
-                />
-              </div>
-            </Panel>
+
           </div>
 
           <Panel title="Top sessions">
@@ -354,12 +328,8 @@ export default function UsagePage() {
             </table>
           </Panel>
 
-          <p className="text-xs text-gray-600">
-            Shadow cost is <em>not</em> charged to a card — it is the list-price value of Codex included tokens. See{" "}
-            <Link href="https://github.com/mrhinkle/mission-control-ops/issues/12" className="underline">
-              issue #12
-            </Link>
-            .
+          <p className="text-xs text-gray-400">
+            Hermes shadow cost is the estimated list-price value of included Codex tokens. It is separate from provider charges and recorded subscription fees.
           </p>
         </>
       )}
