@@ -184,7 +184,7 @@ export async function getUsageSummary(opts: {
     const snaps = (await db`
       select distinct on (account_id) account_id, collected_at, credits_remaining, detail
       from account_snapshots
-      where account_id in ('openrouter-shared', 'anthropic-api-org') or account_id like 'claude-code:%'
+      where account_id in ('openrouter-shared', 'anthropic-api-org', 'xai-api-team') or account_id like 'claude-code:%'
       order by account_id, collected_at desc
     `) as Record<string, unknown>[];
     const snapshots: AccountSnapshot[] = snaps.map((s) => ({
