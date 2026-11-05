@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Claude Code hook: tool traces are now sent from a freshly started Python process (fork+exec) instead of a bare `os.fork()`. On macOS the forked child segfaulted in urllib's system-proxy lookup (`_scproxy`), so traces silently never arrived. The request reaches the child on stdin, so the token is not visible in a process list. A new test waits for the detached send to arrive.
+
 ### Documentation
 
 - README: a 90-second narrated demo (Fleet, History, Progress and the Gibson 3D view) in `docs/demo/`, with captions.

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Trace span construction in the Claude Code hook (pure functions, no network)."""
+import http.server
 import importlib.util
 import os
 import socket
 import tempfile
+import threading
 import time
 import unittest
+import urllib.request
 from pathlib import Path
 
 HOOK = Path(__file__).resolve().parents[2] / "agents" / "claude-code" / "mission_control_hook.py"
@@ -121,6 +124,42 @@ class HookResilienceTests(unittest.TestCase):
         elapsed = time.time() - start
         srv.close()
         self.assertLess(elapsed, 0.5, f"tool hook blocked for {elapsed:.2f}s on an unresponsive server")
+
+    def test_detached_send_actually_arrives(self):
+        # The background send must reach the server, not just return quickly.
+        # A bare os.fork() child segfaults on macOS inside urllib's system-proxy
+        # lookup (_scproxy), so the request silently never arrives.
+        got = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                got.append((self.path, self.headers.get("Authorization"), body))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{srv.server_port}/api/v1/traces",
+                data=b'{"ok": 1}',
+                headers={"Content-Type": "application/json", "Authorization": "Bearer t"},
+                method="POST",
+            )
+            start = time.time()
+            hook.post_detached(req)
+            self.assertLess(time.time() - start, 0.5, "post_detached must not wait on the network")
+            deadline = time.time() + 10
+            while not got and time.time() < deadline:
+                time.sleep(0.05)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(got, [("/api/v1/traces", "Bearer t", b'{"ok": 1}')])
 
     def test_backoff_skips_tracing_after_a_failure_then_expires(self):
         marker = hook._backoff_path()

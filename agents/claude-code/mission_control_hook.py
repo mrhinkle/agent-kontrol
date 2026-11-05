@@ -14,10 +14,12 @@ Config via environment (put these in ~/.zshenv or the hook command):
 Fail-open by design: any error exits 0 so hooks never block your session.
 Stdlib only — no dependencies.
 """
+import base64
 import hashlib
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 import urllib.request
@@ -261,26 +263,58 @@ def _send_now(req) -> None:
             pass
 
 
+# Children started by post_detached. Holding them until exit stops CPython from
+# warning that they are still running; the hook process exits right away anyway.
+_detached = []
+
+
 def post_detached(req) -> None:
-    """Send in a forked child so the agent never waits on the network (POSIX).
-    Where fork is unavailable the send is synchronous, bounded by its timeout."""
-    if not hasattr(os, "fork"):
-        _send_now(req)
-        return
+    """Send from a fresh interpreter so the agent never waits on the network.
+
+    This is fork+exec, never a bare os.fork(). On macOS a forked copy of a
+    process inherits Apple framework state, and urllib's system-proxy lookup
+    (_scproxy) segfaults in it, so the send silently never happens. The request
+    goes to the child on stdin, so the token never appears in a process list.
+    If the child cannot be started, the send is synchronous, bounded by its timeout.
+    """
+    job = json.dumps({
+        "url": req.full_url,
+        "method": req.get_method(),
+        "headers": dict(req.header_items()),
+        "data": base64.b64encode(req.data or b"").decode("ascii"),
+    }).encode()
     try:
-        pid = os.fork()
+        child = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--send"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,  # outlive the hook and any signal to its group
+        )
     except Exception:
         _send_now(req)
         return
-    if pid != 0:
-        return  # parent: return to the agent immediately
+    _detached.append(child)
     try:
-        devnull = os.open(os.devnull, os.O_RDWR)
-        for fd in (0, 1, 2):
-            os.dup2(devnull, fd)
-        _send_now(req)
-    finally:
-        os._exit(0)
+        child.stdin.write(job)
+        child.stdin.close()
+    except Exception:
+        pass
+
+
+def _send_from_stdin() -> None:
+    """Child side of post_detached: rebuild the request and send it."""
+    try:
+        job = json.load(sys.stdin)
+        req = urllib.request.Request(
+            job["url"],
+            data=base64.b64decode(job["data"]) or None,
+            headers=job["headers"],
+            method=job["method"],
+        )
+    except Exception:
+        return
+    _send_now(req)
 
 
 def main() -> None:
@@ -373,6 +407,9 @@ def main() -> None:
 
 if __name__ == "__main__":
     try:
-        main()
+        if sys.argv[1:] == ["--send"]:
+            _send_from_stdin()
+        else:
+            main()
     finally:
         sys.exit(0)
