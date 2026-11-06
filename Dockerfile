@@ -2,8 +2,8 @@
 
 FROM node:22-slim AS deps
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci
+COPY package.json pnpm-lock.yaml ./
+RUN npm install -g pnpm@10.33.0 && pnpm install --frozen-lockfile
 
 FROM node:22-slim AS build
 WORKDIR /app
