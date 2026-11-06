@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Gibson: load tasks in valid 200-row pages, preserving the 400-task view instead of failing with `tasks API 400`.
+
 ### Documentation
 
 - README: a 90-second narrated demo (Fleet, History, Progress and the Gibson 3D view) in `docs/demo/`, with captions.
