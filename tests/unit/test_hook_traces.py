@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """Trace span construction in the Claude Code hook (pure functions, no network)."""
 import importlib.util
+import json
 import os
 import socket
+import subprocess
 import tempfile
+import threading
 import time
 import unittest
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 HOOK = Path(__file__).resolve().parents[2] / "agents" / "claude-code" / "mission_control_hook.py"
 spec = importlib.util.spec_from_file_location("mc_hook", HOOK)
@@ -116,11 +122,76 @@ class HookResilienceTests(unittest.TestCase):
         url = f"http://127.0.0.1:{srv.getsockname()[1]}"
         payload = {"session_id": "slow", "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_use_id": "t", "tool_response": {}}
         os.environ["MC_TOKEN"] = "x"
-        start = time.time()
-        hook.send_traces(url, "agent", "PostToolUse", payload)
-        elapsed = time.time() - start
-        srv.close()
-        self.assertLess(elapsed, 0.5, f"tool hook blocked for {elapsed:.2f}s on an unresponsive server")
+        children = []
+        real_popen = subprocess.Popen
+
+        def observe_child(*args, **kwargs):
+            child = real_popen(*args, **kwargs)
+            children.append(child)
+            return child
+
+        try:
+            start = time.monotonic()
+            with patch.object(hook.subprocess, "Popen", side_effect=observe_child):
+                hook.send_traces(url, "agent", "PostToolUse", payload)
+            elapsed = time.monotonic() - start
+            self.assertLess(elapsed, 0.5, f"tool hook blocked for {elapsed:.2f}s on an unresponsive server")
+            self.assertEqual(len(children), 1)
+            self.assertEqual(children[0].wait(timeout=7), 0)
+            self.assertTrue(hook.trace_backoff_active())
+        finally:
+            srv.close()
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()
+
+    def test_detached_child_delivers_and_exits_cleanly_with_threads_running(self):
+        received = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                received.append((self.path, self.headers.get("Authorization"),
+                                 self.rfile.read(int(self.headers["Content-Length"]))))
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        server.timeout = 5
+        thread = threading.Thread(target=server.handle_request)
+        thread.start()
+        children = []
+        real_popen = subprocess.Popen
+
+        def observe_child(*args, **kwargs):
+            child = real_popen(*args, **kwargs)
+            children.append(child)
+            return child
+
+        body = json.dumps({"trace": "local regression test"}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_port}/api/v1/traces", data=body,
+            headers={"Authorization": "Bearer test-only", "Content-Type": "application/json"}, method="POST")
+        try:
+            # Native proxy lookup works before forking, but cannot safely run in a fork-only child.
+            urllib.request.getproxies()
+            with patch.object(hook.subprocess, "Popen", side_effect=observe_child):
+                hook.post_detached(req)
+            self.assertEqual(len(children), 1)
+            self.assertNotIn("test-only", repr(children[0].args))
+            self.assertEqual(children[0].wait(timeout=7), 0)
+            thread.join(timeout=6)
+            self.assertEqual(received, [("/api/v1/traces", "Bearer test-only", body)])
+        finally:
+            thread.join(timeout=6)
+            server.server_close()
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()
 
     def test_backoff_skips_tracing_after_a_failure_then_expires(self):
         marker = hook._backoff_path()
