@@ -181,8 +181,13 @@ interface Act {
 type ReducerHandler = (ctx: HandlerCtx) => Promise<Act>;
 
 type ChildOutcome =
-  | { kind: "done" | "dropped"; emit: string | null }
-  | { kind: "retry" | "half"; emit: string | null; until?: string };
+  | { kind: "done" | "dropped"; emit: string | null; key?: string }
+  | { kind: "retry" | "half"; emit: string | null; until?: string; key?: string };
+
+function episodeOf(key: string): string {
+  const index = key.lastIndexOf(":");
+  return index >= 0 ? key.slice(index + 1) : key;
+}
 
 export function reducerMode(env: NodeJS.ProcessEnv = process.env): "off" | "dry" | "on" {
   const raw = env.MC_REDUCERS;
@@ -630,7 +635,44 @@ function childEmit(row: TransitionRow): string | null {
   return null;
 }
 
+async function resumeRemembered(ctx: HandlerCtx, number: number, key: string): Promise<ChildOutcome | null> {
+  const child = await ctx.deps.store.get(key);
+  if (!child) return null;
+  if (child.status === "done" || child.status === "dropped" || child.status === "skipped") {
+    return { kind: child.status === "done" ? "done" : "dropped", emit: childEmit(child), key };
+  }
+  if (child.status === "failed" && (child.steps.terminal === true || child.attempts >= REDUCER_MAX_ATTEMPTS)) {
+    return { kind: "dropped", emit: null, key };
+  }
+  if (waiting(child, ctx.deps)) return { kind: "retry", emit: null, until: child.steps.next_attempt_at, key };
+
+  const pinned = child.steps.pinned_head ?? child.steps.pending_merge ?? episodeOf(key);
+  if (child.steps.pending_merge) {
+    const live = await ctx.deps.github.getPull(ctx.event.repo!, number);
+    if (!live || !sameSha(live.headSha, child.steps.pending_merge)) {
+      await saveChild(ctx, key, number, "dropped", "stale_head", {
+        ...child.steps,
+        terminal: true,
+        pending_merge: undefined,
+        pinned_head: pinned,
+      }, child.attempts, live?.headSha ?? null);
+      return { kind: "dropped", emit: null, key };
+    }
+    return null;
+  }
+  if (child.status === "half_done" && (child.steps.completed ?? []).includes("merge")) {
+    const outcome = await resumeAfterMerge(ctx, key, number, child, pinned);
+    return { ...outcome, key };
+  }
+  return null;
+}
+
 async function updateOneLocked(ctx: HandlerCtx, number: number): Promise<ChildOutcome> {
+  const remembered = ctx.existing?.steps.children?.[String(number)];
+  if (remembered) {
+    const resumed = await resumeRemembered(ctx, number, remembered);
+    if (resumed) return resumed;
+  }
   const repo = ctx.event.repo!;
   const github = ctx.deps.github;
   const first = await github.getPull(repo, number);
@@ -704,6 +746,7 @@ async function updateOneLocked(ctx: HandlerCtx, number: number): Promise<ChildOu
     child = await saveChild(ctx, key, number, "started", null, {
       ...(child?.steps ?? {}),
       pending_merge: pinned,
+      pinned_head: pinned,
       completed,
       reviewers: first.reviewers,
       deliveries: addDelivery(child?.steps.deliveries, ctx.event.delivery_id),
@@ -737,22 +780,25 @@ async function updateOneLocked(ctx: HandlerCtx, number: number): Promise<ChildOu
 
   const after = await github.getPull(repo, number);
   if (!after || sameSha(after.headSha, pinned)) {
-    await saveChild(ctx, key, number, "half_done", "awaiting_new_head", { completed, reviewers: first.reviewers, pending_merge: undefined, terminal: false }, attempts, pinned);
-    return { kind: "half", emit: null };
+    await saveChild(ctx, key, number, "half_done", "awaiting_new_head", {
+      completed, reviewers: first.reviewers, pending_merge: undefined, pinned_head: pinned, terminal: false,
+    }, attempts, pinned);
+    return { kind: "half", emit: null, key };
   }
   await recordEcho(ctx, repo, number, after.headSha);
-  return finishReviewers(ctx, key, number, completed, attempts, after, first.reviewers);
+  return finishReviewers(ctx, key, number, completed, attempts, after, first.reviewers, pinned);
 }
 
 async function resumeAfterMerge(ctx: HandlerCtx, key: string, number: number, child: TransitionRow, pinned: string): Promise<ChildOutcome> {
-  if (ctx.dry) return { kind: "half", emit: null };
+  const pinnedHead = child.steps.pinned_head ?? pinned;
+  if (ctx.dry) return { kind: "half", emit: null, key };
   const after = await ctx.deps.github.getPull(ctx.event.repo!, number);
-  if (!after || sameSha(after.headSha, pinned)) {
-    return { kind: "half", emit: null };
+  if (!after || sameSha(after.headSha, pinnedHead)) {
+    return { kind: "half", emit: null, key };
   }
   await recordEcho(ctx, ctx.event.repo!, number, after.headSha);
   const reviewers = child.steps.reviewers ?? after.reviewers;
-  return finishReviewers(ctx, key, number, [...(child.steps.completed ?? [])], child.attempts, after, reviewers);
+  return finishReviewers(ctx, key, number, [...(child.steps.completed ?? [])], child.attempts, after, reviewers, pinnedHead);
 }
 
 async function finishReviewers(
@@ -763,8 +809,11 @@ async function finishReviewers(
   attempts: number,
   after: GhPull,
   reviewers: string[],
+  pinnedHead: string,
 ): Promise<ChildOutcome> {
-  const doneSteps: TransitionSteps = { completed, reviewers, terminal: false, pending_merge: undefined };
+  const doneSteps: TransitionSteps = {
+    completed, reviewers, terminal: false, pending_merge: undefined, pinned_head: pinnedHead,
+  };
   if (!completed.includes("reviewers")) {
     try {
       await ctx.deps.github.requestReviewers(ctx.event.repo!, number, reviewers);
@@ -772,11 +821,13 @@ async function finishReviewers(
     } catch (error) {
       const reason = error instanceof GitHubCallError ? error.reason : "error";
       await saveChild(ctx, key, number, "half_done", reason, { ...doneSteps, completed: [...completed], reviewers }, attempts, after.headSha);
-      return { kind: "half", emit: null };
+      return { kind: "half", emit: null, key };
     }
   }
-  await saveChild(ctx, key, number, "done", null, { completed, terminal: true, emitted: ["update-branch"], pending_merge: undefined }, attempts, after.headSha);
-  return { kind: "done", emit: "update-branch" };
+  await saveChild(ctx, key, number, "done", null, {
+    completed, reviewers, terminal: true, emitted: ["update-branch"], pending_merge: undefined, pinned_head: pinnedHead,
+  }, attempts, after.headSha);
+  return { kind: "done", emit: "update-branch", key };
 }
 
 async function handlePush(ctx: HandlerCtx): Promise<Act> {
@@ -786,12 +837,14 @@ async function handlePush(ctx: HandlerCtx): Promise<Act> {
   if (ref !== `refs/heads/${info.defaultBranch}`) return drop("non_default");
   const pulls = await ctx.deps.github.listOpenPulls(repo);
   const emitted: string[] = [];
+  const children: Record<string, string> = { ...(ctx.existing?.steps.children ?? {}) };
   let retry = false;
   let half = false;
   let until: string | undefined;
   for (const pull of pulls) {
     if (pull.baseRef !== info.defaultBranch) continue;
     const outcome = await updateOne(ctx, pull.number);
+    if (outcome.key) children[String(pull.number)] = outcome.key;
     if (outcome.emit) emitted.push(outcome.emit);
     if (outcome.kind === "retry") {
       retry = true;
@@ -800,9 +853,10 @@ async function handlePush(ctx: HandlerCtx): Promise<Act> {
       half = true;
     }
   }
-  if (retry) return { status: "failed", reason: "child_retry", emitted, retryAt: until };
-  if (half) return { status: "half_done", reason: "awaiting_reviewers", emitted };
-  return { status: "done", reason: null, emitted };
+  const steps = { children };
+  if (retry) return { status: "failed", reason: "child_retry", emitted, retryAt: until, steps };
+  if (half) return { status: "half_done", reason: "awaiting_reviewers", emitted, steps };
+  return { status: "done", reason: null, emitted, steps };
 }
 
 async function closedMissing(id: string, event: ReducerEvent, github: ReducerGitHub): Promise<boolean> {

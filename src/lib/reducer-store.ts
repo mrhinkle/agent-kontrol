@@ -35,6 +35,10 @@ export interface TransitionSteps {
   pending_merge?: string;
   /** Reviewers to re-request after the merge. Captured before the head moves. */
   reviewers?: string[];
+  /** Pre-merge head for an update-branch child. The live head changes after the merge. */
+  pinned_head?: string;
+  /** Child transition keys a push already started, keyed by pull number. */
+  children?: Record<string, string>;
 }
 
 export interface TransitionRow {
