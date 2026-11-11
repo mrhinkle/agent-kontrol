@@ -117,3 +117,44 @@ then delivers both in order. Generation fencing, cross-consumer/cursor denial,
 credential expiry/revocation, explicit retention reconciliation, backpressure and
 connection expiry are separately verified. Those are local source tests, not
 production proof that the webhook bridge or the reviewer is activated.
+
+## Deterministic reducers (#80)
+
+Reducers are off unless the owner turns them on. `MC_REDUCERS` unset, blank, or `0` records each event as `skipped-by-flag` and does not call GitHub. `dry` re-reads GitHub and records the transition it would take. `1` or `on` performs the writes. Any other value is off.
+
+GitHub App permissions for the installation token: Issues: write, Pull requests: write, Contents: write (merge-base only), Metadata: read. The token comes from `MC_GITHUB_APP_ID`, `MC_GITHUB_APP_PRIVATE_KEY`, and `MC_GITHUB_APP_BOT_LOGIN`. A repo with no installation, a revoked token, or a 403/404 for those permissions is a `failed` transition (`not_installed`, `token_revoked`, or `missing_permission`), not a silent drop. Rate limits, including a secondary limit, honor `Retry-After` when it is longer than the computed wait. A transition retries at most 5 times: 30 seconds, doubling, with the exponential part capped at 10 minutes. After the cap it stays `failed` and the morning brief lists it.
+
+`push` to the default branch updates open pull requests that are behind it with a merge commit (`PUT /pulls/{n}/update-branch` and `expected_head_sha` only). Reducers never rebase or force-push. They re-read GitHub by id. They do not read inbox rows, including rows the sweeper has already deleted. The Consumer column is a lane id from `CONSUMERS` in `src/lib/reducers.ts`. Registering those lanes is outside this table.
+
+`scripts/generate-reducer-docs.ts` rewrites the table below from that catalogue. `npm run test:ui` fails when the checked-in table differs.
+
+<!-- reducer-catalogue:start -->
+| Catalogue id | Event | Action | Consumer | Guard | Transition | Emits | GitHub writes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| pull_request.opened | pull_request | opened | pr-lifecycle | re-read pull; head matches; draft records no work item | judgment | work-item | no |
+| pull_request.synchronize | pull_request | synchronize | pr-lifecycle | re-read pull; drop when head differs from the event | record-head | head-moved | no |
+| pull_request.ready_for_review | pull_request | ready_for_review | pr-lifecycle | re-read pull; head matches; not a draft | judgment | work-item | no |
+| pull_request.closed | pull_request | closed | pr-lifecycle | re-read closed; missing or still open creates no state | record-closed | pr-merged or pr-closed | no |
+| issues.closed | issues | closed | issues | re-read closed; every same-repo blocker closed; marker before comment | unblock-dependents | became-unblocked | yes |
+| issues.labeled | issues | labeled | decisions | decision label still on the issue | record-decision-label | decision-label-added | no |
+| issues.unlabeled | issues | unlabeled | decisions | decision label already absent | record-decision-label | decision-label-removed | no |
+| push | push |  | branch-update | default branch only; never draft, fork, conflict, protected, or rebase | update-branch | update-branch or update-branch-conflict | yes |
+| check_suite.completed | check_suite | completed | checks | every required context succeeded at the pinned head | record-contexts | contexts-green | no |
+| pull_request_review.submitted | pull_request_review | submitted | reviews | review head is the pull's current head | record-review | review-evidence | no |
+| issue_comment.created | issue_comment | created | issues | issue still exists | record-comment | comment-seen | no |
+| sweep:consumer-silent | consumer-silent |  | sweeper | synthetic sweep row | route-synthetic |  | no |
+| sweep:consumer-silent-cleared | consumer-silent-cleared |  | sweeper | synthetic sweep row | route-synthetic |  | no |
+| sweep:pr-stuck | pr-stuck |  | sweeper | synthetic sweep row | route-synthetic |  | no |
+| sweep:pr-stuck-cleared | pr-stuck-cleared |  | sweeper | synthetic sweep row | route-synthetic |  | no |
+| sweep:pause-unexplained | pause-unexplained |  | sweeper | synthetic sweep row | route-synthetic |  | no |
+| sweep:pause-unexplained-cleared | pause-unexplained-cleared |  | sweeper | synthetic sweep row | route-synthetic |  | no |
+| sweep:pause-expired | pause-expired |  | sweeper | synthetic sweep row | route-synthetic |  | no |
+| sweep:pause-expired-cleared | pause-expired-cleared |  | sweeper | synthetic sweep row | route-synthetic |  | no |
+| sweep:resume-uncited | resume-uncited |  | sweeper | synthetic sweep row | route-synthetic |  | no |
+| sweep:resume-uncited-cleared | resume-uncited-cleared |  | sweeper | synthetic sweep row | route-synthetic |  | no |
+| sweep:decision-aging | decision-aging |  | sweeper | synthetic sweep row | route-synthetic |  | no |
+| sweep:decision-aging-cleared | decision-aging-cleared |  | sweeper | synthetic sweep row | route-synthetic |  | no |
+| sweep:dispatch-ready-empty | dispatch-ready-empty |  | sweeper | synthetic sweep row | route-synthetic |  | no |
+| sweep:dispatch-ready-empty-cleared | dispatch-ready-empty-cleared |  | sweeper | synthetic sweep row | route-synthetic |  | no |
+<!-- reducer-catalogue:end -->
+

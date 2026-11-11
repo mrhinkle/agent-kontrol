@@ -7,6 +7,7 @@ import type { RepoSnapshot, SnapshotDetail } from "@/lib/progress-types";
 import { getWatchedRepos, visibleOnBoard } from "@/lib/watched-repos";
 import { formatPausedLines, unmeasuredPaused, type PausedSection } from "@/lib/sweep-logic";
 import { readPaused } from "@/lib/sweeper";
+import { formatReducerFailureLines, listTerminalReducerFailures, type ReducerFailureLine } from "@/lib/reducer-store";
 
 /**
  * The morning brief, read from Postgres.
@@ -115,6 +116,11 @@ export interface MorningBrief {
    * measured false is DATA INCOMPLETE, never "none".
    */
   paused: PausedSection;
+  /**
+   * Reducer transitions that hit the retry cap. Omitted when the read failed
+   * or the list is empty, so a quiet morning does not grow a new section.
+   */
+  reducer_failures?: ReducerFailureLine[];
 }
 
 export interface CoordinatorEvent {
@@ -549,6 +555,7 @@ export function assembleBrief(input: {
   coordinator: BriefCoordinator;
   repos: readonly BriefRepo[];
   paused?: PausedSection;
+  reducerFailures?: ReducerFailureLine[];
 }): MorningBrief {
   const repos = input.repos.map((repo) => {
     if (repo.incomplete || repo.decisions !== null) return repo;
@@ -595,6 +602,9 @@ export function assembleBrief(input: {
     stuck_prs: stuckTotal === null && stuck.length === 0 ? null : stuck,
     decisions: decisionTotal === null && decisions.length === 0 ? null : decisions,
     paused: input.paused ?? unmeasuredPaused("scheduler status not loaded"),
+    ...(input.reducerFailures && input.reducerFailures.length > 0
+      ? { reducer_failures: input.reducerFailures }
+      : {}),
   };
 }
 
@@ -729,6 +739,11 @@ export function formatBriefText(
   lines.push("");
   lines.push(...formatPausedLines(brief.paused ?? unmeasuredPaused("scheduler status not loaded")));
   lines.push("");
+  const failureLines = formatReducerFailureLines(brief.reducer_failures ?? []);
+  if (failureLines.length > 0) {
+    lines.push(...failureLines);
+    lines.push("");
+  }
   for (const repo of brief.repos) {
     if (repo.merged_prs == null || repo.merged_prs <= 0) continue;
     // A positive count with no measured list is not an empty heading.
@@ -999,6 +1014,7 @@ export async function loadBrief(
   const coordinator = await coordinatorFromDb(settings, nowIso);
   // Held, unexplained, and expired use the database clock, like the sweeper.
   const paused = await readPaused();
+  const failures = await listTerminalReducerFailures();
   return assembleBrief({
     generatedAt: nowIso,
     windowHours: hours,
@@ -1008,6 +1024,7 @@ export async function loadBrief(
     coordinator,
     repos: sections,
     paused,
+    reducerFailures: failures && failures.length > 0 ? failures : undefined,
   });
 }
 

@@ -546,6 +546,25 @@ paused_lines() {
 paused_lines <<<"$brief"
 echo
 
+# BEGIN reducer_failure_lines
+# Print only when reducer_failures is a non-empty array. Absent or empty prints nothing.
+reducer_failure_lines() {
+  jq -r '
+    (.reducer_failures // []) as $rows
+    | if ($rows | type) != "array" or ($rows | length) == 0 then empty
+      else
+        "REDUCER FAILURES (\($rows | length)) \u2014 retry cap reached",
+        ($rows[] | "  \(.repo)\(if .number == null then "" else " #\(.number)" end)  \(.reducer)  \(.reason // "")  attempts=\(.attempts)")
+      end
+  '
+}
+# END reducer_failure_lines
+failure_text="$(reducer_failure_lines <<<"$brief")"
+if [[ -n "$failure_text" ]]; then
+  printf '%s\n' "$failure_text"
+  echo
+fi
+
 # A positive merge count with no measured list is not an empty heading.
 # null (or any non-array) is unmeasured. An empty array prints nothing.
 # BEGIN shipped_lines
