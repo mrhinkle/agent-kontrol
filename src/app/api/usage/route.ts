@@ -12,6 +12,8 @@ export const dynamic = "force-dynamic";
  * GET /api/usage?window=24h|7d|30d
  * GET /api/usage?since=ISO&until=ISO
  * Defaults: rolling 7d ending now (computed at request time).
+ * Auth: dashboard session, MC_TOKEN, or an agent credential with usage:read.
+ * POST /api/usage/ingest stays on MC_TOKEN.
  */
 export async function GET(req: Request) {
   const denied = await enforceApi(req);
@@ -32,6 +34,7 @@ export async function GET(req: Request) {
     const summary = await getUsageSummary({
       since: resolved.since,
       until: resolved.until,
+      window: resolved.window,
     });
     summary.window_label = resolved.window;
     return NextResponse.json(summary);
@@ -47,7 +50,7 @@ export async function GET(req: Request) {
         fleet: {
           paid_cost_usd: 0,
           shadow_cost_usd: 0,
-          subscription_fees_usd: 0,
+          subscription_fees_usd: null,
           input_tokens: 0,
           output_tokens: 0,
           cache_read_tokens: 0,

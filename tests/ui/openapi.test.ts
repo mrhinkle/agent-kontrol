@@ -372,12 +372,16 @@ describe("OpenAPI document", () => {
     assert.ok(list, "GET /api/decisions is in the document");
     assert.deepEqual(list.parameters?.find((item) => item.name === "status")?.schema.enum, [...LIST_STATUSES]);
     assert.deepEqual(list.parameters?.find((item) => item.name === "shape")?.schema.enum, [...LIST_SHAPES]);
-    assert.match(list.description ?? "", /decisions:write/);
+    assert.match(list.description ?? "", /agent credential with decisions:read/);
+    assert.match(list.description ?? "", /only decisions:write/);
+    assert.match(list.description ?? "", /insufficient_scope/);
+    assert.doesNotMatch(list.description ?? "", /An agent credential is denied/);
 
     const post = paths["/api/decisions"]?.post;
     const postRefs = post?.requestBody?.content["application/json"].schema.oneOf?.map((item) => item.$ref);
     assert.deepEqual(postRefs, ["#/components/schemas/DecisionUpsert", "#/components/schemas/DecisionReconcile"]);
-    assert.match(post?.description ?? "", /decisions:write/);
+    assert.match(post?.description ?? "", /An agent credential is denied/);
+    assert.match(post?.description ?? "", /decisions:read or decisions:write/);
 
     const patch = paths["/api/decisions/{id}"]?.patch;
     assert.equal(patch?.requestBody?.content["application/json"].schema.$ref, "#/components/schemas/PatchDecision");
@@ -422,5 +426,17 @@ describe("OpenAPI document", () => {
       (schemaOf(doc, "CreateCredential").properties?.scopes as { items: { enum: string[] } }).items.enum.includes("decisions:write"),
       true,
     );
+    assert.equal(
+      (schemaOf(doc, "CreateCredential").properties?.scopes as { items: { enum: string[] } }).items.enum.includes("usage:read"),
+      true,
+    );
+    const usagePaths = doc.paths as Record<string, { get?: { description?: string }; post?: { description?: string } }>;
+    const usageGet = usagePaths["/api/usage"]?.get;
+    assert.match(usageGet?.description ?? "", /usage:read/);
+    assert.match(usageGet?.description ?? "", /insufficient_scope/);
+    const usageIngest = usagePaths["/api/usage/ingest"]?.post;
+    assert.match(usageIngest?.description ?? "", /MC_TOKEN/);
+    assert.match(usageIngest?.description ?? "", /insufficient_scope/);
+    assert.doesNotMatch(usageIngest?.description ?? "", /usage:read/);
   });
 });

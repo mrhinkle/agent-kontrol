@@ -2,7 +2,9 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
-import { createCredential, resetCredentialsForTests } from "../../src/lib/credentials";
+import { NextRequest } from "next/server";
+import { authCookieValue } from "../../src/lib/authcrypto";
+import { createCredential, resetCredentialsForTests, revokeCredential, setCredentialClockForTests } from "../../src/lib/credentials";
 import {
   ageDays,
   collectorDecisionBody,
@@ -22,6 +24,7 @@ import {
   type GhItem,
 } from "../../src/lib/decisions";
 import { authorizeRoute, scopeForRoute } from "../../src/lib/scopes";
+import { middleware } from "../../src/middleware";
 
 /**
  * The brief's .decisions list has to come out of the table the same way
@@ -607,15 +610,27 @@ describe("decision routes", { concurrency: false }, () => {
     return created.token;
   }
 
-  it("maps PATCH to decisions:write and leaves GET and POST off the agent table", () => {
-    assert.equal(scopeForRoute("PATCH", "/api/decisions/4"), "decisions:write");
-    assert.equal(scopeForRoute("GET", "/api/decisions"), null);
+  it("maps GET to decisions:read and leaves POST and the id read unmapped", () => {
+    assert.equal(scopeForRoute("GET", "/api/decisions"), "decisions:read");
     assert.equal(scopeForRoute("POST", "/api/decisions"), null);
+    assert.equal(scopeForRoute("GET", "/api/decisions/4"), null);
+    assert.equal(scopeForRoute("PATCH", "/api/decisions/4"), "decisions:write");
+    assert.equal(scopeForRoute("POST", "/api/decisions/4/writeback"), "decisions:write");
+    assert.equal(scopeForRoute("GET", "/api/usage"), "usage:read");
+    assert.equal(scopeForRoute("GET", "/api/usage/ingest"), null);
+    assert.equal(scopeForRoute("POST", "/api/usage/ingest"), null);
     const writer = { kind: "agent" as const, id: "c", scopes: ["decisions:write"] };
-    assert.equal(authorizeRoute(writer, "PATCH", "/api/decisions/4").ok, true);
+    const reader = { kind: "agent" as const, id: "r", scopes: ["decisions:read"] };
+    assert.equal(authorizeRoute(reader, "GET", "/api/decisions").ok, true);
     assert.equal(authorizeRoute(writer, "GET", "/api/decisions").ok, false);
-    assert.equal(authorizeRoute(writer, "POST", "/api/decisions").ok, false);
+    assert.equal(authorizeRoute(writer, "PATCH", "/api/decisions/4").ok, true);
+    assert.equal(authorizeRoute(reader, "POST", "/api/decisions").ok, false);
+    assert.equal(authorizeRoute(reader, "PATCH", "/api/decisions/4").ok, false);
+    assert.equal(authorizeRoute(reader, "GET", "/api/decisions/4").ok, false);
     assert.equal(authorizeRoute({ kind: "legacy" }, "POST", "/api/decisions").ok, true);
+    assert.equal(authorizeRoute({ kind: "legacy" }, "GET", "/api/decisions").ok, true);
+    assert.equal(authorizeRoute({ kind: "session" }, "GET", "/api/decisions").ok, true);
+    assert.equal(authorizeRoute({ kind: "dev-open" }, "GET", "/api/decisions").ok, true);
   });
 
   it("answers the demo contract and rejects a bad body before looking for a database", async () => {
@@ -745,5 +760,156 @@ describe("decision routes", { concurrency: false }, () => {
     }), { params: Promise.resolve({ id: "4" }) });
     assert.equal(scoped.status, 200);
     assert.deepEqual(await scoped.json(), { ok: true, demo: true });
+  });
+
+  it("serves the two reads only to the matching scope and keeps writes closed", async () => {
+    const { GET: getDecisions, POST: postDecisions } = await import("../../src/app/api/decisions/route");
+    const { PATCH } = await import("../../src/app/api/decisions/[id]/route");
+    const { POST: postWriteback } = await import("../../src/app/api/decisions/[id]/writeback/route");
+    const { GET: getUsage } = await import("../../src/app/api/usage/route");
+    const { POST: postUsage } = await import("../../src/app/api/usage/ingest/route");
+
+    const decisionBody = { key: `github:${REPO}#1`, source: "github-label", title: "T" };
+    const patchBody = { status: "decided", decision: "Ship it", decided_by: "mark" };
+
+    function agentRequest(token: string, path: string, method = "GET", body?: unknown): Request {
+      const headers = new Headers({ authorization: `Bearer ${token}` });
+      assert.equal(headers.get("cookie"), null);
+      assert.equal(env.MC_TOKEN, undefined);
+      if (body !== undefined) headers.set("content-type", "application/json");
+      return new Request(`http://localhost${path}`, {
+        method,
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    }
+
+    async function denied(res: Response, scope: string | null) {
+      assert.equal(res.status, 403);
+      const body = await res.json() as { code: string; fix: string };
+      assert.equal(body.code, "insufficient_scope");
+      if (scope) assert.match(body.fix, new RegExp(scope.replace(":", "\\:")));
+      else assert.equal(body.fix, "This route is not granted by any agent scope.");
+    }
+
+    const openDecisions = await getDecisions(new Request("http://localhost/api/decisions"));
+    assert.equal(openDecisions.status, 200);
+    assert.deepEqual(await openDecisions.json(), { demo: true, decisions: [] });
+    const openUsage = await getUsage(new Request("http://localhost/api/usage"));
+    assert.equal(openUsage.status, 200);
+    assert.equal((await openUsage.json()).demo, true);
+
+    const decisionsReader = await issue(["decisions:read"]);
+    const decisionsOk = await getDecisions(agentRequest(decisionsReader, "/api/decisions"));
+    assert.equal(decisionsOk.status, 200);
+    assert.deepEqual(await decisionsOk.json(), { demo: true, decisions: [] });
+
+    const usageReader = await issue(["usage:read"]);
+    const writer = await issue(["decisions:write"]);
+    const fleetOnly = await issue(["fleet:read"]);
+    const readOnly = await issue(["fleet:read", "tasks:read", "decisions:read", "usage:read"]);
+
+    await denied(await getUsage(agentRequest(decisionsReader, "/api/usage")), "usage:read");
+
+    const usageOk = await getUsage(agentRequest(usageReader, "/api/usage"));
+    assert.equal(usageOk.status, 200);
+    assert.equal((await usageOk.json()).demo, true);
+    await denied(await getDecisions(agentRequest(usageReader, "/api/decisions")), "decisions:read");
+
+    await denied(await getDecisions(agentRequest(writer, "/api/decisions")), "decisions:read");
+    await denied(await getDecisions(agentRequest(fleetOnly, "/api/decisions")), "decisions:read");
+    await denied(await getUsage(agentRequest(fleetOnly, "/api/usage")), "usage:read");
+
+    await denied(
+      await postDecisions(agentRequest(readOnly, "/api/decisions", "POST", decisionBody)),
+      null,
+    );
+    await denied(
+      await PATCH(agentRequest(readOnly, "/api/decisions/4", "PATCH", patchBody), { params: Promise.resolve({ id: "4" }) }),
+      "decisions:write",
+    );
+    await denied(
+      await postWriteback(agentRequest(readOnly, "/api/decisions/4/writeback", "POST", {}), { params: Promise.resolve({ id: "4" }) }),
+      "decisions:write",
+    );
+    await denied(await postUsage(agentRequest(readOnly, "/api/usage/ingest", "POST", { facts: [] })), null);
+
+    const written = await PATCH(agentRequest(writer, "/api/decisions/4", "PATCH", patchBody), {
+      params: Promise.resolve({ id: "4" }),
+    });
+    assert.equal(written.status, 200);
+    assert.deepEqual(await written.json(), { ok: true, demo: true });
+
+    const unknown = "akc_unknown-fixture-not-issued";
+    for (const call of [
+      () => getDecisions(agentRequest(unknown, "/api/decisions")),
+      () => getUsage(agentRequest(unknown, "/api/usage")),
+    ]) {
+      const res = await call();
+      assert.equal(res.status, 401);
+      assert.equal((await res.json()).code, "unauthorized");
+    }
+
+    const revoked = await createCredential({ label: "revoked reader", scopes: ["decisions:read"] });
+    assert.equal(revoked.ok, true);
+    if (!revoked.ok) throw new Error("unreachable");
+    await revokeCredential(revoked.credential.id);
+    const revokedRes = await getDecisions(agentRequest(revoked.token, "/api/decisions"));
+    assert.equal(revokedRes.status, 401);
+    assert.equal((await revokedRes.json()).code, "unauthorized");
+
+    const expiring = await createCredential({
+      label: "expiring reader",
+      scopes: ["usage:read"],
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+    });
+    assert.equal(expiring.ok, true);
+    if (!expiring.ok) throw new Error("unreachable");
+    setCredentialClockForTests(() => Date.now() + 120_000);
+    const expiredRes = await getUsage(agentRequest(expiring.token, "/api/usage"));
+    assert.equal(expiredRes.status, 401);
+    assert.equal((await expiredRes.json()).code, "unauthorized");
+    setCredentialClockForTests(null);
+
+    env.MC_DASHBOARD_PASSWORD = "test-dashboard-password";
+    const absentDecisions = await getDecisions(new Request("http://localhost/api/decisions"));
+    const absentUsage = await getUsage(new Request("http://localhost/api/usage"));
+    assert.equal(absentDecisions.status, 401);
+    assert.equal((await absentDecisions.json()).code, "unauthorized");
+    assert.equal(absentUsage.status, 401);
+    assert.equal((await absentUsage.json()).code, "unauthorized");
+    assert.equal((await middleware(new NextRequest("http://localhost/api/decisions"))).status, 401);
+    assert.equal((await middleware(new NextRequest("http://localhost/api/usage"))).status, 401);
+    const forwarded = { authorization: `Bearer ${fleetOnly}` };
+    assert.equal((await middleware(new NextRequest("http://localhost/api/decisions", { headers: forwarded }))).status, 200);
+    assert.equal((await middleware(new NextRequest("http://localhost/api/usage", { headers: forwarded }))).status, 200);
+    const gate = fs.readFileSync("src/middleware.ts", "utf8");
+    assert.equal(gate.includes("api\\/decisions"), false);
+    assert.match(gate, /api\\\/usage\\\/ingest/);
+    assert.equal(gate.includes("api\\/usage$"), false);
+    assert.match(gate, /Forwarding is not a grant/);
+
+    const cookie = await authCookieValue("test-dashboard-password");
+    const sessionDecisions = await getDecisions(new Request("http://localhost/api/decisions", {
+      headers: { cookie: `mc_auth=${cookie}` },
+    }));
+    const sessionUsage = await getUsage(new Request("http://localhost/api/usage", {
+      headers: { cookie: `mc_auth=${cookie}` },
+    }));
+    assert.equal(sessionDecisions.status, 200);
+    assert.deepEqual(await sessionDecisions.json(), { demo: true, decisions: [] });
+    assert.equal(sessionUsage.status, 200);
+    assert.equal((await sessionUsage.json()).demo, true);
+
+    env.MC_TOKEN = "test-mc-token";
+    const tokenDecisions = await getDecisions(new Request("http://localhost/api/decisions", {
+      headers: { authorization: "Bearer test-mc-token" },
+    }));
+    const tokenUsage = await getUsage(new Request("http://localhost/api/usage", {
+      headers: { authorization: "Bearer test-mc-token" },
+    }));
+    assert.equal(tokenDecisions.status, 200);
+    assert.equal(tokenUsage.status, 200);
+    delete env.MC_TOKEN;
   });
 });

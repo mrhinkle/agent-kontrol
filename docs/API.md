@@ -17,7 +17,8 @@ The `agent_credentials` table stores the label, the first 8 characters of the to
 | Route group | Accepted credentials |
 | --- | --- |
 | Dashboard UI and data routes (default) | Session cookie `mc_auth`, or `Authorization: Bearer <MC_TOKEN>` |
-| `GET` and `POST /api/decisions` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `decisions:write` |
+| `GET /api/decisions` | Session cookie, `MC_TOKEN`, or an agent credential with `decisions:read`. An agent credential without that scope, including one that holds only `decisions:write`, is denied |
+| `POST /api/decisions` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `decisions:read` or `decisions:write` |
 | `GET /api/activity` | Session cookie or `MC_TOKEN` only. An agent credential is denied, including one that holds `fleet:read`. Same boundary as `GET /api/traces` |
 | `PATCH /api/decisions/:id` | Session cookie, `MC_TOKEN`, or an agent credential with `decisions:write` |
 | `POST /api/decisions/:id/writeback` | Session cookie, `MC_TOKEN`, or an agent credential with `decisions:write` |
@@ -28,6 +29,7 @@ The `agent_credentials` table stores the label, the first 8 characters of the to
 | `POST /api/watch/beat`, `GET /api/watch/beats` | Verified `akc_` credential only. `watch:write` for the POST, `watch:read` for the GET. `MC_TOKEN`, the dashboard session, an OAuth access token, and a caller allowed only because the dashboard password is unset are `401` |
 | `POST /api/sweep`, `POST /api/sweep/consumers` | `Authorization: Bearer <MC_TOKEN>`, or the dashboard session cookie when `MC_DASHBOARD_PASSWORD` is set. An agent credential, an OAuth token, and a caller allowed only because the password is unset are refused (`403` `trusted_writer_required`, `403` `insufficient_scope`, or `401`) |
 | `GET /api/sweep` | Session cookie, `MC_TOKEN`, or an agent credential with `progress:read`. Read-only |
+| `GET /api/usage` | Session cookie, `MC_TOKEN`, or an agent credential with `usage:read`. `POST /api/usage/ingest` stays `MC_TOKEN` only |
 | Sweeper observations on `POST /api/ingest` (`kind` `sweep.scheduler_job`, `sweep.queue`, `sweep.pr_snapshot`) | `Authorization: Bearer <MC_TOKEN>` only. An agent credential with `status:write`, an OAuth token, and a dev-open caller are `403` `trusted_writer_required` and nothing is written |
 | `POST /api/webhooks/github` (exact path) | A valid `X-Hub-Signature-256` HMAC under `MC_GITHUB_WEBHOOK_SECRET`, and nothing else. A session cookie, `MC_TOKEN`, an agent credential, or an OAuth token does not stand in for it. Neighboring paths stay behind the dashboard gate |
 | Login, OAuth, and discovery: `/login`, `/api/login`, `/oauth/*`, `/.well-known/*` | No cookie gate; these routes enforce their own auth |
@@ -78,7 +80,7 @@ Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI
 | GET | `/api/brief/alerts` | Cookie, bearer, or `progress:read` | Threshold conditions and whether each was sent. Does not send. |
 | POST | `/api/brief/alerts/evaluate` | Bearer `MC_TOKEN` only | Compute the same conditions. Sends only when `brief.alerts.enabled` is true. |
 | POST | `/api/progress/ingest` | Bearer | One collection tick from `scripts/collect-progress.sh` |
-| GET | `/api/decisions` | Cookie or bearer | Decision queue, oldest first, each row with `age_days`. `shape=brief` is the morning-brief `.decisions` list |
+| GET | `/api/decisions` | Cookie, bearer, or `decisions:read` | Decision queue, oldest first, each row with `age_days`. `shape=brief` is the morning-brief `.decisions` list |
 | POST | `/api/decisions` | Cookie or bearer | Upsert one decision, or reconcile a collector sweep |
 | PATCH | `/api/decisions/:id` | Cookie, bearer, or `decisions:write` | Record a decision, a deferral, or a withdrawal, and write a decision back to GitHub |
 | POST | `/api/decisions/:id/writeback` | Cookie, bearer, or `decisions:write` | Retry the GitHub comment without deciding the row again |
@@ -99,7 +101,7 @@ Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI
 | POST | `/api/v1/traces` | Bearer | OTLP/HTTP JSON trace export |
 | GET | `/api/traces` | Cookie or bearer | Trace summaries, newest first |
 | GET | `/api/traces/:traceId` | Cookie or bearer | The spans of one trace |
-| GET | `/api/usage` | Cookie or bearer | Usage ledger |
+| GET | `/api/usage` | Cookie, bearer, or `usage:read` | Usage ledger |
 | POST | `/api/usage/ingest` | Bearer | Ingest usage facts |
 | GET | `/api/skill-bundles` | Session or MC_TOKEN | Download a gzip tar of the skill tree for one runtime. Operator only |
 | POST | `/api/login` | Own (rate-limited) | Dashboard password login |
@@ -351,7 +353,7 @@ On `decided`, the route then writes back to GitHub. The target is parsed only fr
 
 `actor_type`, `actor_id`, `chosen_option`, and `writeback` are nullable columns (`supabase/migrations/20261027_decisions_resolve.sql`).
 
-MCP `request_decision` (scope `decisions:request`) upserts `key` `agent:<actor id>:<slug>` with `force` false. `list_decisions` (`decisions:read`) reads the queue and does not change it. `resolve_decision` is `decisions:write`. An agent credential with only the request and read scopes cannot resolve and cannot call PATCH or the write-back retry.
+MCP `request_decision` (scope `decisions:request`) upserts `key` `agent:<actor id>:<slug>` with `force` false. `list_decisions` and `GET /api/decisions` (`decisions:read`) read the queue and do not change it. `resolve_decision` is `decisions:write`. An agent credential with only the request and read scopes cannot resolve and cannot call POST, PATCH, or the write-back retry. `decisions:write` alone cannot call GET.
 
 Demo mode (no `DATABASE_URL`), after the body validates: `GET` returns `{ "demo": true, "decisions": [] }`. `POST` returns `{ "ok": true, "demo": true, "note": "DATABASE_URL not set; decision dropped" }`. `PATCH` and `POST /api/decisions/:id/writeback` return `{ "ok": true, "demo": true }`.
 
@@ -383,8 +385,8 @@ A request that sends `Authorization`, including a valid `MC_TOKEN` or a valid ag
 
 Usage and Costs is experimental.
 
-- `GET /api/usage?window=24h|7d|30d`, or `?since=ISO&until=ISO` — the usage ledger. The default window is a rolling 7 days.
-- `POST /api/usage/ingest` — bearer `MC_TOKEN` — body `{collected_at?, kind?, facts: UsageFact[], snapshot?}`. This route is separate from `POST /api/ingest`, which is liveness only.
+- `GET /api/usage?window=24h|7d|30d`, or `?since=ISO&until=ISO` — the usage ledger. The default window is a rolling 7 days. An agent credential needs `usage:read`. That scope does not grant ingest.
+- `POST /api/usage/ingest` — bearer `MC_TOKEN` — body `{collected_at?, kind?, facts: UsageFact[], snapshot?}`. This route is separate from `POST /api/ingest`, which is liveness only. An agent credential is denied, including one that holds `usage:read`.
 
 ### Traces
 

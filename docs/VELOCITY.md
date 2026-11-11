@@ -1,5 +1,7 @@
 # Velocity: the morning brief and the decision queue
 
+For the separate PR/CI/CD benchmark dashboard and immutable capture history, see [Development-velocity benchmarks](DEVELOPMENT-VELOCITY.md).
+
 Status: **specification + first collector**, 2026-10-25. The `scripts/morning-brief.sh` sweep
 and the `decisions` table ship with this document. The API, dashboard page, MCP tools and
 repo discovery are tracked in the epic linked from the CHANGELOG.

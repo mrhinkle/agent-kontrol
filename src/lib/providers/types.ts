@@ -17,6 +17,6 @@ export interface ProviderUsageBatch {
 
 export interface ProviderAdapter {
   id: string;
-  fetchUsage(account: AccountRecord, since: Date): Promise<ProviderUsageBatch>;
+  fetchUsage(account: AccountRecord, since: Date, until?: Date): Promise<ProviderUsageBatch>;
   fetchSnapshot?(account: AccountRecord): Promise<AccountSnapshot>;
 }
