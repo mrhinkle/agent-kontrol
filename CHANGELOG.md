@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - Gibson: load tasks in valid 200-row pages, preserving the 400-task view instead of failing with `tasks API 400`.
+- Database errors are diagnosable from the logs. The credentials routes, the watch beat routes, the credential lookup and rate-limit paths, and the idle-pool handlers used to log only the error name (for example `[settings/credentials] list credentials NeonDbError`). They now log the name, the Postgres SQLSTATE or driver `code`, and the message with connection URLs, `user:password@` and `password=` pairs, Neon `npg_` passwords, bearer tokens and `akc_` credentials replaced, capped at 300 characters, following `cause` and the Neon `sourceError` up to three levels. `detail`, `hint`, the query, its parameters, the request body and `DATABASE_URL` are never logged.
 
 ### Documentation
 

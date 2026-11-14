@@ -29,6 +29,7 @@
 import { errorBody } from "./api-error";
 import { credentialNow, isValidRateLimit, memoryCredentialForQuota } from "./credentials";
 import { isConfigured, withTransaction } from "./db";
+import { describeDbError } from "./db-error";
 
 export {
   DEFAULT_REQUESTS_PER_DAY,
@@ -107,7 +108,7 @@ async function charge(id: string): Promise<ChargeResult> {
   try {
     return await chargeDatabase(id);
   } catch (e) {
-    console.error("[credential-rate-limit] charge failed", e instanceof Error ? e.name : "error");
+    console.error("[credential-rate-limit] charge failed", describeDbError(e));
     return { status: "unavailable" };
   }
 }

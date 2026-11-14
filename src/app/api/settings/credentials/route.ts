@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { requireDashboardSession } from "@/lib/auth";
+import { describeDbError } from "@/lib/db-error";
 import {
   createCredential,
   listCredentials,
@@ -27,7 +28,7 @@ export const dynamic = "force-dynamic";
  */
 
 function failure(what: string, e: unknown) {
-  console.error(`[settings/credentials] ${what}`, e instanceof Error ? e.name : "error");
+  console.error(`[settings/credentials] ${what}`, describeDbError(e));
   return NextResponse.json({ error: `Could not ${what}.` }, { status: 500 });
 }
 
