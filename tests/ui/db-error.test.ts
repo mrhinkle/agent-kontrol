@@ -44,6 +44,16 @@ describe("sanitizeErrorMessage", () => {
     );
   });
 
+  // CodeRabbit re-review of PR #157 at 91df6c6.
+  it("replaces quoted passwords that hold escaped quotes", () => {
+    const json = JSON.stringify({ password: 'alpha"bravoSecret', user: "ak" });
+    assert.equal(sanitizeErrorMessage(`bad config ${json}`), 'bad config {"password"=[redacted],"user":"ak"}');
+    assert.equal(sanitizeErrorMessage("bad config {'password': 'it\\'sSecret'}"), "bad config {'password'=[redacted]}");
+
+    const cut = sanitizeErrorMessage(`https://db.example/${"x".repeat(1940)} password="alpha\\"bravo charlieSecretDelta"`);
+    assert.equal(/alpha|bravo|charlie|Secret/.test(cut), false, cut);
+  });
+
   it("leaves no fragment of a secret that the input bound cuts in half", () => {
     const quoted = sanitizeErrorMessage(`https://db.example/${"x".repeat(1940)} password="alpha bravoCharlieDeltaEchoFoxtrotGolf"`);
     assert.equal(quoted.includes("alpha"), false);

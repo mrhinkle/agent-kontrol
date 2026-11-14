@@ -26,8 +26,11 @@ const URL_LIKE = /\b[a-z][a-z0-9+.-]*:\/\/(?:[^\s@]*@)?[^\s"'<>()[\]{}]*[^\s"'<>
 // `user:password@host` without a scheme. The password may hold `/` and quotes.
 const USERINFO = /[^\s:/@"'=]+:[^\s@]+@(?=[A-Za-z0-9[])/g;
 // `password=…`, `PGPASSWORD=…`, `db_password: …`, `"password":"…"`. A quoted
-// value with no closing quote (cut off by MAX_INPUT) is redacted to the end.
-const PASSWORD_PAIR = /(password|passwd|pwd)(["']?)\s*[=:]\s*("[^"]*"?|'[^']*'?|[^\s,;&]+)/gi;
+// value may hold backslash-escaped quotes (JSON.stringify output), and one
+// with no closing quote (cut off by MAX_INPUT) is redacted to the end. The two
+// branches inside each quoted value cannot match the same character, so the
+// pattern stays linear.
+const PASSWORD_PAIR = /(password|passwd|pwd)(["']?)\s*[=:]\s*("(?:[^"\\]|\\.)*"?|'(?:[^'\\]|\\.)*'?|[^\s,;&]+)/gi;
 const NEON_PASSWORD = /npg_[A-Za-z0-9]+/g;
 const BEARER = /\bBearer\s+[^\s"',;]+/gi;
 const AGENT_CREDENTIAL = /akc_[A-Za-z0-9_-]+/g;
