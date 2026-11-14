@@ -19,10 +19,15 @@ const MAX_MESSAGE = 300;
 const MAX_INPUT = 2000;
 const MAX_DEPTH = 3;
 
-// Ends on a character that is not sentence punctuation, so "…/db, retrying" keeps its comma.
-const URL_LIKE = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()[\]{}]*[^\s"'<>()[\]{}.,;:!?]/gi;
-const USERINFO = /[^\s:/@"'=]+:[^\s/@"']+@(?=[A-Za-z0-9[])/g;
-const PASSWORD_PAIR = /\b(password|passwd|pwd)\s*[=:]\s*("[^"]*"|'[^']*'|[^\s,;&]+)/gi;
+// A URL with optional `user:password@`. The credentials may hold any character
+// but whitespace and `@` (parentheses, quotes, `/`). The rest ends on a
+// character that is not sentence punctuation, so "…/db, retrying" keeps its comma.
+const URL_LIKE = /\b[a-z][a-z0-9+.-]*:\/\/(?:[^\s@]*@)?[^\s"'<>()[\]{}]*[^\s"'<>()[\]{}.,;:!?]/gi;
+// `user:password@host` without a scheme. The password may hold `/` and quotes.
+const USERINFO = /[^\s:/@"'=]+:[^\s@]+@(?=[A-Za-z0-9[])/g;
+// `password=…`, `PGPASSWORD=…`, `db_password: …`, `"password":"…"`. A quoted
+// value with no closing quote (cut off by MAX_INPUT) is redacted to the end.
+const PASSWORD_PAIR = /(password|passwd|pwd)(["']?)\s*[=:]\s*("[^"]*"?|'[^']*'?|[^\s,;&]+)/gi;
 const NEON_PASSWORD = /npg_[A-Za-z0-9]+/g;
 const BEARER = /\bBearer\s+[^\s"',;]+/gi;
 const AGENT_CREDENTIAL = /akc_[A-Za-z0-9_-]+/g;
@@ -30,11 +35,13 @@ const SAFE_CODE = /^[A-Za-z0-9_]{1,40}$/;
 
 /** Removes secrets and URLs from an error message and caps its length. */
 export function sanitizeErrorMessage(message: string, max: number = MAX_MESSAGE): string {
-  const bounded = message.length > MAX_INPUT ? message.slice(0, MAX_INPUT) : message;
+  // A cut can leave half a secret that no pattern recognizes, so a cut message
+  // also loses its last, partial token.
+  const bounded = message.length > MAX_INPUT ? `${message.slice(0, MAX_INPUT).replace(/\S*$/, "")}…` : message;
   const cleaned = bounded
     .replace(URL_LIKE, "[url]")
     .replace(USERINFO, "[redacted]@")
-    .replace(PASSWORD_PAIR, "$1=[redacted]")
+    .replace(PASSWORD_PAIR, "$1$2=[redacted]")
     .replace(NEON_PASSWORD, "[redacted]")
     .replace(BEARER, "Bearer [redacted]")
     .replace(AGENT_CREDENTIAL, "[redacted]")
@@ -44,15 +51,20 @@ export function sanitizeErrorMessage(message: string, max: number = MAX_MESSAGE)
   return scrubbed.length > max ? `${scrubbed.slice(0, max)}…` : scrubbed;
 }
 
+/** A name or code is logged only when it is a short identifier that no secret pattern touches. */
+function isSafeIdentifier(value: string): boolean {
+  return SAFE_CODE.test(value) && sanitizeErrorMessage(value) === value;
+}
+
 function describeOne(err: unknown, previousMessage: string | null): { text: string; message: string | null } {
   if (!err || typeof err !== "object") {
     const message = err === undefined || err === null ? null : sanitizeErrorMessage(String(err));
     return { text: message ? `error message=${JSON.stringify(message)}` : "error", message };
   }
   const record = err as { name?: unknown; code?: unknown; message?: unknown };
-  const name = err instanceof Error && SAFE_CODE.test(err.name) ? err.name : "error";
+  const name = err instanceof Error && isSafeIdentifier(err.name) ? err.name : "error";
   const rawCode = typeof record.code === "string" || typeof record.code === "number" ? String(record.code) : "";
-  const code = SAFE_CODE.test(rawCode) && sanitizeErrorMessage(rawCode) === rawCode ? rawCode : null;
+  const code = isSafeIdentifier(rawCode) ? rawCode : null;
   const message = typeof record.message === "string" && record.message ? sanitizeErrorMessage(record.message) : null;
   let text = name;
   if (code) text += ` code=${code}`;

@@ -26,6 +26,36 @@ describe("sanitizeErrorMessage", () => {
     assert.equal(sanitizeErrorMessage("login ak_owner:s3cret@db.example:5432 refused"), "login [redacted]@db.example:5432 refused");
   });
 
+  // Review findings on PR #157 (CodeRabbit and Codex at 425da1e).
+  it("replaces URL credentials that hold parentheses, quotes or a slash", () => {
+    assert.equal(sanitizeErrorMessage("connect postgres://u:pw(S3cret)@db.example/db failed"), "connect [url] failed");
+    assert.equal(sanitizeErrorMessage(`connect postgres://u:pa"ss@db.example/db failed`), "connect [url] failed");
+    assert.equal(sanitizeErrorMessage("(see postgres://db.example/db)"), "(see [url])");
+    assert.equal(sanitizeErrorMessage("login user:pa/ss@db failed"), "login [redacted]@db failed");
+    assert.equal(sanitizeErrorMessage(`login user:pa"ss@db failed`), "login [redacted]@db failed");
+  });
+
+  it("replaces passwords under quoted and prefixed keys", () => {
+    assert.equal(sanitizeErrorMessage('bad config {"password":"hunter2"}'), 'bad config {"password"=[redacted]}');
+    assert.equal(sanitizeErrorMessage("bad config {'pwd': 'hunter2'}"), "bad config {'pwd'=[redacted]}");
+    assert.equal(
+      sanitizeErrorMessage("PGPASSWORD=hunter2 db_password=hunter3"),
+      "PGPASSWORD=[redacted] db_password=[redacted]",
+    );
+  });
+
+  it("leaves no fragment of a secret that the input bound cuts in half", () => {
+    const quoted = sanitizeErrorMessage(`https://db.example/${"x".repeat(1940)} password="alpha bravoCharlieDeltaEchoFoxtrotGolf"`);
+    assert.equal(quoted.includes("alpha"), false);
+    assert.equal(quoted.includes("bravo"), false);
+    assert.equal(quoted, "[url] password=[redacted]");
+
+    for (let pad = 1940; pad < 1990; pad += 1) {
+      const out = sanitizeErrorMessage(`https://db.example/${"x".repeat(pad)} ak_owner:s3cretpassword@db.example`);
+      assert.equal(/s3c|cret|pass|word/.test(out), false, `pad ${pad}: ${out}`);
+    }
+  });
+
   it("replaces bearer tokens, agent credentials and known token shapes", () => {
     assert.equal(sanitizeErrorMessage("Authorization: Bearer short.tok"), "Authorization: Bearer [redacted]");
     assert.equal(sanitizeErrorMessage("token akc_AbC-123_xyz rejected"), "token [redacted] rejected");
@@ -50,7 +80,12 @@ describe("sanitizeErrorMessage", () => {
     const started = Date.now();
     const out = sanitizeErrorMessage(huge);
     assert.ok(Date.now() - started < 500, "sanitizing took too long");
-    assert.equal(out.length, 301);
+    // One 200,000-character token: the cut drops it whole rather than log half of it.
+    assert.equal(out, "…");
+
+    const words = sanitizeErrorMessage(`${"word ".repeat(1000)}${NEON_PASSWORD}`);
+    assert.equal(words.length, 301);
+    assert.equal(words.includes("npg_"), false);
   });
 });
 
@@ -91,6 +126,14 @@ describe("describeDbError", () => {
     const loop = new Error("loop");
     (loop as { cause?: unknown }).cause = loop;
     assert.equal(describeDbError(loop), 'Error message="loop"');
+  });
+
+  it("drops a name that looks like a secret", () => {
+    for (const name of ["akc_liveSecret", NEON_PASSWORD, "has space"]) {
+      const err = new Error("boom");
+      err.name = name;
+      assert.equal(describeDbError(err), 'error message="boom"');
+    }
   });
 
   it("drops a code that is not a plain identifier or that looks like a secret", () => {
