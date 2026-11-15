@@ -44,6 +44,40 @@ describe("sanitizeErrorMessage", () => {
     );
   });
 
+  // CodeRabbit re-review of PR #157 at 36aea54 (backslash before a line break),
+  // plus a sweep of other encodings run before pushing the fix.
+  it("leaves no part of a secret in any of these encodings", () => {
+    // Every input hides the pieces SECa and RETb (or their base64); none may survive.
+    const cases: Record<string, string> = {
+      plain: "password=SECaRETb",
+      colon: "password: SECaRETb",
+      "spaced, quoted": 'password = "SECa RETb"',
+      json: JSON.stringify({ password: "SECa RETb" }),
+      "json, space after colon": '{"password": "SECa RETb"}',
+      "json, escaped quote": JSON.stringify({ password: 'SECa"RETb' }),
+      "single quotes, escaped quote": "{'password': 'SECa\\'RETb'}",
+      "backslash then LF": 'password="SECa\\\nRETb"',
+      "backslash then CRLF": 'password="SECa\\\r\nRETb"',
+      "json inside json": JSON.stringify({ msg: JSON.stringify({ password: "SECa RETb" }) }),
+      "json inside json, escaped quote": JSON.stringify({ msg: JSON.stringify({ password: 'SECa"RETb' }) }),
+      PGPASSWORD: "PGPASSWORD=SECaRETb",
+      sslpassword: "sslpassword=SECaRETb",
+      "pwd key": '{"pwd":"SECa RETb"}',
+      "url, parenthesis": "postgres://u:SECa(RETb@h/db",
+      "url, quote": 'postgres://u:SECa"RETb@h/db',
+      "url, query": "postgres://h/db?password=SECaRETb",
+      "userinfo, slash": "u:SECa/RETb@h",
+      "authorization, bearer": "Authorization: Bearer SECaRETb",
+      "authorization, basic": "Authorization: Basic U0VDYVJFVGI6eA==",
+      "authorization, json": JSON.stringify({ authorization: "Basic U0VDYVJFVGI6eA==" }),
+    };
+    for (const [name, input] of Object.entries(cases)) {
+      const out = sanitizeErrorMessage(`before ${input} after`);
+      assert.equal(/SECa|RETb|U0VDYVJFVGI6eA/.test(out), false, `${name}: ${out}`);
+      assert.match(out, /^before /, `${name}: ${out}`);
+    }
+  });
+
   // CodeRabbit re-review of PR #157 at 91df6c6.
   it("replaces quoted passwords that hold escaped quotes", () => {
     const json = JSON.stringify({ password: 'alpha"bravoSecret', user: "ak" });
@@ -67,7 +101,8 @@ describe("sanitizeErrorMessage", () => {
   });
 
   it("replaces bearer tokens, agent credentials and known token shapes", () => {
-    assert.equal(sanitizeErrorMessage("Authorization: Bearer short.tok"), "Authorization: Bearer [redacted]");
+    assert.equal(sanitizeErrorMessage("Authorization: Bearer short.tok"), "Authorization=[redacted]");
+    assert.equal(sanitizeErrorMessage("sent Bearer short.tok upstream"), "sent Bearer [redacted] upstream");
     assert.equal(sanitizeErrorMessage("token akc_AbC-123_xyz rejected"), "token [redacted] rejected");
     assert.equal(sanitizeErrorMessage("key ghp_abcdefghijklmnopqrstuvwxyz0123"), "key [redacted]");
   });

@@ -25,12 +25,21 @@ const MAX_DEPTH = 3;
 const URL_LIKE = /\b[a-z][a-z0-9+.-]*:\/\/(?:[^\s@]*@)?[^\s"'<>()[\]{}]*[^\s"'<>()[\]{}.,;:!?]/gi;
 // `user:password@host` without a scheme. The password may hold `/` and quotes.
 const USERINFO = /[^\s:/@"'=]+:[^\s@]+@(?=[A-Za-z0-9[])/g;
-// `password=…`, `PGPASSWORD=…`, `db_password: …`, `"password":"…"`. A quoted
-// value may hold backslash-escaped quotes (JSON.stringify output), and one
-// with no closing quote (cut off by MAX_INPUT) is redacted to the end. The two
-// branches inside each quoted value cannot match the same character, so the
-// pattern stays linear.
-const PASSWORD_PAIR = /(password|passwd|pwd)(["']?)\s*[=:]\s*("(?:[^"\\]|\\.)*"?|'(?:[^'\\]|\\.)*'?|[^\s,;&]+)/gi;
+// A quoted value: `"…"` or `'…'`, opened by a bare or backslash-escaped quote
+// (JSON inside JSON), with any backslash escape inside it (`\"`, `\\`, a
+// backslash before a line break). With no closing quote (cut off by MAX_INPUT)
+// it runs to the end. The two branches inside cannot match the same
+// character, so matching stays linear.
+const QUOTED_VALUE = String.raw`\\?"(?:[^"\\]|\\[\s\S])*"?|\\?'(?:[^'\\]|\\[\s\S])*'?`;
+// A key, optionally quoted (`"password":`, `\"password\":`), then `=` or `:`.
+const KEY_TAIL = String.raw`(\\?["']?)\s*[=:]\s*`;
+// `password=…`, `PGPASSWORD=…`, `db_password: …`, `{"password":"…"}`.
+const PASSWORD_PAIR = new RegExp(String.raw`(password|passwd|pwd)${KEY_TAIL}(${QUOTED_VALUE}|[^\s,;&]+)`, "gi");
+// `Authorization: Basic …`, `Bearer …` or any other scheme, quoted or not.
+const AUTHORIZATION_PAIR = new RegExp(
+  String.raw`(authorization)${KEY_TAIL}(${QUOTED_VALUE}|[A-Za-z]+\s+[^\s"',;]+|[^\s"',;]+)`,
+  "gi",
+);
 const NEON_PASSWORD = /npg_[A-Za-z0-9]+/g;
 const BEARER = /\bBearer\s+[^\s"',;]+/gi;
 const AGENT_CREDENTIAL = /akc_[A-Za-z0-9_-]+/g;
@@ -45,6 +54,7 @@ export function sanitizeErrorMessage(message: string, max: number = MAX_MESSAGE)
     .replace(URL_LIKE, "[url]")
     .replace(USERINFO, "[redacted]@")
     .replace(PASSWORD_PAIR, "$1$2=[redacted]")
+    .replace(AUTHORIZATION_PAIR, "$1$2=[redacted]")
     .replace(NEON_PASSWORD, "[redacted]")
     .replace(BEARER, "Bearer [redacted]")
     .replace(AGENT_CREDENTIAL, "[redacted]")
