@@ -19,10 +19,11 @@ const MAX_MESSAGE = 300;
 const MAX_INPUT = 2000;
 const MAX_DEPTH = 3;
 
-// A URL with optional `user:password@`. The credentials may hold any character
-// but whitespace and `@` (parentheses, quotes, `/`). The rest ends on a
-// character that is not sentence punctuation, so "…/db, retrying" keeps its comma.
-const URL_LIKE = /\b[a-z][a-z0-9+.-]*:\/\/(?:[^\s@]*@)?[^\s"'<>()[\]{}]*[^\s"'<>()[\]{}.,;:!?]/gi;
+// A URL runs to the next whitespace: credentials, path and query may hold any
+// other character (parentheses, quotes, `@`, `/`), and a `?password=…` key
+// must not be cut off from its value. Only trailing punctuation and closing
+// brackets or quotes are given back, so "…/db, retrying" keeps its comma.
+const URL_LIKE = /\b[a-z][a-z0-9+.-]*:\/\/\S*[^\s.,;:!?)\]}"'>]/gi;
 // `user:password@host` without a scheme. The password may hold `/` and quotes.
 const USERINFO = /[^\s:/@"'=]+:[^\s@]+@(?=[A-Za-z0-9[])/g;
 // A quoted value: `"…"` or `'…'`, opened by a bare or backslash-escaped quote

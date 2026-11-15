@@ -66,6 +66,11 @@ describe("sanitizeErrorMessage", () => {
       "url, parenthesis": "postgres://u:SECa(RETb@h/db",
       "url, quote": 'postgres://u:SECa"RETb@h/db',
       "url, query": "postgres://h/db?password=SECaRETb",
+      // Codex round 4 at 6af4be5: the URL replacement ate the key and stopped at "(".
+      "url, query, parentheses": "postgres://db.example/db?password=(SECaRETb)",
+      "url, query, quotes": 'postgres://db.example/db?password="SECaRETb"',
+      "url, query, brackets": "postgres://db.example/db?password=[SECa]{RETb}",
+      "url in json inside json": JSON.stringify({ msg: JSON.stringify({ url: "postgres://u:SECa@h/db?x=RETb" }) }),
       "userinfo, slash": "u:SECa/RETb@h",
       "authorization, bearer": "Authorization: Bearer SECaRETb",
       "authorization, basic": "Authorization: Basic U0VDYVJFVGI6eA==",
