@@ -12,7 +12,8 @@ describe("sanitizeErrorMessage", () => {
   it("replaces connection and other URLs", () => {
     for (const url of [URL, "postgres://u:p@localhost:5432/db", "https://ep-synthetic.neon.tech/sql", "wss://ep-synthetic.neon.tech/v2"]) {
       const out = sanitizeErrorMessage(`could not connect to ${url}, retrying`);
-      assert.equal(out, "could not connect to [url], retrying");
+      // The whole token goes, trailing comma included: giving punctuation back can leak a secret's last character.
+      assert.equal(out, "could not connect to [url] retrying");
     }
   });
 
@@ -30,7 +31,7 @@ describe("sanitizeErrorMessage", () => {
   it("replaces URL credentials that hold parentheses, quotes or a slash", () => {
     assert.equal(sanitizeErrorMessage("connect postgres://u:pw(S3cret)@db.example/db failed"), "connect [url] failed");
     assert.equal(sanitizeErrorMessage(`connect postgres://u:pa"ss@db.example/db failed`), "connect [url] failed");
-    assert.equal(sanitizeErrorMessage("(see postgres://db.example/db)"), "(see [url])");
+    assert.equal(sanitizeErrorMessage("(see postgres://db.example/db)"), "(see [url]");
     assert.equal(sanitizeErrorMessage("login user:pa/ss@db failed"), "login [redacted]@db failed");
     assert.equal(sanitizeErrorMessage(`login user:pa"ss@db failed`), "login [redacted]@db failed");
   });
@@ -77,6 +78,14 @@ describe("sanitizeErrorMessage", () => {
       "password, parentheses": "password=(SECa)RETb",
       "bearer, comma": "Bearer SECa,RETb",
       "authorization, basic, comma": "Authorization: Basic SECa,RETb",
+      // Codex round 6 at 84baae6: trailing punctuation that belongs to the secret.
+      "password, trailing bang": "password=SECaRETb!",
+      "url, trailing bang": "postgres://db/db?password=SECaRETb!",
+      "bearer, trailing bang": "Bearer SECaRETb!",
+      "npg_, punctuation inside": "npg_SECa!RETb",
+      "akc_, punctuation inside": "akc_SECa.RETb",
+      "userinfo, odd host": "u:SECaRETb@-db",
+      "userinfo, no host": "u:SECaRETb@ next",
       "url in json inside json": JSON.stringify({ msg: JSON.stringify({ url: "postgres://u:SECa@h/db?x=RETb" }) }),
       "userinfo, slash": "u:SECa/RETb@h",
       "authorization, bearer": "Authorization: Bearer SECaRETb",
@@ -88,6 +97,15 @@ describe("sanitizeErrorMessage", () => {
       assert.equal(/SECa|RETb|U0VDYVJFVGI6eA/.test(out), false, `${name}: ${out}`);
       assert.match(out, /^before /, `${name}: ${out}`);
     }
+  });
+
+  it("redacts the whole token, trailing punctuation included", () => {
+    assert.equal(sanitizeErrorMessage("password=Secret! then"), "password=[redacted] then");
+    assert.equal(sanitizeErrorMessage("postgres://db/db?password=Secret! then"), "[url] then");
+    assert.equal(sanitizeErrorMessage("Bearer Secret! then"), "Bearer [redacted] then");
+    assert.equal(sanitizeErrorMessage("Authorization: Basic Secret! then"), "Authorization=[redacted] then");
+    assert.equal(sanitizeErrorMessage("npg_Sec!ret) then"), "[redacted] then");
+    assert.equal(sanitizeErrorMessage("u:Secret!@-db then"), "[redacted]@-db then");
   });
 
   // CodeRabbit re-review of PR #157 at 91df6c6.

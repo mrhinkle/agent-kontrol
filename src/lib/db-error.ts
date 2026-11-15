@@ -20,18 +20,16 @@ const MAX_INPUT = 2000;
 const MAX_DEPTH = 3;
 
 // One rule for every unquoted secret: it runs to the next whitespace, whatever
-// characters it holds (parentheses, quotes, commas, `@`, `/`). Stopping at any
-// other character leaves the rest of the secret behind. Only trailing
-// punctuation and closing brackets or quotes are given back, so
-// "…/db, retrying" keeps its comma. A value made only of punctuation is
-// taken whole.
-const TO_WHITESPACE = String.raw`(?:\S*[^\s.,;:!?)\]}"'>]|\S+)`;
+// characters it holds (parentheses, quotes, commas, `@`, `/`, a final `!`).
+// Stopping at, or giving back, any other character can leave part of the
+// secret behind. The price is cosmetic: "…/db, retrying" loses its comma.
+const TO_WHITESPACE = String.raw`\S+`;
 // A URL. A `?password=…` key inside it goes with it, so it is never cut off
 // from its value.
-const URL_LIKE = new RegExp(String.raw`\b[a-z][a-z0-9+.-]*:\/\/${TO_WHITESPACE}`, "gi");
+const URL_LIKE = new RegExp(String.raw`\b[a-z][a-z0-9+.-]*:\/\/\S*`, "gi");
 // `user:password@host` without a scheme. The password runs to the last `@`
-// of its token, so it may hold `@`, `/` and quotes.
-const USERINFO = /[^\s:/@"'=]+:\S*@(?=[A-Za-z0-9[])/g;
+// of its token, so it may hold `@`, `/` and quotes, whatever follows it.
+const USERINFO = /[^\s:/@"'=]+:\S*@/g;
 // A quoted value: `"…"` or `'…'`, opened by a bare or backslash-escaped quote
 // (JSON inside JSON), with any backslash escape inside it (`\"`, `\\`, a
 // backslash before a line break). With no closing quote (cut off by MAX_INPUT)
@@ -47,9 +45,9 @@ const AUTHORIZATION_PAIR = new RegExp(
   String.raw`(authorization)${KEY_TAIL}(${QUOTED_VALUE}|[A-Za-z]+\s+${TO_WHITESPACE}|${TO_WHITESPACE})`,
   "gi",
 );
-const NEON_PASSWORD = /npg_[A-Za-z0-9]+/g;
+const NEON_PASSWORD = /npg_\S*/g;
 const BEARER = new RegExp(String.raw`\bBearer\s+${TO_WHITESPACE}`, "gi");
-const AGENT_CREDENTIAL = /akc_[A-Za-z0-9_-]+/g;
+const AGENT_CREDENTIAL = /akc_\S*/g;
 const SAFE_CODE = /^[A-Za-z0-9_]{1,40}$/;
 
 /** Removes secrets and URLs from an error message and caps its length. */
