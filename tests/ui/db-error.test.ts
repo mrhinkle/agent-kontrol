@@ -220,6 +220,28 @@ describe("sanitizeErrorMessage", () => {
     assert.equal(sanitizeErrorMessage('column "token" does not exist'), 'column "token" does not exist');
   });
 
+  // Codex review of PR #157 at 929bab6: the rule above also caught a quoted
+  // key in prose and hid the rest of the diagnosis. It now applies only to a
+  // key inside an object (after `{` or `,`); in prose the next word goes, as
+  // for any bare value.
+  it("keeps prose that quotes a secret key readable", () => {
+    assert.equal(
+      sanitizeErrorMessage('invalid JSON near "token": unexpected character at position 12'),
+      'invalid JSON near "token"=[redacted] character at position 12',
+    );
+    assert.equal(
+      sanitizeErrorMessage('Unexpected token "password": expected string at 4'),
+      'Unexpected token "password"=[redacted] string at 4',
+    );
+    // A literal followed by a well-formed field is two fields, as in valid JSON:
+    // the same shape as `{"token":null,"message":"password authentication failed"}`,
+    // which must stay readable.
+    assert.equal(
+      sanitizeErrorMessage('{"password":123,"message":"connection reset"}'),
+      '{"password"=[redacted],"message":"connection reset"}',
+    );
+  });
+
   // Found while fixing the Codex finding at 1030f65: an object or array under a secret
   // key holds quoted text with spaces, so it is redacted to the end of the message.
   it("leaves no part of a secret in an object or array under a secret key", () => {

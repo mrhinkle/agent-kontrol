@@ -59,10 +59,14 @@ const NOT_DONE = String.raw`(?!\uE000)`;
 // (`{"token":null,"message":"password authentication failed"}`).
 const LITERAL = String.raw`(?:null|true|false|none|-?\d[\d.e+-]*)(?=\s*(?:[}\]]|$|,\s*\\?["'][^"'\\\s]*\\?["']\s*[:=]))`;
 const LITERAL_PAIR = new RegExp(String.raw`(${SECRET_KEYS}|${HEADER_KEYS})(\\?["'])\s*[=:]\s*${LITERAL}`, "gi");
-// Any other bare value under a quoted key (`{"password":123,abc def}`) is not
-// valid JSON or Python, so where it ends is unknown: it is redacted to the end
-// of its line.
-const QUOTED_KEY_BARE = new RegExp(String.raw`(${SECRET_KEYS}|${HEADER_KEYS})(\\?["'])\s*[=:]\s*${NOT_DONE}([^\r\n]+)`, "gi");
+// Any other bare value under a quoted key inside an object (the key follows
+// `{` or `,`: `{"password":123,abc def}`) is not valid JSON or Python, so
+// where it ends is unknown: it is redacted to the end of its line. A quoted
+// key in prose (`near "token": unexpected character`) is left to SECRET_WORD.
+const QUOTED_KEY_BARE = new RegExp(
+  String.raw`([{,]\s*\\?["'][^"'\\\s]*?)(${SECRET_KEYS}|${HEADER_KEYS})(\\?["'])\s*[=:]\s*${NOT_DONE}([^\r\n]+)`,
+  "gi",
+);
 // An object or array under a secret or header key (`{"token":{"access":"…"}}`,
 // `{ token: [ '…' ] }`, pretty-printed over several lines) has no end a pattern
 // can find without parsing, so it is redacted to the end of the message.
@@ -93,7 +97,7 @@ export function sanitizeErrorMessage(message: string, max: number = MAX_MESSAGE)
     .replace(QUOTED_PAIR, `$1$2=${DONE}`)
     .replace(LITERAL_PAIR, `$1$2=${DONE}`)
     .replace(NESTED_PAIR, `$1$2=${DONE}`)
-    .replace(QUOTED_KEY_BARE, `$1$2=${DONE}`)
+    .replace(QUOTED_KEY_BARE, `$1$2$3=${DONE}`)
     .replace(HEADER_LINE, `$1$2=${DONE}`)
     .replace(BEARER, "Bearer [redacted]")
     .replace(SECRET_WORD, `$1$2=${DONE}`)
