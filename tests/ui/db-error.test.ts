@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { inspect } from "node:util";
 import { NeonDbError } from "@neondatabase/serverless";
 import { describeDbError, sanitizeErrorMessage } from "../../src/lib/db-error";
 import { UnknownWriteOutcome } from "../../src/lib/write-outcome";
@@ -154,10 +155,67 @@ describe("sanitizeErrorMessage", () => {
       '{"authorization"=[redacted],"user":"ak"}',
     );
     assert.equal(sanitizeErrorMessage(JSON.stringify({ password: "SECa RETb", user: "ak" })), '{"password"=[redacted],"user":"ak"}');
-    assert.equal(sanitizeErrorMessage(JSON.stringify({ token: null, password: "SECa RETb" })), '{"token"=[redacted]');
-    // The internal stand-in for a redacted value cannot be forged by the message.
+    assert.equal(
+      sanitizeErrorMessage(JSON.stringify({ token: null, password: "SECa RETb" })),
+      '{"token"=[redacted],"password"=[redacted]}',
+    );
+    // The internal stand-ins for a redacted value and a URL cannot be forged by the message.
     assert.equal(sanitizeErrorMessage("password=SECaRETb"), "password=[redacted]");
     assert.equal(sanitizeErrorMessage("Authorization: SECa RETb"), "Authorization=[redacted]");
+    assert.equal(sanitizeErrorMessage("password=SECaRETb"), "password=[redacted]");
+    assert.equal(sanitizeErrorMessage('token=[url]{"a":"SECa RETb"}'), "token=[redacted]");
+  });
+
+  // Codex review of PR #157 at 1030f65: a bare value under a secret key in
+  // compact JSON swallowed the next field, so the diagnosis was lost.
+  it("keeps the next field readable after a literal under a secret key", () => {
+    assert.equal(
+      sanitizeErrorMessage(JSON.stringify({ token: null, message: 'password authentication failed for user "ak"' })),
+      '{"token"=[redacted],"message":"password authentication failed for user \\"ak\\""}',
+    );
+    const diagnosis = 'password authentication failed for user "ak"';
+    let checked = 0;
+    for (const key of ["token", "password", "api_key", "secret", "credential", "authorization", "cookie"]) {
+      for (const literal of [null, 123, -1.5, true, false]) {
+        const fields = { [key]: literal, message: diagnosis };
+        const python = literal === null ? "None" : literal === true ? "True" : literal === false ? "False" : String(literal);
+        const encodings: Record<string, string> = {
+          json: JSON.stringify(fields),
+          "json, spaced": JSON.stringify(fields, null, 1).replace(/\n/g, ""),
+          "json inside json": JSON.stringify({ msg: JSON.stringify(fields) }),
+          python: `{'${key}': ${python}, 'message': '${diagnosis}'}`,
+        };
+        for (const [name, input] of Object.entries(encodings)) {
+          const out = sanitizeErrorMessage(input);
+          assert.ok(out.includes("authentication failed for user"), `${name}: ${input} -> ${out}`);
+          checked += 1;
+        }
+      }
+    }
+    assert.equal(checked, 140);
+  });
+
+  // Found while fixing the finding above: an object or array under a secret
+  // key holds quoted text with spaces, so it is redacted to the end of the line.
+  it("leaves no part of a secret in an object or array under a secret key", () => {
+    let checked = 0;
+    for (const key of ["token", "password", "secret", "api_key", "authorization"]) {
+      for (const nested of [{ access: "SECa RETb" }, ["SECa RETb"], { a: { b: "SECa RETb" } }, [{ v: "SECa RETb" }]]) {
+        const fields = { [key]: nested, user: "ak" };
+        const encodings: Record<string, string> = {
+          json: JSON.stringify(fields),
+          "json, spaced": JSON.stringify(fields, null, 1).replace(/\n/g, ""),
+          "json inside json": JSON.stringify({ msg: JSON.stringify(fields) }),
+          inspect: inspect(fields, { breakLength: Infinity, depth: 5 }),
+        };
+        for (const [name, input] of Object.entries(encodings)) {
+          const out = sanitizeErrorMessage(input);
+          assert.equal(/SECa|RETb/.test(out), false, `${name}: ${input} -> ${out}`);
+          checked += 1;
+        }
+      }
+    }
+    assert.equal(checked, 80);
   });
 
   it("redacts the whole token, trailing punctuation included", () => {
