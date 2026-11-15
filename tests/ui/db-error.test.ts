@@ -207,7 +207,6 @@ describe("sanitizeErrorMessage", () => {
       "{'pwd': None, SECaRETb}",
       '{"password":-1.5e3,SECaRETb}',
       '"password":123,SECaRETb',
-      '{"password":12 SECa}',
       '{"secret":false , SECa RETb}',
       '{\\"token\\":null,SECa RETb}',
       '{"authorization":null,SECa RETb}',
@@ -220,15 +219,21 @@ describe("sanitizeErrorMessage", () => {
     assert.equal(sanitizeErrorMessage('column "token" does not exist'), 'column "token" does not exist');
   });
 
-  // Codex review of PR #157 at 929bab6: the rule above also caught a quoted
-  // key in prose and hid the rest of the diagnosis. It now applies only to a
-  // key inside an object (after `{` or `,`); in prose the next word goes, as
-  // for any bare value.
+  // Codex reviews of PR #157 at 929bab6 and dff78ba: the rule above also
+  // caught a quoted key in prose and hid the rest of the diagnosis. It now
+  // applies only to a literal glued to more text; in prose the next word goes,
+  // as for any bare value.
   it("keeps prose that quotes a secret key readable", () => {
     assert.equal(
       sanitizeErrorMessage('invalid JSON near "token": unexpected character at position 12'),
       'invalid JSON near "token"=[redacted] character at position 12',
     );
+    assert.equal(
+      sanitizeErrorMessage('invalid JSON, "token": unexpected character at position 12'),
+      'invalid JSON, "token"=[redacted] character at position 12',
+    );
+    assert.equal(sanitizeErrorMessage('"token": 12 characters too long'), '"token"=[redacted] characters too long');
+    assert.equal(sanitizeErrorMessage('bad "token": nonexistent key'), 'bad "token"=[redacted] key');
     assert.equal(
       sanitizeErrorMessage('Unexpected token "password": expected string at 4'),
       'Unexpected token "password"=[redacted] string at 4',

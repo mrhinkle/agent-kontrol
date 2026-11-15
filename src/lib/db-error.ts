@@ -59,12 +59,14 @@ const NOT_DONE = String.raw`(?!\uE000)`;
 // (`{"token":null,"message":"password authentication failed"}`).
 const LITERAL = String.raw`(?:null|true|false|none|-?\d[\d.e+-]*)(?=\s*(?:[}\]]|$|,\s*\\?["'][^"'\\\s]*\\?["']\s*[:=]))`;
 const LITERAL_PAIR = new RegExp(String.raw`(${SECRET_KEYS}|${HEADER_KEYS})(\\?["'])\s*[=:]\s*${LITERAL}`, "gi");
-// Any other bare value under a quoted key inside an object (the key follows
-// `{` or `,`: `{"password":123,abc def}`) is not valid JSON or Python, so
-// where it ends is unknown: it is redacted to the end of its line. A quoted
-// key in prose (`near "token": unexpected character`) is left to SECRET_WORD.
-const QUOTED_KEY_BARE = new RegExp(
-  String.raw`([{,]\s*\\?["'][^"'\\\s]*?)(${SECRET_KEYS}|${HEADER_KEYS})(\\?["'])\s*[=:]\s*${NOT_DONE}([^\r\n]+)`,
+// A literal under a quoted key that runs straight on into more text, or into a
+// comma that does not start a real next field (`{"password":123,abc def}`,
+// `{'pwd': None, abc}`), is not valid JSON or Python, so where the value ends
+// is unknown: it is redacted to the end of its line. Any other bare value
+// (`near "token": unexpected character`) is left to SECRET_WORD.
+const LITERAL_START = String.raw`(?:(?:null|true|false|none)\b|-?\d[\d.e+-]*(?![\d.e+-]))(?=\s*,|[^\s,}\]])`;
+const MALFORMED_LITERAL = new RegExp(
+  String.raw`(${SECRET_KEYS}|${HEADER_KEYS})(\\?["'])\s*[=:]\s*${LITERAL_START}[^\r\n]*`,
   "gi",
 );
 // An object or array under a secret or header key (`{"token":{"access":"…"}}`,
@@ -91,13 +93,13 @@ export function sanitizeErrorMessage(message: string, max: number = MAX_MESSAGE)
   // `{"dsn":"postgres://h/db","password":"alpha bravo"}`, swallow the next key
   // and the start of its value and leave the rest. So every pattern that knows
   // where its own secret ends (quoted values, literals under a quoted key,
-  // nested values, other bare values under a quoted key, header lines) runs first, then BEARER and SECRET_WORD, and
+  // nested values, malformed literals under a quoted key, header lines) runs first, then BEARER and SECRET_WORD, and
   // only then URL_LIKE and USERINFO.
   const cleaned = bounded
     .replace(QUOTED_PAIR, `$1$2=${DONE}`)
     .replace(LITERAL_PAIR, `$1$2=${DONE}`)
     .replace(NESTED_PAIR, `$1$2=${DONE}`)
-    .replace(QUOTED_KEY_BARE, `$1$2$3=${DONE}`)
+    .replace(MALFORMED_LITERAL, `$1$2=${DONE}`)
     .replace(HEADER_LINE, `$1$2=${DONE}`)
     .replace(BEARER, "Bearer [redacted]")
     .replace(SECRET_WORD, `$1$2=${DONE}`)
