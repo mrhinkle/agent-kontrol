@@ -24,8 +24,7 @@ const MAX_DEPTH = 3;
 // Stopping at, or giving back, any other character can leave part of the
 // secret behind. The price is cosmetic: "…/db, retrying" loses its comma.
 const TO_WHITESPACE = String.raw`\S+`;
-// A URL. A `?password=…` key inside it goes with it, so it is never cut off
-// from its value.
+// A URL, credentials and query included, through the next whitespace.
 const URL_LIKE = new RegExp(String.raw`\b[a-z][a-z0-9+.-]*:\/\/\S*`, "gi");
 // `user:password@host` without a scheme. The password runs to the last `@`
 // of its token, so it may hold `@`, `/` and quotes, whatever follows it.
@@ -47,13 +46,11 @@ const SECRET_KEYS = String.raw`password|passwd|pwd|secret|token|api[._-]?key|cre
 const HEADER_KEYS = String.raw`authorization|cookie`;
 // Any of those keys with a quoted value.
 const QUOTED_PAIR = new RegExp(String.raw`(${SECRET_KEYS}|${HEADER_KEYS})${KEY_TAIL}(${QUOTED_VALUE})`, "gi");
-// Stand-ins for a value already redacted and for a URL already replaced, so
-// the later passes leave them (and the `}` or `,` after them) alone. Both are
-// removed from the input first, so no message can forge them.
+// Stands in for a value already redacted, so the later passes leave it (and
+// the `}` or `,` after it) alone. Removed from the input first, so no message
+// can forge it.
 const DONE = "\uE000";
 const NOT_DONE = String.raw`(?!\uE000)`;
-const URL_DONE = "\uE001";
-const MARKERS = /[\uE000\uE001]/g;
 // Under a quoted key (JSON, a Python dict) any text value is quoted, so a bare
 // value is a literal: `null`, `true`, `None`, a number. It ends at the next
 // `,`, `}`, `]` or whitespace, which keeps the fields after it readable
@@ -61,14 +58,14 @@ const MARKERS = /[\uE000\uE001]/g;
 // else under a quoted key is left to the passes below.
 const LITERAL = String.raw`(?:null|true|false|none|-?\d[\d.e+-]*)(?=[\s,}\]]|$)`;
 const LITERAL_PAIR = new RegExp(String.raw`(${SECRET_KEYS}|${HEADER_KEYS})(\\?["'])\s*[=:]\s*${LITERAL}`, "gi");
+// An object or array under a secret or header key (`{"token":{"access":"…"}}`,
+// `{ token: [ '…' ] }`, pretty-printed over several lines) has no end a pattern
+// can find without parsing, so it is redacted to the end of the message.
+const NESTED_PAIR = new RegExp(String.raw`(${SECRET_KEYS}|${HEADER_KEYS})${KEY_TAIL}[{[][\s\S]*`, "gi");
 // A header value holds spaces and commas, so an unquoted one runs to the end of its line.
 const HEADER_LINE = new RegExp(String.raw`(${HEADER_KEYS})${KEY_TAIL}${NOT_DONE}([^\r\n]+)`, "gi");
-// A secret key with an unquoted value. A nested object or array
-// (`{"token":{"access":"…"}}`, `{ token: [ '…' ] }`) can hold quoted text with
-// spaces, so it is redacted to the end of its line; any other value runs to
-// the next whitespace.
-const NESTED = String.raw`[{[][^\r\n]*`;
-const SECRET_WORD = new RegExp(String.raw`(${SECRET_KEYS})${KEY_TAIL}${NOT_DONE}(${NESTED}|${TO_WHITESPACE})`, "gi");
+// A secret key with any other unquoted value, which runs to the next whitespace.
+const SECRET_WORD = new RegExp(String.raw`(${SECRET_KEYS})${KEY_TAIL}${NOT_DONE}(${TO_WHITESPACE})`, "gi");
 const NEON_PASSWORD = /npg_\S*/g;
 const BEARER = new RegExp(String.raw`\bBearer\s+${TO_WHITESPACE}`, "gi");
 const AGENT_CREDENTIAL = /akc_\S*/g;
@@ -78,27 +75,27 @@ const SAFE_CODE = /^[A-Za-z0-9_]{1,40}$/;
 export function sanitizeErrorMessage(message: string, max: number = MAX_MESSAGE): string {
   // A cut can leave half a secret that no pattern recognizes, so a cut message
   // also loses its last, partial token.
-  const unmarked = message.replace(MARKERS, "");
+  const unmarked = message.replaceAll(DONE, "");
   const bounded = unmarked.length > MAX_INPUT ? `${unmarked.slice(0, MAX_INPUT).replace(/\S*$/, "")}…` : unmarked;
-  // The order matters. An unquoted value runs to the next whitespace, so in
-  // compact JSON (`{"token":null,"password":"alpha bravo"}`) it would swallow
-  // the next key and the start of its value and leave the rest. Every pattern
-  // that knows where its own secret ends (quoted values, literals under a
-  // quoted key, header lines, bearer tokens) therefore runs before SECRET_WORD. Key/value pairs run before
-  // USERINFO, which would otherwise eat a key and the start of its value
-  // (`password:"alpha@db bravo"`) and leave the rest.
+  // The order matters. A pattern that runs to the next whitespace (SECRET_WORD,
+  // URL_LIKE, USERINFO) would, in compact JSON such as
+  // `{"dsn":"postgres://h/db","password":"alpha bravo"}`, swallow the next key
+  // and the start of its value and leave the rest. So every pattern that knows
+  // where its own secret ends (quoted values, literals under a quoted key,
+  // nested values, header lines) runs first, then BEARER and SECRET_WORD, and
+  // only then URL_LIKE and USERINFO.
   const cleaned = bounded
-    .replace(URL_LIKE, URL_DONE)
     .replace(QUOTED_PAIR, `$1$2=${DONE}`)
     .replace(LITERAL_PAIR, `$1$2=${DONE}`)
+    .replace(NESTED_PAIR, `$1$2=${DONE}`)
     .replace(HEADER_LINE, `$1$2=${DONE}`)
     .replace(BEARER, "Bearer [redacted]")
     .replace(SECRET_WORD, `$1$2=${DONE}`)
+    .replace(URL_LIKE, "[url]")
     .replace(USERINFO, "[redacted]@")
     .replace(NEON_PASSWORD, "[redacted]")
     .replace(AGENT_CREDENTIAL, "[redacted]")
     .replaceAll(DONE, "[redacted]")
-    .replaceAll(URL_DONE, "[url]")
     .replace(/\s+/g, " ")
     .trim();
   const scrubbed = redactText(cleaned, Number.MAX_SAFE_INTEGER);

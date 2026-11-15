@@ -159,10 +159,9 @@ describe("sanitizeErrorMessage", () => {
       sanitizeErrorMessage(JSON.stringify({ token: null, password: "SECa RETb" })),
       '{"token"=[redacted],"password"=[redacted]}',
     );
-    // The internal stand-ins for a redacted value and a URL cannot be forged by the message.
+    // The internal stand-in for a redacted value cannot be forged by the message.
     assert.equal(sanitizeErrorMessage("password=SECaRETb"), "password=[redacted]");
     assert.equal(sanitizeErrorMessage("Authorization: SECa RETb"), "Authorization=[redacted]");
-    assert.equal(sanitizeErrorMessage("password=SECaRETb"), "password=[redacted]");
     assert.equal(sanitizeErrorMessage('token=[url]{"a":"SECa RETb"}'), "token=[redacted]");
   });
 
@@ -196,7 +195,7 @@ describe("sanitizeErrorMessage", () => {
   });
 
   // Found while fixing the finding above: an object or array under a secret
-  // key holds quoted text with spaces, so it is redacted to the end of the line.
+  // key holds quoted text with spaces, so it is redacted to the end of the message.
   it("leaves no part of a secret in an object or array under a secret key", () => {
     let checked = 0;
     for (const key of ["token", "password", "secret", "api_key", "authorization"]) {
@@ -216,6 +215,73 @@ describe("sanitizeErrorMessage", () => {
       }
     }
     assert.equal(checked, 80);
+  });
+
+  // CodeRabbit re-review of PR #157 at 10a0848: a URL ran on into the next
+  // field (`{"dsn":"postgresql://h/db","password":"a b"}`), and a nested value
+  // pretty-printed over several lines kept its inner lines. Swept here across
+  // first fields, secret fields and layouts, multi-line ones included.
+  it("leaves no part of a secret after a URL, a bearer token or a literal, in any layout", () => {
+    assert.equal(
+      sanitizeErrorMessage(JSON.stringify({ dsn: "postgresql://h/db", password: "SECa RETb" })),
+      '{"dsn":"[url]',
+    );
+    assert.equal(sanitizeErrorMessage(JSON.stringify({ token: { access: "SECa RETb" } }, null, 2)), '{ "token"=[redacted]');
+    const firsts: Array<[string, unknown]> = [
+      ["token", null],
+      ["password", 123],
+      ["secret", true],
+      ["dsn", "postgresql://h/db"],
+      ["dsn", "postgresql://u:pw@h/db?sslmode=require"],
+      ["message", "failed at postgres://h/db"],
+      ["note", "Bearer abc"],
+      ["authorization", null],
+    ];
+    const seconds: Array<[string, unknown]> = [
+      ["password", "SECa RETb"],
+      ["authorization", "Basic SECa RETb"],
+      ["authorization", 'Digest username="u", response="SECa RETb"'],
+      ["cookie", "a=SECa; b=RETb"],
+      ["note", "Bearer SECaRETb"],
+      ["note", "via npg_SECaRETb"],
+      ["note", "via akc_SECaRETb"],
+      ["dsn", "postgresql://u:SECaRETb@h/db"],
+      ["dsn", "u:SECaRETb@h"],
+      ["token", { access: "SECa RETb" }],
+      ["secret", ["SECa RETb"]],
+      ["api_key", { a: { b: "SECa RETb" } }],
+      ["authorization", { scheme: "Basic", value: "SECa RETb" }],
+    ];
+    const python = (value: unknown): string => {
+      if (value === null) return "None";
+      if (typeof value === "boolean") return value ? "True" : "False";
+      if (typeof value === "number") return String(value);
+      if (typeof value === "string") return `'${value.replace(/'/g, "\\'")}'`;
+      if (Array.isArray(value)) return `[${value.map(python).join(", ")}]`;
+      return `{${Object.entries(value as object).map(([k, v]) => `'${k}': ${python(v)}`).join(", ")}}`;
+    };
+    let checked = 0;
+    for (const [firstKey, firstValue] of firsts) {
+      for (const [key, value] of seconds) {
+        if (firstKey === key) continue;
+        const fields = { [firstKey]: firstValue, [key]: value };
+        const encodings: Record<string, string> = {
+          json: JSON.stringify(fields),
+          "json, spaced": JSON.stringify(fields, null, 1).replace(/\n/g, ""),
+          "json, pretty": JSON.stringify(fields, null, 2),
+          "json inside json": JSON.stringify({ msg: JSON.stringify(fields) }),
+          python: python(fields),
+          "inspect, one line": inspect(fields, { breakLength: Infinity, depth: 5 }),
+          "inspect, multiline": inspect(fields, { breakLength: 1, depth: 5 }),
+        };
+        for (const [name, input] of Object.entries(encodings)) {
+          const out = sanitizeErrorMessage(input);
+          assert.equal(/SECa|RETb/.test(out), false, `${name}: ${JSON.stringify(input)} -> ${out}`);
+          checked += 1;
+        }
+      }
+    }
+    assert.equal(checked, 637);
   });
 
   it("redacts the whole token, trailing punctuation included", () => {
