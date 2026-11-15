@@ -38,13 +38,17 @@ const USERINFO = /[^\s:/@"'=]+:\S*@/g;
 const QUOTED_VALUE = String.raw`\\?"(?:[^"\\]|\\[\s\S])*"?|\\?'(?:[^'\\]|\\[\s\S])*'?`;
 // A key, optionally quoted (`"password":`, `\"password\":`), then `=` or `:`.
 const KEY_TAIL = String.raw`(\\?["']?)\s*[=:]\s*`;
-// `password=…`, `PGPASSWORD=…`, `db_password: …`, `{"password":"…"}`.
-const PASSWORD_PAIR = new RegExp(String.raw`(password|passwd|pwd)${KEY_TAIL}(${QUOTED_VALUE}|${TO_WHITESPACE})`, "gi");
-// `Authorization: Basic …`, `Bearer …` or any other scheme, quoted or not.
-const AUTHORIZATION_PAIR = new RegExp(
-  String.raw`(authorization)${KEY_TAIL}(${QUOTED_VALUE}|[A-Za-z]+\s+${TO_WHITESPACE}|${TO_WHITESPACE})`,
+// `password=…`, `PGPASSWORD=…`, `db_password: …`, `{"password":"…"}`, and the
+// other secret-looking keys that `SECRET_KEY` in ./traces.ts already drops
+// from span attributes (token, secret, api key, credential, private key).
+const SECRET_PAIR = new RegExp(
+  String.raw`(password|passwd|pwd|secret|token|api[._-]?key|credential|private[._-]?key)${KEY_TAIL}(${QUOTED_VALUE}|${TO_WHITESPACE})`,
   "gi",
 );
+// `Authorization: …` (any scheme, including Digest's comma-separated
+// parameters) and `Cookie: …` (`a=1; b=2`). These values hold spaces and
+// commas, so an unquoted one is redacted to the end of its line.
+const HEADER_PAIR = new RegExp(String.raw`(authorization|cookie)${KEY_TAIL}(${QUOTED_VALUE}|[^\r\n]+)`, "gi");
 const NEON_PASSWORD = /npg_\S*/g;
 const BEARER = new RegExp(String.raw`\bBearer\s+${TO_WHITESPACE}`, "gi");
 const AGENT_CREDENTIAL = /akc_\S*/g;
@@ -55,11 +59,13 @@ export function sanitizeErrorMessage(message: string, max: number = MAX_MESSAGE)
   // A cut can leave half a secret that no pattern recognizes, so a cut message
   // also loses its last, partial token.
   const bounded = message.length > MAX_INPUT ? `${message.slice(0, MAX_INPUT).replace(/\S*$/, "")}…` : message;
+  // Key/value pairs run before USERINFO, which would otherwise eat a key and
+  // the start of its value (`password:"alpha@db bravo"`) and leave the rest.
   const cleaned = bounded
     .replace(URL_LIKE, "[url]")
+    .replace(SECRET_PAIR, "$1$2=[redacted]")
+    .replace(HEADER_PAIR, "$1$2=[redacted]")
     .replace(USERINFO, "[redacted]@")
-    .replace(PASSWORD_PAIR, "$1$2=[redacted]")
-    .replace(AUTHORIZATION_PAIR, "$1$2=[redacted]")
     .replace(NEON_PASSWORD, "[redacted]")
     .replace(BEARER, "Bearer [redacted]")
     .replace(AGENT_CREDENTIAL, "[redacted]")

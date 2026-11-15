@@ -86,6 +86,17 @@ describe("sanitizeErrorMessage", () => {
       "akc_, punctuation inside": "akc_SECa.RETb",
       "userinfo, odd host": "u:SECaRETb@-db",
       "userinfo, no host": "u:SECaRETb@ next",
+      // CodeRabbit re-review at bdf454e: pass order, and Digest parameters.
+      "quoted password holding @ and a space": 'password:"SECa@db RETb"',
+      "authorization, digest": 'Authorization: Digest username="SECa", nonce="RETb", response="RETb0123"',
+      // Other keys from SECRET_KEY in ./traces.ts.
+      "token key": "token=SECaRETb",
+      "secret key": "secret: SECaRETb",
+      "api_key key": "api_key=SECaRETb",
+      "x-api-key header": "X-Api-Key: SECaRETb",
+      "private_key json": JSON.stringify({ private_key: "SECa RETb" }),
+      "credential key": "credential=SECaRETb",
+      "cookie header": "Cookie: session=SECa; other=RETb",
       "url in json inside json": JSON.stringify({ msg: JSON.stringify({ url: "postgres://u:SECa@h/db?x=RETb" }) }),
       "userinfo, slash": "u:SECa/RETb@h",
       "authorization, bearer": "Authorization: Bearer SECaRETb",
@@ -103,9 +114,24 @@ describe("sanitizeErrorMessage", () => {
     assert.equal(sanitizeErrorMessage("password=Secret! then"), "password=[redacted] then");
     assert.equal(sanitizeErrorMessage("postgres://db/db?password=Secret! then"), "[url] then");
     assert.equal(sanitizeErrorMessage("Bearer Secret! then"), "Bearer [redacted] then");
-    assert.equal(sanitizeErrorMessage("Authorization: Basic Secret! then"), "Authorization=[redacted] then");
+    // A header value runs to the end of its line (Digest parameters hold spaces and commas).
+    assert.equal(sanitizeErrorMessage("Authorization: Basic Secret! then\nnext line"), "Authorization=[redacted] next line");
     assert.equal(sanitizeErrorMessage("npg_Sec!ret) then"), "[redacted] then");
     assert.equal(sanitizeErrorMessage("u:Secret!@-db then"), "[redacted]@-db then");
+  });
+
+  it("leaves ordinary Postgres and driver messages as they are", () => {
+    for (const msg of [
+      "Unexpected token } in JSON at position 5",
+      'duplicate key value violates unique constraint "agent_credentials_token_hash_key"',
+      "Key (token_hash)=(0123abcd) already exists.",
+      'password authentication failed for user "ak_owner"',
+      'column "token_prefix" of relation "agent_credentials" does not exist',
+      "credential_store_unavailable",
+      "Error connecting to database: TypeError: fetch failed",
+    ]) {
+      assert.equal(sanitizeErrorMessage(msg), msg);
+    }
   });
 
   // CodeRabbit re-review of PR #157 at 91df6c6.
