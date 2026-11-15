@@ -19,13 +19,19 @@ const MAX_MESSAGE = 300;
 const MAX_INPUT = 2000;
 const MAX_DEPTH = 3;
 
-// A URL runs to the next whitespace: credentials, path and query may hold any
-// other character (parentheses, quotes, `@`, `/`), and a `?password=…` key
-// must not be cut off from its value. Only trailing punctuation and closing
-// brackets or quotes are given back, so "…/db, retrying" keeps its comma.
-const URL_LIKE = /\b[a-z][a-z0-9+.-]*:\/\/\S*[^\s.,;:!?)\]}"'>]/gi;
-// `user:password@host` without a scheme. The password may hold `/` and quotes.
-const USERINFO = /[^\s:/@"'=]+:[^\s@]+@(?=[A-Za-z0-9[])/g;
+// One rule for every unquoted secret: it runs to the next whitespace, whatever
+// characters it holds (parentheses, quotes, commas, `@`, `/`). Stopping at any
+// other character leaves the rest of the secret behind. Only trailing
+// punctuation and closing brackets or quotes are given back, so
+// "…/db, retrying" keeps its comma. A value made only of punctuation is
+// taken whole.
+const TO_WHITESPACE = String.raw`(?:\S*[^\s.,;:!?)\]}"'>]|\S+)`;
+// A URL. A `?password=…` key inside it goes with it, so it is never cut off
+// from its value.
+const URL_LIKE = new RegExp(String.raw`\b[a-z][a-z0-9+.-]*:\/\/${TO_WHITESPACE}`, "gi");
+// `user:password@host` without a scheme. The password runs to the last `@`
+// of its token, so it may hold `@`, `/` and quotes.
+const USERINFO = /[^\s:/@"'=]+:\S*@(?=[A-Za-z0-9[])/g;
 // A quoted value: `"…"` or `'…'`, opened by a bare or backslash-escaped quote
 // (JSON inside JSON), with any backslash escape inside it (`\"`, `\\`, a
 // backslash before a line break). With no closing quote (cut off by MAX_INPUT)
@@ -35,14 +41,14 @@ const QUOTED_VALUE = String.raw`\\?"(?:[^"\\]|\\[\s\S])*"?|\\?'(?:[^'\\]|\\[\s\S
 // A key, optionally quoted (`"password":`, `\"password\":`), then `=` or `:`.
 const KEY_TAIL = String.raw`(\\?["']?)\s*[=:]\s*`;
 // `password=…`, `PGPASSWORD=…`, `db_password: …`, `{"password":"…"}`.
-const PASSWORD_PAIR = new RegExp(String.raw`(password|passwd|pwd)${KEY_TAIL}(${QUOTED_VALUE}|[^\s,;&]+)`, "gi");
+const PASSWORD_PAIR = new RegExp(String.raw`(password|passwd|pwd)${KEY_TAIL}(${QUOTED_VALUE}|${TO_WHITESPACE})`, "gi");
 // `Authorization: Basic …`, `Bearer …` or any other scheme, quoted or not.
 const AUTHORIZATION_PAIR = new RegExp(
-  String.raw`(authorization)${KEY_TAIL}(${QUOTED_VALUE}|[A-Za-z]+\s+[^\s"',;]+|[^\s"',;]+)`,
+  String.raw`(authorization)${KEY_TAIL}(${QUOTED_VALUE}|[A-Za-z]+\s+${TO_WHITESPACE}|${TO_WHITESPACE})`,
   "gi",
 );
 const NEON_PASSWORD = /npg_[A-Za-z0-9]+/g;
-const BEARER = /\bBearer\s+[^\s"',;]+/gi;
+const BEARER = new RegExp(String.raw`\bBearer\s+${TO_WHITESPACE}`, "gi");
 const AGENT_CREDENTIAL = /akc_[A-Za-z0-9_-]+/g;
 const SAFE_CODE = /^[A-Za-z0-9_]{1,40}$/;
 

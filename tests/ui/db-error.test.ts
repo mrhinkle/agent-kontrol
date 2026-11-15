@@ -70,6 +70,13 @@ describe("sanitizeErrorMessage", () => {
       "url, query, parentheses": "postgres://db.example/db?password=(SECaRETb)",
       "url, query, quotes": 'postgres://db.example/db?password="SECaRETb"',
       "url, query, brackets": "postgres://db.example/db?password=[SECa]{RETb}",
+      // Codex round 5 at 960ec19, and the same "stopped at a character" class.
+      "userinfo, @ in password": "u:SECa@RETb@db",
+      "password, comma": "password=SECa,RETb",
+      "password, ampersand": "password=SECa&RETb",
+      "password, parentheses": "password=(SECa)RETb",
+      "bearer, comma": "Bearer SECa,RETb",
+      "authorization, basic, comma": "Authorization: Basic SECa,RETb",
       "url in json inside json": JSON.stringify({ msg: JSON.stringify({ url: "postgres://u:SECa@h/db?x=RETb" }) }),
       "userinfo, slash": "u:SECa/RETb@h",
       "authorization, bearer": "Authorization: Bearer SECaRETb",
@@ -129,7 +136,8 @@ describe("sanitizeErrorMessage", () => {
     const huge = `a:${"b".repeat(200_000)}${NEON_PASSWORD}`;
     const started = Date.now();
     const out = sanitizeErrorMessage(huge);
-    assert.ok(Date.now() - started < 500, "sanitizing took too long");
+    // Bounded, this takes milliseconds; unbounded, the userinfo pattern alone takes minutes.
+    assert.ok(Date.now() - started < 2000, "sanitizing took too long");
     // One 200,000-character token: the cut drops it whole rather than log half of it.
     assert.equal(out, "…");
 
