@@ -194,7 +194,33 @@ describe("sanitizeErrorMessage", () => {
     assert.equal(checked, 140);
   });
 
-  // Found while fixing the finding above: an object or array under a secret
+  // Codex review of PR #157 at 8ae1d22: a literal under a quoted key ended at
+  // any comma, so malformed text such as `{"password":123,SECa RETb}` kept the
+  // rest. A literal now ends early only before a real next field or `}`/`]`,
+  // and any other bare value under a quoted key is redacted to the end of its line.
+  it("redacts a malformed bare value under a quoted key to the end of its line", () => {
+    for (const input of [
+      '{"password":123,SECa RETb}',
+      '{"password":123,SECaRETb}',
+      '{"token":null,SECa}',
+      '{"password":true,"SECa"}',
+      "{'pwd': None, SECaRETb}",
+      '{"password":-1.5e3,SECaRETb}',
+      '"password":123,SECaRETb',
+      '{"password":12 SECa}',
+      '{"secret":false , SECa RETb}',
+      '{\\"token\\":null,SECa RETb}',
+      '{"authorization":null,SECa RETb}',
+    ]) {
+      const out = sanitizeErrorMessage(`${input}\nnext line`);
+      assert.equal(/SECa|RETb/.test(out), false, `${input} -> ${out}`);
+      assert.match(out, /next line$/, `${input} -> ${out}`);
+    }
+    assert.equal(sanitizeErrorMessage('{"token":5,\n  "message": "ok"}'), '{"token"=[redacted], "message": "ok"}');
+    assert.equal(sanitizeErrorMessage('column "token" does not exist'), 'column "token" does not exist');
+  });
+
+  // Found while fixing the Codex finding at 1030f65: an object or array under a secret
   // key holds quoted text with spaces, so it is redacted to the end of the message.
   it("leaves no part of a secret in an object or array under a secret key", () => {
     let checked = 0;
