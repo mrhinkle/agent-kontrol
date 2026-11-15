@@ -110,6 +110,56 @@ describe("sanitizeErrorMessage", () => {
     }
   });
 
+  // CodeRabbit re-review of PR #157 at 6e27b5a: in compact JSON an unquoted
+  // value (`"token":null`) ran on into the next key and left the rest of that
+  // key's value. Swept here across keys, first values, second fields and encodings.
+  it("leaves no part of a secret in the field after an unquoted value", () => {
+    const seconds: Array<[string, string]> = [
+      ["password", "SECa RETb"],
+      ["authorization", "Basic SECa RETb"],
+      ["authorization", 'Digest username="u", response="SECa RETb"'],
+      ["cookie", "a=SECa; b=RETb"],
+      ["note", "Bearer SECaRETb"],
+      ["note", "via npg_SECaRETb"],
+      ["note", "via akc_SECaRETb"],
+      ["dsn", "postgresql://u:SECaRETb@h/db"],
+      ["dsn", "u:SECaRETb@h"],
+    ];
+    let checked = 0;
+    for (const firstKey of ["token", "password", "api_key", "secret"]) {
+      for (const firstValue of [null, 123, true]) {
+        for (const [key, value] of seconds) {
+          const fields = { [firstKey]: firstValue, [key]: value };
+          const encodings: Record<string, string> = {
+            json: JSON.stringify(fields),
+            "json, spaced": JSON.stringify(fields, null, 1).replace(/\n/g, ""),
+            "json inside json": JSON.stringify({ msg: JSON.stringify(fields) }),
+            python: `{'${firstKey}': ${firstValue === null ? "None" : String(firstValue)}, '${key}': '${value.replace(/'/g, "\\'")}'}`,
+            "key=value": `${firstKey}=${String(firstValue)},${key}="${value.replace(/"/g, '\\"')}"`,
+          };
+          for (const [name, input] of Object.entries(encodings)) {
+            const out = sanitizeErrorMessage(input);
+            assert.equal(/SECa|RETb/.test(out), false, `${name}: ${input} -> ${out}`);
+            checked += 1;
+          }
+        }
+      }
+    }
+    assert.equal(checked, 540);
+  });
+
+  it("redacts a field once and keeps what follows it", () => {
+    assert.equal(
+      sanitizeErrorMessage(JSON.stringify({ authorization: "Basic SECa RETb", user: "ak" })),
+      '{"authorization"=[redacted],"user":"ak"}',
+    );
+    assert.equal(sanitizeErrorMessage(JSON.stringify({ password: "SECa RETb", user: "ak" })), '{"password"=[redacted],"user":"ak"}');
+    assert.equal(sanitizeErrorMessage(JSON.stringify({ token: null, password: "SECa RETb" })), '{"token"=[redacted]');
+    // The internal stand-in for a redacted value cannot be forged by the message.
+    assert.equal(sanitizeErrorMessage("password=SECaRETb"), "password=[redacted]");
+    assert.equal(sanitizeErrorMessage("Authorization: SECa RETb"), "Authorization=[redacted]");
+  });
+
   it("redacts the whole token, trailing punctuation included", () => {
     assert.equal(sanitizeErrorMessage("password=Secret! then"), "password=[redacted] then");
     assert.equal(sanitizeErrorMessage("postgres://db/db?password=Secret! then"), "[url] then");

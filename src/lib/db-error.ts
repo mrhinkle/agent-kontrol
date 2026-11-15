@@ -41,14 +41,21 @@ const KEY_TAIL = String.raw`(\\?["']?)\s*[=:]\s*`;
 // `password=…`, `PGPASSWORD=…`, `db_password: …`, `{"password":"…"}`, and the
 // other secret-looking keys that `SECRET_KEY` in ./traces.ts already drops
 // from span attributes (token, secret, api key, credential, private key).
-const SECRET_PAIR = new RegExp(
-  String.raw`(password|passwd|pwd|secret|token|api[._-]?key|credential|private[._-]?key)${KEY_TAIL}(${QUOTED_VALUE}|${TO_WHITESPACE})`,
-  "gi",
-);
+const SECRET_KEYS = String.raw`password|passwd|pwd|secret|token|api[._-]?key|credential|private[._-]?key`;
 // `Authorization: …` (any scheme, including Digest's comma-separated
-// parameters) and `Cookie: …` (`a=1; b=2`). These values hold spaces and
-// commas, so an unquoted one is redacted to the end of its line.
-const HEADER_PAIR = new RegExp(String.raw`(authorization|cookie)${KEY_TAIL}(${QUOTED_VALUE}|[^\r\n]+)`, "gi");
+// parameters) and `Cookie: …` (`a=1; b=2`).
+const HEADER_KEYS = String.raw`authorization|cookie`;
+// Any of those keys with a quoted value.
+const QUOTED_PAIR = new RegExp(String.raw`(${SECRET_KEYS}|${HEADER_KEYS})${KEY_TAIL}(${QUOTED_VALUE})`, "gi");
+// Stands in for a value already redacted, so the passes after QUOTED_PAIR
+// leave it (and the `}` or `,` after it) alone. Removed from the input first,
+// so no message can forge it.
+const DONE = "\uE000";
+const NOT_DONE = String.raw`(?!\uE000)`;
+// A header value holds spaces and commas, so an unquoted one runs to the end of its line.
+const HEADER_LINE = new RegExp(String.raw`(${HEADER_KEYS})${KEY_TAIL}${NOT_DONE}([^\r\n]+)`, "gi");
+// A secret key with an unquoted value, which runs to the next whitespace.
+const SECRET_WORD = new RegExp(String.raw`(${SECRET_KEYS})${KEY_TAIL}${NOT_DONE}(${TO_WHITESPACE})`, "gi");
 const NEON_PASSWORD = /npg_\S*/g;
 const BEARER = new RegExp(String.raw`\bBearer\s+${TO_WHITESPACE}`, "gi");
 const AGENT_CREDENTIAL = /akc_\S*/g;
@@ -58,17 +65,25 @@ const SAFE_CODE = /^[A-Za-z0-9_]{1,40}$/;
 export function sanitizeErrorMessage(message: string, max: number = MAX_MESSAGE): string {
   // A cut can leave half a secret that no pattern recognizes, so a cut message
   // also loses its last, partial token.
-  const bounded = message.length > MAX_INPUT ? `${message.slice(0, MAX_INPUT).replace(/\S*$/, "")}…` : message;
-  // Key/value pairs run before USERINFO, which would otherwise eat a key and
-  // the start of its value (`password:"alpha@db bravo"`) and leave the rest.
+  const unmarked = message.replaceAll(DONE, "");
+  const bounded = unmarked.length > MAX_INPUT ? `${unmarked.slice(0, MAX_INPUT).replace(/\S*$/, "")}…` : unmarked;
+  // The order matters. An unquoted value runs to the next whitespace, so in
+  // compact JSON (`{"token":null,"password":"alpha bravo"}`) it would swallow
+  // the next key and the start of its value and leave the rest. Every pattern
+  // that knows where its own secret ends (quoted values, header lines, bearer
+  // tokens) therefore runs before SECRET_WORD. Key/value pairs run before
+  // USERINFO, which would otherwise eat a key and the start of its value
+  // (`password:"alpha@db bravo"`) and leave the rest.
   const cleaned = bounded
     .replace(URL_LIKE, "[url]")
-    .replace(SECRET_PAIR, "$1$2=[redacted]")
-    .replace(HEADER_PAIR, "$1$2=[redacted]")
+    .replace(QUOTED_PAIR, `$1$2=${DONE}`)
+    .replace(HEADER_LINE, `$1$2=${DONE}`)
+    .replace(BEARER, "Bearer [redacted]")
+    .replace(SECRET_WORD, `$1$2=${DONE}`)
     .replace(USERINFO, "[redacted]@")
     .replace(NEON_PASSWORD, "[redacted]")
-    .replace(BEARER, "Bearer [redacted]")
     .replace(AGENT_CREDENTIAL, "[redacted]")
+    .replaceAll(DONE, "[redacted]")
     .replace(/\s+/g, " ")
     .trim();
   const scrubbed = redactText(cleaned, Number.MAX_SAFE_INTEGER);
