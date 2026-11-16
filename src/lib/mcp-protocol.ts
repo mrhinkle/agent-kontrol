@@ -13,6 +13,15 @@ const FRAME_CAP = 1024 * 1024;
 const TAIL = 4;
 const CAUSE_CAP = 1000;
 
+/**
+ * Combined array elements and object members allowed in one `tools/call`
+ * arguments object. The SDK counts those and stops before Zod. 4096 is
+ * above a full watched-repo write (25 repos) and the owner cap (20), and a
+ * schema rejection at this ceiling stays under the 1 MiB frame cap. Strings
+ * do not count. The frame cap itself stays 1 MiB.
+ */
+export const MCP_MAX_TOOL_INPUT_ELEMENTS = 4096;
+
 const storage = new AsyncLocalStorage<{ initialCredentialStoreOutage: boolean }>();
 
 export function runWithMcpRequest<T>(fn: () => T): T {

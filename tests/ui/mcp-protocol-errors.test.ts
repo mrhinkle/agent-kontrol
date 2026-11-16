@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { createCredential, plantCredentialForTests, resetCredentialsForTests, revokeCredential } from "../../src/lib/credentials";
 import { setSqlForTests } from "../../src/lib/db";
 import { demoStoreSize, resetDemoStoreForTests } from "../../src/lib/demo-store";
-import { enrichMcpResponse } from "../../src/lib/mcp-protocol";
+import { enrichMcpResponse, MCP_MAX_TOOL_INPUT_ELEMENTS } from "../../src/lib/mcp-protocol";
 
 /**
  * Issue #52 Q6, MCP response boundary. Drives the exported /api/mcp route
@@ -73,14 +73,17 @@ function toolCall(id: number, name: string, args: unknown) {
 }
 
 async function rpc(res: Response): Promise<any> {
+  return (await messageOf(res)).message;
+}
+
+async function messageOf(res: Response): Promise<{ bytes: number; message: any }> {
   const type = res.headers.get("content-type") ?? "";
   const text = await res.text();
-  if (!text) return null;
-  if (type.includes("application/json")) return JSON.parse(text);
+  if (!text) return { bytes: 0, message: null };
+  if (type.includes("application/json")) return { bytes: text.length, message: JSON.parse(text) };
   const frames = text.split(/\n\n|\r\n\r\n/).filter((frame) => frame.trim().length > 0);
   const messages = frames.flatMap((frame) => frame.split(/\r?\n/).filter((line) => line.startsWith("data:")).map((line) => JSON.parse(line.slice(5).trim())));
-  if (messages.length === 1) return messages[0];
-  return messages;
+  return { bytes: text.length, message: messages.length === 1 ? messages[0] : messages };
 }
 
 function challenge(res: Response): string {
@@ -294,6 +297,74 @@ describe("MCP SDK errors, quota, and success", { concurrency: false }, () => {
     assert.match(body.result.structuredContent.cause, /-32602/);
     assert.equal(body.result.structuredContent.code === "mcp_invalid_params", false);
     assert.equal(demoStoreSize().notes, 0);
+  });
+
+  it("rejects an oversized arguments object before Zod and still teaches the short isError", async () => {
+    env.MC_TOKEN = "test-mc-token";
+    assert.equal(MCP_MAX_TOOL_INPUT_ELEMENTS, 4096);
+    // The SDK counts the content key, the tags key, and each tag. Exactly 4096 is allowed.
+    const atLimit = MCP_MAX_TOOL_INPUT_ELEMENTS - 2;
+    const token = "test-mc-token";
+
+    function assertShortCap(message: any, id: number) {
+      assert.equal(message.id, id);
+      assert.equal(message.error, undefined);
+      assert.equal(message.result.isError, true);
+      const text = message.result.content[0].text as string;
+      assert.match(text, /-32602/);
+      assert.match(text, /maximum of 4096/);
+      assert.equal(message.result.structuredContent.code, "mcp_tool_error");
+      assert.equal(message.result.structuredContent.retryable, false);
+      assert.equal(typeof message.result.structuredContent.fix, "string");
+      assert.match(message.result.structuredContent.cause, /maximum of 4096/);
+    }
+
+    const huge = await messageOf(await post(token, toolCall(700, "remember", {
+      content: "test",
+      tags: Array.from({ length: 20000 }, () => 1),
+    })));
+    assert.ok(huge.bytes < 8192);
+    assertShortCap(huge.message, 700);
+    assert.equal(demoStoreSize().notes, 0);
+
+    const above = await messageOf(await post(token, toolCall(701, "remember", {
+      content: "test",
+      tags: Array.from({ length: atLimit + 1 }, () => 1),
+    })));
+    assert.ok(above.bytes < 8192);
+    assertShortCap(above.message, 701);
+    assert.equal(demoStoreSize().notes, 0);
+
+    const below = await messageOf(await post(token, toolCall(702, "remember", {
+      content: "test",
+      tags: Array.from({ length: atLimit }, () => 1),
+    })));
+    assert.ok(below.bytes > 50_000);
+    assert.ok(below.bytes < 1024 * 1024);
+    assert.equal(below.message.id, 702);
+    assert.equal(below.message.error, undefined);
+    assert.equal(below.message.result.isError, true);
+    const belowText = below.message.result.content[0].text as string;
+    assert.match(belowText, /-32602/);
+    assert.equal(belowText.includes("maximum of 4096"), false);
+    assert.equal(below.message.result.structuredContent.code, "mcp_tool_error");
+    assert.equal(below.message.result.structuredContent.retryable, false);
+    assert.equal(demoStoreSize().notes, 0);
+
+    const invalid = await messageOf(await post(token, toolCall(703, "remember", { tags: [1] })));
+    assert.equal(invalid.message.id, 703);
+    assert.equal(invalid.message.result.isError, true);
+    assert.match(invalid.message.result.content[0].text, /-32602/);
+    assert.equal(invalid.message.result.structuredContent.code, "mcp_tool_error");
+    assert.equal(demoStoreSize().notes, 0);
+
+    const ok = await messageOf(await post(token, toolCall(704, "remember", { content: "test", tags: ["one"] })));
+    assert.equal(ok.message.id, 704);
+    assert.equal(ok.message.error, undefined);
+    assert.equal(ok.message.result.isError, undefined);
+    assert.match(ok.message.result.content[0].text, /Stored memory/);
+    assert.equal(ok.message.result.structuredContent.receipt.kind, "remember");
+    assert.equal(demoStoreSize().notes, 1);
   });
 
   it("passes an application error envelope through without structuredContent", async () => {
