@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { withTransaction, type SqlTag } from "./db";
 import { streamControlBody } from "./events-http";
+import { insertToolReceipt } from "./tool-receipt";
 
 // A literal end assertion also rejects the trailing newline JavaScript's $ permits.
 export const CONSUMER_ID = /^[a-z0-9][a-z0-9._-]{0,63}(?![\s\S])/;
@@ -61,17 +62,47 @@ export function cursorPosition(consumer: string, cursor: string | null): string 
   return parts[1];
 }
 
+/** Events kind for a registration write. The target credential id is not this actor. */
+export const EVENT_CONSUMER_REGISTER_RECEIPT = "event_consumer.register";
+
+/**
+ * Bind one credential, filter, and generation.
+ * The receipt actor is the authenticated registrant from the route.
+ * `credential_id` is the target binding, not that actor.
+ * An ineligible credential, a credential already bound to another consumer,
+ * or a receipt that stores no row leaves the table unchanged.
+ */
 export async function registerStreamConsumer(c: ConsumerRegistration): Promise<void> {
   await withTransaction(async tx => {
     const credentials = await tx`select id from agent_credentials where id = ${c.credential_id}
       and revoked_at is null and (expires_at is null or expires_at > clock_timestamp())
       and 'events:read' = any(scopes) for share`;
     if (!credentials.length) throw new EventStreamError("credential_not_eligible", 400);
-    await tx`insert into event_stream_consumers (id, credential_id, repos, event_types, enabled)
+    const rows = await tx`insert into event_stream_consumers (id, credential_id, repos, event_types, enabled)
       values (${c.id}, ${c.credential_id}, ${c.repos}::text[], ${c.event_types}::text[], ${c.enabled})
       on conflict (id) do update set credential_id = excluded.credential_id, repos = excluded.repos,
       event_types = excluded.event_types, enabled = excluded.enabled,
-      generation = event_stream_consumers.generation + 1, updated_at = clock_timestamp()`;
+      generation = event_stream_consumers.generation + 1, updated_at = clock_timestamp()
+      returning id, credential_id, generation::text as generation, enabled, repos, event_types`;
+    const row = rows[0];
+    if (!row || row.id !== c.id || row.credential_id !== c.credential_id) {
+      throw new Error("consumer registration missing");
+    }
+    const generation = typeof row.generation === "string" ? row.generation : "";
+    if (!/^(0|[1-9][0-9]{0,18})$/.test(generation)) throw new Error("consumer generation missing");
+    await insertToolReceipt(tx, {
+      kind: EVENT_CONSUMER_REGISTER_RECEIPT,
+      title: "Event consumer registered",
+      extra: {
+        operation: "register",
+        consumer_id: c.id,
+        credential_id: c.credential_id,
+        generation,
+        enabled: row.enabled === true,
+        repos: stringList(row.repos),
+        event_types: stringList(row.event_types),
+      },
+    });
   }).catch(error => {
     const pg = error as { code?: string; constraint?: string };
     if (pg?.code === "23505" && pg.constraint === "event_stream_consumers_credential_id_key") {
@@ -79,6 +110,13 @@ export async function registerStreamConsumer(c: ConsumerRegistration): Promise<v
     }
     throw error;
   });
+}
+
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new Error("consumer filter missing");
+  }
+  return value.slice();
 }
 
 async function binding(tx: SqlTag, consumer: string, credential: string) {

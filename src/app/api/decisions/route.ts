@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { enforceApi } from "@/lib/auth";
+import { actorFromPrincipal, runWithActor } from "@/lib/actor";
+import { deny, enforceApi, resolveApiAccess } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import {
@@ -31,6 +32,8 @@ export const maxDuration = 30;
  * POST /api/decisions
  *      Upsert one row by key, or { reconcile: { repo, source, seen_keys } }
  *      to withdraw label-sourced rows the collector did not see.
+ *      The receipt actor is this request's principal. Body actor fields,
+ *      requested_by, and agent_id are not authority.
  */
 
 const DEMO_NOTE = "DATABASE_URL not set; decision dropped";
@@ -69,8 +72,9 @@ export async function GET(req: Request) {
 }
 
 export async function POST(req: Request) {
-  const denied = await enforceApi(req);
-  if (denied) return denied;
+  const access = await resolveApiAccess(req);
+  if (!access.ok) return deny(access);
+  const actor = actorFromPrincipal(access.principal);
   const read = await readJson(req);
   if (!read.ok) return read.response;
   const body = read.body;
@@ -90,8 +94,8 @@ export async function POST(req: Request) {
     if (!parsed.ok) return apiError(parsed.code, { message: parsed.message, fields: parsed.fields });
     if (!isConfigured()) return NextResponse.json({ ok: true, demo: true, note: DEMO_NOTE });
     try {
-      const result = await reconcileDecisions(parsed.value);
-      return NextResponse.json({ ok: true, ...result });
+      const result = await runWithActor(actor, () => reconcileDecisions(parsed.value));
+      return NextResponse.json({ ok: true, reconciled: result.reconciled, withdrawn: result.withdrawn });
     } catch (e) {
       return publicError("[decisions] reconcile failed", e);
     }
@@ -101,7 +105,7 @@ export async function POST(req: Request) {
   if (!parsed.ok) return apiError(parsed.code, { message: parsed.message, fields: parsed.fields });
   if (!isConfigured()) return NextResponse.json({ ok: true, demo: true, note: DEMO_NOTE });
   try {
-    const result = await upsertDecision(parsed.value);
+    const result = await runWithActor(actor, () => upsertDecision(parsed.value));
     if (result.writeback_in_progress) {
       return apiError("writeback_in_progress", {
         message: "A write-back is in progress for this decision.",

@@ -17,12 +17,12 @@ import { isConfigured } from "./db";
 import { parseDeferInstant, readOptions } from "./decision-format";
 import { writeDecisionBack, type WritebackOutcome } from "./decision-writeback";
 import {
+  commitDecisionPatch,
   decisionPersistenceOn,
   decisionWritebackLocked,
   getDecision,
   isDecisionStatus,
   parseListQuery,
-  patchDecision,
   listDecisions,
   upsertDecision,
   usingDecisionTestStore,
@@ -48,7 +48,7 @@ export interface ResolveBody {
 }
 
 export type ResolveOutcome =
-  | { ok: true; decision: Decision }
+  | { ok: true; decision: Decision; receipt?: Receipt | null }
   | {
       ok: false;
       code: "not_found" | "conflict" | "stale" | "writeback_in_progress" | "validation_failed" | "missing_field";
@@ -179,7 +179,14 @@ function writebackInProgress(): ResolveOutcome {
   };
 }
 
-export async function resolveDecision(input: ResolveBody & { id: number; actor: Actor | null }): Promise<ResolveOutcome> {
+export async function resolveDecision(
+  input: ResolveBody & {
+    id: number;
+    actor: Actor | null;
+    recordReopen?: boolean;
+    recordResolveReceipt?: boolean;
+  },
+): Promise<ResolveOutcome> {
   const row = await getDecision(input.id);
   if (!row) return notFound();
   if (input.expected_revision != null && row.revision !== input.expected_revision) return stale();
@@ -217,7 +224,7 @@ export async function resolveDecision(input: ResolveBody & { id: number; actor: 
     };
   }
 
-  const updated = await patchDecision(input.id, {
+  const updated = await commitDecisionPatch(input.id, {
     status: next,
     decision: decisionText ?? null,
     setDecision: decisionText !== undefined,
@@ -233,6 +240,8 @@ export async function resolveDecision(input: ResolveBody & { id: number; actor: 
     expectedUpdatedAt: input.expected_updated_at ?? null,
     expectedRevision: input.expected_revision ?? null,
     guardTerminal: true,
+    recordReopen: input.recordReopen === true,
+    recordResolveReceipt: input.recordResolveReceipt === true,
   });
   if (!updated) {
     const again = await getDecision(input.id);
@@ -242,8 +251,12 @@ export async function resolveDecision(input: ResolveBody & { id: number; actor: 
     if (again.status === "decided" || again.status === "withdrawn") return terminalConflict();
     return notFound();
   }
-  if (updated.status !== "decided") return { ok: true, decision: updated };
-  return afterWrite(updated, await writeDecisionBack(updated));
+  if (updated.decision.status !== "decided") {
+    return { ok: true, decision: updated.decision, receipt: updated.receipt };
+  }
+  const followed = await afterWrite(updated.decision, await writeDecisionBack(updated.decision));
+  if (!followed.ok) return followed;
+  return { ok: true, decision: followed.decision, receipt: updated.receipt };
 }
 
 /**
@@ -298,11 +311,14 @@ function text(value: string): McpToolResult {
 }
 
 /**
- * Receipt after the decision row is stored. Validation, stale, conflict, and
- * writeback_in_progress return before this. A test store, or no database,
- * uses the same in-memory events list as the other demo write tools.
+ * Receipt after resolve stores the decision row. request_decision returns the
+ * receipt upsertDecision commits with the row, so this is not called twice.
+ * An MCP reopen already stored `resolve_decision` in the patch transaction;
+ * the tool returns that receipt and does not call this. Validation, stale,
+ * conflict, and writeback_in_progress return before this. A test store, or
+ * no database, uses the same in-memory events list as the other demo write tools.
  */
-async function receiptFor(kind: "request_decision" | "resolve_decision", decision: Decision): Promise<Receipt | null> {
+async function receiptFor(kind: "resolve_decision", decision: Decision): Promise<Receipt | null> {
   const title = decision.title.slice(0, 200);
   const extra = { decision_id: decision.id, key: decision.key, status: decision.status };
   if (!isConfigured() || usingDecisionTestStore()) return recordDemoActivity(kind, title, extra);
@@ -356,9 +372,11 @@ export async function requestDecisionTool(args: {
     first_seen_at: null,
     github_present: null,
     force: false,
-  });
-  const receipt = await receiptFor("request_decision", result.decision);
-  return withReceipt(JSON.stringify({ status_held: result.status_held, decision: result.decision }), receipt);
+  }, "request");
+  return withReceipt(
+    JSON.stringify({ status_held: result.status_held, decision: result.decision }),
+    result.receipt ?? null,
+  );
 }
 
 export async function listDecisionsTool(args: {
@@ -397,8 +415,13 @@ export async function resolveDecisionTool(args: {
     ...(args.expected_revision !== undefined ? { expected_revision: args.expected_revision } : {}),
   });
   if (!parsed.ok) return mcpToolError(parsed.code, { message: parsed.message, fields: parsed.fields });
-  const outcome = await resolveDecision({ ...parsed.value, id: args.id, actor });
+  const outcome = await resolveDecision({
+    ...parsed.value,
+    id: args.id,
+    actor,
+    recordResolveReceipt: parsed.value.status === "open",
+  });
   if (!outcome.ok) return mcpToolError(outcome.code, { message: outcome.message, fields: outcome.fields });
-  const receipt = await receiptFor("resolve_decision", outcome.decision);
+  const receipt = outcome.receipt ?? await receiptFor("resolve_decision", outcome.decision);
   return withReceipt(JSON.stringify({ decision: outcome.decision }), receipt);
 }
