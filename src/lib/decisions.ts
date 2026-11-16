@@ -25,7 +25,9 @@ import { insertToolReceipt } from "./tool-receipt";
  * The upsert label uses the status the locked write replaced, including a
  * row another transaction committed while this statement waited. `actor_type`
  * and `actor_id` on the row stay the resolver. A blocked reopen, or a
- * reconcile that changes nothing, stores no receipt.
+ * reconcile that changes nothing, stores no receipt. A REST reopen stores
+ * one receipt for the principal in the same transaction when the locked row
+ * was decided, deferred, or withdrawn. The row's resolver columns still clear.
  */
 
 export const DECISION_STATUSES = ["open", "decided", "deferred", "withdrawn"] as const;
@@ -34,6 +36,8 @@ export const DECISION_STATUSES = ["open", "decided", "deferred", "withdrawn"] as
 export const DECISION_UPSERT_RECEIPT = "decision.upsert";
 export const DECISION_FORCE_REOPEN_RECEIPT = "decision.force_reopen";
 export const DECISION_RECONCILE_RECEIPT = "decision.reconcile";
+/** REST PATCH status=open. Not the collector force-reopen and not MCP resolve. */
+export const DECISION_REOPEN_RECEIPT = "decision.reopen";
 
 /**
  * How long a write-back may hold `writeback_lock`. Neon HTTP cannot keep a
@@ -230,6 +234,13 @@ export interface PatchInput {
    * on every mutation so omitting status cannot change the answer text.
    */
   guardTerminal?: boolean;
+  /**
+   * REST reopen only. Set from the authenticated route, never from the body.
+   * A successful open of a decided, deferred, or withdrawn row stores one
+   * receipt in this transaction. MCP resolve does not set it, so its later
+   * receipt stays the only one. A zero-row update stores nothing.
+   */
+  recordReopen?: boolean;
 }
 
 export interface DecisionStore {
@@ -1276,13 +1287,17 @@ export async function patchDecision(id: number, input: PatchInput): Promise<Deci
     const row = await testStore.patch(id, input);
     return row ? presentDecision(row, now) : null;
   }
-  const db = sql();
   const status = input.status ?? null;
   const setActor = input.setActor === true;
   const setChosen = input.setChosen === true;
   const guardTerminal = input.guardTerminal === true;
   const expectedRevision = input.expectedRevision ?? null;
+  return withTransaction(async (db) => {
   const rows = await db`
+    with cleared as materialized (
+      select set_config('ak.decision_previous_status', '', true) as cleared
+    ),
+    updated as (
     update decisions
     set
       status = coalesce(${status}, status),
@@ -1338,9 +1353,13 @@ export async function patchDecision(id: number, input: PatchInput): Promise<Deci
         when ${status} = 'open' then null
         else writeback_lock_at
       end,
-      revision = revision + 1,
+      -- Record the locked row's pre-update status. The added term is zero.
+      revision = revision
+        + 1
+        + octet_length(set_config('ak.decision_previous_status', decisions.status, true)) * 0,
       updated_at = now()
     where id = ${id}
+      and (select count(*) from cleared) = 1
       and (
         ${expectedRevision}::int is null
         or revision = ${expectedRevision}
@@ -1356,8 +1375,32 @@ export async function patchDecision(id: number, input: PatchInput): Promise<Deci
         or writeback_lock_at < now() - make_interval(secs => ${WRITEBACK_LOCK_LEASE_SECONDS})
       )
     returning *
+    )
+    select updated.*, nullif(current_setting('ak.decision_previous_status', true), '') as previous_status
+    from updated
   `;
   const row = rows[0];
   if (!row) return null;
-  return presentDecision(row, now);
+  const previous = typeof row.previous_status === "string" ? row.previous_status : null;
+  const decision = presentDecision(row, now);
+  const reopened = input.recordReopen === true
+    && decision.status === "open"
+    && (previous === "decided" || previous === "deferred" || previous === "withdrawn");
+  if (reopened) {
+    const key = typeof row.key === "string" ? row.key : "";
+    if (!key) throw new Error("decision key missing");
+    await insertToolReceipt(db, {
+      kind: DECISION_REOPEN_RECEIPT,
+      title: "Decision reopened",
+      extra: {
+        operation: "reopen",
+        decision_id: decisionResourceId(row.id),
+        key,
+        source: decision.source,
+        status: decision.status,
+      },
+    });
+  }
+  return decision;
+  });
 }

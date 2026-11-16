@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { apiError, publicError } from "@/lib/api-error";
-import { actorFromPrincipal } from "@/lib/actor";
+import { actorFromPrincipal, runWithActor } from "@/lib/actor";
 import { deny, resolveApiAccess } from "@/lib/auth";
 import { decisionPersistenceOn, parseDecisionId } from "@/lib/decisions";
 import { parseResolveBody, resolveDecision } from "@/lib/decision-resolve";
@@ -12,13 +12,15 @@ export const maxDuration = 30;
  * PATCH /api/decisions/:id
  *
  * Dashboard session, MC_TOKEN, or an agent credential with decisions:write.
- * The stored actor is the principal. Body decided_by is ignored.
- * status decided writes the row, then tries the GitHub comment. A failed
- * write-back still leaves the row decided and sets writeback to not_written.
+ * The principal is the actor. Body decided_by is ignored. status open clears
+ * the resolver columns and stores that principal on one receipt. status
+ * decided writes the row, then tries the GitHub comment. A failed write-back
+ * still leaves the row decided and sets writeback to not_written.
  */
 export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const access = await resolveApiAccess(req);
   if (!access.ok) return deny(access);
+  const actor = actorFromPrincipal(access.principal);
   const { id: rawId } = await ctx.params;
   const id = parseDecisionId(rawId);
   if (id == null) {
@@ -37,11 +39,12 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
   if (!parsed.ok) return apiError(parsed.code, { message: parsed.message, fields: parsed.fields });
   if (!decisionPersistenceOn()) return NextResponse.json({ ok: true, demo: true });
   try {
-    const outcome = await resolveDecision({
+    const outcome = await runWithActor(actor, () => resolveDecision({
       ...parsed.value,
       id,
-      actor: actorFromPrincipal(access.principal),
-    });
+      actor,
+      recordReopen: parsed.value.status === "open",
+    }));
     if (!outcome.ok) {
       return apiError(outcome.code, {
         message: outcome.message,

@@ -179,7 +179,9 @@ function writebackInProgress(): ResolveOutcome {
   };
 }
 
-export async function resolveDecision(input: ResolveBody & { id: number; actor: Actor | null }): Promise<ResolveOutcome> {
+export async function resolveDecision(
+  input: ResolveBody & { id: number; actor: Actor | null; recordReopen?: boolean },
+): Promise<ResolveOutcome> {
   const row = await getDecision(input.id);
   if (!row) return notFound();
   if (input.expected_revision != null && row.revision !== input.expected_revision) return stale();
@@ -233,6 +235,7 @@ export async function resolveDecision(input: ResolveBody & { id: number; actor: 
     expectedUpdatedAt: input.expected_updated_at ?? null,
     expectedRevision: input.expected_revision ?? null,
     guardTerminal: true,
+    recordReopen: input.recordReopen === true,
   });
   if (!updated) {
     const again = await getDecision(input.id);
