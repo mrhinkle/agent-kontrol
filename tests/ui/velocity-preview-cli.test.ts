@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseVelocity, summarizeVelocity, VELOCITY_MAX_BYTES } from "../../src/lib/velocity";
+import { previewFile, PreviewReject } from "../../scripts/preview-velocity";
 import { velocityFixture } from "./velocity-fixture";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -83,6 +84,37 @@ function validatorMessage(value: unknown): string {
   throw new Error("expected the shared validator to reject the capture");
 }
 
+const VALIDATION_FIX = "Correct the capture so it matches the shared velocity contract, then run the command again.";
+
+function failure(code: string, error: string, cause: string, fix: string) {
+  return { error, code, cause, fix, retryable: false };
+}
+
+function validationFailure(message: string) {
+  return failure("validation", message, message, VALIDATION_FIX);
+}
+
+const READ_FAILURE = failure(
+  "read",
+  "Capture file could not be read.",
+  "The path could not be opened, read, or closed as a file.",
+  "Pass a readable regular file and run the command again.",
+);
+const USAGE_FAILURE = failure(
+  "usage",
+  "Usage: pnpm exec tsx scripts/preview-velocity.ts CAPTURE.json",
+  "The command needs exactly one capture path.",
+  "Run pnpm exec tsx scripts/preview-velocity.ts CAPTURE.json with one local JSON file.",
+);
+
+function assertRejected(result: { code: number; stdout: string; stderr: string }, expected: ReturnType<typeof failure>, label: string) {
+  assert.equal(result.code, 1, label);
+  assert.equal(result.stdout, "", label);
+  const body = JSON.parse(result.stderr) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(body), ["error", "code", "cause", "fix", "retryable"], label);
+  assert.deepEqual(body, expected, label);
+}
+
 describe("velocity preview CLI", () => {
   it("rejects network and credential reads when the guard is armed", async () => {
     const fetched = await nodeEval("fetch('https://example.com/')");
@@ -125,13 +157,15 @@ describe("velocity preview CLI", () => {
   it("rejects invalid schema, metric version, JSON, UTF-8, oversize, and missing files", async () => {
     const raw = rawCapture();
     const secret = "super-secret-marker";
-    const cases: { name: string; file: string; bytes: Buffer | string; message: string }[] = [
-      { name: "schema", file: "schema.json", bytes: JSON.stringify({ ...raw, schemaVersion: 2 }), message: validatorMessage({ ...raw, schemaVersion: 2 }) },
-      { name: "metric", file: "metric.json", bytes: JSON.stringify({ ...raw, metricVersion: "not-a-velocity-metric" }), message: validatorMessage({ ...raw, metricVersion: "not-a-velocity-metric" }) },
-      { name: "json", file: "broken.json", bytes: `{${secret}`, message: "Capture is not valid UTF-8 JSON." },
-      { name: "utf8", file: "bad-utf8.json", bytes: Buffer.from([0xff, 0xfe, 0xfd]), message: "Capture is not valid UTF-8 JSON." },
-      { name: "oversize", file: "oversize.json", bytes: Buffer.alloc(VELOCITY_MAX_BYTES + 1, 0x78), message: "Capture exceeds the 2 MB limit." },
-      { name: "exact-limit", file: "exact.json", bytes: Buffer.alloc(VELOCITY_MAX_BYTES, 0x7b), message: "Capture is not valid UTF-8 JSON." },
+    const schemaMessage = validatorMessage({ ...raw, schemaVersion: 2 });
+    const metricMessage = validatorMessage({ ...raw, metricVersion: "not-a-velocity-metric" });
+    const cases: { name: string; file: string; bytes: Buffer | string; expected: ReturnType<typeof failure> }[] = [
+      { name: "schema", file: "schema.json", bytes: JSON.stringify({ ...raw, schemaVersion: 2 }), expected: validationFailure(schemaMessage) },
+      { name: "metric", file: "metric.json", bytes: JSON.stringify({ ...raw, metricVersion: "not-a-velocity-metric" }), expected: validationFailure(metricMessage) },
+      { name: "json", file: "broken.json", bytes: `{${secret}`, expected: failure("json", "Capture is not valid UTF-8 JSON.", "The file is valid UTF-8 but is not JSON.", "Correct the JSON syntax and run the command again.") },
+      { name: "utf8", file: "bad-utf8.json", bytes: Buffer.from([0xff, 0xfe, 0xfd]), expected: failure("utf8", "Capture is not valid UTF-8 JSON.", "The file is not valid UTF-8.", "Save the capture as UTF-8 JSON and run the command again.") },
+      { name: "oversize", file: "oversize.json", bytes: Buffer.alloc(VELOCITY_MAX_BYTES + 1, 0x78), expected: failure("oversize", "Capture exceeds the 2 MB limit.", "The file is larger than 2 MB.", "Pass a capture of at most 2 MB and run the command again.") },
+      { name: "exact-limit", file: "exact.json", bytes: Buffer.alloc(VELOCITY_MAX_BYTES, 0x7b), expected: failure("json", "Capture is not valid UTF-8 JSON.", "The file is valid UTF-8 but is not JSON.", "Correct the JSON syntax and run the command again.") },
     ];
     for (const item of cases) {
       const file = join(dir, item.file);
@@ -139,9 +173,7 @@ describe("velocity preview CLI", () => {
       const before = sha(file);
       const listing = readdirSync(dir).sort();
       const result = await preview([file], { VELOCITY_PREVIEW_CAPTURE: file });
-      assert.equal(result.code, 1, item.name);
-      assert.equal(result.stdout, "", item.name);
-      assert.deepEqual(JSON.parse(result.stderr), { error: item.message }, item.name);
+      assertRejected(result, item.expected, item.name);
       assert.equal(result.stderr.includes(secret), false, item.name);
       assert.equal(result.stderr.includes(file), false, item.name);
       assert.equal(result.stderr.includes("not-a-velocity-metric"), false, item.name);
@@ -150,10 +182,21 @@ describe("velocity preview CLI", () => {
     }
     const missing = join(dir, "missing-do-not-print.json");
     const missingResult = await preview([missing]);
-    assert.equal(missingResult.code, 1);
-    assert.deepEqual(JSON.parse(missingResult.stderr), { error: "Capture file could not be read." });
+    assertRejected(missingResult, READ_FAILURE, "missing");
     assert.equal(missingResult.stderr.includes("missing-do-not-print"), false);
-    assert.equal(missingResult.stdout, "");
+    assert.equal(missingResult.stderr.includes("ENOENT"), false);
+  });
+
+  it("reports a directory as an unreadable file and hides the filesystem diagnostic", async () => {
+    const dot = await preview(["."]);
+    assertRejected(dot, READ_FAILURE, "dot");
+    assert.equal(dot.stderr.includes("EISDIR"), false);
+    assert.equal(dot.stderr.includes("illegal operation"), false);
+    assert.equal(dot.stderr.includes(root), false);
+    const directory = await preview([dir]);
+    assertRejected(directory, READ_FAILURE, "directory");
+    assert.equal(directory.stderr.includes(dir), false);
+    assert.equal(directory.stderr.includes("EISDIR"), false);
   });
 
   it("does not read credentials, config, or a second path", async () => {
@@ -161,13 +204,11 @@ describe("velocity preview CLI", () => {
     writeFileSync(config, "MC_TOKEN=super-secret-marker\n");
     const before = sha(config);
     const usage = await preview([]);
-    assert.equal(usage.code, 1);
-    assert.deepEqual(JSON.parse(usage.stderr), { error: "Usage: pnpm exec tsx scripts/preview-velocity.ts CAPTURE.json" });
+    assertRejected(usage, USAGE_FAILURE, "usage");
     const extra = await preview([config, "--config", config], { VELOCITY_PREVIEW_CAPTURE: config });
-    assert.equal(extra.code, 1);
     assert.equal(extra.stderr.includes("velocity-preview-guard"), false);
     assert.equal(extra.stderr.includes("super-secret-marker"), false);
-    assert.deepEqual(JSON.parse(extra.stderr), { error: "Usage: pnpm exec tsx scripts/preview-velocity.ts CAPTURE.json" });
+    assertRejected(extra, USAGE_FAILURE, "extra");
     assert.equal(sha(config), before);
     const source = readFileSync(join(root, script), "utf8");
     assert.equal(source.includes("process.env"), false);
@@ -175,5 +216,87 @@ describe("velocity preview CLI", () => {
     assert.equal(source.includes("fetch("), false);
     assert.doesNotMatch(source, /node:(http|https|net|dns|tls)/);
     assert.equal(source.includes("velocity-store"), false);
+  });
+
+  it("does not replace an earlier rejection with a close failure or classify a read error as validation", async () => {
+    const raw = rawCapture();
+    const schema = { ...raw, schemaVersion: 2 };
+    const schemaMessage = validatorMessage(schema);
+    const readLeak = "Repositories must be unique, ignoring case.";
+    const closeLeak = "EBADF: close-marker /private/capture.json";
+    const utf8Failure = failure("utf8", "Capture is not valid UTF-8 JSON.", "The file is not valid UTF-8.", "Save the capture as UTF-8 JSON and run the command again.");
+    const jsonFailure = failure("json", "Capture is not valid UTF-8 JSON.", "The file is valid UTF-8 but is not JSON.", "Correct the JSON syntax and run the command again.");
+    const oversizeFailure = failure("oversize", "Capture exceeds the 2 MB limit.", "The file is larger than 2 MB.", "Pass a capture of at most 2 MB and run the command again.");
+
+    async function run(bytes: Buffer | null, faults: { open?: Error; read?: Error; close?: Error } = {}) {
+      let closed = 0;
+      let value: unknown;
+      let error: unknown;
+      try {
+        value = await previewFile("capture.json", async () => {
+          if (faults.open) throw faults.open;
+          return {
+            read: async (buffer: Buffer, offset: number, length: number) => {
+              if (faults.read) throw faults.read;
+              const source = bytes ?? Buffer.alloc(0);
+              if (offset >= source.length) return { bytesRead: 0 };
+              const n = Math.min(length, source.length - offset);
+              source.copy(buffer, offset, offset, offset + n);
+              return { bytesRead: n };
+            },
+            close: async () => {
+              closed += 1;
+              if (faults.close) throw faults.close;
+            },
+          };
+        });
+      } catch (caught) {
+        error = caught;
+      }
+      return { value, error, closed };
+    }
+
+    function body(error: unknown) {
+      assert.ok(error instanceof PreviewReject);
+      return { error: error.message, code: error.code, cause: error.reason, fix: error.fix, retryable: error.retryable };
+    }
+
+    const readAndClose = await run(null, { read: new Error(`EISDIR: ${readLeak}`), close: new Error(closeLeak) });
+    assert.equal(readAndClose.closed, 1);
+    assert.deepEqual(body(readAndClose.error), READ_FAILURE);
+    assert.equal(JSON.stringify(body(readAndClose.error)).includes(readLeak), false);
+    assert.equal(JSON.stringify(body(readAndClose.error)).includes("EISDIR"), false);
+    assert.equal(JSON.stringify(body(readAndClose.error)).includes(closeLeak), false);
+
+    const opened = await run(null, { open: new Error(`EACCES: ${dir}`) });
+    assert.equal(opened.closed, 0);
+    assert.deepEqual(body(opened.error), READ_FAILURE);
+    assert.equal(JSON.stringify(body(opened.error)).includes(dir), false);
+
+    const oversize = await run(Buffer.alloc(VELOCITY_MAX_BYTES + 1, 0x78), { close: new Error(closeLeak) });
+    assert.deepEqual(body(oversize.error), oversizeFailure);
+    assert.equal(JSON.stringify(body(oversize.error)).includes(closeLeak), false);
+
+    const utf8 = await run(Buffer.from([0xff, 0xfe, 0xfd]), { close: new Error(closeLeak) });
+    assert.deepEqual(body(utf8.error), utf8Failure);
+    assert.equal(JSON.stringify(body(utf8.error)).includes(closeLeak), false);
+
+    const json = await run(Buffer.from("{"), { close: new Error(closeLeak) });
+    assert.deepEqual(body(json.error), jsonFailure);
+    assert.equal(JSON.stringify(body(json.error)).includes(closeLeak), false);
+
+    const invalid = await run(Buffer.from(JSON.stringify(schema)), { close: new Error(closeLeak) });
+    assert.deepEqual(body(invalid.error), validationFailure(schemaMessage));
+    assert.equal(JSON.stringify(body(invalid.error)).includes(closeLeak), false);
+
+    const closedValid = await run(Buffer.from(JSON.stringify(raw)), { close: new Error(closeLeak) });
+    assert.deepEqual(body(closedValid.error), READ_FAILURE);
+    assert.equal(JSON.stringify(body(closedValid.error)).includes(closeLeak), false);
+
+    const accepted = await run(Buffer.from(JSON.stringify(raw)));
+    assert.equal(accepted.error, undefined);
+    assert.equal(accepted.closed, 1);
+    const expectedPreview = parseVelocity(raw);
+    assert.deepEqual(accepted.value, { preview: expectedPreview, summary: summarizeVelocity(expectedPreview) });
   });
 });

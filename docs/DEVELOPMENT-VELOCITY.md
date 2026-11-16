@@ -37,7 +37,16 @@ Success writes one JSON object to stdout and exits 0. The object is pretty-print
 - `preview`: the object returned by `parseVelocity`. Owners and repositories are lowercased and sorted, samples are sorted, and instants are canonical ISO strings.
 - `summary`: the object returned by `summarizeVelocity(preview)`. This is the same fleet rollup the Velocity page shows for that capture. A single file is a preview, not a stored baseline and not a trend.
 
-Failure writes one JSON object to stderr, `{"error":"<message>"}`, and exits 1. An oversize file reports `Capture exceeds the 2 MB limit.` Invalid UTF-8 or JSON reports `Capture is not valid UTF-8 JSON.` An unreadable path reports `Capture file could not be read.` A capture that fails the shared contract reports that validator message, truncated to 240 characters, the same limit as the page notice. The failure text omits the file path and the raw capture. The command does not write the capture, create an output file, or call `POST /api/velocity/ingest`.
+Failure writes one JSON object to stderr and exits 1. The object keeps `error` and adds `code`, `cause`, `fix`, and `retryable`, in that order. `retryable` is false for every code: the same arguments fail again until the caller changes them. The fix says what to change.
+
+- `usage` — missing, empty, or extra arguments. `error` is `Usage: pnpm exec tsx scripts/preview-velocity.ts CAPTURE.json`. `cause` is `The command needs exactly one capture path.` `fix` is `Run pnpm exec tsx scripts/preview-velocity.ts CAPTURE.json with one local JSON file.`
+- `read` — the path could not be opened, read, or closed as a file. A directory is this code. `error` is `Capture file could not be read.` `cause` is `The path could not be opened, read, or closed as a file.` `fix` is `Pass a readable regular file and run the command again.` Open, read, and close failures use these fixed sentences. They do not include the path, an operating-system code, or an exception message.
+- `oversize` — the file is larger than 2 MB. `error` is `Capture exceeds the 2 MB limit.` `cause` is `The file is larger than 2 MB.` `fix` is `Pass a capture of at most 2 MB and run the command again.`
+- `utf8` — the bytes are not UTF-8. `error` is `Capture is not valid UTF-8 JSON.` `cause` is `The file is not valid UTF-8.` `fix` is `Save the capture as UTF-8 JSON and run the command again.`
+- `json` — the bytes are UTF-8 but `JSON.parse` rejects them. `error` is the same sentence as `utf8`. `cause` is `The file is valid UTF-8 but is not JSON.` `fix` is `Correct the JSON syntax and run the command again.`
+- `validation` — `parseVelocity` rejects the value. `error` and `cause` are both that validator message, truncated to 240 characters, the same limit as the page notice. `fix` is `Correct the capture so it matches the shared velocity contract, then run the command again.`
+
+`oversize` and `utf8` are decided while reading. `json` and `validation` run only after the bytes are in memory. A close failure does not replace those four results. It is reported as `read` only when the bytes parsed and the shared validator accepted them. A read failure is never labeled `validation`. The failure text omits the file path and the raw capture. The command does not write the capture, create an output file, or call `POST /api/velocity/ingest`.
 
 ## API and history
 
