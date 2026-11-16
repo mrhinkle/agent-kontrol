@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
+import { actorFromPrincipal, runWithActor } from "@/lib/actor";
 import { apiError, publicError } from "@/lib/api-error";
-import { enforceApi } from "@/lib/auth";
+import { deny, resolveApiAccess } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import { parseSyncBody } from "@/lib/skills/settings";
 import { syncSkills } from "@/lib/skills/sync";
@@ -16,8 +17,8 @@ export const maxDuration = 60;
  */
 
 export async function POST(req: Request) {
-  const denied = await enforceApi(req);
-  if (denied) return denied;
+  const access = await resolveApiAccess(req);
+  if (!access.ok) return deny(access);
   const text = await req.text();
   let body: unknown = null;
   if (text.trim()) {
@@ -33,7 +34,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; sync not run." });
   }
   try {
-    const result = await syncSkills({ trigger: parsed.trigger });
+    const result = await runWithActor(actorFromPrincipal(access.principal), () =>
+      syncSkills({ trigger: parsed.trigger }),
+    );
     return NextResponse.json(result);
   } catch (err) {
     return publicError("[skills] sync failed", err);
