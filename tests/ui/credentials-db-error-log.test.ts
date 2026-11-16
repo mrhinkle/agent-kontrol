@@ -77,7 +77,13 @@ describe("credentials route database errors", { concurrency: false }, () => {
     const res = await GET(new Request("http://localhost/api/settings/credentials"));
 
     assert.equal(res.status, 500);
-    assert.deepEqual(await res.json(), { error: "Could not list credentials." });
+    const listed = await res.json() as Record<string, unknown>;
+    assert.equal(listed.error, "Could not list credentials.");
+    assert.equal(listed.code, "internal_error");
+    assert.equal(listed.retryable, true);
+    assert.equal(typeof listed.fix, "string");
+    assert.deepEqual(Object.keys(listed).sort(), ["code", "error", "fix", "retryable"]);
+    assertNoSecrets(JSON.stringify(listed));
     assert.equal(logged.length, 1);
     const line = logged[0];
     assert.match(line, /^\[settings\/credentials\] list credentials NeonDbError/);
@@ -108,8 +114,13 @@ describe("credentials route database errors", { concurrency: false }, () => {
     );
 
     assert.equal(res.status, 500);
-    const body = await res.json();
-    assert.deepEqual(body, { error: "Could not create the credential." });
+    const body = await res.json() as Record<string, unknown>;
+    assert.equal(body.error, "Could not create the credential.");
+    assert.equal(body.code, "internal_error");
+    assert.equal(body.retryable, true);
+    assert.equal(typeof body.fix, "string");
+    assert.deepEqual(Object.keys(body).sort(), ["code", "error", "fix", "retryable"]);
+    assertNoSecrets(JSON.stringify(body));
     assert.equal(logged.length, 1);
     const line = logged[0];
     assert.match(line, /^\[settings\/credentials\] create the credential NeonDbError/);

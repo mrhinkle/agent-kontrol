@@ -2,7 +2,7 @@ import { createMcpHandler, getPublicOrigin, withMcpAuth } from "mcp-handler";
 import { z } from "zod";
 import { currentActor, runWithPrincipal } from "@/lib/actor";
 import { activityDetail, readReceipt, withReceipt } from "@/lib/activity";
-import { apiError, memoryKeyError, toolResultFromCaught, type McpToolResult } from "@/lib/api-error";
+import { apiError, errorBody, memoryKeyError, toolResultFromCaught, type McpToolResult } from "@/lib/api-error";
 import { secretsMatch, verifyAccessToken } from "@/lib/authcrypto";
 import { resolveAgentCredential } from "@/lib/credentials";
 import { chargeCredentialRequest, rateLimitedResponse } from "@/lib/credential-rate-limit";
@@ -811,7 +811,11 @@ async function meterMcpRequest(req: Request, principal: ReturnType<typeof princi
   if (charged.status === "reject") {
     // Same body and header mcp-handler sends for a bad bearer.
     const metadata = `${getPublicOrigin(req)}${RESOURCE_METADATA_PATH}`;
-    return new Response(JSON.stringify({ error: "invalid_token", error_description: "Invalid token" }), {
+    return new Response(JSON.stringify(errorBody("unauthorized", {
+      message: "invalid_token",
+      fix: "Send a current bearer token. This credential expired or was revoked while the request waited.",
+      extra: { error_description: "Invalid token" },
+    })), {
       status: 401,
       headers: {
         "WWW-Authenticate": `Bearer error="invalid_token", error_description="Invalid token", resource_metadata="${metadata}"`,
@@ -819,7 +823,7 @@ async function meterMcpRequest(req: Request, principal: ReturnType<typeof princi
       },
     });
   }
-  return new Response(JSON.stringify({ error: "credential_store_unavailable" }), {
+  return new Response(JSON.stringify(errorBody("credential_store_unavailable")), {
     status: 503,
     headers: { "content-type": "application/json" },
   });
