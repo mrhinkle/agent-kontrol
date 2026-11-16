@@ -36,6 +36,7 @@ type TaskRoute = (req: Request, ctx: { params: Promise<{ id: string }> }) => Pro
 type TraceRoute = (req: Request, ctx: { params: Promise<{ traceId: string }> }) => Promise<Response>;
 
 let mode: SqlMode = "empty";
+let sqlCalls = 0;
 
 const saved = {
   db: process.env.DATABASE_URL,
@@ -78,6 +79,7 @@ globalThis.Request = class extends NativeRequest {
     };
   },
   async query(text: string) {
+    sqlCalls += 1;
     if (mode === "throw") throw new Error("db down SECRET-DETAIL");
     if (mode === "missing-relation") {
       throw Object.assign(new Error('relation "messages" does not exist'), { code: "42P01" });
@@ -179,14 +181,33 @@ async function callTool(name: string, args: Record<string, unknown>, withAuth = 
   }
 }
 
-function toolBody(text: string): { isError?: boolean; content?: { text: string }[] } {
+function toolBody(text: string): {
+  isError?: boolean;
+  content?: { text: string }[];
+  structuredContent?: { code?: string; cause?: string; fix?: string; retryable?: boolean };
+} {
   const line = text.split("\n").find((item) => item.startsWith("data: "));
   assert.ok(line, text.slice(0, 400));
   const msg = JSON.parse(line.slice("data: ".length)) as {
-    result?: { isError?: boolean; content?: { text: string }[] };
+    result?: {
+      isError?: boolean;
+      content?: { text: string }[];
+      structuredContent?: { code?: string; cause?: string; fix?: string; retryable?: boolean };
+    };
   };
   assert.ok(msg.result, text.slice(0, 400));
   return msg.result;
+}
+
+function assertMissingBearer(body: Record<string, unknown>) {
+  assert.equal(body.error, "invalid_token");
+  assert.equal(body.error_description, "No authorization provided");
+  assert.equal(body.code, "unauthorized");
+  assert.equal(body.cause, "No authorization provided");
+  assert.equal(body.fix, "Send Authorization: Bearer with a current agent credential, legacy token, or OAuth access token.");
+  assert.equal(body.retryable, false);
+  assert.equal(body.jsonrpc, undefined);
+  assert.equal(body.result, undefined);
 }
 
 function assertTool(result: { isError?: boolean; content?: { text: string }[] }, code: ErrorCode, error?: string) {
@@ -385,7 +406,7 @@ describe("documented REST error triggers", () => {
     await assertFlat(task, "invalid_json", "invalid JSON");
   });
 
-  it("invalid_json: POST /api/mcp with a non-JSON or empty body", async () => {
+  it("invalid_json: an authenticated non-JSON MCP body, while an anonymous one is 401 before parsing", async () => {
     const before = new Set(handles());
     try {
       const headers = {
@@ -415,6 +436,7 @@ describe("documented REST error triggers", () => {
       }));
       await assertFlat(plain, "invalid_json", "invalid JSON");
 
+      const sqlBefore = sqlCalls;
       const anon = await mcpPost(new Request("http://localhost/api/mcp", {
         method: "POST",
         headers: {
@@ -425,10 +447,13 @@ describe("documented REST error triggers", () => {
       }));
       assert.equal(anon.status, 401);
       const www = anon.headers.get("www-authenticate") ?? "";
+      assert.match(www, /error="invalid_token"/);
       assert.match(www, /resource_metadata=/);
       assert.match(www, /\/\.well-known\/oauth-protected-resource/);
       const anonBody = await anon.json() as Record<string, unknown>;
-      assert.equal(anonBody.code, undefined);
+      assertMissingBearer(anonBody);
+      assert.equal(anonBody.code, "unauthorized");
+      assert.equal(sqlCalls, sqlBefore);
     } finally {
       for (const handle of handles()) {
         if (!before.has(handle)) handle.unref?.();
@@ -707,8 +732,9 @@ describe("documented MCP error triggers", () => {
     assert.equal(text.includes("task_not_claimable"), false);
   });
 
-  it("unauthorized is the HTTP 401, not a tool result", async () => {
+  it("unauthorized: a missing bearer is HTTP 401 with teaching, not a tool result", async () => {
     const before = new Set(handles());
+    const sqlBefore = sqlCalls;
     try {
       const res = await mcpPost(new Request("http://localhost/api/mcp", {
         method: "POST",
@@ -724,10 +750,13 @@ describe("documented MCP error triggers", () => {
         }),
       }));
       assert.equal(res.status, 401);
-      assert.match(res.headers.get("www-authenticate") ?? "", /oauth-protected-resource/);
+      const www = res.headers.get("www-authenticate") ?? "";
+      assert.match(www, /error="invalid_token"/);
+      assert.match(www, /resource_metadata=/);
+      assert.match(www, /oauth-protected-resource/);
       const body = await res.json() as Record<string, unknown>;
-      assert.equal(body.code, undefined);
-      assert.equal(body.retryable, undefined);
+      assertMissingBearer(body);
+      assert.equal(sqlCalls, sqlBefore);
     } finally {
       for (const handle of handles()) {
         if (!before.has(handle)) handle.unref?.();
@@ -735,13 +764,19 @@ describe("documented MCP error triggers", () => {
     }
   });
 
-  it("missing_field is not returned when the tool schema rejects a missing argument", async () => {
+  it("schema rejection: a missing remember argument stays a non-retryable SDK isError", async () => {
+    const sqlBefore = sqlCalls;
     const { res, text } = await callTool("remember", {});
     assert.equal(res.status, 200);
     const result = toolBody(text);
     assert.equal(result.isError, true);
+    assert.match(result.content?.[0].text ?? "", /-32602/);
     assert.equal(text.includes('"code":"missing_field"'), false);
-    assert.equal(text.includes('"retryable"'), false);
+    assert.equal(result.structuredContent?.code, "mcp_tool_error");
+    assert.equal(result.structuredContent?.retryable, false);
+    assert.match(result.structuredContent?.cause ?? "", /-32602/);
+    assert.equal(typeof result.structuredContent?.fix, "string");
+    assert.equal(sqlCalls, sqlBefore);
   });
 
 });

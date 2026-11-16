@@ -322,13 +322,15 @@ describe("B owner discovery and replacement receipts", { skip: !OPT_IN, concurre
 
     const failed = await ownerRow(FAILED);
     assert.equal(failed?.actor_id, "mc-token");
-    assert.match(String(failed?.last_error), /gh repo list failed/);
+    assert.equal(failed?.last_error, "The collector did not complete the repository listing.");
+    assert.equal(String(failed?.last_error).includes("gh repo list failed"), false);
     assert.equal(failed?.last_discovered_at, null);
     assert.equal(await repoCount(FAILED), 0);
     const errorProof = await receipts("owners.discover", FAILED);
     assert.equal(errorProof.length, 1);
     assert.equal(errorProof[0].detail.operation, "error");
     assert.deepEqual(errorProof[0].detail.added, []);
+    assert.equal(JSON.stringify(errorProof[0].detail).includes("gh repo list failed"), false);
 
     const older = new Date(Date.parse(sweptAt) - 60_000).toISOString();
     const stale = await discover([sweep(KEPT, older, true, `other${KEPT}`)], LEGACY);
