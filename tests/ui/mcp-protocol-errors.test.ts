@@ -485,15 +485,72 @@ describe("MCP response adapter stream behavior", { concurrency: false }, () => {
     assert.equal(body.id, 4);
   });
 
-  it("keeps content-length when the SSE body does not change", async () => {
+  it("drops SSE length headers before streaming and still preserves an unchanged body", async () => {
     const frame = encoder.encode("event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n");
-    const res = await enrichMcpResponse(sseResponse([frame], { "content-length": String(frame.length), "x-kept": "yes" }));
-    assert.equal(res.headers.get("content-length"), String(frame.length));
+    const res = await enrichMcpResponse(sseResponse([frame], {
+      "content-length": String(frame.length),
+      "content-md5": "original",
+      digest: "original",
+      "x-kept": "yes",
+    }));
+    assert.equal(res.headers.get("content-length"), null);
+    assert.equal(res.headers.get("content-md5"), null);
+    assert.equal(res.headers.get("digest"), null);
     assert.equal(res.headers.get("x-kept"), "yes");
     assert.deepEqual(new Uint8Array(await res.arrayBuffer()), frame);
   });
 
-  it("strips stale length headers only when the first chunk mutates", async () => {
+  it("drops SSE length headers when a split error frame grows after the first byte", async () => {
+    const payload = JSON.stringify({
+      jsonrpc: "2.0",
+      id: "kept",
+      error: { code: -32601, message: "Method not found", data: { vendor: 7 } },
+    });
+    const bytes = encoder.encode(`event: message\ndata: ${payload}\n\n`);
+    const res = await enrichMcpResponse(sseResponse([bytes.subarray(0, 1), bytes.subarray(1)], {
+      "content-length": String(bytes.length),
+      "content-md5": "original-digest",
+      digest: "original-digest",
+    }));
+    const body = new Uint8Array(await res.arrayBuffer());
+    assert.equal(res.headers.get("content-length"), null);
+    assert.equal(res.headers.get("content-md5"), null);
+    assert.equal(res.headers.get("digest"), null);
+    assert.equal(body.byteLength > bytes.byteLength, true);
+    const data = JSON.parse(new TextDecoder().decode(body).split("data: ")[1]);
+    assert.equal(data.id, "kept");
+    assert.equal(data.error.code, -32601);
+    assert.equal(data.error.data.vendor, 7);
+    assert.equal(data.error.data.code, "mcp_method_not_found");
+  });
+
+  it("passes a complete frame above the cap through without decoding it", async () => {
+    const cap = 1024 * 1024;
+    const frame = encoder.encode(`data: ${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      error: { code: -32602, message: "x".repeat(cap + 64) },
+    })}\n\n`);
+    assert.equal(frame.byteLength > cap, true);
+    const Decoder = globalThis.TextDecoder;
+    const decoded: number[] = [];
+    globalThis.TextDecoder = class extends Decoder {
+      decode(input?: AllowSharedBufferSource, options?: TextDecodeOptions): string {
+        if (input && "byteLength" in input) decoded.push(input.byteLength);
+        return super.decode(input, options);
+      }
+    } as typeof TextDecoder;
+    try {
+      const res = await enrichMcpResponse(sseResponse([frame]));
+      const body = new Uint8Array(await res.arrayBuffer());
+      assert.deepEqual(body, frame);
+      assert.equal(decoded.some((size) => size > cap), false);
+    } finally {
+      globalThis.TextDecoder = Decoder;
+    }
+  });
+
+  it("strips stale length headers when the first chunk mutates", async () => {
     const payload = JSON.stringify({
       jsonrpc: "2.0",
       id: 1,

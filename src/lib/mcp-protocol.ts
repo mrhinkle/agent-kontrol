@@ -304,6 +304,12 @@ class FrameParser {
       }
       const frame = buf.subarray(0, end);
       buf = buf.subarray(end);
+      // A complete frame over the cap is passed through. Decoding it would
+      // hold another copy, and the original protocol frame stays valid.
+      if (frame.byteLength > FRAME_CAP) {
+        this.queue.push(frame);
+        continue;
+      }
       const rewritten = rewriteFrame(frame);
       if (rewritten.mutated) this.mutated = true;
       this.queue.push(rewritten.bytes);
@@ -341,7 +347,9 @@ async function enrichSseResponse(response: Response): Promise<Response> {
     else if (winner.result.value) parser.push(winner.result.value);
   }
   const headers = new Headers(response.headers);
-  if (parser.mutated) stripStaleLength(headers);
+  // Drop length metadata before streaming. A later frame may grow, and the
+  // adapter does not buffer the rest of the stream to find out.
+  stripStaleLength(headers);
   const stream = new ReadableStream<Uint8Array>({
     async pull(controller) {
       while (parser.queue.length === 0) {
