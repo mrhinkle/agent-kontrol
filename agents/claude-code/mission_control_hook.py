@@ -10,9 +10,11 @@ Config via environment (put these in ~/.zshenv or the hook command):
   MC_URL    e.g. https://your-deploy.vercel.app
   MC_TOKEN  shared secret (matches the Vercel env var)
   MC_AGENT  optional agent id override (default: claude-code-<hostname>)
+  MC_READ_MESSAGES  optional; set to 0 to skip the operator inbox.
+                    Unset still polls /api/messages and acks.
 
 Fail-open by design: any error exits 0 so hooks never block your session.
-Stdlib only â€” no dependencies.
+Stdlib only — no dependencies.
 """
 import hashlib
 import json
@@ -324,7 +326,7 @@ def main() -> None:
         # Never copy prompt text into either title or summary.
         title = "New instruction"
     elif event_name == "Stop":
-        title = "Turn finished â€” waiting for input"
+        title = "Turn finished — waiting for input"
     elif event_name == "Notification":
         title = "Needs attention"
     elif event_name == "SessionEnd":
@@ -361,7 +363,8 @@ def main() -> None:
 
     # Two-way: at natural checkpoints, pull any messages the operator queued for this
     # agent and inject them into the session as additional context.
-    if os.environ.get("MC_READ_MESSAGES", "0") == "1" and event_name in ("UserPromptSubmit", "SessionStart"):
+    # Unset keeps polling. MC_READ_MESSAGES=0 is the explicit opt-out.
+    if os.environ.get("MC_READ_MESSAGES", "1") != "0" and event_name in ("UserPromptSubmit", "SessionStart"):
         try:
             ireq = urllib.request.Request(
                 f"{url}/api/messages?agent_id={body['agent_id']}&ack=true",
