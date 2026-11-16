@@ -649,6 +649,11 @@ def _instant(value: object) -> datetime.datetime | None:
     return parsed.astimezone(datetime.timezone.utc)
 
 
+def _route_name(value: object) -> bool:
+    # Platform is always a name. A pinned machine is a name; an unpinned task is JSON null.
+    return isinstance(value, str) and 1 <= len(value) <= 200 and all(ord(ch) >= 32 for ch in value)
+
+
 def _trusted_notice(notice_id: str, payload: object) -> bool:
     if not _DECIMAL_ID.fullmatch(notice_id) or not isinstance(payload, dict):
         return False
@@ -660,40 +665,47 @@ def _trusted_notice(notice_id: str, payload: object) -> bool:
         return False
     if not _DECIMAL_ID.fullmatch(str(payload.get("queue_receipt_id") or "")):
         return False
-    for field in ("platform", "machine"):
-        text = payload.get(field)
-        if not isinstance(text, str) or not text or len(text) > 200 or any(ord(ch) < 32 for ch in text):
-            return False
+    machine = payload.get("machine")
+    # The central producer writes tasks.machine, which is null when the task is not pinned.
+    if not _route_name(payload.get("platform")) or not (machine is None or _route_name(machine)):
+        return False
     return True
 
 
 class ObservationEpoch:
     """Bounded accepted task-ready receipts for one dispatcher process.
 
-    A new observation replaces the epoch and does not clear the eviction
-    boundary. Process restart is a new instance, so continuity starts empty.
+    Each observation or invalidation opens a new local epoch, even when the
+    server repeats a generation. The eviction boundary survives; accepted
+    receipts do not. Process restart is a new instance, so continuity starts empty.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._epoch = 0
         self.generation: str | None = None
         self.baseline: str | None = None
         self.valid = False
         self.evicted_through = 0
-        self._order: list[tuple[str, str]] = []
-        self._items: dict[tuple[str, str], tuple[str, str]] = {}
+        self._order: list[tuple[int, str, str]] = []
+        self._items: dict[tuple[int, str, str], tuple[str, str]] = {}
+
+    def _open_epoch(self, baseline: str | None, generation: str | None) -> None:
+        # Caller holds _lock. Receipts belong to one local epoch; the eviction boundary does not.
+        self._epoch += 1
+        self.baseline = baseline
+        self.generation = generation
+        self.valid = baseline is not None and generation is not None
+        self._items.clear()
+        self._order.clear()
 
     def replace(self, baseline: str, generation: str) -> None:
         with self._lock:
-            self.baseline = baseline
-            self.generation = generation
-            self.valid = True
+            self._open_epoch(baseline, generation)
 
     def invalidate(self) -> None:
         with self._lock:
-            self.valid = False
-            self.baseline = None
-            self.generation = None
+            self._open_epoch(None, None)
 
     def proof(self) -> str | None:
         with self._lock:
@@ -701,11 +713,27 @@ class ObservationEpoch:
                 return None
             return self.generation
 
+    def snapshot(self) -> tuple[int, str, str] | None:
+        """Epoch identity for one claim. Do not hold the lock across the HTTP call."""
+        with self._lock:
+            if not self.valid or self.generation is None or self.baseline is None:
+                return None
+            return (self._epoch, self.generation, self.baseline)
+
+    def _continuous(self, observed: tuple[int, str, str] | None) -> bool:
+        if (not self.valid or self.generation is None or self.baseline is None
+                or not isinstance(observed, tuple) or len(observed) != 3):
+            return False
+        token, generation, baseline = observed
+        if isinstance(token, bool) or not isinstance(token, int):
+            return False
+        return token == self._epoch and generation == self.generation and baseline == self.baseline
+
     def accept(self, generation: str, notice_id: str, task_id: str, episode: str) -> None:
-        key = (generation, notice_id)
         with self._lock:
             if not self.valid or self.generation != generation:
                 return
+            key = (self._epoch, generation, notice_id)
             if key in self._items:
                 return
             self._items[key] = (task_id, episode)
@@ -713,14 +741,17 @@ class ObservationEpoch:
             while len(self._order) > NOTICE_CACHE_LIMIT:
                 old = self._order.pop(0)
                 self._items.pop(old, None)
-                number = int(old[1])
+                number = int(old[2])
                 if number > self.evicted_through:
                     self.evicted_through = number
 
-    def classify_claim(self, trigger: str, reasons: set[str], coverage: object, task_id: object) -> tuple[str, str]:
+    def classify_claim(self, trigger: str, reasons: set[str], coverage: object, task_id: object, observed: tuple[int, str, str] | None) -> tuple[str, str]:
         with self._lock:
             if trigger != "fallback" or reasons != {"fallback"}:
                 return "unknown", "mixed" if len(reasons) > 1 else trigger
+            # The response belongs to the epoch captured when the claim was sent.
+            if not self._continuous(observed):
+                return "unknown", "missing_baseline" if observed is None else "epoch_changed"
             return self._classify_locked(coverage, task_id, max(POLL, 60))
 
     def _classify_locked(self, coverage: object, task_id: object, interval: int) -> tuple[str, str]:
@@ -742,7 +773,7 @@ class ObservationEpoch:
             return "unknown", "invalid_proof"
         if isinstance(task_id, bool) or not isinstance(task_id, (int, str)) or not _DECIMAL_ID.fullmatch(str(task_id)):
             return "unknown", "invalid_proof"
-        found = self._items.get((self.generation, notice_id))
+        found = self._items.get((self._epoch, self.generation, notice_id))
         if found is not None:
             if found == (str(task_id), episode):
                 return "received", "exact_notice"
@@ -765,16 +796,16 @@ def _elapsed_seconds(notice_at: object, measured_at: object) -> float | None:
     return (end - start).total_seconds()
 
 
-def task_claim_request(platform: str, stream: EventStreamWake | None) -> tuple[dict, dict | None]:
+def task_claim_request(platform: str, stream: EventStreamWake | None) -> tuple[dict, dict | None, tuple[int, str, str] | None]:
     body = {"platform": platform, "machine": HOSTNAME, "agent_id": f"{platform}-{HOSTNAME}"}
-    generation = stream.notices.proof() if stream is not None else None
-    if stream is None or generation is None:
-        return body, None
+    observed = stream.notices.snapshot() if stream is not None else None
+    if observed is None:
+        return body, None, None
     return {**body, "coverage": True}, {
         "X-AK-Event-Authorization": f"Bearer {stream.token}",
         "X-AK-Event-Consumer": stream.consumer,
-        "X-AK-Event-Generation": generation,
-    }
+        "X-AK-Event-Generation": observed[1],
+    }, observed
 
 
 def coverage_for_disconnected(trigger: str, reasons: set[str]) -> tuple[str, str]:
@@ -991,7 +1022,7 @@ def main() -> None:
                 break
             claimed = False
             try:
-                body, event_headers = task_claim_request(platform, stream)
+                body, event_headers, observed = task_claim_request(platform, stream)
                 resp = api("/api/tasks/claim", body, headers=event_headers)
                 task = resp.get("task")
                 if task:
@@ -1001,8 +1032,10 @@ def main() -> None:
                         fallback_claims += 1
                     # A fallback claim alone does not prove an event was missed.
                     # fallback_before_notice is a separate, stricter classification.
+                    # `observed` is the epoch from before this HTTP call. A reconnect
+                    # during the call, even one that repeats the server generation, is unknown.
                     if stream is not None:
-                        label, why = stream.notices.classify_claim(trigger, reasons, resp.get("coverage"), task.get("id"))
+                        label, why = stream.notices.classify_claim(trigger, reasons, resp.get("coverage"), task.get("id"), observed)
                     else:
                         label, why = coverage_for_disconnected(trigger, reasons)
                     print(json.dumps({"kind": "claim-wake", "trigger": trigger,

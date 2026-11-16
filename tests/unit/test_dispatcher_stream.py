@@ -302,6 +302,13 @@ class FallbackObservationTests(unittest.TestCase):
         self.assertEqual(client.notices.evicted_through, 8)
         self.assertIsNone(client.cursor)
 
+    def claim(self, client, coverage, task=9, trigger="fallback", reasons=None, observed="live"):
+        if reasons is None:
+            reasons = {trigger}
+        if observed == "live":
+            observed = client.notices.snapshot()
+        return client.notices.classify_claim(trigger, reasons, coverage, task, observed)
+
     def test_exact_accept_is_received_and_replay_is_idempotent(self):
         client, wake = self.opened()
         client._consume(io.BytesIO(task_ready()))
@@ -309,36 +316,34 @@ class FallbackObservationTests(unittest.TestCase):
         self.assertEqual(client.cursor, "reviewer:20")
         self.assertEqual(wake.wait(0), {"event"})
         self.assertEqual(len(client.notices._items), 1)
-        label, reason = client.notices.classify_claim("fallback", {"fallback"}, notified(), 9)
-        self.assertEqual((label, reason), ("received", "exact_notice"))
+        self.assertEqual(self.claim(client, notified()), ("received", "exact_notice"))
 
     def test_withheld_notice_after_the_interval_is_one_fallback_before_notice(self):
         client, _wake = self.opened()
-        label, reason = client.notices.classify_claim("fallback", {"fallback"}, notified(), 9)
-        self.assertEqual((label, reason), ("fallback_before_notice", "notice_absent_at_claim"))
+        observed = client.notices.snapshot()
+        self.assertEqual(self.claim(client, notified(), observed=observed), ("fallback_before_notice", "notice_absent_at_claim"))
         client.notices.accept("4", "20", "9", "4")
-        again, again_reason = client.notices.classify_claim("fallback", {"fallback"}, notified(), 9)
-        self.assertEqual((again, again_reason), ("received", "exact_notice"))
+        self.assertEqual(self.claim(client, notified(), observed=observed), ("received", "exact_notice"))
 
     def test_short_interval_baseline_and_unnotified_stay_unknown(self):
         client, _wake = self.opened()
         short = notified(measured_at="2026-11-15T00:00:30+00:00")
-        self.assertEqual(client.notices.classify_claim("fallback", {"fallback"}, short, 9)[0], "unknown")
-        self.assertEqual(client.notices.classify_claim("fallback", {"fallback"}, notified(notice_id="15"), 9)[1], "before_baseline")
+        self.assertEqual(self.claim(client, short)[0], "unknown")
+        self.assertEqual(self.claim(client, notified(notice_id="15"))[1], "before_baseline")
         absent = {"evidence": "unnotified_or_expired", "reason": "notice_absent", "queue_episode": "4", "notice_id": None, "notice_at": None, "measured_at": "2026-11-15T00:02:00+00:00"}
-        self.assertEqual(client.notices.classify_claim("fallback", {"fallback"}, absent, 9), ("unknown", "notice_absent"))
+        self.assertEqual(self.claim(client, absent), ("unknown", "notice_absent"))
         truncated = {"evidence": "unknown_history", "reason": "audit_window_truncated", "queue_episode": None, "notice_id": None, "notice_at": None, "measured_at": "2026-11-15T00:02:00+00:00"}
-        self.assertEqual(client.notices.classify_claim("fallback", {"fallback"}, truncated, 9)[1], "audit_window_truncated")
+        self.assertEqual(self.claim(client, truncated)[1], "audit_window_truncated")
 
     def test_capacity_mixed_and_disconnect_are_unknown(self):
         client, _wake = self.opened()
-        self.assertEqual(client.notices.classify_claim("capacity", {"capacity"}, notified(), 9), ("unknown", "capacity"))
-        self.assertEqual(client.notices.classify_claim("event", {"event", "fallback"}, notified(), 9), ("unknown", "mixed"))
+        self.assertEqual(self.claim(client, notified(), trigger="capacity", reasons={"capacity"}), ("unknown", "capacity"))
+        self.assertEqual(self.claim(client, notified(), trigger="event", reasons={"event", "fallback"}), ("unknown", "mixed"))
         self.assertEqual(dispatcher.coverage_for_disconnected("reconcile", {"startup"}), ("unknown", "reconcile"))
         client._consume(io.BytesIO(b"event: cursor_expired\ndata: {}\n\n"))
         self.assertIsNone(client.cursor)
         self.assertIsNone(client.notices.proof())
-        self.assertEqual(client.notices.classify_claim("fallback", {"fallback"}, notified(), 9), ("unknown", "missing_baseline"))
+        self.assertEqual(self.claim(client, notified()), ("unknown", "missing_baseline"))
 
     def test_eviction_and_new_generation_cannot_become_a_miss(self):
         client, _wake = self.opened()
@@ -346,34 +351,120 @@ class FallbackObservationTests(unittest.TestCase):
             client.notices.accept("4", str(number), "9", "4")
         self.assertGreater(client.notices.evicted_through, 0)
         evicted = str(client.notices.evicted_through)
-        label, reason = client.notices.classify_claim("fallback", {"fallback"}, notified(notice_id=evicted, queue_episode="4"), 9)
-        self.assertEqual((label, reason), ("unknown", "evicted"))
+        self.assertEqual(self.claim(client, notified(notice_id=evicted, queue_episode="4")), ("unknown", "evicted"))
         boundary = client.notices.evicted_through
         client._consume(io.BytesIO(b'event: observation\ndata: {"baseline":"900","generation":"5"}\n\n'))
         self.assertEqual(client.notices.proof(), "5")
         self.assertEqual(client.notices.evicted_through, boundary)
-        self.assertEqual(client.notices.classify_claim("fallback", {"fallback"}, notified(notice_id=evicted), 9)[1], "evicted")
+        self.assertEqual(len(client.notices._items), 0)
+        self.assertEqual(self.claim(client, notified(notice_id=evicted))[1], "evicted")
         restarted, _wake = DispatcherStreamTests().client()
         self.assertIsNone(restarted.notices.proof())
         self.assertEqual(restarted.notices.evicted_through, 0)
 
+    def test_unpinned_machine_is_accepted_and_bad_routes_end_the_epoch(self):
+        client, _wake = self.opened()
+        payload = {"v": 1, "task_id": "9", "queue_receipt_id": "4", "platform": "codex", "machine": None}
+        wire = {"id": "reviewer:20", "event": "task-ready", "payload": payload}
+        client._consume(io.BytesIO(("id: reviewer:20\nevent: github\ndata: " + json.dumps(wire) + "\n\n").encode()))
+        self.assertEqual(client.cursor, "reviewer:20")
+        self.assertEqual(client.notices.proof(), "4")
+        self.assertEqual(list(client.notices._items.values()), [("9", "4")])
+        self.assertEqual(self.claim(client, notified()), ("received", "exact_notice"))
+        pinned, _wake = self.opened()
+        pinned._consume(io.BytesIO(task_ready(notice="21")))
+        self.assertEqual(pinned.notices.proof(), "4")
+        self.assertEqual(list(pinned.notices._items.values()), [("9", "4")])
+
+        def rejected(machine="box", platform="codex", drop=None, extra=None, notice="22"):
+            fresh, _wake = self.opened()
+            body = {"v": 1, "task_id": "9", "queue_receipt_id": "4", "platform": platform, "machine": machine}
+            if drop:
+                body.pop(drop)
+            if extra:
+                body.update(extra)
+            cursor = "reviewer:" + notice
+            value = {"id": cursor, "event": "task-ready", "payload": body}
+            fresh._consume(io.BytesIO(("id: " + cursor + "\nevent: github\ndata: " + json.dumps(value) + "\n\n").encode()))
+            self.assertEqual(fresh.cursor, cursor)
+            self.assertIsNone(fresh.notices.proof())
+            self.assertEqual(fresh.notices._items, {})
+            self.assertEqual(self.claim(fresh, notified()), ("unknown", "missing_baseline"))
+
+        rejected(machine="")
+        rejected(machine=12, notice="23")
+        rejected(machine=False, notice="24")
+        rejected(platform=None, notice="25")
+        rejected(platform="", notice="26")
+        rejected(drop="machine", notice="27")
+        rejected(machine="bad\nmachine", notice="28")
+        rejected(machine="m" * 201, notice="29")
+        rejected(extra={"title": "secret"}, notice="30")
+
+    def test_delayed_claim_stays_on_the_epoch_that_sent_it(self):
+        client, _wake = self.opened()
+        body, headers, observed = dispatcher.task_claim_request("codex", client)
+        self.assertEqual(body["coverage"], True)
+        self.assertEqual(headers["X-AK-Event-Generation"], "4")
+        self.assertEqual(observed[1:], ("4", "15"))
+        # Unchanged epoch: withheld, then the exact receipt, both use the captured snapshot.
+        self.assertEqual(self.claim(client, notified(), observed=observed), ("fallback_before_notice", "notice_absent_at_claim"))
+        client._consume(io.BytesIO(task_ready()))
+        self.assertEqual(self.claim(client, notified(), observed=observed), ("received", "exact_notice"))
+        # The HTTP claim is still in flight. Disconnect, then a replacement observation
+        # whose retained max baseline shrank to 0. The delayed generation-4 response
+        # must not be scored on generation 5.
+        client.notices.invalidate()
+        client._consume(io.BytesIO(b'event: observation\ndata: {"baseline":"0","generation":"5"}\n\n'))
+        self.assertEqual(client.notices.proof(), "5")
+        self.assertEqual(client.notices.baseline, "0")
+        delayed = notified(notice_at="2026-10-17T03:00:00Z", measured_at="2026-11-16T02:59:59Z")
+        self.assertEqual(self.claim(client, delayed, observed=observed), ("unknown", "epoch_changed"))
+        # A reconnect that repeats server generation 4 is still a new local epoch.
+        client.notices.invalidate()
+        client._consume(io.BytesIO(b'event: observation\ndata: {"baseline":"0","generation":"4"}\n\n'))
+        self.assertEqual(client.notices.proof(), "4")
+        self.assertNotEqual(client.notices.snapshot(), observed)
+        self.assertEqual(self.claim(client, delayed, observed=observed), ("unknown", "epoch_changed"))
+        self.assertNotEqual(self.claim(client, delayed, observed=observed)[0], "received")
+        self.assertNotEqual(self.claim(client, delayed, observed=observed)[0], "fallback_before_notice")
+        # A claim that starts after the replacement may use that epoch. The old response may not.
+        fresh_body, fresh_headers, fresh = dispatcher.task_claim_request("codex", client)
+        self.assertEqual(fresh_body["coverage"], True)
+        self.assertEqual(fresh_headers["X-AK-Event-Generation"], "4")
+        self.assertNotEqual(fresh, observed)
+        self.assertEqual(self.claim(client, delayed, observed=fresh), ("fallback_before_notice", "notice_absent_at_claim"))
+
+    def test_claim_issued_without_an_epoch_ignores_a_later_one(self):
+        client, _wake = DispatcherStreamTests().client()
+        body, headers, observed = dispatcher.task_claim_request("codex", client)
+        self.assertNotIn("coverage", body)
+        self.assertIsNone(headers)
+        self.assertIsNone(observed)
+        client._consume(io.BytesIO(b'event: observation\ndata: {"baseline":"0","generation":"5"}\n\n'))
+        self.assertEqual(client.notices.proof(), "5")
+        self.assertEqual(self.claim(client, notified(), observed=observed), ("unknown", "missing_baseline"))
+
     def test_bad_task_ready_ends_the_epoch_and_claim_headers_follow_the_observation(self):
         client, _wake = self.opened()
-        bare, bare_headers = dispatcher.task_claim_request("codex", None)
+        bare, bare_headers, bare_observed = dispatcher.task_claim_request("codex", None)
         self.assertEqual(set(bare), {"platform", "machine", "agent_id"})
         self.assertIsNone(bare_headers)
-        body, headers = dispatcher.task_claim_request("codex", client)
+        self.assertIsNone(bare_observed)
+        body, headers, observed = dispatcher.task_claim_request("codex", client)
         self.assertEqual(body["coverage"], True)
         self.assertNotIn("akc_test", json.dumps(body))
         self.assertEqual(headers["X-AK-Event-Authorization"], "Bearer akc_test")
         self.assertEqual(headers["X-AK-Event-Consumer"], "reviewer")
         self.assertEqual(headers["X-AK-Event-Generation"], "4")
+        self.assertEqual(client.notices.snapshot(), observed)
         client._consume(io.BytesIO(task_ready(extra={"title": "secret"})))
         self.assertIsNone(client.notices.proof())
         self.assertNotIn("secret", json.dumps(client.notices._items))
-        quiet, quiet_headers = dispatcher.task_claim_request("codex", client)
+        quiet, quiet_headers, quiet_observed = dispatcher.task_claim_request("codex", client)
         self.assertNotIn("coverage", quiet)
         self.assertIsNone(quiet_headers)
+        self.assertIsNone(quiet_observed)
 
     def test_event_header_does_not_replace_the_task_bearer(self):
         captured = {}
