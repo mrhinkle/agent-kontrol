@@ -166,6 +166,30 @@ the plist. Importing `mc_dispatcher` reads no file; only `main()` does.
 - Anything requiring judgment or credentials beyond the repo should be an
   interactive Cowork/Claude session, not a dispatched task.
 
+## Dispatch-ready handoff
+
+`dispatch_ready_bridge.py` is the inert issue-to-task handoff. It does nothing
+unless the caller passes `enabled: true`. One call selects one ready issue from
+an injected snapshot, checks the mapped project is an existing linked worktree,
+and POSTs one `/api/tasks` create. The idempotency key is stable per authority
+and issue, and a private journal is fsynced before that POST. A lost reply
+replays the same key only inside a 23 hour client window. After that, or after
+the caller’s actor id changes, the bridge lists `GET /api/tasks?status=all`
+with an explicit page size and binds a task only when both complete reads show
+the same single matching row. Zero matches, many matches, a demo response, and
+an incomplete page do not create another task. The module reads no credentials
+and writes no GitHub labels.
+
+This does not start the lane. `mc_dispatcher.py` is unchanged, so it still
+claims whatever the existing loop claims and it has no bridge stop check.
+Cross-host processes with separate journals are not coordinated. An issue with
+no P0, P1, or P2 label sorts last and is not enqueued: create priority is 1
+through 3, and 3 is already P2.
+
+```bash
+python3 -m unittest tests.unit.test_dispatch_ready_bridge -v
+```
+
 ## Tests
 
 `python3 -m unittest tests.unit.test_dispatcher_skills -v` (also part of

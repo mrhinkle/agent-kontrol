@@ -253,7 +253,12 @@ and a resolve path, so those come before any page.
    dead-man's check on the brief itself. (brief shipped with this doc; alerts next)
 2. Dispatcher bridge: a small script that claims the top `dispatch-ready` item, starts a lane,
    posts a work event, and halts on the kill switch. Proven end to end before any merge
-   authority.
+   authority. The inert handoff source is `agents/dispatcher/dispatch_ready_bridge.py`.
+   It stays disabled unless the caller passes `enabled: true`, reads issues only through
+   an injected transport, and POSTs at most one existing `/api/tasks` create. It does not
+   claim that task, start a lane, or edit `mc_dispatcher.py`. A queued task is not the
+   end-to-end proof and it grants no merge authority. The dispatcher loop still has no
+   bridge stop check.
 3. `decisions` table + `GET/POST/PATCH /api/decisions` **with GitHub write-back** + collector
    upsert from labels. Resolve ships with the table, as a CLI if the page is not ready.
 4. `/api/brief` + `get_morning_brief` reading the database; scheduler switches to the route.
