@@ -1,4 +1,5 @@
-import { sql } from "./db";
+import { sql, withTransaction, type SqlTag } from "./db";
+import { insertToolReceipt } from "./tool-receipt";
 import { LIST_MAX, stampSortAt } from "./list-params";
 import { retentionDays, type SpanInput, type SpanRow, type TraceSummary } from "./traces";
 
@@ -15,9 +16,10 @@ const numOrNull = (v: unknown): number | null => (v === null || v === undefined 
  * close of one that was opened earlier) merges into the stored row instead of
  * replacing it: the earliest start, the latest known end, and attributes combined.
  */
-export async function upsertSpans(spans: SpanInput[]): Promise<void> {
-  if (spans.length === 0) return;
-  await sql()`
+export async function upsertSpans(spans: SpanInput[], tx?: SqlTag): Promise<{ trace_id: string; span_id: string }[]> {
+  if (spans.length === 0) return [];
+  const db = tx ?? sql();
+  const rows = await db`
     insert into spans (
       trace_id, span_id, parent_span_id, agent_id, session_id, name, kind, status, status_message,
       started_at, ended_at, attributes, model, input_tokens, output_tokens, cost_usd
@@ -69,7 +71,35 @@ export async function upsertSpans(spans: SpanInput[]): Promise<void> {
       input_tokens = coalesce(excluded.input_tokens, spans.input_tokens),
       output_tokens = coalesce(excluded.output_tokens, spans.output_tokens),
       cost_usd = coalesce(excluded.cost_usd, spans.cost_usd)
+    returning trace_id, span_id
   `;
+  return rows.map((row) => {
+    const trace_id = typeof row.trace_id === "string" ? row.trace_id : "";
+    const span_id = typeof row.span_id === "string" ? row.span_id : "";
+    if (!trace_id || !span_id) throw new Error("span id missing");
+    return { trace_id, span_id };
+  });
+}
+
+/**
+ * One OTLP batch commits with one events receipt. The receipt names the
+ * trace and span ids actually written. Pruning stays outside this transaction.
+ */
+export async function storeAcceptedSpans(spans: SpanInput[]): Promise<void> {
+  if (spans.length === 0) return;
+  await withTransaction(async (tx) => {
+    const written = await upsertSpans(spans, tx);
+    if (written.length !== spans.length) throw new Error("Incomplete trace batch");
+    await insertToolReceipt(tx, {
+      kind: "traces.ingest",
+      title: "Trace spans stored",
+      extra: {
+        operation: "upsert",
+        trace_ids: [...new Set(written.map((span) => span.trace_id))].sort(),
+        span_ids: [...new Set(written.map((span) => `${span.trace_id}/${span.span_id}`))].sort(),
+      },
+    });
+  });
 }
 
 export interface TraceFilter {

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { actorFromPrincipal } from "@/lib/actor";
+import { actorFromPrincipal, runWithPrincipal } from "@/lib/actor";
 import { deny, resolveApiAccess } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
@@ -52,10 +52,10 @@ export async function GET(req: Request) {
       const messages = await listConversation({ agent_id });
       return NextResponse.json({ messages });
     }
-    const messages = await fetchMessages({
+    const messages = await runWithPrincipal(access.principal, () => fetchMessages({
       agent_id,
       ack: url.searchParams.get("ack") === "true",
-    });
+    }));
     return NextResponse.json({ messages });
   } catch (e) {
     if (isMessagesSetupError(e)) return setupResponse();
@@ -121,8 +121,9 @@ export async function PATCH(req: Request) {
   if (!body.agent_id) {
     return apiError("missing_field", { message: "agent_id required", fields: { agent_id: "agent_id required" } });
   }
+  const agentId = body.agent_id;
   try {
-    const updated = await markConversationRead({ agent_id: body.agent_id });
+    const updated = await runWithPrincipal(access.principal, () => markConversationRead({ agent_id: agentId }));
     return NextResponse.json({ ok: true, updated });
   } catch (e) {
     if (isMessagesSetupError(e)) return setupResponse();

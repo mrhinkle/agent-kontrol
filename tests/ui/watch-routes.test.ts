@@ -68,6 +68,12 @@ beforeEach(() => {
     const text = strings.join(" ");
     queries.push({ text, values });
     if (text.includes("from watch_beats")) return readRows;
+    if (/insert into watch_beats/i.test(text)) {
+      return typeof values[0] === "string" && values[0].length > 0 ? [{ source: values[0] }] : [];
+    }
+    if (/insert into events/i.test(text)) {
+      return [{ id: 1, kind: values[0], created_at: "2026-11-15T00:00:00.000Z" }];
+    }
     return [];
   });
 });

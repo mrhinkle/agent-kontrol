@@ -1,4 +1,5 @@
-import { sql } from "./db";
+import { sql, withTransaction } from "./db";
+import { insertToolReceipt } from "./tool-receipt";
 import { REPOS, THRESHOLDS, windowDays, type TimeWindow } from "./progress-config";
 import type { SkillsDigest } from "./progress-types";
 import { stallMinutes } from "./skills/clock";
@@ -49,52 +50,83 @@ function num(v: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+function resourceId(value: unknown): string {
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "number" && Number.isFinite(value)) return String(Math.trunc(value));
+  if (typeof value === "string" && value.trim() !== "") return value.trim();
+  throw new Error("snapshot id missing");
+}
+
+function collectedInstant(value: unknown): string {
+  const date = value instanceof Date ? value : typeof value === "string" ? new Date(value) : null;
+  if (!date || Number.isNaN(date.getTime())) throw new Error("snapshot collected_at missing");
+  return date.toISOString();
+}
+
 /**
  * Write one collection tick. Idempotent on (repo, collected_at), so a retried
  * cron run or a re-run backfill corrects the row instead of duplicating it.
+ *
+ * Each accepted row commits on its own, with an events receipt in that same
+ * transaction. A conflict the kind guard ignores is not a write and gets no
+ * receipt. A later row failing leaves earlier rows and their receipts.
  */
 export async function ingestSnapshots(input: IngestInput): Promise<number> {
-  const db = sql();
   const collectedAt = input.collected_at ?? new Date().toISOString();
   const kind = input.kind ?? "tick";
   let written = 0;
 
   for (const r of input.repos) {
     if (!r.repo) continue;
-    const rows = await db`
-      insert into repo_snapshots (
-        repo, label, collected_at, kind,
-        open_issues, open_prs, blocked_issues,
-        merged_prs_24h, issues_closed_24h, issues_opened_24h,
-        total_issues_created, total_issues_closed, total_prs_merged,
-        review_rounds, no_verdict_rate, detail
-      ) values (
-        ${r.repo}, ${r.label ?? null}, ${collectedAt}, ${kind},
-        ${num(r.open_issues)}, ${num(r.open_prs)}, ${num(r.blocked_issues)},
-        ${num(r.merged_prs_24h)}, ${num(r.issues_closed_24h)}, ${num(r.issues_opened_24h)},
-        ${num(r.total_issues_created)}, ${num(r.total_issues_closed)}, ${num(r.total_prs_merged)},
-        ${num(r.review_rounds)}, ${num(r.no_verdict_rate)},
-        ${JSON.stringify(r.detail ?? {})}::jsonb
-      )
-      on conflict (repo, collected_at) do update set
-        label = coalesce(excluded.label, repo_snapshots.label),
-        kind = excluded.kind,
-        open_issues = excluded.open_issues,
-        open_prs = excluded.open_prs,
-        blocked_issues = excluded.blocked_issues,
-        merged_prs_24h = excluded.merged_prs_24h,
-        issues_closed_24h = excluded.issues_closed_24h,
-        issues_opened_24h = excluded.issues_opened_24h,
-        total_issues_created = excluded.total_issues_created,
-        total_issues_closed = excluded.total_issues_closed,
-        total_prs_merged = excluded.total_prs_merged,
-        review_rounds = excluded.review_rounds,
-        no_verdict_rate = excluded.no_verdict_rate,
-        detail = excluded.detail
-      where (repo_snapshots.kind = 'activity') = (excluded.kind = 'activity')
-      returning repo
-    `;
-    written += rows.length;
+    written += await withTransaction(async (q) => {
+      const rows = await q`
+        insert into repo_snapshots (
+          repo, label, collected_at, kind,
+          open_issues, open_prs, blocked_issues,
+          merged_prs_24h, issues_closed_24h, issues_opened_24h,
+          total_issues_created, total_issues_closed, total_prs_merged,
+          review_rounds, no_verdict_rate, detail
+        ) values (
+          ${r.repo}, ${r.label ?? null}, ${collectedAt}, ${kind},
+          ${num(r.open_issues)}, ${num(r.open_prs)}, ${num(r.blocked_issues)},
+          ${num(r.merged_prs_24h)}, ${num(r.issues_closed_24h)}, ${num(r.issues_opened_24h)},
+          ${num(r.total_issues_created)}, ${num(r.total_issues_closed)}, ${num(r.total_prs_merged)},
+          ${num(r.review_rounds)}, ${num(r.no_verdict_rate)},
+          ${JSON.stringify(r.detail ?? {})}::jsonb
+        )
+        on conflict (repo, collected_at) do update set
+          label = coalesce(excluded.label, repo_snapshots.label),
+          kind = excluded.kind,
+          open_issues = excluded.open_issues,
+          open_prs = excluded.open_prs,
+          blocked_issues = excluded.blocked_issues,
+          merged_prs_24h = excluded.merged_prs_24h,
+          issues_closed_24h = excluded.issues_closed_24h,
+          issues_opened_24h = excluded.issues_opened_24h,
+          total_issues_created = excluded.total_issues_created,
+          total_issues_closed = excluded.total_issues_closed,
+          total_prs_merged = excluded.total_prs_merged,
+          review_rounds = excluded.review_rounds,
+          no_verdict_rate = excluded.no_verdict_rate,
+          detail = excluded.detail
+        where (repo_snapshots.kind = 'activity') = (excluded.kind = 'activity')
+        returning id, repo, collected_at, kind
+      `;
+      if (rows.length === 0) return 0;
+      const row = rows[0];
+      await insertToolReceipt(q, {
+        kind: "progress.ingest",
+        title: "Progress snapshot stored",
+        extra: {
+          operation: "upsert",
+          snapshot_id: resourceId(row.id),
+          repo: String(row.repo),
+          collected_at: collectedInstant(row.collected_at),
+          snapshot_kind: String(row.kind),
+        },
+      });
+      return rows.length;
+    });
   }
   return written;
 }

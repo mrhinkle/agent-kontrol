@@ -1,12 +1,15 @@
 import { createHash } from "node:crypto";
 import type { Actor } from "./actor";
 import { isConfigured, sql, withTransaction, type Row } from "./db";
+import { insertToolReceipt } from "./tool-receipt";
 import {
   alignRepoCasing,
   DISCOVERY_WRITE_LOCK,
+  discoveryFailureSummary,
   planDiscovery,
   repoIdentity,
   repoOwner,
+  type DiscoveryFailureCode,
   type DiscoveryOutcome,
   type DiscoverySweep,
   type GhListedRepo,
@@ -35,6 +38,8 @@ export interface DiscoveryRequest {
   truncated?: boolean;
   /** Collector clock time taken just before `gh repo list`. */
   sweptAt?: string | null;
+  /** Set where the request was classified. Absent on a listing the planner still has to judge. */
+  failureCode?: DiscoveryFailureCode;
 }
 
 function iso(value: unknown): string | null {
@@ -157,7 +162,7 @@ export async function replaceWatchedOwners(
     if (expectedVersion !== undefined && expectedVersion !== ownerListVersion(rows.map((r) => ownerFromRow(r)))) {
       return { ok: false, reason: "stale" };
     }
-    await q`
+    const removed = await q`
       with incoming as (
         select * from unnest(
           ${owners.map((o) => o.owner)}::text[],
@@ -180,10 +185,27 @@ export async function replaceWatchedOwners(
           actor_id = excluded.actor_id,
           updated_at = now()
         returning owner
+      ),
+      deleted as (
+        delete from watched_owners w
+        where not exists (select 1 from incoming i where i.owner = w.owner)
+        returning owner
       )
-      delete from watched_owners w
-      where not exists (select 1 from incoming i where i.owner = w.owner)
+      select owner from deleted
     `;
+    const deletedOwners = removed
+      .map((row) => typeof row.owner === "string" ? row.owner : "")
+      .filter((owner) => owner.length > 0)
+      .sort();
+    // Added and retained rows already store the configuring actor. An events
+    // receipt exists only for owners this statement actually deleted.
+    if (deletedOwners.length > 0) {
+      await insertToolReceipt(q, {
+        kind: "owners.replace",
+        title: "Watched owners replaced",
+        extra: { operation: "replace", deleted_owners: deletedOwners },
+      });
+    }
     return { ok: true };
   });
 }
@@ -200,19 +222,27 @@ export function ruleOf(owner: StoredOwner): OwnerRule {
 export function sweepOf(request: DiscoveryRequest): DiscoverySweep {
   const sweptAt = request.sweptAt ?? null;
   if (!request.ok) {
-    return { repos: null, error: request.error?.trim() || "gh repo list failed", truncated: false, sweptAt };
+    return {
+      repos: null,
+      error: request.error?.trim() || "gh repo list failed",
+      truncated: false,
+      sweptAt,
+      failureCode: request.failureCode ?? "collection_failed",
+    };
   }
   return {
     repos: request.repos ?? [],
     error: request.error ?? null,
     truncated: request.truncated === true,
     sweptAt,
+    failureCode: null,
   };
 }
 
-function unchanged(existing: TrackedRepo[], failure: string): DiscoveryOutcome {
+function unchanged(existing: TrackedRepo[], failure: string, failureCode: DiscoveryFailureCode): DiscoveryOutcome {
   return {
     failure,
+    failureCode,
     warning: null,
     repos: existing.map((row) => ({ ...row })),
     added: [],
@@ -258,14 +288,15 @@ function sameDiscoveryRule(rule: OwnerRule, stored: StoredOwner): boolean {
     && stored.includeArchived === rule.includeArchived;
 }
 
-function skippedOutcome(existing: TrackedRepo[], skipped: DiscoverySkip): DiscoveryApplyOutcome {
-  return { ...unchanged(existing, `skipped: ${skipped}`), skipped };
+function skippedOutcome(existing: TrackedRepo[], skipped: Exclude<DiscoverySkip, "stale">): DiscoveryApplyOutcome {
+  return { ...unchanged(existing, discoveryFailureSummary(skipped), skipped), skipped };
 }
 
 /** A stale sweep is not a failure. It writes nothing and keeps the newer stamp. */
 function staleOutcome(existing: TrackedRepo[]): DiscoveryApplyOutcome {
   return {
     failure: null,
+    failureCode: null,
     warning: null,
     repos: existing.map((row) => ({ ...row })),
     added: [],
@@ -308,16 +339,20 @@ async function applyOwnerDiscoveryOnce(
     const owned = outcome.failure
       ? []
       : outcome.repos.filter((row) => repoOwner(row.repo) === rule.owner.toLowerCase());
-    await q`
+    const marked = await q`
       update watched_owners set
         last_error = ${visibleError},
         last_error_at = case when ${visibleError}::text is null then null else now() end,
         last_discovered_at = case when ${outcome.failure}::text is null then ${discoveredAt}::timestamptz else last_discovered_at end,
         updated_at = now()
       where owner = ${rule.owner}
+      returning owner
     `;
-    if (outcome.failure || owned.length === 0) return outcome;
-    await q`
+    if (marked.length !== 1 || marked[0]?.owner !== rule.owner) {
+      throw new Error("owner discovery marker was not stored");
+    }
+    if (!outcome.failure && owned.length > 0) {
+      const storedRepos = await q`
     insert into watched_repos (
       repo, label, short, color, blocked_label, position, origin, pinned, hidden, gone,
       is_fork, is_archived, last_activity_at, updated_at
@@ -349,7 +384,24 @@ async function applyOwnerDiscoveryOnce(
       is_archived = excluded.is_archived,
       gone = excluded.gone,
       updated_at = now()
+    returning repo
     `;
+      const returned = new Set(storedRepos.map((row) => String(row.repo)));
+      if (storedRepos.length !== owned.length || owned.some((row) => !returned.has(row.repo))) {
+        throw new Error("owner discovery repos were not stored");
+      }
+    }
+    await insertToolReceipt(q, {
+      kind: "owners.discover",
+      title: outcome.failure ? "Owner discovery error stored" : "Owner discovery stored",
+      extra: {
+        operation: outcome.failure ? "error" : "apply",
+        owner: rule.owner,
+        added: outcome.added,
+        updated: outcome.updated,
+        marked_gone: outcome.markedGone,
+      },
+    });
     return outcome;
   });
 }
