@@ -60,7 +60,11 @@ export async function POST(req: Request) {
     return apiError("missing_field", { message: "agent_id and kind are required", fields });
   }
   if (body.kind === "run_complete" && !parseRunTelemetry(body.detail)) {
-    return NextResponse.json({ error: "invalid completed-run metadata" }, { status: 400 });
+    return apiError("validation_failed", {
+      message: "invalid completed-run metadata",
+      fix: "Send a completed run with schema mc.run.v2 and the required run fields. The rejected detail was not stored.",
+      extra: { cause: "The completed-run detail did not match the run schema." },
+    });
   }
 
   if (isReservedIngestKind(body.kind)) {
