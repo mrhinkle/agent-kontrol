@@ -150,8 +150,12 @@ describe("watch beats store", () => {
     });
     const hostile = "mini'); drop table watch_beats; --";
     await upsertBeat(hostile, "held", "😀".repeat(500), "2026-10-28T12:00:00.123456Z");
-    assert.equal(captured.length, 1);
-    const query = captured[0];
+    const beats = captured.filter((query) => /insert into watch_beats/i.test(query.text));
+    assert.equal(beats.length, 1);
+    assert.equal(captured[0]?.text.trim(), "begin");
+    assert.equal(captured.at(-1)?.text.trim(), "commit");
+    assert.equal(captured.some((query) => query.text.includes("insert into events")), true);
+    const query = beats[0];
     assert.equal(query.values.length, 4);
     assert.deepEqual(query.values, [hostile, "held", "😀".repeat(500), "2026-10-28T12:00:00.123456Z"]);
     assert.equal(query.text.includes(hostile), false, "the source must be a bound parameter");
@@ -163,7 +167,9 @@ describe("watch beats store", () => {
 
     captured.length = 0;
     await upsertBeat("mini", "ok", "", new Date("2026-10-28T07:00:00-05:00"));
-    assert.equal(captured[0].values[3], "2026-10-28T12:00:00.000Z");
+    const dated = captured.find((query) => /insert into watch_beats/i.test(query.text));
+    assert.ok(dated);
+    assert.equal(dated.values[3], "2026-10-28T12:00:00.000Z");
   });
 
   it("accepts an empty detail and every documented status without inventing received_at", async () => {
@@ -177,10 +183,11 @@ describe("watch beats store", () => {
     }
     await upsertBeat("mini", "ok", "", "2026-10-28T07:30:00+05:30");
     await upsertBeat("mini", "ok", "e\u0301".repeat(250), "2026-10-28T12:00:00.1Z");
-    assert.equal(seen.length, 8);
-    assert.deepEqual(seen.map((values) => values[1]), ["ok", "held", "paused", "stale", "failing", "unknown", "ok", "ok"]);
-    assert.equal(seen[6][3], "2026-10-28T07:30:00+05:30");
-    assert.equal(seen[7][2], "e\u0301".repeat(250));
+    const beats = seen.filter((values) => values.length === 4);
+    assert.equal(beats.length, 8);
+    assert.deepEqual(beats.map((values) => values[1]), ["ok", "held", "paused", "stale", "failing", "unknown", "ok", "ok"]);
+    assert.equal(beats[6][3], "2026-10-28T07:30:00+05:30");
+    assert.equal(beats[7][2], "e\u0301".repeat(250));
   });
 
   it("returns the SQL age and UTC ISO timestamps, and nothing else", async () => {

@@ -1,4 +1,5 @@
-import { sql } from "./db";
+import { sql, withTransaction } from "./db";
+import { insertToolReceipt } from "./tool-receipt";
 
 /**
  * Host liveness beats (mrhinkle/agent-kontrol#81).
@@ -141,15 +142,28 @@ export async function upsertBeat(
   const st = assertStatus(status);
   const det = assertDetail(detail);
   const beat = beatAtForSql(beatAt);
-  await sql()`
-    insert into watch_beats (source, status, detail, beat_at, received_at)
-    values (${src}, ${st}, ${det}, ${beat}::timestamptz, clock_timestamp())
-    on conflict (source) do update set
-      status = excluded.status,
-      detail = excluded.detail,
-      beat_at = excluded.beat_at,
-      received_at = clock_timestamp()
-  `;
+  await withTransaction(async (tx) => {
+    const rows = await tx`
+      insert into watch_beats (source, status, detail, beat_at, received_at)
+      values (${src}, ${st}, ${det}, ${beat}::timestamptz, clock_timestamp())
+      on conflict (source) do update set
+        status = excluded.status,
+        detail = excluded.detail,
+        beat_at = excluded.beat_at,
+        received_at = clock_timestamp()
+      returning source
+    `;
+    const stored = rows[0];
+    const sourceId = stored && typeof stored.source === "string" && stored.source.length > 0
+      ? stored.source
+      : src;
+    if (stored && sourceId !== src) throw new Error("watch source missing");
+    await insertToolReceipt(tx, {
+      kind: "watch.beat",
+      title: "Watch beat stored",
+      extra: { operation: "upsert", source: sourceId },
+    });
+  });
 }
 
 function utcIso(value: unknown): string {

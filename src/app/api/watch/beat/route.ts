@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { enforceApi } from "@/lib/auth";
+import { actorFromPrincipal, runWithActor } from "@/lib/actor";
 import { describeDbError } from "@/lib/db-error";
 import { WatchBeatError, upsertBeat } from "@/lib/watch";
 import {
@@ -72,7 +73,8 @@ export async function POST(req: Request) {
   }
 
   try {
-    await upsertBeat(beat.beat.source, beat.beat.status, beat.beat.detail, beat.beat.beat_at);
+    await runWithActor(actorFromPrincipal(access.principal), () =>
+      upsertBeat(beat.beat.source, beat.beat.status, beat.beat.detail, beat.beat.beat_at));
   } catch (err) {
     if (err instanceof WatchBeatError) {
       return watchError("validation_failed", {
