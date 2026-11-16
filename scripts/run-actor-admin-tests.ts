@@ -39,6 +39,9 @@ async function main(): Promise<void> {
   const { testCredentialAdmin } = await import("./actor-admin-credentials-tests");
   await testCredentialAdmin();
   console.log("actor-admin credentials: ok");
+  const { testSkillSync } = await import("./actor-admin-sync-tests");
+  await testSkillSync();
+  console.log("actor-admin sync: ok");
 }
 
 main().then(
