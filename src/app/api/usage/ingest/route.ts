@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { enforceBearer } from "@/lib/auth";
+import { deny, resolveBearerAccess } from "@/lib/auth";
+import { actorFromPrincipal, runWithActor } from "@/lib/actor";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { isUndefinedTableError, USAGE_SETUP_MESSAGE } from "@/lib/usage-errors";
@@ -15,8 +16,8 @@ export const maxDuration = 60;
  * Dedicated endpoint — do not overload /api/ingest (liveness only).
  */
 export async function POST(req: Request) {
-  const denied = await enforceBearer(req);
-  if (denied) return denied;
+  const access = await resolveBearerAccess(req);
+  if (!access.ok) return deny(access);
   if (!isConfigured()) {
     return NextResponse.json({
       ok: true,
@@ -58,7 +59,7 @@ export async function POST(req: Request) {
   }
 
   try {
-    const written = await ingestUsageBatch(body);
+    const written = await runWithActor(actorFromPrincipal(access.principal), () => ingestUsageBatch(body));
     return NextResponse.json({ ok: true, written });
   } catch (e) {
     if (isUndefinedTableError(e)) {

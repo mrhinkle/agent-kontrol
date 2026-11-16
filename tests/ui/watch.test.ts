@@ -20,6 +20,17 @@ function sqlText(strings: TemplateStringsArray): string {
   return strings.join(" ");
 }
 
+/** A successful beat returns its source. A successful receipt returns one readable row. */
+function truthfulWatchRows(text: string, params: unknown[]): Row[] {
+  if (/insert into watch_beats/i.test(text)) {
+    return typeof params[0] === "string" && params[0].length > 0 ? [{ source: params[0] }] : [];
+  }
+  if (/insert into events/i.test(text)) {
+    return [{ id: 1, kind: params[0], created_at: "2026-11-15T00:00:00.000Z" }];
+  }
+  return [];
+}
+
 describe("watch beats store", () => {
   it("keeps the same watch_beats definition in schema.sql and the changelog migration", () => {
     const schema = fs.readFileSync("supabase/schema.sql", "utf8");
@@ -146,12 +157,16 @@ describe("watch beats store", () => {
     setSqlForTests(async (strings, ...values) => {
       const built = toQuery(strings, values);
       captured.push({ text: built.text, values: built.params });
-      return [];
+      return truthfulWatchRows(built.text, built.params);
     });
     const hostile = "mini'); drop table watch_beats; --";
     await upsertBeat(hostile, "held", "😀".repeat(500), "2026-10-28T12:00:00.123456Z");
-    assert.equal(captured.length, 1);
-    const query = captured[0];
+    const beats = captured.filter((query) => /insert into watch_beats/i.test(query.text));
+    assert.equal(beats.length, 1);
+    assert.equal(captured[0]?.text.trim(), "begin");
+    assert.equal(captured.at(-1)?.text.trim(), "commit");
+    assert.equal(captured.some((query) => query.text.includes("insert into events")), true);
+    const query = beats[0];
     assert.equal(query.values.length, 4);
     assert.deepEqual(query.values, [hostile, "held", "😀".repeat(500), "2026-10-28T12:00:00.123456Z"]);
     assert.equal(query.text.includes(hostile), false, "the source must be a bound parameter");
@@ -163,24 +178,28 @@ describe("watch beats store", () => {
 
     captured.length = 0;
     await upsertBeat("mini", "ok", "", new Date("2026-10-28T07:00:00-05:00"));
-    assert.equal(captured[0].values[3], "2026-10-28T12:00:00.000Z");
+    const dated = captured.find((query) => /insert into watch_beats/i.test(query.text));
+    assert.ok(dated);
+    assert.equal(dated.values[3], "2026-10-28T12:00:00.000Z");
   });
 
   it("accepts an empty detail and every documented status without inventing received_at", async () => {
     const seen: unknown[][] = [];
-    setSqlForTests(async (_strings, ...values) => {
+    setSqlForTests(async (strings, ...values) => {
       seen.push(values);
-      return [];
+      const built = toQuery(strings, values);
+      return truthfulWatchRows(built.text, built.params);
     });
     for (const status of ["ok", "held", "paused", "stale", "failing", "unknown"]) {
       await upsertBeat("mini", status, "", "2026-10-28t12:00:00z");
     }
     await upsertBeat("mini", "ok", "", "2026-10-28T07:30:00+05:30");
     await upsertBeat("mini", "ok", "e\u0301".repeat(250), "2026-10-28T12:00:00.1Z");
-    assert.equal(seen.length, 8);
-    assert.deepEqual(seen.map((values) => values[1]), ["ok", "held", "paused", "stale", "failing", "unknown", "ok", "ok"]);
-    assert.equal(seen[6][3], "2026-10-28T07:30:00+05:30");
-    assert.equal(seen[7][2], "e\u0301".repeat(250));
+    const beats = seen.filter((values) => values.length === 4);
+    assert.equal(beats.length, 8);
+    assert.deepEqual(beats.map((values) => values[1]), ["ok", "held", "paused", "stale", "failing", "unknown", "ok", "ok"]);
+    assert.equal(beats[6][3], "2026-10-28T07:30:00+05:30");
+    assert.equal(beats[7][2], "e\u0301".repeat(250));
   });
 
   it("returns the SQL age and UTC ISO timestamps, and nothing else", async () => {
@@ -259,6 +278,62 @@ describe("watch beats store", () => {
       },
     ]);
     await assert.rejects(readBeats, /age_s/);
+  });
+
+  it("rejects a suppressed beat before any receipt and rolls back", async () => {
+    const captured: string[] = [];
+    setSqlForTests(async (strings, ...values) => {
+      const built = toQuery(strings, values);
+      captured.push(built.text.trim());
+      if (/insert into watch_beats/i.test(built.text)) return [];
+      if (/insert into events/i.test(built.text)) {
+        return [{ id: 1, kind: values[0], created_at: "2026-11-15T00:00:00.000Z" }];
+      }
+      return [];
+    });
+    await assert.rejects(
+      () => upsertBeat("mini", "ok", "private", "2026-10-28T12:00:00Z"),
+      /watch source missing/,
+    );
+    assert.equal(captured.some((text) => text === "commit"), false);
+    assert.equal(captured.at(-1), "rollback");
+    assert.equal(captured.some((text) => /insert into events/i.test(text)), false);
+  });
+
+  it("rejects a returned source that is not the requested source", async () => {
+    const captured: string[] = [];
+    setSqlForTests(async (strings, ...values) => {
+      const built = toQuery(strings, values);
+      captured.push(built.text.trim());
+      if (/insert into watch_beats/i.test(built.text)) return [{ source: "other" }];
+      return truthfulWatchRows(built.text, built.params);
+    });
+    await assert.rejects(
+      () => upsertBeat("mini", "ok", "", "2026-10-28T12:00:00Z"),
+      /watch source missing/,
+    );
+    assert.equal(captured.some((text) => text === "commit"), false);
+    assert.equal(captured.at(-1), "rollback");
+    assert.equal(captured.some((text) => /insert into events/i.test(text)), false);
+  });
+
+  it("rolls the beat back when the receipt insert returns no row", async () => {
+    const captured: string[] = [];
+    setSqlForTests(async (strings, ...values) => {
+      const built = toQuery(strings, values);
+      captured.push(built.text.trim());
+      if (/insert into watch_beats/i.test(built.text)) return [{ source: values[0] }];
+      if (/insert into events/i.test(built.text)) return [];
+      return [];
+    });
+    await assert.rejects(
+      () => upsertBeat("mini", "ok", "", "2026-10-28T12:00:00Z"),
+      /tool receipt was not stored/,
+    );
+    assert.equal(captured.some((text) => /insert into watch_beats/i.test(text)), true);
+    assert.equal(captured.some((text) => /insert into events/i.test(text)), true);
+    assert.equal(captured.some((text) => text === "commit"), false);
+    assert.equal(captured.at(-1), "rollback");
   });
 
   it("raises when DATABASE_URL is missing and does not return beats", async () => {

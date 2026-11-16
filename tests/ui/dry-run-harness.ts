@@ -150,6 +150,10 @@ function returningRows(text: string, params: unknown[]): Row[] {
       },
     ];
   }
+  if (/insert\s+into\s+events\s*\(\s*agent_id\s*,\s*session_id\s*,\s*kind\s*,\s*title\s*,\s*detail\s*\)/i.test(text)) {
+    const kind = typeof params[0] === "string" ? params[0] : "";
+    return kind ? [{ id: 1, kind, created_at: "2026-11-15T00:00:00.000Z" }] : [];
+  }
   return [];
 }
 
