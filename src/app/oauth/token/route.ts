@@ -118,7 +118,9 @@ async function handleAuthorizationCode(
     return oauthError("invalid_grant", "Authorization code is invalid or already used");
   }
   if (new Date(row.expires_at).getTime() < Date.now()) {
-    return oauthError("invalid_grant", "Authorization code has expired");
+    return oauthError("invalid_grant", "Authorization code has expired", 400, {
+      fix: "Start authorization again and redeem the new code. Do not retry this code.",
+    });
   }
 
   // EXACT match on client_id and redirect_uri.
@@ -215,7 +217,9 @@ async function handleRefreshToken(
 
   const payload = await verifyAccessToken(refreshToken);
   if (!payload || payload.typ !== "refresh") {
-    return oauthError("invalid_grant", "Invalid or expired refresh token");
+    return oauthError("invalid_grant", "Invalid or expired refresh token", 400, {
+      fix: "Start authorization again if the refresh token is expired. Do not retry this refresh token.",
+    });
   }
 
   if (payload.client_id !== client.client_id) {
