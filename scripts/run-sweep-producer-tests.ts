@@ -11,7 +11,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { checkPrSnapshotObservation, checkQueueObservation } from "../src/lib/sweep-evidence";
-import { FAKE_TOKEN, Fixture, IngestServer, baseConfig, repoConfig, runProducer, sha, type Json, type PrFixture } from "./sweep-producer-fixtures";
+import { FAKE_TOKEN, Fixture, IngestServer, baseConfig, repoConfig, runProducer, sha, type CtxFixture, type Json, type PrFixture } from "./sweep-producer-fixtures";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "sweep-producer-"));
 const REPO = "Acme/Widgets";
@@ -90,6 +90,44 @@ function kill9(child: ChildProcess): Promise<void> {
 
 const ok = (name: string): PrFixture["contexts"] => [{ kind: "check", name }];
 const green = (): NonNullable<PrFixture["contexts"]> => [{ kind: "check", name: "CI" }, { kind: "status", name: "Postgres" }];
+
+/** GitHub Actions app and the agent-kontrol CI workflow, from the captured rollup. */
+const ACTIONS = { appId: 15368, appSlug: "github-actions", workflowId: 379180191, workflowName: "CI", event: "pull_request" };
+const OLD_RUN = { runId: 43804937161, runNumber: 437, runCreatedAt: "2026-11-16T04:34:38Z" };
+const NEW_RUN = { runId: 43804958702, runNumber: 438, runCreatedAt: "2026-11-16T04:34:50Z" };
+const CAPTURED_HEAD = "fa5b7bf2a327d42f0952360e558cd99dd602b4cd";
+
+function ghCheck(over: Partial<CtxFixture> & Pick<CtxFixture, "name" | "checkId" | "runId" | "runNumber" | "runCreatedAt">): CtxFixture {
+  return {
+    kind: "check",
+    status: "COMPLETED",
+    conclusion: "SUCCESS",
+    startedAt: over.runCreatedAt,
+    completedAt: over.runCreatedAt,
+    ...ACTIONS,
+    ...over,
+  };
+}
+
+function commitStatus(name: string, state: string, createdAt: string, creator = "ci-bot"): CtxFixture {
+  return { kind: "status", name, state, createdAt, creator };
+}
+
+/** PR 153 at fa5b7bf, attempts from the 2026-11-16 rollup. `progress` is the 04:36 observation; `success` is the 04:38 one. */
+function capturedContexts(ci: "progress" | "success"): CtxFixture[] {
+  const ciNew = ci === "progress"
+    ? ghCheck({ name: "ci", checkId: 133093578520, ...NEW_RUN, status: "IN_PROGRESS", conclusion: null, startedAt: "2026-11-16T04:35:09Z", completedAt: null })
+    : ghCheck({ name: "ci", checkId: 133093578520, ...NEW_RUN, conclusion: "SUCCESS", startedAt: "2026-11-16T04:35:09Z", completedAt: "2026-11-16T04:37:23Z" });
+  return [
+    ghCheck({ name: "ci", checkId: 133093417794, ...OLD_RUN, conclusion: "CANCELLED", startedAt: "2026-11-16T04:34:40Z", completedAt: "2026-11-16T04:34:54Z" }),
+    ciNew,
+    ghCheck({ name: "postgres", checkId: 133093417884, ...OLD_RUN, conclusion: "CANCELLED", startedAt: "2026-11-16T04:34:40Z", completedAt: "2026-11-16T04:34:53Z" }),
+    ghCheck({ name: "postgres", checkId: 133093578323, ...NEW_RUN, conclusion: "SUCCESS", startedAt: "2026-11-16T04:35:09Z", completedAt: "2026-11-16T04:36:09Z" }),
+    ghCheck({ name: "docker", checkId: 133093417504, ...OLD_RUN, conclusion: "CANCELLED", startedAt: "2026-11-16T04:34:40Z", completedAt: "2026-11-16T04:35:07Z" }),
+    ghCheck({ name: "docker", checkId: 133093578653, ...NEW_RUN, conclusion: "SUCCESS", startedAt: "2026-11-16T04:35:09Z", completedAt: "2026-11-16T04:36:42Z" }),
+    { kind: "check", name: "CodeRabbit", checkId: 133093144003, status: "COMPLETED", conclusion: "SKIPPED", startedAt: "2026-11-16T04:33:47Z", completedAt: "2026-11-16T04:33:47Z", appId: 347564, appSlug: "coderabbitai" },
+  ];
+}
 
 function standard(fx: Fixture, repo = REPO): void {
   fx.issues(repo, [
@@ -344,6 +382,153 @@ async function main() {
     assert.deepEqual(by.get(19)!.review, { started: false, head_sha: h(19) });
     assert.deepEqual(by.get(20)!.required_checks, { state: "unknown" });
     assert.deepEqual(by.get(21)!.review, { started: false, head_sha: h(21) }, "a pending (unsubmitted) review is not a published review");
+  });
+
+  await check("PRs: current attempt per name and producer, not a stale run", async () => {
+    const fx = new Fixture(root);
+    async function states(required: string[] | undefined, list: PrFixture[]): Promise<Map<number, Json>> {
+      reset();
+      fx.clear(REPO);
+      fx.issues(REPO, []);
+      fx.prs(REPO, list);
+      fx.config(baseConfig({ [REPO]: repoConfig(REPO, { required_checks: required }) }));
+      const r = await runProducer(fx, ["--repo", REPO], live);
+      assert.equal(r.code, 0, r.stderr);
+      const [p] = server.of("sweep.pr_snapshot");
+      valid("sweep.pr_snapshot", p);
+      assert.equal(p.complete, true);
+      return new Map(p.prs.map((row: Json) => [row.number, row]));
+    }
+    async function expectState(label: string, required: string[], contexts: CtxFixture[], state: string): Promise<void> {
+      const head = sha(label);
+      const by = await states(required, [
+        { number: 1, head, contexts },
+        { number: 2, head, contexts: [...contexts].reverse() },
+      ]);
+      assert.equal(by.get(1)!.required_checks.state, state, label);
+      assert.equal(by.get(2)!.required_checks.state, state, `${label} reversed`);
+      assert.equal(by.get(1)!.required_checks.head_sha, head, label);
+    }
+
+    const progress = capturedContexts("progress");
+    let by = await states(["ci", "postgres", "docker"], [
+      { number: 153, head: CAPTURED_HEAD, title: "Add deterministic event reducers with bounded recovery", contexts: progress },
+      { number: 154, head: CAPTURED_HEAD, contexts: [...progress].reverse() },
+    ]);
+    assert.equal(by.get(153)!.required_checks.state, "pending", "cancelled ci does not fail the in-progress replacement");
+    assert.equal(by.get(154)!.required_checks.state, "pending", "captured context order does not matter");
+    assert.deepEqual(by.get(153)!.required_checks, { state: "pending", head_sha: CAPTURED_HEAD });
+    assert.deepEqual(by.get(153)!.review, { started: false, head_sha: CAPTURED_HEAD }, "CodeRabbit skipped is not a review-start signal");
+
+    by = await states(["postgres"], [{ number: 153, head: CAPTURED_HEAD, contexts: progress }]);
+    assert.equal(by.get(153)!.required_checks.state, "success", "current postgres success is not the cancelled attempt");
+
+    by = await states(["ci", "postgres", "docker"], [{ number: 153, head: CAPTURED_HEAD, contexts: capturedContexts("success") }]);
+    assert.equal(by.get(153)!.required_checks.state, "success", "old cancelled, current success");
+
+    const at = (hms: string) => `2026-11-16T${hms}Z`;
+    await expectState("old success, current failure", ["ci"], [
+      ghCheck({ name: "ci", checkId: 10, runId: 10, runNumber: 1, runCreatedAt: at("04:00:00"), conclusion: "SUCCESS", completedAt: at("04:20:00") }),
+      ghCheck({ name: "ci", checkId: 11, runId: 11, runNumber: 2, runCreatedAt: at("04:21:00"), conclusion: "FAILURE", startedAt: at("04:21:00"), completedAt: at("04:22:00") }),
+    ], "failure");
+    await expectState("queued attempt does not inherit an older success", ["ci"], [
+      ghCheck({ name: "ci", checkId: 10, runId: 10, runNumber: 1, runCreatedAt: at("04:00:00"), conclusion: "SUCCESS", completedAt: at("04:05:00") }),
+      ghCheck({ name: "ci", checkId: 11, runId: 11, runNumber: 2, runCreatedAt: at("04:10:00"), status: "QUEUED", conclusion: null, startedAt: null, completedAt: null }),
+    ], "pending");
+    await expectState("older run that finishes later does not replace the newer success", ["ci"], [
+      ghCheck({ name: "ci", checkId: 9000, runId: 10, runNumber: 1, runCreatedAt: at("04:00:00"), conclusion: "FAILURE", completedAt: at("05:00:00") }),
+      ghCheck({ name: "ci", checkId: 3, runId: 20, runNumber: 2, runCreatedAt: at("04:10:00"), conclusion: "SUCCESS", startedAt: at("04:10:00"), completedAt: at("04:11:00") }),
+    ], "success");
+    await expectState("newer failure stands when the older success completes later", ["ci"], [
+      ghCheck({ name: "ci", checkId: 2, runId: 20, runNumber: 2, runCreatedAt: at("04:10:00"), conclusion: "FAILURE", startedAt: at("04:10:00"), completedAt: at("04:12:00") }),
+      ghCheck({ name: "ci", checkId: 1, runId: 10, runNumber: 1, runCreatedAt: at("04:00:00"), conclusion: "SUCCESS", completedAt: at("04:40:00") }),
+    ], "failure");
+    await expectState("a queued rerun inside the current run replaces that run's failure", ["ci"], [
+      ghCheck({ name: "ci", checkId: 5, runId: 10, runNumber: 3, runCreatedAt: at("04:00:00"), conclusion: "FAILURE", completedAt: at("04:05:00") }),
+      ghCheck({ name: "ci", checkId: 6, runId: 10, runNumber: 3, runCreatedAt: at("04:00:00"), status: "QUEUED", conclusion: null, startedAt: null, completedAt: null }),
+    ], "pending");
+    await expectState("three attempts keep the newest", ["ci"], [
+      ghCheck({ name: "ci", checkId: 1, runId: 10, runNumber: 1, runCreatedAt: at("04:00:00"), conclusion: "CANCELLED", completedAt: at("04:01:00") }),
+      ghCheck({ name: "ci", checkId: 2, runId: 11, runNumber: 2, runCreatedAt: at("04:02:00"), conclusion: "FAILURE", completedAt: at("04:03:00") }),
+      ghCheck({ name: "ci", checkId: 3, runId: 12, runNumber: 3, runCreatedAt: at("04:04:00"), conclusion: "SUCCESS", completedAt: at("04:05:00") }),
+    ], "success");
+
+    await expectState("run number and run id disagree", ["ci"], [
+      ghCheck({ name: "ci", checkId: 1, runId: 100, runNumber: 4, runCreatedAt: at("04:00:00"), conclusion: "SUCCESS" }),
+      ghCheck({ name: "ci", checkId: 2, runId: 50, runNumber: 5, runCreatedAt: at("04:10:00"), conclusion: "SUCCESS", startedAt: at("04:10:00") }),
+    ], "unknown");
+    await expectState("equal run numbers with different run ids", ["ci"], [
+      ghCheck({ name: "ci", checkId: 1, runId: 100, runNumber: 5, runCreatedAt: at("04:00:00"), conclusion: "SUCCESS" }),
+      ghCheck({ name: "ci", checkId: 2, runId: 101, runNumber: 5, runCreatedAt: at("04:10:00"), conclusion: "SUCCESS", startedAt: at("04:10:00") }),
+    ], "unknown");
+    await expectState("run creation time contradicts the run number", ["ci"], [
+      ghCheck({ name: "ci", checkId: 1, runId: 10, runNumber: 1, runCreatedAt: at("05:00:00"), conclusion: "SUCCESS" }),
+      ghCheck({ name: "ci", checkId: 2, runId: 20, runNumber: 2, runCreatedAt: at("04:10:00"), conclusion: "SUCCESS", startedAt: at("04:10:00") }),
+    ], "unknown");
+    await expectState("duplicate attempts without a producer", ["ci"], [
+      { kind: "check", name: "ci", status: "COMPLETED", conclusion: "SUCCESS" },
+      { kind: "check", name: "ci", status: "COMPLETED", conclusion: "SUCCESS" },
+    ], "unknown");
+    await expectState("duplicate actions runs without run identity", ["ci"], [
+      { kind: "check", name: "ci", checkId: 1, status: "COMPLETED", conclusion: "SUCCESS", ...ACTIONS, runCreatedAt: at("04:00:00") },
+      { kind: "check", name: "ci", checkId: 2, status: "COMPLETED", conclusion: "SUCCESS", ...ACTIONS, runCreatedAt: at("04:00:00") },
+    ], "unknown");
+    await expectState("check id and start time disagree", ["lint"], [
+      { kind: "check", name: "lint", checkId: 8, status: "COMPLETED", conclusion: "SUCCESS", startedAt: at("04:00:00"), completedAt: at("04:01:00"), appId: 99, appSlug: "sidekick" },
+      { kind: "check", name: "lint", checkId: 7, status: "COMPLETED", conclusion: "SUCCESS", startedAt: at("05:00:00"), completedAt: at("05:01:00"), appId: 99, appSlug: "sidekick" },
+    ], "unknown");
+
+    await expectState("two apps stay separate when each current attempt passes", ["ci"], [
+      ghCheck({ name: "ci", checkId: 1, runId: 10, runNumber: 1, runCreatedAt: at("04:00:00"), conclusion: "CANCELLED", completedAt: at("04:01:00") }),
+      ghCheck({ name: "ci", checkId: 2, runId: 20, runNumber: 2, runCreatedAt: at("04:10:00"), conclusion: "SUCCESS", completedAt: at("04:11:00") }),
+      { kind: "check", name: "ci", checkId: 3, status: "COMPLETED", conclusion: "SUCCESS", startedAt: at("04:00:00"), completedAt: at("04:01:00"), appId: 347564, appSlug: "coderabbitai" },
+    ], "success");
+    await expectState("another app's current failure is kept", ["ci"], [
+      ghCheck({ name: "ci", checkId: 2, runId: 20, runNumber: 2, runCreatedAt: at("04:10:00"), conclusion: "SUCCESS" }),
+      { kind: "check", name: "ci", checkId: 4, status: "COMPLETED", conclusion: "FAILURE", startedAt: at("05:00:00"), completedAt: at("05:01:00"), appId: 347564, appSlug: "coderabbitai" },
+    ], "failure");
+    await expectState("a different workflow does not mask a failing one", ["build"], [
+      ghCheck({ name: "build", checkId: 1, runId: 10, runNumber: 1, runCreatedAt: at("04:00:00"), conclusion: "CANCELLED", completedAt: at("04:01:00") }),
+      ghCheck({ name: "build", checkId: 2, runId: 20, runNumber: 2, runCreatedAt: at("04:10:00"), conclusion: "SUCCESS", completedAt: at("04:11:00") }),
+      ghCheck({ name: "build", checkId: 3, runId: 30, runNumber: 1, runCreatedAt: at("04:00:00"), conclusion: "FAILURE", workflowId: 8, workflowName: "Lint" }),
+    ], "failure");
+    await expectState("same name on two events stays two contributions", ["ci"], [
+      ghCheck({ name: "ci", checkId: 1, runId: 10, runNumber: 1, runCreatedAt: at("04:00:00"), conclusion: "FAILURE", event: "pull_request" }),
+      ghCheck({ name: "ci", checkId: 2, runId: 11, runNumber: 4, runCreatedAt: at("04:00:00"), conclusion: "SUCCESS", event: "push" }),
+    ], "failure");
+    await expectState("an updated status and the current check both have to pass", ["ci"], [
+      ghCheck({ name: "ci", checkId: 1, runId: 10, runNumber: 1, runCreatedAt: at("04:00:00"), conclusion: "SUCCESS" }),
+      commitStatus("ci", "FAILURE", at("03:00:00")),
+      commitStatus("ci", "SUCCESS", at("04:30:00")),
+    ], "success");
+    await expectState("a stale successful status does not outvote the update, or the check", ["ci"], [
+      commitStatus("ci", "SUCCESS", at("03:00:00")),
+      commitStatus("ci", "FAILURE", at("04:30:00")),
+      ghCheck({ name: "ci", checkId: 1, runId: 10, runNumber: 1, runCreatedAt: at("04:00:00"), conclusion: "SUCCESS" }),
+    ], "failure");
+    await expectState("fractional status time is later than the whole second", ["ci"], [
+      commitStatus("ci", "SUCCESS", at("04:34:40")),
+      commitStatus("ci", "PENDING", "2026-11-16T04:34:40.5Z"),
+    ], "pending");
+    await expectState("equal status timestamps are not a guess", ["ci"], [
+      commitStatus("ci", "SUCCESS", at("04:30:00")),
+      commitStatus("ci", "SUCCESS", at("04:30:00")),
+    ], "unknown");
+    await expectState("two status creators stay separate", ["ci"], [
+      commitStatus("ci", "SUCCESS", at("04:30:00"), "alpha"),
+      commitStatus("ci", "FAILURE", at("04:30:00"), "beta"),
+    ], "failure");
+
+    by = await states([], [{ number: 1, head: sha("none"), contexts: green() }]);
+    assert.equal(by.get(1)!.required_checks.state, "unknown", "no configured names");
+    by = await states(["ci", "postgres", "docker"], [{ number: 1, head: sha("miss"), contexts: [ghCheck({ name: "ci", checkId: 1, runId: 10, runNumber: 1, runCreatedAt: at("04:00:00") })] }]);
+    assert.equal(by.get(1)!.required_checks.state, "unknown", "a missing required name");
+    by = await states(["ci", "postgres", "docker"], [{ number: 1, head: CAPTURED_HEAD, contexts: capturedContexts("success"), contextsTruncated: true }]);
+    assert.equal(by.get(1)!.required_checks.state, "unknown", "a truncated context list");
+    assert.equal(by.get(1)!.review, undefined, "no review fact from a truncated list");
+    by = await states(["postgres"], [{ number: 1, head: sha("roll"), commitOid: sha("previous"), contexts: capturedContexts("success") }]);
+    assert.deepEqual(by.get(1)!.required_checks, { state: "unknown", head_sha: sha("previous") }, "rollup not at the head");
+    assert.equal(by.get(1)!.review, undefined);
   });
 
   await check("PRs: without a configured review source, no review fact; without required checks, unknown", async () => {
