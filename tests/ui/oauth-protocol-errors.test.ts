@@ -86,6 +86,40 @@ describe("OAuth register and token teaching", { concurrency: false }, () => {
       retryable: false,
     });
 
+    let sqlCalls = 0;
+    setSqlForTests(async () => {
+      sqlCalls += 1;
+      throw new Error("register SQL must not run");
+    });
+    for (const body of ["null", "[]", "\"client\"", "1", "true"]) {
+      const rejected = await POST(new Request("http://localhost/oauth/register", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+      }));
+      assert.equal(rejected.status, 400, body);
+      const rejectedBody = await rejected.json() as Record<string, unknown>;
+      assertTeaching(rejectedBody, {
+        error: "invalid_client_metadata",
+        description: "Request body must be a JSON object",
+        retryable: false,
+      });
+      assert.equal(rejectedBody.error_description, "Request body must be a JSON object");
+      assert.match(String(rejectedBody.fix), /client metadata/);
+    }
+    assert.equal(sqlCalls, 0);
+    setSqlForTests(null);
+
+    const empty = await POST(new Request("http://localhost/oauth/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    }));
+    assert.equal(empty.status, 400);
+    const emptyBody = await empty.json() as Record<string, unknown>;
+    assert.equal(emptyBody.error, "invalid_redirect_uri");
+    assert.equal(emptyBody.error_description, "redirect_uris is required and must be a non-empty array");
+
     const redirect = await POST(new Request("http://localhost/oauth/register", {
       method: "POST",
       headers: { "content-type": "application/json" },
