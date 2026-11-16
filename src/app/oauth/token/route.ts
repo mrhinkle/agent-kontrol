@@ -21,6 +21,11 @@ type OAuthClientRow = {
   token_endpoint_auth_method: string | null;
 };
 
+type ClientLookup =
+  | { status: "ok"; client: OAuthClientRow }
+  | { status: "missing" }
+  | { status: "unavailable" };
+
 type OAuthCodeRow = {
   code: string;
   client_id: string;
@@ -37,7 +42,7 @@ export async function OPTIONS() {
   return new Response(null, { status: 200, headers: corsHeaders });
 }
 
-async function loadClient(clientId: string): Promise<OAuthClientRow | null> {
+async function loadClient(clientId: string): Promise<ClientLookup> {
   try {
     const rows = await sql()`
       select client_id, client_secret, token_endpoint_auth_method
@@ -45,10 +50,10 @@ async function loadClient(clientId: string): Promise<OAuthClientRow | null> {
       where client_id = ${clientId}
       limit 1
     `;
-    if (!rows[0]) return null;
-    return rows[0] as OAuthClientRow;
+    if (!rows[0]) return { status: "missing" };
+    return { status: "ok", client: rows[0] as OAuthClientRow };
   } catch {
-    return null;
+    return { status: "unavailable" };
   }
 }
 
@@ -60,10 +65,22 @@ async function authenticateClient(
     return oauthError("invalid_request", "client_id is required");
   }
 
-  const client = await loadClient(clientId);
-  if (!client) {
+  const lookedUp = await loadClient(clientId);
+  if (lookedUp.status === "unavailable") {
+    return oauthError(
+      "server_error",
+      "OAuth storage did not complete the client lookup.",
+      503,
+      {
+        retryable: true,
+        fix: "Retry a bounded number of times. OAuth storage did not complete the request.",
+      },
+    );
+  }
+  if (lookedUp.status !== "ok") {
     return oauthError("invalid_client", "Unknown client_id", 401);
   }
+  const client = lookedUp.client;
 
   const method = client.token_endpoint_auth_method || "none";
   if (method === "none") {

@@ -287,6 +287,34 @@ describe("OAuth register and token teaching", { concurrency: false }, () => {
     assert.match(String(refreshBody.fix), /Do not retry this refresh token/);
   });
 
+  it("answers a client-lookup database failure as retryable server_error", async () => {
+    env.DATABASE_URL = "postgresql://oauth-test.invalid/none";
+    env.MC_OAUTH_SECRET = "oauth-test-secret";
+    const { POST } = await import("../../src/app/oauth/token/route");
+    let queries = 0;
+    setSqlForTests(async () => {
+      queries += 1;
+      throw new Error(`store down ${SECRET}`);
+    });
+    const res = await POST(formRequest("/oauth/token", {
+      grant_type: "authorization_code",
+      client_id: "known-client",
+      client_secret: "secret",
+    }));
+    assert.equal(queries, 1);
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get("access-control-allow-origin"), "*");
+    const body = await res.json() as Record<string, unknown>;
+    assertTeaching(body, {
+      error: "server_error",
+      description: "OAuth storage did not complete the client lookup.",
+      retryable: true,
+    });
+    assert.equal(body.fix, "Retry a bounded number of times. OAuth storage did not complete the request.");
+    assert.equal(body.access_token, undefined);
+    assert.equal("principal" in body, false);
+  });
+
   it("returns the token response unchanged after a valid code redemption", async () => {
     env.DATABASE_URL = "postgresql://oauth-test.invalid/none";
     env.MC_OAUTH_SECRET = "oauth-test-secret";
