@@ -425,14 +425,15 @@ describe("limits: store errors fail closed", { concurrency: false }, () => {
     const { GET: fleet } = await import("../../src/app/api/fleet/route");
     const rest = await fleet(fleetReq(c.token));
     assert.equal(rest.status, 503);
-    assert.equal((await rest.json()).error, "credential_store_unavailable");
+    assertStoreUnavailable(await rest.json());
 
     const { GET: beats } = await import("../../src/app/api/watch/beats/route");
     const watch = await beats(
       new Request("http://localhost/api/watch/beats", { headers: { authorization: `Bearer ${c.token}` } }),
     );
     assert.equal(watch.status, 503);
-    assert.equal((await watch.json()).error, "credential_store_unavailable");
+    assert.equal(watch.headers.get("cache-control"), "no-store");
+    assertStoreUnavailable(await watch.json());
 
     const { POST } = await import("../../src/app/api/[transport]/route");
     const mcp = await POST(
@@ -447,9 +448,68 @@ describe("limits: store errors fail closed", { concurrency: false }, () => {
       }),
     );
     assert.equal(mcp.status, 503);
-    assert.equal((await mcp.json()).error, "credential_store_unavailable");
+    assert.equal(mcp.headers.get("www-authenticate"), null);
+    assertStoreUnavailable(await mcp.json());
+  });
+
+  it("MCP answers 401 invalid_token when the credential is gone before the charge", async () => {
+    const c = await issue(["fleet:read"]);
+    const hash = (await import("node:crypto")).createHash("sha256").update(c.token).digest("hex");
+    env.DATABASE_URL = "postgresql://quota-test.invalid/none";
+    const row: Row = {
+      id: c.credential.id,
+      label: "x",
+      token_prefix: c.token.slice(0, 8),
+      token_hash: hash,
+      scopes: ["fleet:read"],
+      created_at: new Date(T0).toISOString(),
+      expires_at: null,
+      revoked_at: null,
+      last_used_at: null,
+      rate_limit_per_minute: 60,
+      rate_limit_per_day: 10_000,
+    };
+    setSqlForTests(async (strings) => {
+      const text = strings.join("?");
+      if (/where token_hash =/.test(text)) return [row];
+      if (/for update/.test(text)) return [];
+      return [];
+    });
+    const { POST } = await import("../../src/app/api/[transport]/route");
+    const mcp = await POST(
+      new Request("http://localhost/api/mcp", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${c.token}`,
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+      }),
+    );
+    assert.equal(mcp.status, 401);
+    const challenge = mcp.headers.get("www-authenticate") ?? "";
+    assert.match(challenge, /error="invalid_token"/);
+    assert.match(challenge, /error_description="Invalid token"/);
+    assert.match(challenge, /resource_metadata="http:\/\/localhost\/\.well-known\/oauth-protected-resource"/);
+    const body = await mcp.json() as Record<string, unknown>;
+    assert.equal(body.error, "invalid_token");
+    assert.equal(body.error_description, "Invalid token");
+    assert.equal(body.code, "unauthorized");
+    assert.equal(body.retryable, false);
+    assert.equal(typeof body.fix, "string");
+    assert.equal(body.jsonrpc, undefined);
   });
 });
+
+function assertStoreUnavailable(body: Record<string, unknown>) {
+  assert.equal(body.error, "credential_store_unavailable");
+  assert.equal(body.code, "credential_store_unavailable");
+  assert.equal(body.retryable, true);
+  assert.equal(typeof body.fix, "string");
+  assert.equal(JSON.stringify(body).includes("simulated quota store outage"), false);
+  assert.deepEqual(Object.keys(body).sort(), ["code", "error", "fix", "retryable"]);
+}
 
 describe("limits: Settings", { concurrency: false }, () => {
   const patch = (body: unknown, headers: Record<string, string> = {}) =>
