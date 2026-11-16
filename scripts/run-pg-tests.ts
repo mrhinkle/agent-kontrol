@@ -24,6 +24,7 @@ import { StaleWrite } from "../src/lib/revision";
 import { readReceipt } from "../src/lib/activity";
 import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview, findAgent, deleteMemory, slugify } from "../src/lib/store";
 import { testTaskQueueNotices } from "./pg-task-notice-tests";
+import { testTaskLaneClaims } from "./pg-task-lane-tests";
 import { updateTaskForTool } from "../src/lib/dry-run-actions";
 import { runWithActor } from "../src/lib/actor";
 import { GET as getRepoSettings, PUT as putRepoSettings } from "../src/app/api/settings/repos/route";
@@ -154,6 +155,7 @@ async function main() {
   assert.equal(untouched.actor_id, `${tag}-actor`);
   assert.equal(untouched.result, "still mine");
   await testTaskQueueNotices();
+  await testTaskLaneClaims();
 
   const absentKey = `${tag}/absent`;
   const raced = await Promise.allSettled([

@@ -866,6 +866,13 @@ export function openApiDocument(): Json {
             platform: { type: "string" },
             machine: { type: "string" },
             agent_id: { type: "string" },
+            project: {
+              type: "string",
+              minLength: 1,
+              maxLength: 100,
+              description:
+                "Optional exact case-sensitive task lane. Omit it to claim any project. Null, blank, a trailing newline, or any other non-lane is validation_failed and writes nothing.",
+            },
           },
         },
         PatchTask: {

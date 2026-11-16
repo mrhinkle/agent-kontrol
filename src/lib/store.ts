@@ -21,6 +21,7 @@ import {
   type TaskCoverage,
   type TaskNoticeObserverProof,
 } from "./task-queue-notice";
+import { isTaskLane } from "./task-lane";
 import { stampSortAt } from "./list-params";
 import { queueLangfuseEvent } from "./langfuse-report";
 import { parseRunTelemetry } from "./run-telemetry";
@@ -1530,27 +1531,71 @@ export async function listTasks(input?: {
   }
 }
 
-/**
- * Atomically claim the next queued task for a platform (and optionally a
- * machine). Guarded update (`status = 'queued'`) means two dispatchers racing
- * for the same row can't both win — the loser just tries the next candidate.
- */
-export async function claimNextTask(input: {
+type ClaimFilterInput = {
   platform: string;
   machine?: string;
   agent_id: string;
-}): Promise<Task | null> {
+  /** Omitted keeps every project. Null, blank, or a non-lane is rejected before SQL. */
+  project?: string | null;
+};
+
+type ClaimScope = {
+  machine: string | null;
+  hasMachine: boolean;
+  project: string | null;
+  hasProject: boolean;
+};
+
+/**
+ * A supplied project is an exact lane or an error. Omitting the property
+ * is the historical unfiltered claim. A present null is not an omission.
+ */
+function claimScope(input: { machine?: string; project?: string | null }): ClaimScope {
+  const supplied = Object.prototype.hasOwnProperty.call(input, "project");
+  if (supplied && !isTaskLane(input.project)) throw new Error("invalid task project filter");
+  const machine = input.machine ? input.machine : null;
+  return {
+    machine,
+    hasMachine: machine !== null,
+    project: supplied ? input.project ?? null : null,
+    hasProject: supplied,
+  };
+}
+
+/** Eligible rows only, before the candidate limit, so a wrong lane or machine cannot hide a later match. */
+async function queuedClaimCandidates(platform: string, scope: ClaimScope): Promise<Task[]> {
+  const db = sql();
+  const rows = await db`
+    select * from tasks
+    where status = 'queued'
+      and platform = any(${[platform, "any"]}::text[])
+      and (
+        machine is null
+        or (${scope.hasMachine}::boolean and machine = ${scope.machine}::text)
+      )
+      and (
+        ${scope.hasProject}::boolean = false
+        or project = ${scope.project}::text
+      )
+    order by priority asc, created_at asc
+    limit 10
+  `;
+  return (rows as Record<string, unknown>[]).map(asTask);
+}
+
+/**
+ * Atomically claim the next queued task for a platform (and optionally a
+ * machine and an exact project). Guarded update (`status = 'queued'`, plus
+ * the same platform, machine, and project predicate) means two dispatchers
+ * racing for the same row can't both win, and a row whose lane changed after
+ * it was selected is not claimed and writes no receipt.
+ */
+export async function claimNextTask(input: ClaimFilterInput): Promise<Task | null> {
+  const scope = claimScope(input);
   const db = sql();
   let candidates: Task[];
   try {
-    const rows = await db`
-      select * from tasks
-      where status = 'queued'
-        and platform = any(${[input.platform, "any"]}::text[])
-      order by priority asc, created_at asc
-      limit 10
-    `;
-    candidates = (rows as Record<string, unknown>[]).map(asTask);
+    candidates = await queuedClaimCandidates(input.platform, scope);
   } catch (e) {
     throw new Error(errMsg(e));
   }
@@ -1560,12 +1605,13 @@ export async function claimNextTask(input: {
   const activityActorType = actor?.actor_type ?? null;
   const activityActorId = actor?.actor_id ?? null;
   for (const t of candidates) {
-    if (t.machine && input.machine && t.machine !== input.machine) continue;
-    if (t.machine && !input.machine) continue;
+    if (t.machine && scope.hasMachine && t.machine !== scope.machine) continue;
+    if (t.machine && !scope.hasMachine) continue;
+    if (scope.hasProject && t.project !== scope.project) continue;
     try {
       // One statement. The event insert reads only the updated row, so a lost
-      // race (zero rows) writes no event. Actor parameters follow `where id`
-      // so the claim's existing binds stay $1..$4.
+      // race (zero rows) writes no event. Platform, machine, and project are
+      // checked again here. Actor parameters stay after that predicate.
       const claimed = await db`
         with changed as (
           update tasks set
@@ -1573,7 +1619,17 @@ export async function claimNextTask(input: {
             assigned_agent = ${input.agent_id},
             claimed_at = ${now},
             updated_at = ${now}
-          where id = ${t.id} and status = 'queued'
+          where id = ${t.id}
+            and status = 'queued'
+            and platform = any(${[input.platform, "any"]}::text[])
+            and (
+              machine is null
+              or (${scope.hasMachine}::boolean and machine = ${scope.machine}::text)
+            )
+            and (
+              ${scope.hasProject}::boolean = false
+              or project = ${scope.project}::text
+            )
           returning *
         ),
         logged as (
@@ -1868,28 +1924,18 @@ function coverageFromClaimRow(row: Record<string, unknown>): TaskCoverage {
  * (events_created_idx) and does not fall back to an older episode.
  * An ineligible observer still claims, with unknown evidence and no ids.
  */
-export async function claimTaskWithCoverage(input: {
-  platform: string;
-  machine?: string;
-  agent_id: string;
+export async function claimTaskWithCoverage(input: ClaimFilterInput & {
   observer: TaskNoticeObserverProof | null;
 }): Promise<{ task: Task | null; coverage: TaskCoverage }> {
+  const scope = claimScope(input);
   if (!input.observer) {
     const task = await claimNextTask(input);
     return { task, coverage: unknownCoverage("ineligible_observer", await coverageMeasuredAt()) };
   }
   const observer = input.observer;
-  const db = sql();
   let candidates: Task[];
   try {
-    const rows = await db`
-      select * from tasks
-      where status = 'queued'
-        and platform = any(${[input.platform, "any"]}::text[])
-      order by priority asc, created_at asc
-      limit 10
-    `;
-    candidates = (rows as Record<string, unknown>[]).map(asTask);
+    candidates = await queuedClaimCandidates(input.platform, scope);
   } catch (e) {
     throw new Error(errMsg(e));
   }
@@ -1899,8 +1945,9 @@ export async function claimTaskWithCoverage(input: {
   const activityActorType = actor?.actor_type ?? null;
   const activityActorId = actor?.actor_id ?? null;
   for (const t of candidates) {
-    if (t.machine && input.machine && t.machine !== input.machine) continue;
-    if (t.machine && !input.machine) continue;
+    if (t.machine && scope.hasMachine && t.machine !== scope.machine) continue;
+    if (t.machine && !scope.hasMachine) continue;
+    if (scope.hasProject && t.project !== scope.project) continue;
     try {
       // The scan cutoff is statement_timestamp(), which is stable for this
       // statement, so the created_at index can stop at the window. A volatile
@@ -1917,7 +1964,17 @@ export async function claimTaskWithCoverage(input: {
             assigned_agent = ${input.agent_id},
             claimed_at = ${now},
             updated_at = ${now}
-          where id = ${t.id} and status = 'queued'
+          where id = ${t.id}
+            and status = 'queued'
+            and platform = any(${[input.platform, "any"]}::text[])
+            and (
+              machine is null
+              or (${scope.hasMachine}::boolean and machine = ${scope.machine}::text)
+            )
+            and (
+              ${scope.hasProject}::boolean = false
+              or project = ${scope.project}::text
+            )
           returning *
         ),
         logged as (
