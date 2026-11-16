@@ -3,6 +3,7 @@ import contextlib
 from email.message import Message
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import threading
@@ -278,9 +279,15 @@ class FallbackObservationTests(unittest.TestCase):
     def setUp(self):
         self.previous_poll = dispatcher.POLL
         dispatcher.POLL = 20
+        # An ambient lane must not change the unfiltered claim contract these tests pin.
+        self.previous_project = os.environ.pop("MC_TASK_PROJECT", None)
 
     def tearDown(self):
         dispatcher.POLL = self.previous_poll
+        if self.previous_project is None:
+            os.environ.pop("MC_TASK_PROJECT", None)
+        else:
+            os.environ["MC_TASK_PROJECT"] = self.previous_project
 
     def opened(self):
         client, wake = DispatcherStreamTests().client()

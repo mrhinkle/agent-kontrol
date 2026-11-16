@@ -1080,5 +1080,74 @@ class TestProcessContainment(Harness):
         self.assert_child_gone()
 
 
+class TestTaskProjectFilter(unittest.TestCase):
+    def setUp(self):
+        self.previous = os.environ.pop("MC_TASK_PROJECT", None)
+
+    def tearDown(self):
+        if self.previous is None:
+            os.environ.pop("MC_TASK_PROJECT", None)
+        else:
+            os.environ["MC_TASK_PROJECT"] = self.previous
+
+    def _stream(self):
+        return mock.Mock(token="akc_test", consumer="reviewer", notices=mock.Mock(snapshot=lambda: (1, "4", "15")))
+
+    def test_unset_omits_project_on_both_claim_shapes(self):
+        bare, headers, observed = md.task_claim_request("grok", None)
+        self.assertEqual(set(bare), {"platform", "machine", "agent_id"})
+        self.assertIsNone(headers)
+        self.assertIsNone(observed)
+        covered, covered_headers, covered_observed = md.task_claim_request("grok", self._stream())
+        self.assertEqual(set(covered), {"platform", "machine", "agent_id", "coverage"})
+        self.assertTrue(covered["coverage"])
+        self.assertEqual(covered_headers["X-AK-Event-Consumer"], "reviewer")
+        self.assertEqual(covered_observed[1:], ("4", "15"))
+
+    def test_valid_project_is_on_every_claim(self):
+        os.environ["MC_TASK_PROJECT"] = "agent-kontrol"
+        bare, _, _ = md.task_claim_request("grok", None)
+        self.assertEqual(bare["project"], "agent-kontrol")
+        self.assertNotIn("coverage", bare)
+        covered, _, _ = md.task_claim_request("grok", self._stream())
+        self.assertEqual(covered["project"], "agent-kontrol")
+        self.assertTrue(covered["coverage"])
+
+    def test_invalid_project_refuses_without_echoing_the_value(self):
+        secret = "not a lane SECRET-VALUE"
+        for value in ("", "agent-kontrol\n", "a" * 101, "has space", "/tmp/abs", secret):
+            os.environ["MC_TASK_PROJECT"] = value
+            with self.assertRaises(ValueError) as caught:
+                md.configured_task_project()
+            if value:
+                self.assertNotIn(value, str(caught.exception))
+            with self.assertRaises(ValueError):
+                md.task_claim_request("grok", None)
+
+    def test_main_rejects_invalid_project_before_any_claim(self):
+        with tempfile.TemporaryDirectory() as home:
+            env = {k: v for k, v in os.environ.items() if not k.startswith("MC_")}
+            env.update({
+                "HOME": home,
+                "MC_URL": "https://ak.invalid",
+                "MC_TOKEN": "sentinel-token",
+                "MC_PLATFORMS": "grok",
+                "MC_TASK_PROJECT": "bad lane",
+            })
+            proc = subprocess.run(
+                [sys.executable, "-c", "import mc_dispatcher as m; m.main()"],
+                cwd=str(DISPATCHER),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("MC_TASK_PROJECT", proc.stderr)
+        self.assertNotIn("bad lane", proc.stderr)
+        self.assertNotIn("dispatcher on", proc.stdout)
+        self.assertNotIn("sentinel-token", proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

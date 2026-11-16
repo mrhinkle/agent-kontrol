@@ -327,6 +327,25 @@ describe("observation validation", () => {
     assert.equal(checkConsumerRegistration({ ...reg, agent_ids: ["Hermes Carmack"] }).ok, false);
     assert.equal(checkConsumerRegistration({ ...reg, queue: { type: "open_minus_blocked" } }).ok, false);
     assert.equal(checkConsumerRegistration({ ...reg, max_silence_hours: 0 }).ok, false);
+    const exact = checkConsumerRegistration({
+      ...reg,
+      queue: { type: "tasks", platform: "codex", project: "agent-kontrol" },
+    });
+    assert.equal(exact.ok, true);
+    if (exact.ok && exact.value.queue.type === "tasks") assert.equal(exact.value.queue.project, "agent-kontrol");
+    for (const project of [null, "", "agent-kontrol\n", "a".repeat(101), "has space"]) {
+      assert.equal(
+        checkConsumerRegistration({ ...reg, queue: { type: "tasks", platform: "codex", project } }).ok,
+        false,
+        JSON.stringify(project),
+      );
+    }
+    const collector = checkConsumerRegistration({
+      ...reg,
+      queue: { type: "collector", queue: "issues:acme/app", project: "agent-kontrol" },
+    });
+    assert.equal(collector.ok, false);
+    if (!collector.ok) assert.match(JSON.stringify(collector.fields), /project/);
   });
 
   it("reserves the sweeper namespace and the synthetic event names", () => {
