@@ -51,6 +51,7 @@ let requestDecisionTool: (args: { slug: string; title: string; why?: string }) =
 let resolveDecisionTool: (args: { id: number; status: string }) => Promise<{
   isError?: boolean;
   content: { type: string; text: string }[];
+  structuredContent?: { receipt?: { id: string; kind: string; at: string } };
 }>;
 let runWithPrincipal: <T>(principal: { kind: "agent"; id: string; scopes: string[] } | { kind: "oauth"; id: string } | { kind: "legacy" } | { kind: "dev-open" }, fn: () => T) => T;
 
@@ -805,7 +806,85 @@ describe("decision actor receipts", { skip: !OPT_IN, concurrency: 1 }, () => {
     const mcpProof = await receiptsForKey(mcpKey);
     assert.equal(mcpProof.length, 1);
     assert.equal(mcpProof[0].kind, "resolve_decision");
+    assert.equal(mcpProof[0].title, "mcp reopen");
+    const mcpDetail = detailOf(mcpProof[0]);
+    assert.equal(mcpDetail.tool, "resolve_decision");
+    assert.equal(mcpDetail.actor_type, "agent");
+    assert.equal(mcpDetail.actor_id, agentId);
+    assert.equal(mcpDetail.status, "open");
+    assert.equal(mcpDetail.key, mcpKey);
     assert.equal((await decisionRows(mcpKey))[0].actor_id, null);
+    const printed = JSON.parse((resolved.content[0].text.split("\n").at(-1) ?? "").replace(/^receipt: /, "")) as {
+      id: string;
+      kind: string;
+      at: string;
+    };
+    assert.equal(printed.id, mcpProof[0].id);
+    assert.equal(printed.kind, "resolve_decision");
+    assert.equal(resolved.structuredContent?.receipt?.id, mcpProof[0].id);
+    assert.equal(resolved.structuredContent?.receipt?.kind, printed.kind);
+    assert.equal(resolved.structuredContent?.receipt?.at, printed.at);
+  });
+
+  it("rolls back an MCP reopen when the resolve_decision receipt does not store", async () => {
+    for (const mode of ["fail", "suppress"] as const) {
+      const mcpKey = `agent:${PREFIX}-mcp-receipt-${mode}`;
+      await sql`
+        insert into decisions (key, source, title, status, decision, actor_type, actor_id, decided_by, decided_at)
+        values (${mcpKey}, 'agent', 'private-title-canary', 'decided', 'prior resolution', 'human', 'prior-resolver', 'prior-resolver', now())
+      `;
+      const before = await sql`select * from decisions where key = ${mcpKey}`;
+      const id = String(before[0].id);
+      await installReceiptTrigger(mode, mcpKey);
+      let thrown = false;
+      let result: { isError?: boolean } | undefined;
+      try {
+        result = await runWithPrincipal(
+          { kind: "agent", id: `${PREFIX}-reopen-${mode}`, scopes: ["decisions:write"] },
+          () => resolveDecisionTool({ id: Number(id), status: "open" }),
+        );
+      } catch {
+        thrown = true;
+      } finally {
+        await dropReceiptTrigger(mode);
+      }
+      const afterRow = await sql`select * from decisions where key = ${mcpKey}`;
+      const events = await receiptsForKey(mcpKey);
+      assert.equal(!thrown && result?.isError !== true, false, `MCP ${mode} receipt failure must not report success`);
+      assert.equal(afterRow[0].status, before[0].status);
+      assert.equal(afterRow[0].actor_id, before[0].actor_id);
+      assert.deepEqual(afterRow, before);
+      assert.equal(events.length, 0);
+    }
+
+    const missing = await runWithPrincipal(
+      { kind: "agent", id: `${PREFIX}-reopen-missing`, scopes: ["decisions:write"] },
+      () => resolveDecisionTool({ id: 987654321, status: "open" }),
+    );
+    assert.equal(missing.isError, true);
+    assert.equal(missing.structuredContent, undefined);
+    const stray = await sql`select count(*)::int as n from events where detail->>'decision_id' = '987654321'`;
+    assert.equal(Number(stray[0].n), 0);
+
+    const lockedKey = `agent:${PREFIX}-mcp-locked`;
+    await sql`
+      insert into decisions (key, source, title, status, decision, actor_type, actor_id, decided_by, decided_at)
+      values (${lockedKey}, 'agent', 'locked reopen', 'decided', 'prior resolution', 'human', 'prior-resolver', 'prior-resolver', now())
+    `;
+    const locked = await decisionRows(lockedKey);
+    const claim = await claimDecisionWriteback(Number(locked[0].id), Number(locked[0].revision));
+    assert.ok(claim);
+    const beforeLock = await receiptsForKey(lockedKey);
+    const blocked = await runWithPrincipal(
+      { kind: "agent", id: `${PREFIX}-reopen-locked`, scopes: ["decisions:write"] },
+      () => resolveDecisionTool({ id: Number(locked[0].id), status: "open" }),
+    );
+    assert.equal(blocked.isError, true);
+    assert.equal(blocked.structuredContent, undefined);
+    const kept = await decisionRows(lockedKey);
+    assert.equal(kept[0].status, "decided");
+    assert.equal(kept[0].actor_id, "prior-resolver");
+    assert.equal((await receiptsForKey(lockedKey)).length, beforeLock.length);
   });
 
   it("attributes session, agent, and dev-open reopens without inventing an operator", async () => {
@@ -1040,7 +1119,7 @@ async function installReceiptTrigger(mode: "fail" | "suppress", which: string) {
       create or replace function ak_dec_fail_receipt() returns trigger
       language plpgsql as $$
       begin
-        if new.kind in ('decision.upsert', 'decision.force_reopen', 'decision.reconcile', 'request_decision', 'decision.reopen')
+        if new.kind in ('decision.upsert', 'decision.force_reopen', 'decision.reconcile', 'request_decision', 'decision.reopen', 'resolve_decision')
            and (
              new.detail->>'key' in (select key from ak_dec_fail_key)
              or exists (
@@ -1068,7 +1147,7 @@ async function installReceiptTrigger(mode: "fail" | "suppress", which: string) {
     create or replace function ak_dec_suppress_receipt() returns trigger
     language plpgsql as $$
     begin
-      if new.kind in ('decision.upsert', 'decision.force_reopen', 'decision.reconcile', 'request_decision', 'decision.reopen')
+      if new.kind in ('decision.upsert', 'decision.force_reopen', 'decision.reconcile', 'request_decision', 'decision.reopen', 'resolve_decision')
          and (
            new.detail->>'key' in (select key from ak_dec_suppress_key)
            or exists (

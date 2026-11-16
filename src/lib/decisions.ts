@@ -26,8 +26,11 @@ import { insertToolReceipt } from "./tool-receipt";
  * row another transaction committed while this statement waited. `actor_type`
  * and `actor_id` on the row stay the resolver. A blocked reopen, or a
  * reconcile that changes nothing, stores no receipt. A REST reopen stores
- * one receipt for the principal in the same transaction when the locked row
- * was decided, deferred, or withdrawn. The row's resolver columns still clear.
+ * one `decision.reopen` receipt for the principal in the same transaction when
+ * the locked row was decided, deferred, or withdrawn. MCP `resolve_decision`
+ * stores its one `resolve_decision` receipt in that same transaction and
+ * returns it, instead of inserting another after commit. The row's resolver
+ * columns still clear. A blocked patch stores neither receipt.
  */
 
 export const DECISION_STATUSES = ["open", "decided", "deferred", "withdrawn"] as const;
@@ -237,10 +240,18 @@ export interface PatchInput {
   /**
    * REST reopen only. Set from the authenticated route, never from the body.
    * A successful open of a decided, deferred, or withdrawn row stores one
-   * receipt in this transaction. MCP resolve does not set it, so its later
-   * receipt stays the only one. A zero-row update stores nothing.
+   * `decision.reopen` receipt in this transaction. A zero-row update stores
+   * nothing. Do not set this with `recordResolveReceipt`.
    */
   recordReopen?: boolean;
+  /**
+   * MCP `resolve_decision` reopen only. Set by the tool, never from a body.
+   * A successful open of a decided, deferred, or withdrawn row stores one
+   * `resolve_decision` receipt in this transaction and returns it. The tool
+   * reuses that receipt and does not insert another. A zero-row update stores
+   * nothing.
+   */
+  recordResolveReceipt?: boolean;
 }
 
 export interface DecisionStore {
@@ -1282,10 +1293,26 @@ export async function reconcileDecisions(input: ReconcileInput): Promise<Reconci
 }
 
 export async function patchDecision(id: number, input: PatchInput): Promise<Decision | null> {
+  const written = await commitDecisionPatch(id, input);
+  return written ? written.decision : null;
+}
+
+/**
+ * The patched row and, for an MCP reopen, the receipt stored with it.
+ * Other callers use `patchDecision` and ignore the receipt. REST reopen still
+ * stores `decision.reopen` here and does not surface that receipt.
+ */
+export async function commitDecisionPatch(
+  id: number,
+  input: PatchInput,
+): Promise<{ decision: Decision; receipt: Receipt | null } | null> {
+  if (input.recordReopen === true && input.recordResolveReceipt === true) {
+    throw new Error("a decision patch records one reopen receipt");
+  }
   const now = nowIso();
   if (testStore) {
     const row = await testStore.patch(id, input);
-    return row ? presentDecision(row, now) : null;
+    return row ? { decision: presentDecision(row, now), receipt: null } : null;
   }
   const status = input.status ?? null;
   const setActor = input.setActor === true;
@@ -1383,10 +1410,20 @@ export async function patchDecision(id: number, input: PatchInput): Promise<Deci
   if (!row) return null;
   const previous = typeof row.previous_status === "string" ? row.previous_status : null;
   const decision = presentDecision(row, now);
-  const reopened = input.recordReopen === true
-    && decision.status === "open"
+  const opened = decision.status === "open"
     && (previous === "decided" || previous === "deferred" || previous === "withdrawn");
-  if (reopened) {
+  let receipt: Receipt | null = null;
+  if (opened && input.recordResolveReceipt === true) {
+    receipt = await insertToolReceipt(db, {
+      kind: "resolve_decision",
+      title: decision.title.slice(0, 200),
+      extra: {
+        decision_id: decision.id,
+        key: decision.key,
+        status: decision.status,
+      },
+    });
+  } else if (opened && input.recordReopen === true) {
     const key = typeof row.key === "string" ? row.key : "";
     if (!key) throw new Error("decision key missing");
     await insertToolReceipt(db, {
@@ -1401,6 +1438,6 @@ export async function patchDecision(id: number, input: PatchInput): Promise<Deci
       },
     });
   }
-  return decision;
+  return { decision, receipt };
   });
 }
