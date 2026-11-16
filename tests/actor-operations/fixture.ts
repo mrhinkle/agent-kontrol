@@ -40,3 +40,40 @@ export async function confirmActorOperationsFixture(sql: SqlTag, database: strin
     throw new Error("connected database is not the actor operations fixture");
   }
 }
+
+/** True only for this fixture's database and role. A failed read is not a match. */
+export function actorOperationsIdentity(
+  row: { db?: unknown; db_user?: unknown } | undefined,
+  database: string,
+): boolean {
+  return row?.db === database && row?.db_user === FIXTURE_USER;
+}
+
+/**
+ * Run mutating cleanup only after a fresh identity read matches this fixture.
+ * A failed or mismatched read returns without calling `mutate`.
+ */
+export async function withOwnedFixtureCleanup(
+  sql: SqlTag,
+  database: string,
+  mutate: () => Promise<void>,
+): Promise<void> {
+  let row: { db?: unknown; db_user?: unknown } | undefined;
+  try {
+    const seen = await sql`select current_database() as db, current_user as db_user`;
+    row = seen[0];
+  } catch {
+    return;
+  }
+  if (!actorOperationsIdentity(row, database)) return;
+  await mutate();
+}
+
+/** Close the pool this process opened. Closing is not a data mutation. */
+export async function closeActorOperationsPool(): Promise<void> {
+  const holder = globalThis as unknown as { __mcPgPool?: { end: () => Promise<void> } };
+  const opened = holder.__mcPgPool;
+  holder.__mcPgPool = undefined;
+  if (!opened) return;
+  await opened.end();
+}

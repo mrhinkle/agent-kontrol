@@ -14,7 +14,7 @@ import { providerWindowRange, type UsageTimeWindow } from "./usage-window";
 import { demoUsageSummary } from "./demo-usage";
 
 type UsageEvidence = {
-  facts: { id: string; idempotency_key: string }[];
+  facts: { id: string }[];
   snapshot: { id: string; account_id: string; collected_at: string } | null;
 };
 
@@ -111,14 +111,11 @@ export async function ingestUsageFacts(input: UsageIngestInput, tx?: SqlTag, evi
         last_seen_at = excluded.last_seen_at,
         collected_at = excluded.collected_at,
         detail = excluded.detail
-      returning id, idempotency_key
+      returning id
     `;
     const row = rows[0] as Record<string, unknown> | undefined;
     if (evidence && row) {
-      evidence.facts.push({
-        id: resourceId(row.id, "usage fact id"),
-        idempotency_key: resourceId(row.idempotency_key, "usage idempotency key"),
-      });
+      evidence.facts.push({ id: resourceId(row.id, "usage fact id") });
     }
     written++;
   }
@@ -198,7 +195,8 @@ function rowToFact(row: Record<string, unknown>): UsageFact {
 
 /**
  * Facts and coverage commit together; a failed import cannot certify a partial report.
- * The events receipt is in that same transaction and names only the rows this batch wrote.
+ * The events receipt is in that same transaction and names the stored fact and snapshot ids.
+ * The usage_facts idempotency key stays on the fact row. It is not copied into the receipt.
  */
 export async function ingestUsageBatch(input: UsageIngestInput & { snapshot?: AccountSnapshot }): Promise<number> {
   if (!isConfigured()) return 0;
@@ -217,7 +215,6 @@ export async function ingestUsageBatch(input: UsageIngestInput & { snapshot?: Ac
       extra: {
         operation: "upsert",
         fact_ids: [...new Set(evidence.facts.map((fact) => fact.id))],
-        idempotency_keys: [...new Set(evidence.facts.map((fact) => fact.idempotency_key))],
         snapshot_id: evidence.snapshot?.id ?? null,
         snapshot_account_id: evidence.snapshot?.account_id ?? null,
         snapshot_collected_at: evidence.snapshot?.collected_at ?? null,

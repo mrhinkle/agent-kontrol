@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { randomUUID } from "node:crypto";
-import { actorOperationsFixture, confirmActorOperationsFixture } from "./fixture";
+import { actorOperationsFixture, closeActorOperationsPool, confirmActorOperationsFixture, withOwnedFixtureCleanup } from "./fixture";
 import { usageIdempotentKey } from "../../src/lib/usage-key";
 import type { UsageFact } from "../../src/lib/usage-types";
 
@@ -79,12 +79,20 @@ async function snapshots(name: string) {
 }
 
 async function receiptsFor(name: string) {
-  const needle = `%${account(name)}%`;
+  const id = account(name);
   return sql`
-    select id::text as id, kind, title, detail
-    from events
-    where kind = 'usage.ingest' and detail::text like ${needle}
-    order by id
+    select e.id::text as id, e.kind, e.title, e.detail
+    from events e
+    where e.kind = 'usage.ingest'
+      and (
+        e.detail->>'snapshot_account_id' = ${id}
+        or exists (
+          select 1 from usage_facts f
+          where f.account_id = ${id}
+            and e.detail->'fact_ids' ? f.id::text
+        )
+      )
+    order by e.id
   `;
 }
 
@@ -112,24 +120,43 @@ describe("B usage ingest actor receipts", { skip: !OPT_IN, concurrency: 1 }, () 
   });
 
   after(async () => {
-    if (process.env.AK_ACTOR_OPERATIONS_FIXTURE !== "1" || !sql) {
+    try {
+      if (process.env.AK_ACTOR_OPERATIONS_FIXTURE !== "1" || !sql) return;
+      const fixture = actorOperationsFixture();
+      await withOwnedFixtureCleanup(sql, fixture.database, async () => {
+        await sql`drop trigger if exists ak_b_usage_fail_receipt on events`;
+        await sql`drop function if exists ak_b_usage_fail_receipt()`;
+        await sql`drop table if exists ak_b_usage_fail_account`;
+        const needle = `${PREFIX}%`;
+        await sql`
+          delete from events e
+          where e.kind = 'usage.ingest'
+            and (
+              e.detail->>'snapshot_account_id' like ${needle}
+              or exists (
+                select 1 from usage_facts f
+                where f.account_id like ${needle}
+                  and e.detail->'fact_ids' ? f.id::text
+              )
+            )
+        `;
+        await sql`delete from usage_facts where account_id like ${needle}`;
+        await sql`delete from account_snapshots where account_id like ${needle}`;
+        await sql`delete from agent_credentials where label = ${PREFIX + "-denied"}`;
+      });
+    } finally {
+      await closeActorOperationsPool();
       restoreEnv();
-      return;
     }
-    await sql`drop trigger if exists ak_b_usage_fail_receipt on events`;
-    await sql`drop function if exists ak_b_usage_fail_receipt()`;
-    await sql`drop table if exists ak_b_usage_fail_account`;
-    const needle = `${PREFIX}%`;
-    await sql`delete from events where kind = 'usage.ingest' and detail::text like ${"%" + PREFIX + "%"}`;
-    await sql`delete from usage_facts where account_id like ${needle}`;
-    await sql`delete from account_snapshots where account_id like ${needle}`;
-    await sql`delete from agent_credentials where label = ${PREFIX + "-denied"}`;
-    restoreEnv();
   });
 
   it("stores the legacy principal for facts and the snapshot and ignores forged labels", async () => {
     const at = "2026-11-15T12:00:00.000Z";
-    const bodyFact = fact("one");
+    const bodyFact = fact("one", {
+      task: "task-canary-private",
+      profile: "profile-canary-private",
+      session_id: "session-canary-private",
+    });
     const res = await post({
       collected_at: at,
       actor_id: "forged-actor-label",
@@ -163,7 +190,7 @@ describe("B usage ingest actor receipts", { skip: !OPT_IN, concurrency: 1 }, () 
     assert.equal(detail.actor_id, "mc-token");
     assert.equal(detail.operation, "upsert");
     assert.deepEqual(detail.fact_ids, [rows[0].id]);
-    assert.deepEqual(detail.idempotency_keys, [rows[0].idempotency_key]);
+    assert.equal("idempotency_keys" in detail, false);
     assert.equal(detail.snapshot_id, snaps[0].id);
     assert.equal(detail.snapshot_account_id, account("one"));
     assert.equal(detail.snapshot_collected_at, at);
@@ -176,6 +203,10 @@ describe("B usage ingest actor receipts", { skip: !OPT_IN, concurrency: 1 }, () 
     assert.equal(text.includes("secret-snapshot-note"), false);
     assert.equal(text.includes(LEGACY), false);
     assert.equal(text.includes("424242"), false);
+    assert.equal(text.includes(rows[0].idempotency_key), false);
+    assert.equal(text.includes("task-canary-private"), false);
+    assert.equal(text.includes("profile-canary-private"), false);
+    assert.equal(text.includes("session-canary-private"), false);
     assert.equal("paid_cost_usd" in detail, false);
     assert.equal("input_tokens" in detail, false);
   });
@@ -193,7 +224,8 @@ describe("B usage ingest actor receipts", { skip: !OPT_IN, concurrency: 1 }, () 
     assert.equal(proof.length, 1);
     const detail = detailOf(proof[0]);
     assert.deepEqual(detail.fact_ids, [rows[0].id]);
-    assert.deepEqual(detail.idempotency_keys, [usageIdempotentKey(first)]);
+    assert.equal("idempotency_keys" in detail, false);
+    assert.equal(JSON.stringify(detail).includes(usageIdempotentKey(first)), false);
     assert.equal(detail.snapshot_id, null);
     assert.equal(detail.actor_id, "mc-token");
     assert.equal(JSON.stringify(detail).includes("80"), false);
@@ -216,7 +248,7 @@ describe("B usage ingest actor receipts", { skip: !OPT_IN, concurrency: 1 }, () 
     assert.equal(proof.length, 1);
     const detail = detailOf(proof[0]);
     assert.deepEqual(detail.fact_ids, []);
-    assert.deepEqual(detail.idempotency_keys, []);
+    assert.equal("idempotency_keys" in detail, false);
     assert.equal(detail.snapshot_id, snaps[0].id);
     assert.equal(detail.actor_id, "mc-token");
     const stray = await sql`

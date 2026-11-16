@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { randomUUID } from "node:crypto";
-import { actorOperationsFixture, confirmActorOperationsFixture } from "./fixture";
+import { actorOperationsFixture, closeActorOperationsPool, confirmActorOperationsFixture, withOwnedFixtureCleanup } from "./fixture";
 
 /**
  * Progress ingest actor receipts. Opt in with AK_ACTOR_OPERATIONS_FIXTURE=1.
@@ -80,17 +80,21 @@ describe("B progress ingest actor receipts", { skip: !OPT_IN, concurrency: 1 }, 
   });
 
   after(async () => {
-    if (process.env.AK_ACTOR_OPERATIONS_FIXTURE !== "1" || !sql) {
+    try {
+      if (process.env.AK_ACTOR_OPERATIONS_FIXTURE !== "1" || !sql) return;
+      const fixture = actorOperationsFixture();
+      await withOwnedFixtureCleanup(sql, fixture.database, async () => {
+        await sql`drop trigger if exists ak_b_progress_fail_receipt on events`;
+        await sql`drop function if exists ak_b_progress_fail_receipt()`;
+        await sql`drop table if exists ak_b_progress_fail_repo`;
+        await sql`delete from events where kind = 'progress.ingest' and detail->>'repo' like ${PREFIX + "/%"}`;
+        await sql`delete from repo_snapshots where repo like ${PREFIX + "/%"}`;
+        await sql`delete from agent_credentials where label = ${PREFIX + "-denied"}`;
+      });
+    } finally {
+      await closeActorOperationsPool();
       restoreEnv();
-      return;
     }
-    await sql`drop trigger if exists ak_b_progress_fail_receipt on events`;
-    await sql`drop function if exists ak_b_progress_fail_receipt()`;
-    await sql`drop table if exists ak_b_progress_fail_repo`;
-    await sql`delete from events where kind = 'progress.ingest' and detail->>'repo' like ${PREFIX + "/%"}`;
-    await sql`delete from repo_snapshots where repo like ${PREFIX + "/%"}`;
-    await sql`delete from agent_credentials where label = ${PREFIX + "-denied"}`;
-    restoreEnv();
   });
 
   it("stores the legacy principal with each accepted row and ignores forged labels", async () => {
