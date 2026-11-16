@@ -14,7 +14,7 @@ Fleet means and quantiles pool individual samples. Median uses the midpoint; p90
 
 ## Capture format and conversion
 
-The shared validator in `src/lib/velocity.ts` defines schema version 1 and method `observed-development-velocity-v1.0`. It runs both in the browser's local preview and at server ingest. A capture contains scope, complete calendar-day window, reporting timezone, capture timestamp/kind, source hashes, inventory completeness and repository measurements. Daily buckets must reconcile with period totals. CI coverage and success samples must reconcile with the created-PR count. Invalid counts, duplicate repositories, unsupported methods, future captures, partial-day windows and out-of-scope repositories are rejected.
+The shared validator in `src/lib/velocity.ts` defines schema version 1 and method `observed-development-velocity-v1.0`. It runs in the browser's local preview, the local preview command, and at server ingest. A capture contains scope, complete calendar-day window, reporting timezone, capture timestamp/kind, source hashes, inventory completeness and repository measurements. Daily buckets must reconcile with period totals. CI coverage and success samples must reconcile with the created-PR count. Invalid counts, duplicate repositories, unsupported methods, future captures, partial-day windows and out-of-scope repositories are rejected.
 
 Convert a private versioned evidence artifact without uploading it:
 
@@ -25,6 +25,19 @@ python3 scripts/convert-velocity.py /private/evidence.json /private/capture.json
 The converter verifies source summaries against individual PR/deployment observations and hashes the input bytes and evidence manifest. It does not fetch evidence files or verify their contents against the manifest; retain the original evidence alongside its receipt. The compact payload omits PR titles, authors and workflow logs. Do not commit real captures or inventories to a public repository.
 
 On the Velocity page, **Preview capture** reads the file into page memory only. It does not upload it, use localStorage, or save a draft. **Save to dashboard** performs the authenticated import. Closing the preview discards the local state. The page's filter controls affect only the repository table, not fleet totals.
+
+The same preview is available as a local read. It takes one JSON capture of at most 2 MB, validates it with `parseVelocity`, and prints `summarizeVelocity` for that normalized snapshot. It needs no credentials, configuration, or dashboard URL.
+
+```sh
+pnpm exec tsx scripts/preview-velocity.ts /private/capture.json
+```
+
+Success writes one JSON object to stdout and exits 0. The object is pretty-printed with two spaces and has two keys, in order:
+
+- `preview`: the object returned by `parseVelocity`. Owners and repositories are lowercased and sorted, samples are sorted, and instants are canonical ISO strings.
+- `summary`: the object returned by `summarizeVelocity(preview)`. This is the same fleet rollup the Velocity page shows for that capture. A single file is a preview, not a stored baseline and not a trend.
+
+Failure writes one JSON object to stderr, `{"error":"<message>"}`, and exits 1. An oversize file reports `Capture exceeds the 2 MB limit.` Invalid UTF-8 or JSON reports `Capture is not valid UTF-8 JSON.` An unreadable path reports `Capture file could not be read.` A capture that fails the shared contract reports that validator message, truncated to 240 characters, the same limit as the page notice. The failure text omits the file path and the raw capture. The command does not write the capture, create an output file, or call `POST /api/velocity/ingest`.
 
 ## API and history
 
