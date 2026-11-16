@@ -28,12 +28,16 @@ export async function POST(req: Request) {
     return oauthError("server_error", "OAuth storage is not configured", 503);
   }
 
-  let body: RegisterBody;
+  let parsed: unknown;
   try {
-    body = (await req.json()) as RegisterBody;
+    parsed = await req.json();
   } catch {
     return oauthError("invalid_client_metadata", "Request body must be JSON");
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return oauthError("invalid_client_metadata", "Request body must be a JSON object");
+  }
+  const body = parsed as RegisterBody;
 
   if (!Array.isArray(body.redirect_uris) || body.redirect_uris.length === 0) {
     return oauthError(

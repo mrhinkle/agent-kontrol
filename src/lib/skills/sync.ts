@@ -12,6 +12,13 @@ export interface SyncOptions {
   fetcher?: SkillSnapshotFetcher;
 }
 
+let fetcherForTests: SkillSnapshotFetcher | null = null;
+
+/** Synthetic snapshots for tests. Production leaves this unset and reads GitHub. */
+export function setSyncFetcherForTests(fetcher: SkillSnapshotFetcher | null): void {
+  fetcherForTests = fetcher;
+}
+
 /**
  * Mirror enabled sources.
  *
@@ -26,6 +33,8 @@ export interface SyncOptions {
  * status is failed when a source was not fetched, a SKILL.md could not be
  * parsed, or a SKILL.md was too large to read. A reported id conflict, a
  * skipped reference, or an ignored runtime name does not by itself fail the run.
+ * Those are notices. Fatal diagnostics are listed before notices, and each
+ * one keeps its source id.
  * Failed still lists the rows that were written. It is not "nothing happened".
  *
  * Skill writes and the finish update run only while this sync's row is still
@@ -67,7 +76,7 @@ export async function syncSkills(options: SyncOptions): Promise<SyncResult> {
   } catch (err) {
     if (err instanceof SyncLeaseLost) return leaseLost();
     const message = err instanceof Error ? err.message : "sync failed";
-    const errors: SyncError[] = [{ source: "sync", message }];
+    const errors: SyncError[] = [{ source: "sync", message, severity: "fatal" }];
     try {
       await finishSyncRun({
         id,
@@ -102,20 +111,21 @@ async function leaseLost(): Promise<SyncResult> {
     changed: [],
     removed: [],
     conflicts: [],
-    errors: [{ source: "sync", message: "sync lease lost" }],
+    errors: [{ source: "sync", message: "sync lease lost", severity: "fatal" }],
     upstream,
   };
 }
 
 async function runSync(options: SyncOptions, started: Date, runId: string): Promise<Applied> {
-  const fetcher = options.fetcher ?? createGitHubFetcher();
+  const fetcher = options.fetcher ?? fetcherForTests ?? createGitHubFetcher();
   const sources = await listSources();
   const existing = await listSkillRows();
   const added: SyncSkillRef[] = [];
   const changed: SyncSkillRef[] = [];
   const removed: string[] = [];
   const conflicts: SyncConflict[] = [];
-  const errors: SyncError[] = [];
+  const fatals: SyncError[] = [];
+  const notices: SyncError[] = [];
   const sourceCommits: { id: string; commit_sha: string }[] = [];
   const failedSourceIds: string[] = [];
   const successfulSourceIds: string[] = [];
@@ -131,13 +141,13 @@ async function runSync(options: SyncOptions, started: Date, runId: string): Prom
     } catch (err) {
       failed = true;
       failedSourceIds.push(source.id);
-      errors.push({ source: source.id, message: err instanceof Error ? err.message : "fetch failed" });
+      fatals.push({ source: source.id, message: err instanceof Error ? err.message : "fetch failed", severity: "fatal" });
       continue;
     }
     successfulSourceIds.push(source.id);
     sourceCommits.push({ id: source.id, commit_sha: snapshot.commit_sha });
     for (const skip of snapshot.skipped ?? []) {
-      errors.push({ source: source.id, message: `${skip.path} skipped (${skip.reason})` });
+      notices.push({ source: source.id, message: `${skip.path} skipped (${skip.reason})`, severity: "notice" });
     }
     const assembled = assembleSkills({
       source_id: source.id,
@@ -147,12 +157,16 @@ async function runSync(options: SyncOptions, started: Date, runId: string): Prom
       preservedDirs: snapshot.preserved_dirs ?? [],
     });
     if (assembled.errors.length > 0) failed = true;
-    for (const item of assembled.errors) errors.push({ source: source.id, message: `${item.path}: ${item.message}` });
-    for (const item of assembled.notices) errors.push({ source: source.id, message: `${item.path}: ${item.message}` });
+    for (const item of assembled.errors) {
+      fatals.push({ source: source.id, message: `${item.path}: ${item.message}`, severity: "fatal" });
+    }
+    for (const item of assembled.notices) {
+      notices.push({ source: source.id, message: `${item.path}: ${item.message}`, severity: "notice" });
+    }
     for (const skill of assembled.skills) {
       for (const problem of skill.problems) {
         failed = true;
-        errors.push({ source: source.id, message: `${skill.path}: ${problem}` });
+        fatals.push({ source: source.id, message: `${skill.path}: ${problem}`, severity: "fatal" });
       }
     }
     candidates.push(...assembled.skills);
@@ -222,7 +236,7 @@ async function runSync(options: SyncOptions, started: Date, runId: string): Prom
     changed,
     removed,
     conflicts,
-    errors,
+    errors: [...fatals, ...notices],
     sourceCommits,
   };
 }

@@ -10,6 +10,8 @@ Config via environment (put these in ~/.zshenv or the hook command):
   MC_URL    e.g. https://your-deploy.vercel.app
   MC_TOKEN  shared secret (matches the Vercel env var)
   MC_AGENT  optional agent id override (default: claude-code-<hostname>)
+  MC_READ_MESSAGES  optional; set to 0 to skip the operator inbox.
+                    Unset still polls /api/messages and acks.
 
 Fail-open by design: any error exits 0 so hooks never block your session.
 Stdlib only — no dependencies.
@@ -18,6 +20,7 @@ import hashlib
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 import urllib.request
@@ -262,25 +265,35 @@ def _send_now(req) -> None:
 
 
 def post_detached(req) -> None:
-    """Send in a forked child so the agent never waits on the network (POSIX).
-    Where fork is unavailable the send is synchronous, bounded by its timeout."""
-    if not hasattr(os, "fork"):
-        _send_now(req)
-        return
+    """Send from a fresh interpreter; macOS proxy APIs are unsafe after fork.
+
+    Pass the request on stdin so credentials never appear in process arguments.
+    """
+    payload = json.dumps({"url": req.full_url, "data": req.data.hex() if req.data is not None else None,
+                          "headers": dict(req.header_items()), "method": req.get_method()}).encode()
     try:
-        pid = os.fork()
+        child = subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "--post-trace"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
     except Exception:
         _send_now(req)
         return
-    if pid != 0:
-        return  # parent: return to the agent immediately
     try:
-        devnull = os.open(os.devnull, os.O_RDWR)
-        for fd in (0, 1, 2):
-            os.dup2(devnull, fd)
-        _send_now(req)
-    finally:
-        os._exit(0)
+        with child.stdin:
+            child.stdin.write(payload)
+    except OSError:
+        pass  # A failed trace must not interrupt the agent.
+
+
+def post_trace_from_stdin() -> None:
+    payload = json.load(sys.stdin)
+    req = urllib.request.Request(
+        payload["url"], data=bytes.fromhex(payload["data"]) if payload["data"] is not None else None,
+        headers=payload["headers"], method=payload["method"],
+    )
+    _send_now(req)
 
 
 def main() -> None:
@@ -307,14 +320,15 @@ def main() -> None:
 
     title = event_name
     if event_name == "SessionStart":
-        title = f"Session started in {cwd}"
+        title = "Session started"
     elif event_name == "UserPromptSubmit":
-        prompt = (payload.get("prompt") or "")[:140]
-        title = f"New instruction: {prompt}" if prompt else "New instruction"
+        # Fleet status is metadata, independent of opt-in trace capture.
+        # Never copy prompt text into either title or summary.
+        title = "New instruction"
     elif event_name == "Stop":
         title = "Turn finished — waiting for input"
     elif event_name == "Notification":
-        title = (payload.get("message") or "Needs attention")[:140]
+        title = "Needs attention"
     elif event_name == "SessionEnd":
         title = "Session ended"
 
@@ -349,7 +363,8 @@ def main() -> None:
 
     # Two-way: at natural checkpoints, pull any messages the operator queued for this
     # agent and inject them into the session as additional context.
-    if event_name in ("UserPromptSubmit", "SessionStart"):
+    # Unset keeps polling. MC_READ_MESSAGES=0 is the explicit opt-out.
+    if os.environ.get("MC_READ_MESSAGES", "1") != "0" and event_name in ("UserPromptSubmit", "SessionStart"):
         try:
             ireq = urllib.request.Request(
                 f"{url}/api/messages?agent_id={body['agent_id']}&ack=true",
@@ -373,6 +388,9 @@ def main() -> None:
 
 if __name__ == "__main__":
     try:
-        main()
+        if sys.argv[1:] == ["--post-trace"]:
+            post_trace_from_stdin()
+        else:
+            main()
     finally:
         sys.exit(0)

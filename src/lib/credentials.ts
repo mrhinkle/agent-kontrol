@@ -17,7 +17,11 @@
  */
 
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { isConfigured, sql } from "./db";
+import { activityDetail } from "./activity";
+import { currentActor } from "./actor";
+import { isConfigured, sql, withTransaction, type Row } from "./db";
+import { recordDemoActivity } from "./demo-store";
+import { describeDbError } from "./db-error";
 import { isScope, SCOPES, type Scope } from "./scopes";
 import {
   DEFAULT_REQUESTS_PER_DAY,
@@ -90,6 +94,62 @@ export function resetCredentialsForTests(): void {
   memory.splice(0, memory.length);
   clock = () => Date.now();
   lastUsedWriter = null;
+  receiptFaultKinds = null;
+}
+
+/**
+ * Events kinds for credential administration. Detail carries the credential
+ * id, the operation, and safe scope or limit metadata. It never carries the
+ * token, its hash, its prefix, or a cookie.
+ */
+export const CREDENTIAL_ADMIN_KINDS = {
+  create: "credential_create",
+  revoke: "credential_revoke",
+  limits: "credential_limits",
+} as const;
+
+const RECEIPT_FAULT_AGENT = "ak-actor-admin-receipt-fault";
+let receiptFaultKinds: Set<string> | null = null;
+
+/**
+ * Tests name a kind whose events insert must fail. The insert uses an
+ * agent id that is not in `agents`, so the foreign key aborts the same
+ * statement as the credential change.
+ */
+export function setCredentialReceiptFaultForTests(kinds: readonly string[] | null): void {
+  receiptFaultKinds = kinds && kinds.length > 0 ? new Set(kinds) : null;
+}
+
+function receiptAgent(kind: string): string | null {
+  return receiptFaultKinds?.has(kind) ? RECEIPT_FAULT_AGENT : null;
+}
+
+function receiptDetail(kind: string, extra: Record<string, unknown>): string {
+  return JSON.stringify(activityDetail(kind, currentActor(), extra));
+}
+
+/**
+ * Demo mode has no events table. The same safe metadata goes into the
+ * process-local activity list, under the actor already installed by the
+ * dashboard route. A recording failure removes the credential change.
+ */
+function recordMemoryAdmin(kind: string, title: string, extra: Record<string, unknown>, undo: () => void): void {
+  try {
+    recordDemoActivity(kind, title, extra);
+  } catch (error) {
+    undo();
+    throw error;
+  }
+}
+
+/** A fake SQL tag returns no row. A real write returns counts and must pair them. */
+function assertPairedReceipt(row: Row | undefined, changedKey: string): void {
+  if (!row || row[changedKey] == null) return;
+  const changed = Number(row[changedKey]);
+  const receipted = Number(row.receipted ?? 0);
+  if (changed === 0 && receipted === 0) return;
+  if (changed === 1 && receipted === 1) return;
+  throw new Error("credential receipt was not stored");
 }
 
 export function credentialNow(): number {
@@ -294,7 +354,7 @@ async function noteUse(id: string): Promise<void> {
   } catch (e) {
     // The credential was already checked. A failed timestamp must not turn
     // a read the caller was allowed to make into an error.
-    console.error("[credentials] last_used_at update failed", id, e instanceof Error ? e.name : "error");
+    console.error("[credentials] last_used_at update failed", id, describeDbError(e));
   }
 }
 
@@ -335,25 +395,57 @@ export async function createCredential(input: {
   };
   if (!isConfigured()) {
     memory.push(row);
+    recordMemoryAdmin(CREDENTIAL_ADMIN_KINDS.create, "Created a credential", {
+      operation: "create",
+      credential_id: row.id,
+      scopes: row.scopes,
+      rate_limit_per_minute: row.rate_limit_per_minute,
+      rate_limit_per_day: row.rate_limit_per_day,
+    }, () => {
+      const index = memory.findIndex((item) => item.id === row.id);
+      if (index >= 0) memory.splice(index, 1);
+    });
     return { ok: true, credential: toPublic(row), token: minted.token };
   }
-  const db = sql();
-  await db`
-    insert into agent_credentials (
-      id, label, token_prefix, token_hash, scopes, created_at, expires_at,
-      rate_limit_per_minute, rate_limit_per_day
-    ) values (
-      ${row.id},
-      ${row.label},
-      ${row.token_prefix},
-      ${row.token_hash},
-      ${row.scopes},
-      ${row.created_at},
-      ${row.expires_at},
-      ${row.rate_limit_per_minute}::integer,
-      ${row.rate_limit_per_day}::integer
-    )
-  `;
+  const kind = CREDENTIAL_ADMIN_KINDS.create;
+  const detail = receiptDetail(kind, {
+    operation: "create",
+    credential_id: row.id,
+    scopes: row.scopes,
+    rate_limit_per_minute: row.rate_limit_per_minute,
+    rate_limit_per_day: row.rate_limit_per_day,
+  });
+  await withTransaction(async (q) => {
+    const written = await q`
+      with written as (
+        insert into agent_credentials (
+          id, label, token_prefix, token_hash, scopes, created_at, expires_at,
+          rate_limit_per_minute, rate_limit_per_day
+        ) values (
+          ${row.id},
+          ${row.label},
+          ${row.token_prefix},
+          ${row.token_hash},
+          ${row.scopes},
+          ${row.created_at},
+          ${row.expires_at},
+          ${row.rate_limit_per_minute}::integer,
+          ${row.rate_limit_per_day}::integer
+        )
+        returning id
+      ),
+      receipt as (
+        insert into events (agent_id, session_id, kind, title, detail)
+        select ${receiptAgent(kind)}, null, ${kind}, ${"Created a credential"}, ${detail}::jsonb
+        from written
+        returning id
+      )
+      select
+        (select count(*)::int from written) as wrote,
+        (select count(*)::int from receipt) as receipted
+    `;
+    assertPairedReceipt(written[0], "wrote");
+  });
   return { ok: true, credential: toPublic(row), token: minted.token };
 }
 
@@ -379,20 +471,61 @@ export async function revokeCredential(id: string): Promise<PublicCredential | n
   const stamp = new Date(credentialNow()).toISOString();
   if (!isConfigured()) {
     const row = memory.find((item) => item.id === id);
-    if (!row) return null;
-    if (!row.revoked_at) row.revoked_at = stamp;
+    if (!row || row.revoked_at) return row ? toPublic(row) : null;
+    const previous = row.revoked_at;
+    row.revoked_at = stamp;
+    recordMemoryAdmin(CREDENTIAL_ADMIN_KINDS.revoke, "Revoked a credential", {
+      operation: "revoke",
+      credential_id: id,
+    }, () => {
+      row.revoked_at = previous;
+    });
     return toPublic(row);
   }
-  const db = sql();
-  const rows = await db`
-    update agent_credentials
-    set revoked_at = coalesce(revoked_at, ${stamp}::timestamptz)
-    where id = ${id}
-    returning id, label, token_prefix, scopes, created_at, expires_at, revoked_at, last_used_at,
-      rate_limit_per_minute, rate_limit_per_day
-  `;
-  const row = rows[0];
-  return row ? toPublic(rowFromDb(row)) : null;
+  const kind = CREDENTIAL_ADMIN_KINDS.revoke;
+  const detail = receiptDetail(kind, { operation: "revoke", credential_id: id });
+  return withTransaction(async (q) => {
+    const rows = await q`
+      with locked as (
+        select id, label, token_prefix, scopes, created_at, expires_at, revoked_at, last_used_at,
+          rate_limit_per_minute, rate_limit_per_day
+        from agent_credentials
+        where id = ${id}
+        for update
+      ),
+      changed as (
+        update agent_credentials as c
+        set revoked_at = ${stamp}::timestamptz
+        from locked
+        where c.id = locked.id and locked.revoked_at is null
+        returning c.id, c.revoked_at
+      ),
+      receipt as (
+        insert into events (agent_id, session_id, kind, title, detail)
+        select ${receiptAgent(kind)}, null, ${kind}, ${"Revoked a credential"}, ${detail}::jsonb
+        from changed
+        returning id
+      )
+      select
+        locked.id,
+        locked.label,
+        locked.token_prefix,
+        locked.scopes,
+        locked.created_at,
+        locked.expires_at,
+        coalesce((select revoked_at from changed), locked.revoked_at) as revoked_at,
+        locked.last_used_at,
+        locked.rate_limit_per_minute,
+        locked.rate_limit_per_day,
+        (select count(*)::int from changed) as changed,
+        (select count(*)::int from receipt) as receipted
+      from locked
+    `;
+    const row = rows[0];
+    if (!row) return null;
+    assertPairedReceipt(row, "changed");
+    return toPublic(rowFromDb(row));
+  });
 }
 
 /**
@@ -415,21 +548,72 @@ export async function updateCredentialLimits(input: {
   if (!isConfigured()) {
     const row = memory.find((item) => item.id === input.id);
     if (!row) return null;
-    if (input.rate_limit_per_minute !== null) row.rate_limit_per_minute = input.rate_limit_per_minute;
-    if (input.rate_limit_per_day !== null) row.rate_limit_per_day = input.rate_limit_per_day;
+    const previousMinute = row.rate_limit_per_minute;
+    const previousDay = row.rate_limit_per_day;
+    const nextMinute = input.rate_limit_per_minute ?? previousMinute;
+    const nextDay = input.rate_limit_per_day ?? previousDay;
+    if (nextMinute === previousMinute && nextDay === previousDay) return toPublic(row);
+    row.rate_limit_per_minute = nextMinute;
+    row.rate_limit_per_day = nextDay;
+    recordMemoryAdmin(CREDENTIAL_ADMIN_KINDS.limits, "Updated credential limits", {
+      operation: "limits",
+      credential_id: input.id,
+      rate_limit_per_minute: { from: previousMinute, to: nextMinute },
+      rate_limit_per_day: { from: previousDay, to: nextDay },
+    }, () => {
+      row.rate_limit_per_minute = previousMinute;
+      row.rate_limit_per_day = previousDay;
+    });
     return toPublic(row);
   }
-  const db = sql();
-  const rows = await db`
-    update agent_credentials
-    set rate_limit_per_minute = coalesce(${input.rate_limit_per_minute}::integer, rate_limit_per_minute),
-        rate_limit_per_day = coalesce(${input.rate_limit_per_day}::integer, rate_limit_per_day)
-    where id = ${input.id}
-    returning id, label, token_prefix, scopes, created_at, expires_at, revoked_at, last_used_at,
-      rate_limit_per_minute, rate_limit_per_day
-  `;
-  const row = rows[0];
-  return row ? toPublic(rowFromDb(row)) : null;
+  return withTransaction(async (q) => {
+    const locked = await q`
+      select id, label, token_prefix, scopes, created_at, expires_at, revoked_at, last_used_at,
+        rate_limit_per_minute, rate_limit_per_day,
+        rate_minute_count, rate_day_count
+      from agent_credentials
+      where id = ${input.id}
+      for update
+    `;
+    const current = locked[0];
+    if (!current) return null;
+    const previousMinute = Number(current.rate_limit_per_minute);
+    const previousDay = Number(current.rate_limit_per_day);
+    const nextMinute = input.rate_limit_per_minute ?? previousMinute;
+    const nextDay = input.rate_limit_per_day ?? previousDay;
+    if (nextMinute === previousMinute && nextDay === previousDay) {
+      return toPublic(rowFromDb(current));
+    }
+    const kind = CREDENTIAL_ADMIN_KINDS.limits;
+    const detail = receiptDetail(kind, {
+      operation: "limits",
+      credential_id: input.id,
+      rate_limit_per_minute: { from: previousMinute, to: nextMinute },
+      rate_limit_per_day: { from: previousDay, to: nextDay },
+    });
+    const rows = await q`
+      with changed as (
+        update agent_credentials
+        set rate_limit_per_minute = ${nextMinute}::integer,
+            rate_limit_per_day = ${nextDay}::integer
+        where id = ${input.id}
+        returning id, label, token_prefix, scopes, created_at, expires_at, revoked_at, last_used_at,
+          rate_limit_per_minute, rate_limit_per_day
+      ),
+      receipt as (
+        insert into events (agent_id, session_id, kind, title, detail)
+        select ${receiptAgent(kind)}, null, ${kind}, ${"Updated credential limits"}, ${detail}::jsonb
+        from changed
+        returning id
+      )
+      select changed.*, (select count(*)::int from changed) as changed, (select count(*)::int from receipt) as receipted
+      from changed
+    `;
+    const row = rows[0];
+    assertPairedReceipt(row, "changed");
+    if (!row) throw new Error("credential receipt was not stored");
+    return toPublic(rowFromDb(row));
+  });
 }
 
 /** Demo-mode row for the quota module. Routes must not call this. */
@@ -454,7 +638,7 @@ export async function resolveAgentCredential(token: string): Promise<ResolveResu
   try {
     row = await findByHash(hash);
   } catch (e) {
-    console.error("[credentials] lookup failed", e instanceof Error ? e.name : "error");
+    console.error("[credentials] lookup failed", describeDbError(e));
     return { status: "unavailable" };
   }
   const stored = row?.token_hash ?? DUMMY_HASH;

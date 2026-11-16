@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { withTransaction, type SqlTag } from "./db";
+import { streamControlBody } from "./events-http";
 
 // A literal end assertion also rejects the trailing newline JavaScript's $ permits.
 export const CONSUMER_ID = /^[a-z0-9][a-z0-9._-]{0,63}(?![\s\S])/;
@@ -90,7 +91,8 @@ async function binding(tx: SqlTag, consumer: string, credential: string) {
   return rows[0];
 }
 
-async function boundedTransaction<T>(run: (tx: SqlTag) => Promise<T>): Promise<T> {
+/** Same bounds as a stream read: one second to take the locks, three for the statement. */
+export async function boundedTransaction<T>(run: (tx: SqlTag) => Promise<T>): Promise<T> {
   return withTransaction(async tx => {
     await tx`set local lock_timeout = '1s'`;
     await tx`set local statement_timeout = '3s'`;
@@ -108,7 +110,7 @@ export async function acquireStream(consumer: string, credential: string): Promi
 }
 
 export interface StreamEvent { id: string; event: string; payload: Record<string, unknown> }
-export interface StreamBatch { expired: boolean; events: StreamEvent[] }
+export interface StreamBatch { expired: boolean; events: StreamEvent[]; baseline?: string }
 
 /** Serialize each enqueue with binding updates and credential revocation. */
 async function enqueueStreamFrame(consumer: string, credential: string, generation: string, enqueue: () => void): Promise<void> {
@@ -139,10 +141,17 @@ export async function readStreamBatch(consumer: string, credential: string, gene
         throw new EventStreamError("foreign_cursor", 403);
       }
     }
+    // Primary key only. The SHARE lock already excludes an insert that has not
+    // committed, so this high-water mark is the observation baseline.
+    const mark = await tx`select coalesce(max(id), 0)::text as baseline from gh_events`;
     const rows = await tx`select id::text as id, event, payload from gh_events
       where id > ${position}::bigint and repo = any(${c.repos}::text[])
       and event = any(${c.event_types}::text[]) order by gh_events.id limit ${STREAM_BATCH}`;
-    return { expired: false, events: rows.map(r => ({ id: String(r.id), event: String(r.event), payload: r.payload })) };
+    return {
+      expired: false,
+      baseline: String(mark[0]?.baseline ?? "0"),
+      events: rows.map(r => ({ id: String(r.id), event: String(r.event), payload: r.payload })),
+    };
   });
 }
 
@@ -164,10 +173,23 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+/** Terminal control frame. `token` is the stream_error error field; cursor and supersession have none. */
+function controlFrame(event: string, token: string | null): string {
+  const teaching = streamControlBody(token ?? event);
+  const data: Record<string, unknown> = {};
+  if (token) data.error = token;
+  data.reconcile = true;
+  data.code = teaching.code;
+  data.cause = teaching.cause;
+  data.fix = teaching.fix;
+  data.retryable = teaching.retryable;
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
 /** Bounded transport; options are internal/test inputs, never request parameters. */
 export function eventStreamResponse(opts: {
   consumer: string; position: string; generation: string; credential: string; signal: AbortSignal;
-  first: StreamBatch; read?: typeof readStreamBatch; pollMs?: number; heartbeatMs?: number; lifetimeMs?: number;
+  first: StreamBatch; baseline?: string; read?: typeof readStreamBatch; pollMs?: number; heartbeatMs?: number; lifetimeMs?: number;
   enqueue?: (push: () => void) => Promise<void>;
 }): Response {
   const stop = new AbortController();
@@ -203,9 +225,16 @@ export function eventStreamResponse(opts: {
       try {
         let batch = opts.first;
         let lastHeartbeat = Date.now();
+        const baseline = opts.baseline;
+        if (!batch.expired && baseline != null
+          && /^(?:0|[1-9][0-9]{0,18})$/.test(baseline)
+          && /^(?:0|[1-9][0-9]{0,18})$/.test(opts.generation)) {
+          const observation = `event: observation\ndata: ${JSON.stringify({ baseline, generation: opts.generation })}\n\n`;
+          if (!await send(observation)) return;
+        }
         while (!stop.signal.aborted) {
           if (batch.expired) {
-            terminal('event: cursor_expired\ndata: {"reconcile":true}\n\n');
+            terminal(controlFrame("cursor_expired", null));
             break;
           }
           for (const event of batch.events) {
@@ -224,7 +253,7 @@ export function eventStreamResponse(opts: {
         const code = e instanceof EventStreamError ? e.code : "stream_unavailable";
         if (!stop.signal.aborted) {
           if (code === "superseded") stop.abort("superseded");
-          else terminal(`event: stream_error\ndata: ${JSON.stringify({ error: code, reconcile: true })}\n\n`);
+          else terminal(controlFrame("stream_error", code));
         }
       } finally {
         clearTimeout(lifetime);
@@ -232,7 +261,7 @@ export function eventStreamResponse(opts: {
         if (active.get(opts.consumer)?.id === id) active.delete(opts.consumer);
         // Same-instance replacement aborts immediately; cross-instance replacement
         // is found by the generation check on the next bounded database poll.
-        if (stop.signal.reason === "superseded") terminal('event: superseded\ndata: {"reconcile":true}\n\n');
+        if (stop.signal.reason === "superseded") terminal(controlFrame("superseded", null));
         try { controller.close(); } catch { /* reader already cancelled */ }
       }
     },

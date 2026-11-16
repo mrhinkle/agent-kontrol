@@ -3,8 +3,8 @@
 ## Development setup
 
 - Node 22
-- `npm ci`
-- `npm run dev` — runs in demo mode when `DATABASE_URL` is unset.
+- `pnpm install --frozen-lockfile`
+- `pnpm run dev` — runs in demo mode when `DATABASE_URL` is unset.
 
 ## Where to start
 
@@ -12,12 +12,12 @@ Read `docs/ARCHITECTURE.md` and the code map in it.
 
 ## Checks CI runs
 
-- `npm run typecheck`
-- `npm run test:ui`
-- `npm test` — includes Python unit tests and ingest/provider/usage/message tests
-- `npm run test:mcp` — starts the app in demo mode (no `DATABASE_URL`) and drives `/api/mcp` with the official MCP client. The token is a throwaway value the test generates. The five write tools store in memory for that process and the test round-trips them. The store is cleared when the process exits.
-- `npm run build`
-- `npm run test:pg` — runs against a Postgres. Set `DATABASE_URL` to a scratch database with `supabase/schema.sql` applied. The suite skips when unset.
+- `pnpm run typecheck`
+- `pnpm run test:ui`
+- `pnpm test` — includes Python unit tests and ingest/provider/usage/message tests
+- `pnpm run test:mcp` — starts the app in demo mode (no `DATABASE_URL`) and drives `/api/mcp` with the official MCP client. The token is a throwaway value the test generates. The five write tools store in memory for that process and the test round-trips them. The store is cleared when the process exits.
+- `pnpm run build`
+- `pnpm run test:pg` — runs against a Postgres. Set `DATABASE_URL` to a scratch database with `supabase/schema.sql` applied. The suite skips when unset.
 
 ## Schema changes
 

@@ -1,6 +1,7 @@
 import { neon, Pool as NeonPool } from "@neondatabase/serverless";
 import { Pool, type PoolClient } from "pg";
 
+import { describeDbError } from "./db-error";
 import { toQuery } from "./sql-template";
 import { asUnknownWriteOutcome } from "./write-outcome";
 
@@ -227,7 +228,7 @@ function getPgPool(): Pool {
     connectionTimeoutMillis: 10000,
   });
   created.on("error", (err: Error) => {
-    console.error("[db] unexpected error on an idle Postgres client:", err);
+    console.error("[db] unexpected error on an idle Postgres client:", describeDbError(err));
   });
 
   pool = created;
@@ -241,7 +242,7 @@ function getNeonPool(databaseUrl: string): NeonPool {
   if (neonGlobal.__mcNeonPool) return neonGlobal.__mcNeonPool;
   const created = new NeonPool({ connectionString: databaseUrl, max: 5 });
   created.on("error", (err: Error) => {
-    console.error("[db] unexpected error on an idle Neon client:", err);
+    console.error("[db] unexpected error on an idle Neon client:", describeDbError(err));
   });
   neonGlobal.__mcNeonPool = created;
   return created;

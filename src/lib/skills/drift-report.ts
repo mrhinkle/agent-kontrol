@@ -63,6 +63,13 @@ export function parseDriftBody(body: unknown): DriftParse {
   return { ok: true, host: record.host.trim(), dir, skills };
 }
 
+let driftReadFault = false;
+
+/** Tests fail the comparison read after the drift row and its receipt commit. */
+export function setDriftReadFaultForTests(on: boolean): void {
+  driftReadFault = on;
+}
+
 export async function recordDrift(input: {
   host: string;
   dir: string;
@@ -74,6 +81,7 @@ export async function recordDrift(input: {
     reported_at: skillNow().toISOString(),
     entries: input.skills,
   });
+  if (driftReadFault) throw new Error("drift comparison read failed");
   const rows = await listSkillRows();
   const mirror = rows.filter((skill) => !skill.removed_at).map((skill) => ({ name: skill.id, sha: skill.sha }));
   const mine = compareDrift(mirror, input.skills);

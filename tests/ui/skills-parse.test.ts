@@ -366,7 +366,7 @@ describe("skill frontmatter and runtimes", () => {
     const cases: [string, RegExp][] = [
       ["runtimes: [\n  codex\n", /does not start as plain text/],
       ["runtimes: [claude,\n  codex]\n", /does not start as plain text/],
-      ["runtimes: {\n  codex\n", /unsupported frontmatter syntax/],
+      ["runtimes: {\n  codex\n", /malformed frontmatter object/],
       ["runtimes: -\n  codex\n", /does not start as plain text/],
       ["runtimes: ?\n  codex\n", /does not start as plain text/],
       ["runtimes: :\n  codex\n", /does not start as plain text/],
@@ -449,6 +449,113 @@ describe("skill frontmatter and runtimes", () => {
       metadata: { author: "a", version: 3 },
       runtimes: ["codex"],
     });
+  });
+});
+
+describe("strict JSON object frontmatter", () => {
+  const fixtureDir = "tests/fixtures/skills-inline-metadata";
+
+  function blockMetadata(raw: string): string {
+    const inline = raw.match(/^metadata: (\{.+\})$/m)?.[1];
+    assert.ok(inline, "pinned fixture has inline metadata");
+    const json = JSON.parse(inline) as { hermes: { tags: string[] } };
+    assert.ok(Array.isArray(json.hermes.tags));
+    return raw.replace(/^metadata: \{.+\}$/m, `metadata:\n  hermes:\n    tags: ${JSON.stringify(json.hermes.tags)}`);
+  }
+
+  function sameResolution(raw: string, directoryName: string): void {
+    const inline = raw.match(/^metadata: (\{.+\})$/m)?.[1];
+    assert.ok(inline);
+    const actual = parseSkillMarkdown(raw, directoryName);
+    const control = parseSkillMarkdown(blockMetadata(raw), directoryName);
+    assert.equal(control.parseProblem, null);
+    assert.equal(actual.parseProblem, null);
+    assert.equal(actual.name, control.name);
+    assert.equal(actual.description, control.description);
+    assert.equal(actual.category, control.category);
+    assert.deepEqual(actual.tags, control.tags);
+    assert.equal(actual.version, control.version);
+    assert.equal(actual.body, control.body);
+    assert.deepEqual(actual.frontmatter.metadata, JSON.parse(inline));
+    assert.deepEqual(actual.frontmatter.metadata, control.frontmatter.metadata);
+    assert.deepEqual(
+      resolveRuntimes({
+        frontmatter: actual.frontmatter,
+        body: actual.body,
+        sibling: null,
+        siblingProblem: null,
+        parseProblem: actual.parseProblem,
+      }),
+      resolveRuntimes({
+        frontmatter: control.frontmatter,
+        body: control.body,
+        sibling: null,
+        siblingProblem: null,
+        parseProblem: control.parseProblem,
+      }),
+    );
+  }
+
+  it("parses pinned upstream inline metadata and keeps the same labels and runtimes", () => {
+    for (const directoryName of ["accesslint-audit", "context-handoff"]) {
+      const raw = fs.readFileSync(`${fixtureDir}/${directoryName}-SKILL.md`, "utf8");
+      sameResolution(raw, directoryName);
+    }
+    const accesslint = parseSkillMarkdown(fs.readFileSync(`${fixtureDir}/accesslint-audit-SKILL.md`, "utf8"), "accesslint-audit");
+    assert.equal(accesslint.category, "Website Operations");
+    assert.deepEqual(accesslint.tags, ["audit", "accessibility"]);
+    assert.equal(accesslint.version, "1.0.2");
+    const metadata = accesslint.frontmatter.metadata as { hermes: { tags: string[] } };
+    assert.deepEqual(metadata.hermes.tags, ["accessibility", "wcag", "audit", "a11y"]);
+    const handoff = parseSkillMarkdown(fs.readFileSync(`${fixtureDir}/context-handoff-SKILL.md`, "utf8"), "context-handoff");
+    assert.equal(handoff.category, "Meta");
+    assert.deepEqual(handoff.tags, ["recovery", "claude-cowork"]);
+    assert.equal(handoff.version, "1.1.1");
+    const handoffMeta = handoff.frontmatter.metadata as { hermes: { tags: string[] } };
+    assert.deepEqual(handoffMeta.hermes.tags, ["context-window", "handoff", "session", "memory", "cowork"]);
+  });
+
+  it("rejects malformed inline objects and still rejects anchors, aliases, and tags", () => {
+    for (const metadata of ["{not json}", "{a: 1}", '{"a": 1,}', '{"a": 1} extra', "{", '{"a": 1} # comment']) {
+      const parsed = parseSkillMarkdown(`---\nname: bad\nmetadata: ${metadata}\n---\nBody\n`, "bad");
+      assert.equal(parsed.parseProblem, "malformed frontmatter object", metadata);
+      assert.deepEqual(parsed.frontmatter, {});
+    }
+    for (const metadata of ["&anchor", "*alias", "!tag", "!!str"]) {
+      const parsed = parseSkillMarkdown(`---\nname: bad\nmetadata: ${metadata}\n---\nBody\n`, "bad");
+      assert.equal(parsed.parseProblem, "unsupported frontmatter syntax", metadata);
+      assert.deepEqual(parsed.frontmatter, {});
+    }
+  });
+
+  it("keeps nested JSON values and special keys as own data", () => {
+    const parsed = parseSkillMarkdown(
+      '---\nname: typed\nmetadata: {"n": 1.5, "ok": true, "no": false, "empty": null, "note": "b}c", "tags": ["one", {"__proto__": {"polluted": true}}], "__proto__": {"polluted": true}, "constructor": {"prototype": {"x": 1}}, "prototype": {"y": 2}}\n---\nBody\n',
+      "typed",
+    );
+    assert.equal(parsed.parseProblem, null);
+    const metadata = parsed.frontmatter.metadata as Record<string, unknown>;
+    assert.equal(metadata.n, 1.5);
+    assert.equal(metadata.ok, true);
+    assert.equal(metadata.no, false);
+    assert.equal(metadata.empty, null);
+    assert.equal(metadata.note, "b}c");
+    assert.deepEqual(Object.getOwnPropertyDescriptor(metadata, "__proto__")?.value, { polluted: true });
+    assert.deepEqual(Object.getOwnPropertyDescriptor(metadata, "constructor")?.value, { prototype: { x: 1 } });
+    assert.deepEqual(Object.getOwnPropertyDescriptor(metadata, "prototype")?.value, { y: 2 });
+    const tags = metadata.tags as unknown[];
+    const nested = tags[1] as Record<string, unknown>;
+    assert.deepEqual(Object.getOwnPropertyDescriptor(nested, "__proto__")?.value, { polluted: true });
+    assert.equal(Object.prototype.hasOwnProperty.call(Object.prototype, "polluted"), false);
+    assert.equal(({} as { polluted?: unknown }).polluted, undefined);
+
+    const special = parseSkillMarkdown('---\n__proto__: {"polluted": true}\nconstructor: {"prototype": {"x": 1}}\n---\nBody\n', "special");
+    assert.equal(special.parseProblem, null);
+    assert.equal(Object.getPrototypeOf(special.frontmatter), Object.prototype);
+    assert.deepEqual(Object.getOwnPropertyDescriptor(special.frontmatter, "__proto__")?.value, { polluted: true });
+    assert.deepEqual(Object.getOwnPropertyDescriptor(special.frontmatter, "constructor")?.value, { prototype: { x: 1 } });
+    assert.equal((special.frontmatter as { polluted?: unknown }).polluted, undefined);
+    assert.equal(({} as { polluted?: unknown }).polluted, undefined);
   });
 });
 

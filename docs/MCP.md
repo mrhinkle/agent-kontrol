@@ -15,7 +15,7 @@ The MCP endpoint does not use the dashboard session cookie. It enforces its own 
 - `Authorization: Bearer <akc_…>` — a per-agent credential issued from Settings. The token is shown once, at creation. Scopes on that credential are enforced, and so are its request limits (below).
 - An OAuth access token (JWT) issued by this server. Verification and issuance are unchanged. An authenticated OAuth principal has access to every mapped tool. The scope string on that token is `mcp`, and that string is not checked against the table below.
 
-Without valid auth the endpoint answers `401` with a `WWW-Authenticate` header pointing at `/.well-known/oauth-protected-resource`. A revoked, expired, or unknown agent credential takes that same `401` path. A valid credential that lacks the scope for the tool answers `403`:
+Without valid auth the endpoint answers `401` with a `WWW-Authenticate` header pointing at `/.well-known/oauth-protected-resource`. The JSON body keeps the SDK `error` and `error_description` and adds `code` `unauthorized`, `cause`, `fix`, and `retryable` false. An `akc_` token whose credential store cannot be read on that first check is `503` `credential_store_unavailable` and sends no `WWW-Authenticate` header. A revoked, expired, or unknown agent credential takes the `401` path. A valid credential that lacks the scope for the tool answers `403`:
 
 ```json
 { "error": "The credential does not have the tasks:write scope.", "code": "insufficient_scope", "fix": "Use a credential that has the tasks:write scope", "retryable": false }
@@ -36,9 +36,10 @@ A tool name that is not registered is denied for every caller, including `MC_TOK
 | `messages:read` | `check_inbox` | `GET /api/messages` |
 | `messages:write` | `reply_to_operator`, `reply_to_mark`, `send_message` | `POST /api/messages/reply` |
 | `progress:read` | `get_progress_digest`, `get_morning_brief` | `GET /api/progress`, `GET /api/progress/digest`, `GET /api/brief` |
-| `decisions:read` | `list_decisions` | — (no REST route; the agent calls `list_decisions`) |
+| `decisions:read` | `list_decisions` | `GET /api/decisions` |
 | `decisions:request` | `request_decision` | — (no REST route; the agent calls `request_decision`) |
 | `decisions:write` | `resolve_decision` | `PATCH /api/decisions/:id`, `POST /api/decisions/:id/writeback` |
+| `usage:read` | — (no MCP tool) | `GET /api/usage` |
 | `skills:read` | `list_skills`, `get_skill` | `GET /api/skills`, `GET /api/skills/:id` |
 | `skills:write` | `run_skill` | — (no REST route; the agent calls `run_skill`) |
 | `watch:read` | — (no MCP tool) | `GET /api/watch/beats` |
@@ -51,13 +52,13 @@ A tool name that is not registered is denied for every caller, including `MC_TOK
 
 `send_message` is the MCP form of operator `POST /api/messages`. That REST route stays off this table, so an agent credential still cannot call it. The tool requires `messages:write`. `delete_note` uses `memory:write`. There is no memory DELETE route. `requeue_task` uses `tasks:write`, the same scope as `PATCH /api/tasks/:id`. `list_activity` and `GET /api/activity` are operator-only, the same boundary as traces. No agent scope grants them, including `fleet:read`. `MC_TOKEN` and an OAuth access token can call `list_activity`. The dashboard session and `MC_TOKEN` can call `GET /api/activity`. `get_settings` and `set_watched_repos` use that same operator boundary. No agent scope grants them. `MC_TOKEN` and an OAuth access token can call them. `get_settings` returns the bodies of `GET /api/settings/repos` and `GET /api/settings/owners`. `set_watched_repos` is the MCP form of `PUT /api/settings/repos`. An agent credential still cannot call those REST routes.
 
-Collector and operator routes are not in this table. An agent credential cannot call them. `MC_TOKEN` and the dashboard session still can. That set is `POST /api/progress/ingest`, `POST /api/usage/ingest`, `GET /api/usage`, `GET /api/observability`, `POST /api/v1/traces`, `GET /api/traces`, `GET /api/traces/:traceId`, `GET /api/activity`, `POST /api/messages`, `PATCH /api/messages`, `GET /api/decisions`, `POST /api/decisions`, `PATCH /api/skills/:id`, `POST /api/skills/sync`, `POST /api/skills/drift`, `GET /api/skill-bundles`, `GET`/`PUT`/`PATCH /api/settings/repos`, and `GET`/`PUT /api/settings/owners` plus `POST /api/settings/owners/discover`. `GET`/`POST`/`PATCH`/`DELETE /api/settings/credentials` accepts only the dashboard session. `PATCH /api/decisions/:id` and `POST /api/decisions/:id/writeback` are the `decisions:write` row above. `request_decision` and `list_decisions` are the request and read rows. Neither of those scopes can resolve a decision.
+Collector and operator routes are not in this table. An agent credential cannot call them. `MC_TOKEN` and the dashboard session still can. That set is `POST /api/progress/ingest`, `POST /api/usage/ingest`, `GET /api/observability`, `POST /api/v1/traces`, `GET /api/traces`, `GET /api/traces/:traceId`, `GET /api/activity`, `POST /api/messages`, `PATCH /api/messages`, `POST /api/decisions`, `PATCH /api/skills/:id`, `POST /api/skills/sync`, `POST /api/skills/drift`, `GET /api/skill-bundles`, `GET`/`PUT`/`PATCH /api/settings/repos`, and `GET`/`PUT /api/settings/owners` plus `POST /api/settings/owners/discover`. `GET`/`POST`/`PATCH`/`DELETE /api/settings/credentials` accepts only the dashboard session. `GET /api/decisions` is the `decisions:read` row. `GET /api/usage` is the `usage:read` row. Neither read grants POST, PATCH, or write-back, and `usage:read` does not grant `POST /api/usage/ingest`. `PATCH /api/decisions/:id` and `POST /api/decisions/:id/writeback` are the `decisions:write` row above. `request_decision` and `list_decisions` are the request and read rows. Neither of those scopes can resolve a decision. `decisions:write` does not grant `GET /api/decisions`.
 
 `check_inbox` and `GET /api/messages?ack=true` can mark inbox rows delivered. That side effect is part of `messages:read`, which is how the inbox already worked.
 
 ### Request limits
 
-Each agent credential has a per-minute and a per-day request limit, 60 and 10,000 by default, editable in Settings. One HTTP request to `/api/mcp` counts once after authentication and the scope check: an `initialize`, a notification, a POST batch, a `GET` that opens the stream, and a `DELETE`. Tool calls are not counted separately; a batch with several `tools/call` messages is one request. A held stream does not count again, and a reconnect is a new request. The minute is the clock minute and the day is the UTC day. Over a limit, the HTTP answer is `429` with `Retry-After` seconds and `{ "code": "rate_limited", "retryable": true, "retry_after", "window", "limit" }`. That is an HTTP status, not a tool result. A quota store error is `503 {"error":"credential_store_unavailable"}`. A credential revoked or expired while its request waited is the usual `401` with `WWW-Authenticate`. `MC_TOKEN` and OAuth are not metered. The REST rules are in [API.md](API.md#request-limits-for-agent-credentials).
+Each agent credential has a per-minute and a per-day request limit, 60 and 10,000 by default, editable in Settings. One HTTP request to `/api/mcp` counts once after authentication and the scope check: an `initialize`, a notification, a POST batch, a `GET` that opens the stream, and a `DELETE`. Tool calls are not counted separately; a batch with several `tools/call` messages is one request. A held stream does not count again, and a reconnect is a new request. The minute is the clock minute and the day is the UTC day. Over a limit, the HTTP answer is `429` with `Retry-After` seconds and `{ "code": "rate_limited", "retryable": true, "retry_after", "window", "limit" }`. That is an HTTP status, not a tool result. A quota store error is `503` with `error` and `code` `credential_store_unavailable`, a `fix`, and `retryable` true. A credential revoked or expired while its request waited is `401` with `error` `invalid_token`, `error_description` `Invalid token`, `code` `unauthorized`, `fix`, `retryable` false, and the same `WWW-Authenticate` challenge. `MC_TOKEN` and OAuth are not metered. The REST rules are in [API.md](API.md#request-limits-for-agent-credentials).
 
 ### What a credential stores
 
@@ -76,7 +77,7 @@ Check that the endpoint is reachable and gated:
 curl -i https://YOUR-DEPLOY.vercel.app/api/mcp
 ```
 
-Expect `401` and a `WWW-Authenticate` header pointing at `/.well-known/oauth-protected-resource`.
+Expect `401` and a `WWW-Authenticate` header pointing at `/.well-known/oauth-protected-resource`. The JSON body also has `code` `unauthorized`, `cause`, `fix`, and `retryable` false. A missing bearer stays `401`, not `503`.
 
 Then confirm the bearer token works with an MCP `initialize` request:
 
@@ -415,9 +416,9 @@ A tool failure returns `isError: true`. The text of the result is JSON with the 
 
 `task_not_claimable` is defined so a caller can handle it. No tool returns it. `claim_task` with nothing queued is a normal result whose text says there is no queued task, not an error.
 
-Arguments that fail the tool's input schema are rejected by the MCP SDK before the handler runs. That result is `isError: true` whose text is the schema message, not this JSON. The catalogue below is what the handler itself returns.
+Arguments that fail the tool's input schema are rejected by the MCP SDK before the handler runs. That result stays `isError: true` and the text stays the schema message. It may also include `structuredContent` with `code` `mcp_tool_error`, `cause`, `fix`, and `retryable` false. The handler does not run. A `tools/call` arguments object whose combined array elements and object members exceed 4096 is rejected before that schema check. The text is the SDK's short maximum-elements message, still `isError: true`, with the same `structuredContent`. The handler does not run. That ceiling is above a full watched-repo write (25 repos) and the owner cap (20). The 1 MiB SSE frame cap is unchanged, and a complete frame over that cap is still passed through without teaching. The catalogue below is what the handler itself returns.
 
-The HTTP `401` for a missing or invalid bearer is unchanged: `WWW-Authenticate` points at `/.well-known/oauth-protected-resource`. An authenticated `POST /api/mcp` whose body is empty or not JSON answers HTTP `400` with `code` `invalid_json` and `error` `invalid JSON`. That response is not a tool result.
+The HTTP `401` for a missing or invalid bearer keeps its status and `WWW-Authenticate` header pointing at `/.well-known/oauth-protected-resource`. The body adds `code` `unauthorized`, `cause`, `fix`, and `retryable` false beside the SDK fields. An authenticated `POST /api/mcp` whose body is empty or not JSON answers HTTP `400` with `code` `invalid_json` and `error` `invalid JSON`. That response is not a tool result.
 
 | Code | Retryable | When a tool returns it |
 | --- | --- | --- |
@@ -520,7 +521,7 @@ The content SHA is SHA-256 hex over the raw SKILL.md bytes, UTF-8, with no newli
 
 `sha` on a skill row is that content hash. `commit_sha` is the upstream commit at which the content last changed. `upstream.sha` and `upstream.syncedAt` come from the latest finished sync that recorded a non-empty source commit, of any status. A failed sync that still recorded the commit it fetched, including one failed by a parse problem, is the source of that sha. A failed fetch that recorded no commit does not replace an older one. That sha can be newer than a skill's `commit_sha` when a sync found nothing to write.
 
-Reference files are text only. A file over 256 KB, or a file that would push the skill's references over 1 MB, is skipped. A binary file is skipped. Those skips are listed in the sync `errors` and do not by themselves mark the sync failed. A SKILL.md over 1 MB, or a SKILL.md that is not UTF-8 text, marks the sync failed and keeps the stored row. A failed fetch does the same for that source: the rows stay, and they are not reported as removed.
+Reference files are text only. A file over 256 KB, or a file that would push the skill's references over 1 MB, is skipped. A binary file is skipped. Those skips are listed in the sync `errors` with `severity` `notice` and do not by themselves mark the sync failed. A SKILL.md over 1 MB, or a SKILL.md that is not UTF-8 text, marks the sync failed and keeps the stored row. A failed fetch does the same for that source: the rows stay, and they are not reported as removed.
 
 ### REST
 
@@ -553,13 +554,15 @@ curl -s -X POST https://YOUR-DEPLOY.vercel.app/api/skills/sync \
   -d '{"trigger":"scheduled"}'
 ```
 
-The GitHub token is `GH_TOKEN`, otherwise `GITHUB_TOKEN`. Those are the names the `gh` CLI already uses. A public repository can be read with no token. HTTP 401, 403, 404, a truncated tree, or any other fetch failure keeps that source's rows. The body `status` is `failed`. It is not a removal.
+The GitHub token is `GH_TOKEN`, otherwise `GITHUB_TOKEN`. Those are the names the `gh` CLI already uses. A public repository can be read with no token. If GitHub answers 401 or 403 to the token (an org that blocks fine-grained tokens, an expired token), the sync retries that source once without it, so public sources still read; a private source then fails with the original status. HTTP 401, 403, 404, a truncated tree, or any other fetch failure keeps that source's rows. The body `status` is `failed`. It is not a removal.
 
 One sync at a time. The lease is a `skill_sync_runs` row with `status` `running`, guarded by a partial unique index. A second sync returns `status: "busy"` and does not fetch. A running row older than 10 minutes is marked failed so a crashed sync does not wedge the mirror. The old process can still be alive. Every skill write and the finish update run only while that sync's row is still `status` `running`. If a newer sync has taken the lease, the old one stops, returns `status: "busy"` with error `sync lease lost`, and its writes do not land. When nothing changed, `added`, `changed`, and `removed` are empty and no skill row is written. The sync run still records the commit that was fetched.
 
 An id that appears in more than one source is kept by the earlier source (`position` ascending). The other is listed in `conflicts` and is not stored. The same source producing the same id twice keeps the first path.
 
 `status: "failed"` means a source was not fetched, a SKILL.md could not be parsed, or a SKILL.md could not be read. Rows that were written are still listed in `added` and `changed`. A parse problem is not a written row: the existing skill stays out of `added`, `changed`, and `removed`, and a new skill is absent. A conflict, a skipped reference, or an ignored runtime name does not by itself fail the run. Unreadable frontmatter is not stored and is not treated as compatible with every runtime.
+
+A frontmatter value that is one strict JSON object on a single line is stored, including nested objects and arrays. A malformed object is a parse failure. YAML anchors, aliases, and tags stay unreadable. Each `errors[]` entry is `{source, message, severity}`. `severity` is `fatal` or `notice`, and fatal entries are listed first. A notice is a skipped reference or an ignored runtime name. The skills page shows the first fatal cause with its source id, the added, changed, and removed counts, and the remaining diagnostics. Notices alone leave `status` `ok`.
 
 ### Scheduled skills
 

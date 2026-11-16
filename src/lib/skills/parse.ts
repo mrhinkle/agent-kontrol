@@ -1,6 +1,7 @@
 /**
  * Minimal YAML frontmatter for SKILL.md. No extra dependency.
- * Unsupported constructs (tabs, anchors, flow maps) are a parse problem.
+ * A single-line strict JSON object is kept. Tabs, anchors, aliases, tags,
+ * and any other flow syntax are a parse problem.
  * A parse problem never means the skill is compatible with every runtime.
  */
 
@@ -261,7 +262,14 @@ function parseYamlMap(text: string): { ok: true; data: Record<string, unknown> }
       i += 1;
       continue;
     }
-    if (rest.startsWith("{") || rest.startsWith("&") || rest.startsWith("*") || rest.startsWith("!")) {
+    if (rest.startsWith("{")) {
+      const parsed = parseInlineJsonObject(rest);
+      if (!parsed.ok) return parsed;
+      assignOwn(map, key, parsed.value);
+      i += 1;
+      continue;
+    }
+    if (rest.startsWith("&") || rest.startsWith("*") || rest.startsWith("!")) {
       return { ok: false, error: "unsupported frontmatter syntax" };
     }
     const continuation = readPlainContinuation(lines, i + 1, indent);
@@ -417,4 +425,29 @@ function plainValue(text: string): unknown {
   if (text === "false") return false;
   if (/^-?[0-9]+$/.test(text)) return Number(text);
   return text;
+}
+
+/** Own data property, including `__proto__`, so the key is stored and the prototype stays put. */
+function assignOwn(map: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(map, key, { value, enumerable: true, writable: true, configurable: true });
+}
+
+/**
+ * One strict JSON object. Nested objects and arrays are the JSON.parse values,
+ * whose special keys are already own data. Anything that is not that object fails closed.
+ */
+function parseInlineJsonObject(text: string): { ok: true; value: Record<string, unknown> } | { ok: false; error: string } {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
+    return { ok: false, error: "malformed frontmatter object" };
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { ok: false, error: "malformed frontmatter object" };
+    }
+    return { ok: true, value: parsed as Record<string, unknown> };
+  } catch {
+    return { ok: false, error: "malformed frontmatter object" };
+  }
 }

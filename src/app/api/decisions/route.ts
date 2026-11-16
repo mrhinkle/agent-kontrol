@@ -17,8 +17,9 @@ export const maxDuration = 30;
 
 /**
  * Decision queue.
- * Auth: dashboard session or MC_TOKEN. An agent credential cannot call this
- * route; resolving a row is PATCH, and that requires decisions:write.
+ * Auth: dashboard session, MC_TOKEN, or an agent credential with decisions:read.
+ * POST stays off the agent scope table. Resolving a row is PATCH, and that
+ * requires decisions:write.
  *
  * GET  /api/decisions?status=open&repo=&source=&limit=&shape=row
  *      Oldest first by first_seen_at. Each row includes age_days.

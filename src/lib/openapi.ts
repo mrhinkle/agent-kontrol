@@ -272,7 +272,7 @@ export function openApiDocument(): Json {
           type: "object",
           required: ["error"],
           properties: { error: { type: "string" } },
-          description: "Stream-specific failures contain error. Authentication and quota failures may include the standard error fields too.",
+          description: "Stream-specific failures contain error. Authentication and quota failures may include the standard error fields too. SSE control data also includes code, cause, fix, and retryable. error stays required.",
         },
         Error: {
           type: "object",
@@ -616,7 +616,7 @@ export function openApiDocument(): Json {
             activity_days: { type: "integer" },
             include_forks: { type: "boolean" },
             include_archived: { type: "boolean" },
-            last_error: { type: ["string", "null"], description: "Set when gh repo list failed, was rate-limited, or returned no repos. A truncated list stores a warning here and still sets last_discovered_at." },
+            last_error: { type: ["string", "null"], description: "Set when gh repo list failed, was rate-limited, or returned no repos. The stored text is a fixed summary for that failure, not the collector diagnostic. A truncated list stores a warning here and still sets last_discovered_at." },
             last_error_at: { type: ["string", "null"], format: "date-time" },
             last_discovered_at: { type: ["string", "null"], format: "date-time" },
             actor_type: { type: ["string", "null"], enum: ["human", "agent", null] },
@@ -1637,7 +1637,7 @@ export function openApiDocument(): Json {
           tags: ["decisions"],
           summary: "Decision queue, oldest first.",
           description:
-            "Dashboard session or MC_TOKEN. An agent credential is denied, including one that holds decisions:write, with 403 and code insufficient_scope. status defaults to open and also returns deferred rows whose defer_until has passed. shape defaults to row. shape=brief ignores status and source: decisions is the morning-brief list from complete github-label rows, and incomplete_repos names owner/name repos whose brief-eligible rows are missing kind, labels, opened_at, or repo_short. A rejected status, shape, repo, source, or limit is 400 validation_failed.",
+            "Dashboard session, MC_TOKEN, or an agent credential with decisions:read. An agent credential without decisions:read, including one that holds only decisions:write, is 403 insufficient_scope. status defaults to open and also returns deferred rows whose defer_until has passed. shape defaults to row. shape=brief ignores status and source: decisions is the morning-brief list from complete github-label rows, and incomplete_repos names owner/name repos whose brief-eligible rows are missing kind, labels, opened_at, or repo_short. A rejected status, shape, repo, source, or limit is 400 validation_failed.",
           security: cookieOrBearer,
           parameters: [
             query(
@@ -1704,7 +1704,7 @@ export function openApiDocument(): Json {
           tags: ["decisions"],
           summary: "Upsert one decision, or reconcile a collector sweep.",
           description:
-            "Dashboard session or MC_TOKEN. An agent credential is denied, including one that holds decisions:write, with 403 and code insufficient_scope. Send either a decision (key, source, title) or { reconcile }, not both. A non-JSON body is 400 invalid_json. A missing key, source, or title is 400 missing_field. Any other rejected field is 400 validation_failed. force true while an unexpired write-back claim holds a decided or deferred row is 409 writeback_in_progress and does not change the row. With no database the response is ok, demo, and note, and the row is dropped.",
+            "Dashboard session or MC_TOKEN. An agent credential is denied, including one that holds decisions:read or decisions:write, with 403 and code insufficient_scope. Send either a decision (key, source, title) or { reconcile }, not both. A non-JSON body is 400 invalid_json. A missing key, source, or title is 400 missing_field. Any other rejected field is 400 validation_failed. force true while an unexpired write-back claim holds a decided or deferred row is 409 writeback_in_progress and does not change the row. With no database the response is ok, demo, and note, and the row is dropped.",
           security: cookieOrBearer,
           requestBody: body({ oneOf: [ref("DecisionUpsert"), ref("DecisionReconcile")] }),
           responses: {
@@ -1838,7 +1838,7 @@ export function openApiDocument(): Json {
       "/api/velocity/ingest": {
         post: operation({
           operationId: "recordVelocityBenchmark", tags: ["progress"], summary: "Append an immutable, validated development-velocity capture.",
-          description: "Operator session with exact same-origin Origin, or existing MC_TOKEN collector bearer. Agents, OAuth and dev-open are denied. UTF-8 JSON body is limited to 2 MB and 1000 repositories. Contract is src/lib/velocity.ts; scripts/convert-velocity.py converts the versioned evidence artifact. Validates complete calendar days, cohort/sample/count identities, unique repository scope and finite nonnegative values. Canonical payload SHA-256 is the primary key. Exact repeat imports return the original receipt with duplicate=true; changed evidence appends a row. No update/delete path. Server actor and record time are authoritative. No schema is applied by this endpoint.",
+          description: "Operator session with exact same-origin Origin, or existing MC_TOKEN collector bearer. Agents, OAuth and dev-open are denied. UTF-8 JSON body is limited to 2 MB and 1000 repositories. Contract is src/lib/velocity.ts; scripts/convert-velocity.py converts the versioned evidence artifact. A local no-credential preview that does not call this endpoint is `pnpm exec tsx scripts/preview-velocity.ts CAPTURE.json`: stdout is the normalized snapshot (`preview`) and shared summary (`summary`). Validates complete calendar days, cohort/sample/count identities, unique repository scope and finite nonnegative values. Canonical payload SHA-256 is the primary key. Exact repeat imports return the original receipt with duplicate=true; changed evidence appends a row. No update/delete path. Server actor and record time are authoritative. No schema is applied by this endpoint.",
           security: operatorSessionOrMcToken,
           requestBody: body({ type: "object", required: ["schemaVersion", "metricVersion", "capturedAt", "captureKind", "window", "scope", "inventoryComplete", "source", "repositories"], properties: {
             schemaVersion: { type: "integer", const: 1 }, metricVersion: { type: "string", const: "observed-development-velocity-v1.0" }, capturedAt: { type: "string", format: "date-time" }, captureKind: { type: "string", enum: ["observed", "reconstructed"] },
@@ -2035,7 +2035,7 @@ export function openApiDocument(): Json {
           tags: ["settings"],
           summary: "Apply one collector tick of gh repo list results.",
           description:
-            "Auth matches PUT /api/settings/repos. A result with ok false, a rate-limit error, or zero repos records last_error and does not change tracked repos. A truncated list updates the repos it saw, does not mark the others gone, and stores a warning on last_error while still setting last_discovered_at. An unknown owner is an error on that result and does not fail the batch. A duplicate owner in one request is 400 and writes nothing. A missing swept_at, a swept_at that is not RFC 3339, or a swept_at more than 5 minutes in the future is 400. pushedAt must be RFC 3339 or null; anything else is 400. Repo names that differ only by case in one result are 400. A repo name that is not safe to store fails that owner's sweep and writes no repo changes. New-repo activity uses swept_at, not the server clock. One owner's metadata update and repo changes commit together, under one global advisory lock shared by every owner, after reloading tracked repos. The lock is not held during gh repo list. swept_at orders overlapping ticks: a sweep that is not newer than last_discovered_at returns ok true with skipped stale and writes nothing. A short-name unique violation replans once and then is 409 with results plus added, updated, and marked_gone as empty arrays on the response and on each result. Discovery does not change pin, hide, label, short, color, origin, fieldsOverridden, or the actor who saved the owner. An existing repo is matched case-insensitively and keeps its stored casing. No database, or a missing watched_owners table, is 409 and includes results plus added, updated, and marked_gone as empty arrays on the response and on each result.",
+            "Auth matches PUT /api/settings/repos. A result with ok false, a rate-limit error, or zero repos records a fixed last_error summary for that failure, not the collector diagnostic, and does not change tracked repos. A truncated list updates the repos it saw, does not mark the others gone, and stores a warning on last_error while still setting last_discovered_at. An unknown owner is an error on that result and does not fail the batch. A duplicate owner in one request is 400 and writes nothing. A missing swept_at, a swept_at that is not RFC 3339, or a swept_at more than 5 minutes in the future is 400. pushedAt must be RFC 3339 or null; anything else is 400. Repo names that differ only by case in one result are 400. A repo name that is not safe to store fails that owner's sweep and writes no repo changes. New-repo activity uses swept_at, not the server clock. One owner's metadata update and repo changes commit together, under one global advisory lock shared by every owner, after reloading tracked repos. The lock is not held during gh repo list. swept_at orders overlapping ticks: a sweep that is not newer than last_discovered_at returns ok true with skipped stale and writes nothing. A short-name unique violation replans once and then is 409 with results plus added, updated, and marked_gone as empty arrays on the response and on each result. Discovery does not change pin, hide, label, short, color, origin, fieldsOverridden, or the actor who saved the owner. An existing repo is matched case-insensitively and keeps its stored casing. No database, or a missing watched_owners table, is 409 and includes results plus added, updated, and marked_gone as empty arrays on the response and on each result.",
           security: cookieOrBearer,
           requestBody: body(ref("OwnerDiscovery")),
           responses: {
@@ -2135,6 +2135,8 @@ export function openApiDocument(): Json {
           operationId: "getUsage",
           tags: ["usage"],
           summary: "Usage ledger.",
+          description:
+            "Dashboard session, MC_TOKEN, or an agent credential with usage:read. An agent credential without usage:read is 403 insufficient_scope. window is 24h, 7d, or 30d. The default is a rolling 7 days.",
           security: cookieOrBearer,
           parameters: [
             query("window", { type: "string", enum: [...USAGE_WINDOWS] }, "Rolling window. Default 7d. Ignored when since and until are both set."),
@@ -2152,11 +2154,14 @@ export function openApiDocument(): Json {
           operationId: "getObservability",
           tags: ["usage"],
           summary: "Run metrics for the Langfuse page.",
-          security: cookieOrBearer,
+          description:
+            "Dashboard session or MC_TOKEN. An agent credential is denied with 403 insufficient_scope. No agent scope grants this route. A store failure is 503 internal_error with error, code, cause, fix, and retryable. The body does not include the exception text.",
+          security: operatorSessionOrMcToken,
           responses: {
             "200": jsonResponse("Run totals, recent runs, and per-model rollups. Carries demo: true without a database.", { type: "object" }),
-            "503": jsonResponse("The run store is unavailable.", ref("ErrorMessage")),
-            ...flatErrors,
+            "401": jsonResponse("The credential is missing or not valid.", ref("Error")),
+            "403": jsonResponse("An agent credential cannot call this route.", ref("Error")),
+            "503": jsonResponse("Run metrics unavailable. Structured error; the exception text is not included.", ref("Error")),
           },
         }),
       },
@@ -2165,6 +2170,8 @@ export function openApiDocument(): Json {
           operationId: "ingestUsage",
           tags: ["usage"],
           summary: "Ingest usage facts. Separate from liveness ingest.",
+          description:
+            "Bearer MC_TOKEN. An agent credential is denied with 403 insufficient_scope. The usage read scope does not grant this route.",
           security: bearerOnly,
           requestBody: body(ref("UsageIngest")),
           responses: {
@@ -2356,7 +2363,7 @@ export function openApiDocument(): Json {
           tags: ["skills"],
           summary: "Mirror skill sources from GitHub.",
           description:
-            "Operator route. An agent credential is denied. Omit the body, or send {trigger:manual}, for a manual run. A scheduler sends {trigger:scheduled} with MC_TOKEN. status in the body is ok, failed, or busy. failed means a source or a SKILL.md could not be evaluated. It is not a deletion. busy writes nothing. With no database the body is a no-op note and no sync is claimed.",
+            "Operator route. An agent credential is denied. Omit the body, or send {trigger:manual}, for a manual run. A scheduler sends {trigger:scheduled} with MC_TOKEN. status in the body is ok, failed, or busy. failed means a source or a SKILL.md could not be evaluated. It is not a deletion. busy writes nothing. With no database the body is a no-op note and no sync is claimed. errors entries have source, message, and severity (fatal or notice). Fatal entries come first. A skipped reference or an ignored runtime name is a notice and does not by itself fail the run. A single-line strict JSON object in frontmatter is accepted.",
           security: cookieOrBearer,
           requestBody: body({
             type: "object",
@@ -2605,7 +2612,7 @@ export function openApiDocument(): Json {
           operationId: "streamConsumerEvents",
           tags: ["events"],
           summary: "Replay and tail the registered consumer's inbox events over SSE.",
-          description: `Requires an active akc_ credential with events:read bound to the named consumer. MC_TOKEN, sessions, OAuth, query credentials and open-demo access are refused. Every database batch rechecks credential, enabled binding, filters and generation. Events have event: github and JSON {id,event,payload}; id is consumer:decimal-bigint. Ordering uses the bigint column, not its text representation. A short bounded SHARE lock prevents a late-committing low sequence id being skipped. Delivery is at least once; consumers deduplicate and reconcile. A new connection fences the previous generation. Missing retained cursors emit cursor_expired without an id; stale generations emit superseded; sanitized failures emit stream_error. Heartbeat comments arrive every ${STREAM_HEARTBEAT_MS / 1000}s when the reader is making progress. The server closes at ${STREAM_LIFETIME_MS / 1000}s; reconnect with the last complete event id. Frames are bounded to ${STREAM_FRAME_MAX} bytes. Scope-authorized requests count against the credential quota before binding/cursor validation; stream polls and heartbeats do not each consume another request.`,
+          description: `Requires an active akc_ credential with events:read bound to the named consumer. MC_TOKEN, sessions, OAuth, query credentials and open-demo access are refused. Every database batch rechecks credential, enabled binding, filters and generation. Events have event: github and JSON {id,event,payload}; id is consumer:decimal-bigint. Ordering uses the bigint column, not its text representation. A short bounded SHARE lock prevents a late-committing low sequence id being skipped. Delivery is at least once; consumers deduplicate and reconcile. A new connection fences the previous generation. Missing retained cursors emit cursor_expired without an id; stale generations emit superseded; sanitized failures emit stream_error. Heartbeat comments arrive every ${STREAM_HEARTBEAT_MS / 1000}s when the reader is making progress. The server closes at ${STREAM_LIFETIME_MS / 1000}s; reconnect with the last complete event id. Frames are bounded to ${STREAM_FRAME_MAX} bytes. Control data for stream_error, cursor_expired, and superseded includes code, cause, fix, and retryable. A superseded consumer reconnects only after the newer stream is gone. Scope-authorized requests count against the credential quota before binding/cursor validation; stream polls and heartbeats do not each consume another request.`,
           security: [{ agentCredential: [] }],
           parameters: [
             query("consumer", { type: "string", pattern: CONSUMER_ID.source, maxLength: 64 }, "Exactly one registered consumer id.", { required: true }),

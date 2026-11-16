@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { enforceApi } from "@/lib/auth";
+import { runWithPrincipal } from "@/lib/actor";
+import { deny, enforceApi, resolveApiAccess } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { diffMemoryWrite, readDryRun, readExpectedRevision } from "@/lib/dry-run";
@@ -51,8 +52,8 @@ export async function GET(req: Request) {
  * or the route answers 409 stale_write and writes nothing.
  */
 export async function POST(req: Request) {
-  const denied = await enforceApi(req);
-  if (denied) return denied;
+  const access = await resolveApiAccess(req);
+  if (!access.ok) return deny(access);
   let body: {
     content?: unknown;
     key?: unknown;
@@ -132,14 +133,15 @@ export async function POST(req: Request) {
     if (revision.revision === undefined) {
       return NextResponse.json({ ok: true, demo: true, applied: false, note: "DATABASE_URL not set; note not stored." });
     }
+    const expectedRevision = revision.revision;
     try {
-      const item = await demoRememberGuarded({
+      const item = await runWithPrincipal(access.principal, () => demoRememberGuarded({
         content: input.content,
         key: input.key,
         tags: input.tags,
         agent_id: typeof input.agent_id === "string" ? input.agent_id : undefined,
-        expected_revision: revision.revision,
-      });
+        expected_revision: expectedRevision,
+      }));
       return NextResponse.json({ ok: true, demo: true, applied: true, item });
     } catch (e) {
       return publicError("[memory] write failed", e);
@@ -147,13 +149,13 @@ export async function POST(req: Request) {
   }
   try {
     if (dry.dryRun) return NextResponse.json(await previewMemoryWrite(input));
-    const item = await remember({
+    const item = await runWithPrincipal(access.principal, () => remember({
       content: input.content,
       key: input.key,
       tags: input.tags,
       agent_id: typeof input.agent_id === "string" ? input.agent_id : undefined,
       expected_revision: revision.revision,
-    });
+    }));
     return NextResponse.json({ ok: true, applied: true, item });
   } catch (e) {
     return publicError("[memory] write failed", e);

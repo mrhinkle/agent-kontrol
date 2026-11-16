@@ -23,6 +23,7 @@ import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/ide
 import { StaleWrite } from "../src/lib/revision";
 import { readReceipt } from "../src/lib/activity";
 import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview, findAgent, deleteMemory, slugify } from "../src/lib/store";
+import { testTaskQueueNotices } from "./pg-task-notice-tests";
 import { updateTaskForTool } from "../src/lib/dry-run-actions";
 import { runWithActor } from "../src/lib/actor";
 import { GET as getRepoSettings, PUT as putRepoSettings } from "../src/app/api/settings/repos/route";
@@ -152,6 +153,7 @@ async function main() {
   const untouched = await updateTask({ id: actorTask.id, result: "still mine" });
   assert.equal(untouched.actor_id, `${tag}-actor`);
   assert.equal(untouched.result, "still mine");
+  await testTaskQueueNotices();
 
   const absentKey = `${tag}/absent`;
   const raced = await Promise.allSettled([
@@ -218,21 +220,25 @@ async function main() {
   assert.equal((await getWatchedRepos(fallback)).source, "file");
   await testRepoSettingsVersionAndReceipt(tag);
 
+  // Span timestamps are relative to now: fixed dates age out of the retention window and break "recent spans are kept".
+  const spanBase = new Date(Date.now() - 2 * 86400_000);
+  spanBase.setUTCHours(12, 0, 0, 0);
+  const spanAt = (sec: number) => new Date(spanBase.getTime() + sec * 1000).toISOString();
   // Traces: upsert merges an open span with its close, lists summarize, prune removes old rows.
   const traceId = randomUUID().replace(/-/g, "");
   const mk = (id: string, parent: string | null, over: Partial<SpanInput> = {}): SpanInput => ({
     trace_id: traceId, span_id: id, parent_span_id: parent, agent_id: `${tag}-agent`, session_id: "s1", name: id,
-    kind: "tool", status: "unset", status_message: null, started_at: "2026-10-09T12:00:00.000Z", ended_at: null,
+    kind: "tool", status: "unset", status_message: null, started_at: spanAt(0), ended_at: null,
     attributes: { a: 1 }, model: null, input_tokens: null, output_tokens: null, cost_usd: null, ...over,
   });
   await upsertSpans([mk("00000000000000a1", null, { kind: "session", name: "session" }), mk("00000000000000a2", "00000000000000a1")]);
-  await upsertSpans([mk("00000000000000a2", null, { status: "error", status_message: "bad", ended_at: "2026-10-09T12:00:02.000Z", attributes: { b: "x" }, input_tokens: 10, output_tokens: 5, cost_usd: 0.25 })]);
+  await upsertSpans([mk("00000000000000a2", null, { status: "error", status_message: "bad", ended_at: spanAt(2), attributes: { b: "x" }, input_tokens: 10, output_tokens: 5, cost_usd: 0.25 })]);
   const stored = await getTrace(traceId);
   assert.equal(stored.length, 2);
   const child = stored.find((s) => s.span_id === "00000000000000a2")!;
   assert.equal(child.parent_span_id, "00000000000000a1", "a later write without a parent keeps the stored parent");
   assert.equal(child.status, "error");
-  assert.equal(child.ended_at, "2026-10-09T12:00:02.000Z");
+  assert.equal(child.ended_at, spanAt(2));
   assert.deepEqual(child.attributes, { a: 1, b: "x" }, "attributes merge");
   assert.equal(child.input_tokens, 10);
   assert.equal(child.cost_usd, 0.25);
@@ -244,13 +250,13 @@ async function main() {
   assert.equal(summary.root_name, "session");
   assert.equal(summary.output_tokens, 5);
   assert.equal((await listTraces({ agent: `${tag}-agent`, errorsOnly: true })).length, 1);
-  assert.equal((await listTraces({ agent: `${tag}-agent`, before: "2026-10-09T11:00:00.000Z" })).length, 0, "before filters by start time");
+  assert.equal((await listTraces({ agent: `${tag}-agent`, before: spanAt(-3600) })).length, 0, "before filters by start time");
   // Out-of-order and retried updates are monotonic: the later end and a failure survive a stale "ok".
-  await upsertSpans([mk("00000000000000a2", "00000000000000a1", { status: "ok", ended_at: "2026-10-09T12:00:01.000Z", attributes: { c: "late" } })]);
+  await upsertSpans([mk("00000000000000a2", "00000000000000a1", { status: "ok", ended_at: spanAt(1), attributes: { c: "late" } })]);
   const afterStale = (await getTrace(traceId)).find((s) => s.span_id === "00000000000000a2")!;
   assert.equal(afterStale.status, "error", "a stale ok cannot erase an error");
   assert.equal(afterStale.status_message, "bad");
-  assert.equal(afterStale.ended_at, "2026-10-09T12:00:02.000Z", "a stale end cannot shorten a span");
+  assert.equal(afterStale.ended_at, spanAt(2), "a stale end cannot shorten a span");
   assert.equal(afterStale.attributes.c, "late", "attributes still merge");
   // Always a different id from traceId: flip the last hex digit, so the test cannot collide with itself.
   const oldTrace = traceId.slice(0, 31) + (traceId.endsWith("0") ? "1" : "0");
@@ -2444,8 +2450,11 @@ async function testDecisionWritebackHardening(tag: string) {
 /**
  * An empty configured database reports the stored-list version, so the first
  * save that sends it is not stale. The dry run diffs that empty list. A
- * receipt insert that fails rolls the replace back. A normal write leaves
- * one receipt and the new list. REST PUT still writes no receipt.
+ * receipt insert that fails rolls the replace back. A normal MCP write leaves
+ * one receipt and the new list. REST PUT writes one receipt for that saved
+ * list. This harness unsets the dashboard password and MC_TOKEN, so the
+ * stored actor is null. A dry run writes none. A direct replace that does
+ * not pass a receipt writes none.
  */
 async function testRepoSettingsVersionAndReceipt(tag: string): Promise<void> {
   const digits = tag.replace(/\D/g, "").slice(-8);
@@ -2465,9 +2474,9 @@ async function testRepoSettingsVersionAndReceipt(tag: string): Promise<void> {
   const savedToken = process.env.MC_TOKEN;
   delete process.env.MC_DASHBOARD_PASSWORD;
   delete process.env.MC_TOKEN;
-  const detailOf = (value: unknown): { version?: string; tool?: string; actor_id?: string } => {
-    if (typeof value === "string") return JSON.parse(value) as { version?: string; tool?: string; actor_id?: string };
-    if (value && typeof value === "object") return value as { version?: string; tool?: string; actor_id?: string };
+  const detailOf = (value: unknown): { version?: string; tool?: string; actor_type?: string | null; actor_id?: string | null } => {
+    if (typeof value === "string") return JSON.parse(value) as { version?: string; tool?: string; actor_type?: string | null; actor_id?: string | null };
+    if (value && typeof value === "object") return value as { version?: string; tool?: string; actor_type?: string | null; actor_id?: string | null };
     return {};
   };
   const dropTrigger = async () => {
@@ -2562,6 +2571,11 @@ async function testRepoSettingsVersionAndReceipt(tag: string): Promise<void> {
     assert.equal(restDiff.would_write, true);
     assert.equal(restDiff.changes.some((change) => change.op === "remove"), false);
     assert.equal(restDiff.changes.some((change) => change.op === "add" && change.summary.includes(repoB)), true);
+    const previewEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+    `;
+    assert.equal(Number(previewEvents[0].n), 0, "a REST dry run writes no receipt");
     const restPut = await putRepoSettings(new Request("http://localhost/api/settings/repos", {
       method: "PUT",
       headers: { "content-type": "application/json" },
@@ -2569,15 +2583,26 @@ async function testRepoSettingsVersionAndReceipt(tag: string): Promise<void> {
     }));
     const restText = await restPut.text();
     assert.equal(restPut.status, 200, restText);
-    const restSaved = JSON.parse(restText) as { source: string; repos: { repo: string }[]; version: string };
+    const restSaved = JSON.parse(restText) as { source: string; repos: { repo: string }[]; version: string; receipt?: unknown };
     assert.equal(restSaved.source, "database");
     assert.deepEqual(restSaved.repos.map((item) => item.repo), [repoB]);
     assert.notEqual(restSaved.version, gotBody.version);
+    assert.equal(restSaved.receipt, undefined, "REST still returns the settings document");
     const restEvents = await sql()`
-      select count(*)::int as n from events
+      select id::text as id, kind, title, detail
+      from events
       where kind = 'set_watched_repos' and id > ${floorId}::bigint
+      order by id asc
     `;
-    assert.equal(Number(restEvents[0].n), 0, "REST PUT writes no receipt");
+    assert.equal(restEvents.length, 1, "REST PUT writes one receipt for the saved list");
+    const restDetail = detailOf(restEvents[0].detail);
+    assert.equal(String(restEvents[0].kind), "set_watched_repos");
+    assert.equal(String(restEvents[0].title), "Watched repos replaced");
+    assert.equal(restDetail.tool, "set_watched_repos");
+    assert.equal(restDetail.actor_type, null);
+    assert.equal(restDetail.actor_id, null);
+    assert.equal(restDetail.version, restSaved.version);
+    await sql()`delete from events where id = ${String(restEvents[0].id)}::bigint`;
     await sql()`delete from watched_repos where repo = ${repoB}`;
 
     await replaceWatchedRepos([row(repoA, shortA, "Kept")]);
@@ -2589,6 +2614,7 @@ async function testRepoSettingsVersionAndReceipt(tag: string): Promise<void> {
       select count(*)::int as n from events
       where kind = 'set_watched_repos' and id > ${floorId}::bigint
     `;
+    assert.equal(Number(eventsBeforeFail[0].n), 0, "a direct replace without a receipt writes none");
     await sql()`
       create or replace function ak_test_fail_repo_event()
       returns trigger
