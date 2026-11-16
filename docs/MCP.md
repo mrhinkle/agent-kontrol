@@ -15,7 +15,7 @@ The MCP endpoint does not use the dashboard session cookie. It enforces its own 
 - `Authorization: Bearer <akc_…>` — a per-agent credential issued from Settings. The token is shown once, at creation. Scopes on that credential are enforced, and so are its request limits (below).
 - An OAuth access token (JWT) issued by this server. Verification and issuance are unchanged. An authenticated OAuth principal has access to every mapped tool. The scope string on that token is `mcp`, and that string is not checked against the table below.
 
-Without valid auth the endpoint answers `401` with a `WWW-Authenticate` header pointing at `/.well-known/oauth-protected-resource`. A revoked, expired, or unknown agent credential takes that same `401` path. A valid credential that lacks the scope for the tool answers `403`:
+Without valid auth the endpoint answers `401` with a `WWW-Authenticate` header pointing at `/.well-known/oauth-protected-resource`. The JSON body keeps the SDK `error` and `error_description` and adds `code` `unauthorized`, `cause`, `fix`, and `retryable` false. An `akc_` token whose credential store cannot be read on that first check is `503` `credential_store_unavailable` and sends no `WWW-Authenticate` header. A revoked, expired, or unknown agent credential takes the `401` path. A valid credential that lacks the scope for the tool answers `403`:
 
 ```json
 { "error": "The credential does not have the tasks:write scope.", "code": "insufficient_scope", "fix": "Use a credential that has the tasks:write scope", "retryable": false }
@@ -77,7 +77,7 @@ Check that the endpoint is reachable and gated:
 curl -i https://YOUR-DEPLOY.vercel.app/api/mcp
 ```
 
-Expect `401` and a `WWW-Authenticate` header pointing at `/.well-known/oauth-protected-resource`.
+Expect `401` and a `WWW-Authenticate` header pointing at `/.well-known/oauth-protected-resource`. The JSON body also has `code` `unauthorized`, `cause`, `fix`, and `retryable` false. A missing bearer stays `401`, not `503`.
 
 Then confirm the bearer token works with an MCP `initialize` request:
 
@@ -416,9 +416,9 @@ A tool failure returns `isError: true`. The text of the result is JSON with the 
 
 `task_not_claimable` is defined so a caller can handle it. No tool returns it. `claim_task` with nothing queued is a normal result whose text says there is no queued task, not an error.
 
-Arguments that fail the tool's input schema are rejected by the MCP SDK before the handler runs. That result is `isError: true` whose text is the schema message, not this JSON. The catalogue below is what the handler itself returns.
+Arguments that fail the tool's input schema are rejected by the MCP SDK before the handler runs. That result stays `isError: true` and the text stays the schema message. It may also include `structuredContent` with `code` `mcp_tool_error`, `cause`, `fix`, and `retryable` false. The handler does not run. A `tools/call` arguments object whose combined array elements and object members exceed 4096 is rejected before that schema check. The text is the SDK's short maximum-elements message, still `isError: true`, with the same `structuredContent`. The handler does not run. That ceiling is above a full watched-repo write (25 repos) and the owner cap (20). The 1 MiB SSE frame cap is unchanged, and a complete frame over that cap is still passed through without teaching. The catalogue below is what the handler itself returns.
 
-The HTTP `401` for a missing or invalid bearer is unchanged: `WWW-Authenticate` points at `/.well-known/oauth-protected-resource`. An authenticated `POST /api/mcp` whose body is empty or not JSON answers HTTP `400` with `code` `invalid_json` and `error` `invalid JSON`. That response is not a tool result.
+The HTTP `401` for a missing or invalid bearer keeps its status and `WWW-Authenticate` header pointing at `/.well-known/oauth-protected-resource`. The body adds `code` `unauthorized`, `cause`, `fix`, and `retryable` false beside the SDK fields. An authenticated `POST /api/mcp` whose body is empty or not JSON answers HTTP `400` with `code` `invalid_json` and `error` `invalid JSON`. That response is not a tool result.
 
 | Code | Retryable | When a tool returns it |
 | --- | --- | --- |
