@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { withTransaction, type SqlTag } from "./db";
+import { streamControlBody } from "./events-http";
 
 // A literal end assertion also rejects the trailing newline JavaScript's $ permits.
 export const CONSUMER_ID = /^[a-z0-9][a-z0-9._-]{0,63}(?![\s\S])/;
@@ -164,6 +165,19 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+/** Terminal control frame. `token` is the stream_error error field; cursor and supersession have none. */
+function controlFrame(event: string, token: string | null): string {
+  const teaching = streamControlBody(token ?? event);
+  const data: Record<string, unknown> = {};
+  if (token) data.error = token;
+  data.reconcile = true;
+  data.code = teaching.code;
+  data.cause = teaching.cause;
+  data.fix = teaching.fix;
+  data.retryable = teaching.retryable;
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
 /** Bounded transport; options are internal/test inputs, never request parameters. */
 export function eventStreamResponse(opts: {
   consumer: string; position: string; generation: string; credential: string; signal: AbortSignal;
@@ -205,7 +219,7 @@ export function eventStreamResponse(opts: {
         let lastHeartbeat = Date.now();
         while (!stop.signal.aborted) {
           if (batch.expired) {
-            terminal('event: cursor_expired\ndata: {"reconcile":true}\n\n');
+            terminal(controlFrame("cursor_expired", null));
             break;
           }
           for (const event of batch.events) {
@@ -224,7 +238,7 @@ export function eventStreamResponse(opts: {
         const code = e instanceof EventStreamError ? e.code : "stream_unavailable";
         if (!stop.signal.aborted) {
           if (code === "superseded") stop.abort("superseded");
-          else terminal(`event: stream_error\ndata: ${JSON.stringify({ error: code, reconcile: true })}\n\n`);
+          else terminal(controlFrame("stream_error", code));
         }
       } finally {
         clearTimeout(lifetime);
@@ -232,7 +246,7 @@ export function eventStreamResponse(opts: {
         if (active.get(opts.consumer)?.id === id) active.delete(opts.consumer);
         // Same-instance replacement aborts immediately; cross-instance replacement
         // is found by the generation check on the next bounded database poll.
-        if (stop.signal.reason === "superseded") terminal('event: superseded\ndata: {"reconcile":true}\n\n');
+        if (stop.signal.reason === "superseded") terminal(controlFrame("superseded", null));
         try { controller.close(); } catch { /* reader already cancelled */ }
       }
     },
