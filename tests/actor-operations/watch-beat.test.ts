@@ -320,18 +320,54 @@ describe("B watch beat actor receipts", { skip: !OPT_IN, concurrency: 1 }, () =>
   });
 
   it("does not audit a beat whose insert or update was suppressed", async () => {
-    const issued = await createCredential({
-      label: `${PREFIX}-suppress-writer`,
+    const macbookWriter = await createCredential({
+      label: `${PREFIX}-suppress-macbook`,
       scopes: ["watch:write"],
       rate_limit_per_minute: 1000,
       rate_limit_per_day: 1000,
     });
-    assert.equal(issued.ok, true);
-    if (!issued.ok) return;
-    bind({ watcher: [issued.credential.id], macbook: [issued.credential.id] });
+    const watcherWriter = await createCredential({
+      label: `${PREFIX}-suppress-watcher`,
+      scopes: ["watch:write"],
+      rate_limit_per_minute: 1000,
+      rate_limit_per_day: 1000,
+    });
+    assert.equal(macbookWriter.ok, true);
+    assert.equal(watcherWriter.ok, true);
+    if (!macbookWriter.ok || !watcherWriter.ok) return;
+    assert.notEqual(macbookWriter.credential.id, watcherWriter.credential.id);
+    // One credential id cannot be listed for two sources. That rejection is
+    // setup_required and never reaches the database, so each source gets its own id.
+    bind({
+      macbook: [macbookWriter.credential.id],
+      watcher: [watcherWriter.credential.id],
+    });
+
+    await sql`delete from watch_beats where source = 'macbook'`;
+    await sql`delete from events where kind = 'watch.beat' and detail->>'source' = 'macbook'`;
+    const macbookControl = await post(beat("macbook", "ok", "macbook-control"), macbookWriter.token);
+    assert.equal(macbookControl.status, 200);
+    assert.equal((await row("macbook")).length, 1);
+    assert.equal((await row("macbook"))[0].detail, "macbook-control");
+    const macbookProof = await receipts("macbook");
+    assert.equal(macbookProof.length, 1);
+    assert.equal(detailOf(macbookProof[0]).actor_id, macbookWriter.credential.id);
+    assert.equal(detailOf(macbookProof[0]).source, "macbook");
+
+    const watcherControl = await post(beat("watcher", "ok", "watcher-control"), watcherWriter.token);
+    assert.equal(watcherControl.status, 200);
     const before = await row("watcher");
     assert.equal(before.length, 1);
-    const beforeReceipts = (await receipts("watcher")).length;
+    assert.equal(before[0].status, "ok");
+    assert.equal(before[0].detail, "watcher-control");
+    const beforeProof = await receipts("watcher");
+    const watcherActorProof = beforeProof.filter((record) => detailOf(record).actor_id === watcherWriter.credential.id);
+    assert.equal(watcherActorProof.length >= 1, true);
+    assert.equal(detailOf(watcherActorProof[watcherActorProof.length - 1]).source, "watcher");
+
+    // The authorized insert above must be gone so the next macbook post is an insert.
+    await sql`delete from watch_beats where source = 'macbook'`;
+    await sql`delete from events where kind = 'watch.beat' and detail->>'source' = 'macbook'`;
     await sql`
       create or replace function ak_b_watch_suppress_beat() returns trigger
       language plpgsql as $$
@@ -353,25 +389,29 @@ describe("B watch beat actor receipts", { skip: !OPT_IN, concurrency: 1 }, () =>
       for each row execute function ak_b_watch_suppress_beat()
     `;
     try {
-      await sql`delete from watch_beats where source = 'macbook'`;
-      await sql`delete from events where kind = 'watch.beat' and detail->>'source' = 'macbook'`;
-      const inserted = await post(beat("macbook", "ok", "insert-canary"), issued.token);
+      const inserted = await post(beat("macbook", "ok", "insert-canary"), macbookWriter.token);
       assert.equal(inserted.status, 503);
       const insertBody = await inserted.json() as { code?: string };
+      const insertText = JSON.stringify(insertBody);
       assert.equal(insertBody.code, "setup_required");
-      assert.equal(JSON.stringify(insertBody).includes("insert-canary"), false);
+      assert.equal(insertText.includes("insert-canary"), false);
+      assert.equal(insertText.includes("watch source missing"), false);
+      assert.equal(insertText.includes("macbook-control"), false);
       assert.equal((await row("macbook")).length, 0);
       assert.equal((await receipts("macbook")).length, 0);
 
-      const updated = await post(beat("watcher", "paused", "update-canary"), issued.token);
+      const updated = await post(beat("watcher", "paused", "update-canary"), watcherWriter.token);
       assert.equal(updated.status, 503);
       const updateBody = await updated.json() as { code?: string };
+      const updateText = JSON.stringify(updateBody);
       assert.equal(updateBody.code, "setup_required");
-      assert.equal(JSON.stringify(updateBody).includes("update-canary"), false);
+      assert.equal(updateText.includes("update-canary"), false);
+      assert.equal(updateText.includes("watch source missing"), false);
       const stored = await row("watcher");
       assert.equal(stored[0].status, before[0].status);
       assert.equal(stored[0].detail, before[0].detail);
-      assert.equal((await receipts("watcher")).length, beforeReceipts);
+      assert.equal((await receipts("watcher")).length, beforeProof.length);
+      assert.equal(JSON.stringify(await receipts("watcher")).includes("update-canary"), false);
     } finally {
       await sql`drop trigger if exists ak_b_watch_suppress_beat on watch_beats`;
       await sql`drop function if exists ak_b_watch_suppress_beat()`;

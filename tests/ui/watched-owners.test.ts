@@ -94,6 +94,24 @@ function atAge(days: number, extraMs = 0): string {
   return new Date(NOW.getTime() - (days * MS_PER_DAY + extraMs)).toISOString();
 }
 
+/** Rows a real write would return. Empty means the statement stored nothing. */
+function ownerWriteRows(text: string, values: unknown[]): Row[] | null {
+  const compact = text.replace(/\s+/g, " ").trim().toLowerCase();
+  if (compact.includes("insert into events")) {
+    const kind = typeof values[0] === "string" ? values[0] : "";
+    return kind ? [{ id: 1, kind, created_at: "2026-11-15T00:00:00.000Z" }] : [];
+  }
+  if (compact.includes("update watched_owners")) {
+    const owner = values[values.length - 1];
+    return typeof owner === "string" ? [{ owner }] : [];
+  }
+  if (compact.includes("insert into watched_repos") && compact.includes("unnest")) {
+    const repos = values[0];
+    return Array.isArray(repos) ? repos.map((repo) => ({ repo: String(repo) })) : [];
+  }
+  return null;
+}
+
 describe("watched owners discovery", () => {
   it("F1 a failed, rate-limited, or empty gh list does not delete or hide tracked repos", async () => {
     const existing = [
@@ -117,7 +135,7 @@ describe("watched owners discovery", () => {
     }
 
     const calls: string[] = [];
-    setSqlForTests(async (strings) => {
+    setSqlForTests(async (strings, ...values) => {
       const text = strings.join(" ");
       calls.push(text);
       if (/from watched_repos/i.test(text)) {
@@ -140,7 +158,7 @@ describe("watched owners discovery", () => {
       if (/from watched_owners/i.test(text)) {
         return [{ owner: "acme", activity_days: 30, include_forks: false, include_archived: false, last_discovered_at: null }];
       }
-      return [];
+      return ownerWriteRows(text, values) ?? [];
     });
     const failed = await applyOwnerDiscovery(owner(), existing, { repos: [], error: "gh repo list returned no repos", truncated: false }, NOW);
     assert.match(failed.failure ?? "", /no repos/);
@@ -416,7 +434,7 @@ describe("watched owners discovery", () => {
       }
       if (text.includes("from watched_owners")) return stored;
       if (text.includes("from watched_repos") || text.includes("from agent_credentials")) return [];
-      return [];
+      return ownerWriteRows(text, values) ?? [];
     });
 
     const tokenRes = await putOwners(new Request("http://localhost/api/settings/owners", {
@@ -454,13 +472,14 @@ describe("watched owners discovery", () => {
     assert.equal(writes.at(-1)?.[4], null);
     assert.equal(writes.at(-1)?.[5], null);
     const discoverSql: string[] = [];
-    setSqlForTests(async (strings) => {
-      discoverSql.push(strings.join(" "));
-      if (strings.join(" ").includes("from watched_owners")) {
+    setSqlForTests(async (strings, ...values) => {
+      const text = strings.join(" ");
+      discoverSql.push(text);
+      if (text.includes("from watched_owners")) {
         return [{ owner: "acme", activity_days: 30, include_forks: false, include_archived: false, actor_type: "human", actor_id: "operator" }];
       }
-      if (strings.join(" ").includes("from watched_repos")) return [];
-      return [];
+      if (text.includes("from watched_repos")) return [];
+      return ownerWriteRows(text, values) ?? [];
     });
     const discovered = await postDiscover(new Request("http://localhost/api/settings/owners/discover", {
       method: "POST",
@@ -664,7 +683,7 @@ describe("watched owners discovery", () => {
         else arrive();
         return snapshot;
       }
-      return [];
+      return ownerWriteRows(text, values) ?? [];
     });
 
     const version = ownerListVersion([]);
@@ -777,6 +796,7 @@ describe("watched owners discovery", () => {
       if (/insert into watched_repos/i.test(text)) {
         throw Object.assign(new Error("repo insert failed"), { code: "53100" });
       }
+      if (/update watched_owners/i.test(text)) return [{ owner: "acme" }];
       if (/from watched_owners/i.test(text)) {
         return [{ owner: "acme", activity_days: 30, include_forks: false, include_archived: false, last_discovered_at: null }];
       }
@@ -942,7 +962,7 @@ describe("watched owners discovery", () => {
       if (text.includes("update watched_owners")) {
         if (values.includes(NEWER)) state.discoveredAt = NEWER;
         else if (values.includes(OLDER)) state.discoveredAt = OLDER;
-        return [];
+        return ownerWriteRows(text, values) ?? [];
       }
       if (text.includes("insert into watched_repos")) {
         const names = values[0] as string[];
@@ -952,9 +972,9 @@ describe("watched owners discovery", () => {
           if (row?.gone === true && gone[i] === false) state.resurrected = true;
           if (row) row.gone = gone[i];
         });
-        return [];
+        return ownerWriteRows(text, values) ?? [];
       }
-      return [];
+      return ownerWriteRows(text, values) ?? [];
     });
 
     const post = (sweptAt: string, names: string[]) => postDiscover(new Request("http://localhost/api/settings/owners/discover", {
@@ -1145,9 +1165,9 @@ describe("watched owners discovery", () => {
           insertedShorts.push(shorts[i]);
           if (!stored.some((row) => row.repo === name)) stored.push({ repo: name, short: shorts[i] });
         });
-        return [];
+        return ownerWriteRows(text, values) ?? [];
       }
-      return [];
+      return ownerWriteRows(text, values) ?? [];
     });
 
     const sweep = (ownerName: string) => applyOwnerDiscovery(
@@ -1264,6 +1284,7 @@ describe("watched owners discovery", () => {
       if (text.includes("from watched_owners") && !text.includes("update")) {
         return [{ owner: "acme", activity_days: 30, include_forks: false, include_archived: false, last_discovered_at: null }];
       }
+      if (text.includes("update watched_owners")) return [{ owner: "acme" }];
       if (text.includes("insert into watched_repos")) {
         inserts += 1;
         const err = new Error('duplicate key value violates unique constraint "watched_repos_short_key"');
@@ -1379,7 +1400,7 @@ describe("watched owners discovery", () => {
         }
         return owners.map((row) => ({ ...row }));
       }
-      return [];
+      return ownerWriteRows(text, values) ?? [];
     });
 
     const discoverPromise = postDiscover(new Request("http://localhost/api/settings/owners/discover", {
@@ -1520,7 +1541,7 @@ describe("watched owners discovery", () => {
         return [];
       }
       if (text.includes("from watched_owners")) return owners.map((row) => ({ ...row }));
-      return [];
+      return ownerWriteRows(text, values) ?? [];
     });
 
     const discoveryPromise = applyOwnerDiscovery(

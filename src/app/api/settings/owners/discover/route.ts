@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { runWithPrincipal } from "@/lib/actor";
 import { apiError, publicError } from "@/lib/api-error";
 import { deny, resolveApiAccess } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
@@ -245,36 +246,39 @@ export async function POST(req: Request) {
       );
     }
     const owners = listed.owners;
-    let existing = await loadTrackedRepos();
-    const out = [];
-    for (const item of parsed) {
-      const stored = owners.find((owner) => owner.owner === item.owner);
-      if (!stored) {
-        out.push({
+    const out = await runWithPrincipal(access.principal, async () => {
+      let existing = await loadTrackedRepos();
+      const results = [];
+      for (const item of parsed) {
+        const stored = owners.find((owner) => owner.owner === item.owner);
+        if (!stored) {
+          results.push({
+            owner: item.owner,
+            ok: false,
+            error: "owner is not watched",
+            added: 0,
+            updated: 0,
+            marked_gone: 0,
+            ...itemTeaching("owner_not_watched", "owner is not watched"),
+          });
+          continue;
+        }
+        const outcome = await applyOwnerDiscovery(ruleOf(stored), existing, sweepOf(item), now);
+        if (!outcome.failure) existing = outcome.repos;
+        const failed = outcome.failure !== null;
+        results.push({
           owner: item.owner,
-          ok: false,
-          error: "owner is not watched",
-          added: 0,
-          updated: 0,
-          marked_gone: 0,
-          ...itemTeaching("owner_not_watched", "owner is not watched"),
+          ok: !failed,
+          error: outcome.failure ?? outcome.warning,
+          ...(outcome.skipped ? { skipped: outcome.skipped } : {}),
+          added: outcome.added.length,
+          updated: outcome.updated.length,
+          marked_gone: outcome.markedGone.length,
+          ...(failed ? itemTeaching(outcome.failureCode ?? "collection_failed", outcome.failure ?? "") : {}),
         });
-        continue;
       }
-      const outcome = await applyOwnerDiscovery(ruleOf(stored), existing, sweepOf(item), now);
-      if (!outcome.failure) existing = outcome.repos;
-      const failed = outcome.failure !== null;
-      out.push({
-        owner: item.owner,
-        ok: !failed,
-        error: outcome.failure ?? outcome.warning,
-        ...(outcome.skipped ? { skipped: outcome.skipped } : {}),
-        added: outcome.added.length,
-        updated: outcome.updated.length,
-        marked_gone: outcome.markedGone.length,
-        ...(failed ? itemTeaching(outcome.failureCode ?? "collection_failed", outcome.failure ?? "") : {}),
-      });
-    }
+      return results;
+    });
     return NextResponse.json({ results: out });
   } catch (e) {
     if (e instanceof DiscoveryShortConflict) {

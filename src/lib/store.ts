@@ -5,6 +5,7 @@ import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } fr
 import { StaleWrite, absentRevision } from "./revision";
 import { writeSessionNote } from "./session-memory";
 import { sql, withTransaction, type SqlTag } from "./db";
+import { insertToolReceipt, ToolReceiptError } from "./tool-receipt";
 import { boundedTransaction } from "./events-stream";
 import {
   QUEUE_EPISODE_SCAN_LIMIT,
@@ -20,7 +21,6 @@ import {
   type TaskCoverage,
   type TaskNoticeObserverProof,
 } from "./task-queue-notice";
-import { insertToolReceipt, ToolReceiptError } from "./tool-receipt";
 import { stampSortAt } from "./list-params";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
 import { asUnknownWriteOutcome } from "./write-outcome";
