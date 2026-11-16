@@ -136,6 +136,9 @@ describe("B trace ingest actor receipts", { skip: !OPT_IN, concurrency: 1 }, () 
       await sql`drop trigger if exists ak_b_traces_fail_receipt on events`;
       await sql`drop function if exists ak_b_traces_fail_receipt()`;
       await sql`drop table if exists ak_b_traces_fail`;
+      await sql`drop trigger if exists ak_b_traces_suppress_receipt on events`;
+      await sql`drop function if exists ak_b_traces_suppress_receipt()`;
+      await sql`drop table if exists ak_b_traces_suppress`;
       if (traceIds.length > 0) {
         await sql`delete from events where kind = 'traces.ingest' and detail::text like any(${traceIds.map((id) => `%${id}%`)}::text[])`;
         await sql`delete from spans where trace_id = any(${traceIds}::text[])`;
@@ -297,6 +300,48 @@ describe("B trace ingest actor receipts", { skip: !OPT_IN, concurrency: 1 }, () 
       await sql`drop trigger if exists ak_b_traces_fail_receipt on events`;
       await sql`drop function if exists ak_b_traces_fail_receipt()`;
       await sql`drop table if exists ak_b_traces_fail`;
+    }
+  });
+
+  it("drops the span when its receipt is silently suppressed and keeps an earlier trace", async () => {
+    const kept = ids();
+    const keptRes = await post(otlp([kept]), LEGACY);
+    assert.equal(keptRes.status, 200);
+    const fail = ids();
+    await sql`create table if not exists ak_b_traces_suppress (trace_id text primary key)`;
+    await sql`delete from ak_b_traces_suppress`;
+    await sql`insert into ak_b_traces_suppress (trace_id) values (${fail.traceId})`;
+    await sql`
+      create or replace function ak_b_traces_suppress_receipt() returns trigger
+      language plpgsql as $$
+      begin
+        if new.kind = 'traces.ingest'
+           and position((select trace_id from ak_b_traces_suppress) in new.detail::text) > 0 then
+          return null;
+        end if;
+        return new;
+      end;
+      $$
+    `;
+    await sql`drop trigger if exists ak_b_traces_suppress_receipt on events`;
+    await sql`
+      create trigger ak_b_traces_suppress_receipt
+      before insert on events
+      for each row execute function ak_b_traces_suppress_receipt()
+    `;
+    try {
+      const res = await post(otlp([fail]), LEGACY);
+      assert.equal(res.status, 500);
+      const body = await res.json() as { code?: string };
+      assert.equal(body.code, "internal_error");
+      assert.equal((await spans(kept.traceId)).length, 1);
+      assert.equal((await receipts(kept.traceId)).length, 1);
+      assert.equal((await spans(fail.traceId)).length, 0);
+      assert.equal((await receipts(fail.traceId)).length, 0);
+    } finally {
+      await sql`drop trigger if exists ak_b_traces_suppress_receipt on events`;
+      await sql`drop function if exists ak_b_traces_suppress_receipt()`;
+      await sql`drop table if exists ak_b_traces_suppress`;
     }
   });
 

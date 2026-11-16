@@ -43,7 +43,7 @@ async function snapshots(name: string) {
     select id::text as id, repo, kind, open_issues, detail
     from repo_snapshots
     where repo = ${repo(name)}
-    order by id
+    order by repo_snapshots.id
   `;
 }
 
@@ -52,7 +52,7 @@ async function receipts(name: string) {
     select id::text as id, kind, title, detail
     from events
     where kind = 'progress.ingest' and detail->>'repo' = ${repo(name)}
-    order by id
+    order by events.id
   `;
 }
 
@@ -87,6 +87,9 @@ describe("B progress ingest actor receipts", { skip: !OPT_IN, concurrency: 1 }, 
         await sql`drop trigger if exists ak_b_progress_fail_receipt on events`;
         await sql`drop function if exists ak_b_progress_fail_receipt()`;
         await sql`drop table if exists ak_b_progress_fail_repo`;
+        await sql`drop trigger if exists ak_b_progress_suppress_receipt on events`;
+        await sql`drop function if exists ak_b_progress_suppress_receipt()`;
+        await sql`drop table if exists ak_b_progress_suppress_repo`;
         await sql`delete from events where kind = 'progress.ingest' and detail->>'repo' like ${PREFIX + "/%"}`;
         await sql`delete from repo_snapshots where repo like ${PREFIX + "/%"}`;
         await sql`delete from agent_credentials where label = ${PREFIX + "-denied"}`;
@@ -261,6 +264,51 @@ describe("B progress ingest actor receipts", { skip: !OPT_IN, concurrency: 1 }, 
       await sql`drop trigger if exists ak_b_progress_fail_receipt on events`;
       await sql`drop function if exists ak_b_progress_fail_receipt()`;
       await sql`drop table if exists ak_b_progress_fail_repo`;
+    }
+  });
+
+  it("drops a snapshot when its receipt is silently suppressed and keeps an earlier row", async () => {
+    await sql`create table if not exists ak_b_progress_suppress_repo (repo text primary key)`;
+    await sql`delete from ak_b_progress_suppress_repo`;
+    await sql`insert into ak_b_progress_suppress_repo (repo) values (${repo("suppressed")})`;
+    await sql`
+      create or replace function ak_b_progress_suppress_receipt() returns trigger
+      language plpgsql as $$
+      begin
+        if new.kind = 'progress.ingest'
+           and new.detail->>'repo' = (select repo from ak_b_progress_suppress_repo) then
+          return null;
+        end if;
+        return new;
+      end;
+      $$
+    `;
+    await sql`drop trigger if exists ak_b_progress_suppress_receipt on events`;
+    await sql`
+      create trigger ak_b_progress_suppress_receipt
+      before insert on events
+      for each row execute function ak_b_progress_suppress_receipt()
+    `;
+    try {
+      const at = "2026-11-15T16:30:00.000Z";
+      const res = await post({
+        collected_at: at,
+        repos: [
+          { repo: repo("kept-suppress"), open_issues: 1 },
+          { repo: repo("suppressed"), open_issues: 2 },
+        ],
+      }, LEGACY);
+      assert.equal(res.status, 500);
+      const body = await res.json() as { code?: string };
+      assert.equal(body.code, "internal_error");
+      assert.equal((await snapshots("kept-suppress")).length, 1);
+      assert.equal((await receipts("kept-suppress")).length, 1);
+      assert.equal((await snapshots("suppressed")).length, 0);
+      assert.equal((await receipts("suppressed")).length, 0);
+    } finally {
+      await sql`drop trigger if exists ak_b_progress_suppress_receipt on events`;
+      await sql`drop function if exists ak_b_progress_suppress_receipt()`;
+      await sql`drop table if exists ak_b_progress_suppress_repo`;
     }
   });
 

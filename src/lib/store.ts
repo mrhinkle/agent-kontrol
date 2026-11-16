@@ -5,7 +5,7 @@ import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } fr
 import { StaleWrite, absentRevision } from "./revision";
 import { writeSessionNote } from "./session-memory";
 import { sql, withTransaction, type SqlTag } from "./db";
-import { insertToolReceipt } from "./tool-receipt";
+import { insertToolReceipt, ToolReceiptError } from "./tool-receipt";
 import { stampSortAt } from "./list-params";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
 import { asUnknownWriteOutcome } from "./write-outcome";
@@ -1730,7 +1730,9 @@ export async function readMemoryForPreview(key: string): Promise<{ item: MemoryI
 /**
  * One events row for a write that already committed in its own statement.
  * Decision tools use this after the row is stored. The kind is the tool name.
- * A write that must roll back with its receipt calls `insertToolReceipt` on its own transaction instead.
+ * A suppressed insert returns null so that already-committed write still
+ * resolves. Any other database error throws. A write that must roll back
+ * with its receipt calls `insertToolReceipt` on its own transaction instead.
  */
 export async function recordToolReceipt(input: {
   kind: string;
@@ -1740,6 +1742,7 @@ export async function recordToolReceipt(input: {
   try {
     return await insertToolReceipt(sql(), input);
   } catch (e) {
+    if (e instanceof ToolReceiptError) return null;
     throw new Error(`recordToolReceipt: ${errMsg(e)}`);
   }
 }

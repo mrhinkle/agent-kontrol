@@ -127,6 +127,9 @@ describe("B usage ingest actor receipts", { skip: !OPT_IN, concurrency: 1 }, () 
         await sql`drop trigger if exists ak_b_usage_fail_receipt on events`;
         await sql`drop function if exists ak_b_usage_fail_receipt()`;
         await sql`drop table if exists ak_b_usage_fail_account`;
+        await sql`drop trigger if exists ak_b_usage_suppress_receipt on events`;
+        await sql`drop function if exists ak_b_usage_suppress_receipt()`;
+        await sql`drop table if exists ak_b_usage_suppress_account`;
         const needle = `${PREFIX}%`;
         await sql`
           delete from events e
@@ -378,6 +381,54 @@ describe("B usage ingest actor receipts", { skip: !OPT_IN, concurrency: 1 }, () 
       await sql`drop trigger if exists ak_b_usage_fail_receipt on events`;
       await sql`drop function if exists ak_b_usage_fail_receipt()`;
       await sql`drop table if exists ak_b_usage_fail_account`;
+    }
+  });
+
+  it("drops facts and the snapshot together when the receipt is silently suppressed", async () => {
+    const kept = await post({
+      facts: [fact("suppress-keep")],
+      snapshot: { account_id: account("suppress-keep"), collected_at: "2026-11-15T20:00:00.000Z", balance_usd: 2 },
+    }, LEGACY);
+    assert.equal(kept.status, 200);
+    await sql`create table if not exists ak_b_usage_suppress_account (account_id text primary key)`;
+    await sql`delete from ak_b_usage_suppress_account`;
+    await sql`insert into ak_b_usage_suppress_account (account_id) values (${account("suppress-fail")})`;
+    await sql`
+      create or replace function ak_b_usage_suppress_receipt() returns trigger
+      language plpgsql as $$
+      begin
+        if new.kind = 'usage.ingest'
+           and new.detail->>'snapshot_account_id' = (select account_id from ak_b_usage_suppress_account) then
+          return null;
+        end if;
+        return new;
+      end;
+      $$
+    `;
+    await sql`drop trigger if exists ak_b_usage_suppress_receipt on events`;
+    await sql`
+      create trigger ak_b_usage_suppress_receipt
+      before insert on events
+      for each row execute function ak_b_usage_suppress_receipt()
+    `;
+    try {
+      const res = await post({
+        facts: [fact("suppress-fail")],
+        snapshot: { account_id: account("suppress-fail"), collected_at: "2026-11-15T20:30:00.000Z", balance_usd: 4 },
+      }, LEGACY);
+      assert.equal(res.status, 500);
+      const body = await res.json() as { code?: string };
+      assert.equal(body.code, "internal_error");
+      assert.equal((await facts("suppress-keep")).length, 1);
+      assert.equal((await snapshots("suppress-keep")).length, 1);
+      assert.equal((await receiptsFor("suppress-keep")).length, 1);
+      assert.equal((await facts("suppress-fail")).length, 0);
+      assert.equal((await snapshots("suppress-fail")).length, 0);
+      assert.equal((await receiptsFor("suppress-fail")).length, 0);
+    } finally {
+      await sql`drop trigger if exists ak_b_usage_suppress_receipt on events`;
+      await sql`drop function if exists ak_b_usage_suppress_receipt()`;
+      await sql`drop table if exists ak_b_usage_suppress_account`;
     }
   });
 

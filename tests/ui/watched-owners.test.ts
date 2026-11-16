@@ -1763,6 +1763,9 @@ describe("watched owners discovery", () => {
         writes.push({ text, values });
         return [];
       }
+      if (text.includes("insert into events")) {
+        return [{ id: 1, kind: values[0], created_at: "2026-11-15T00:00:00.000Z" }];
+      }
       if (text.includes("from watched_repos")) return [{ ...stored }];
       return [];
     });
@@ -2007,6 +2010,9 @@ describe("watched owners discovery", () => {
         const pinned = values[6];
         if (Array.isArray(pinned)) row.pinned = pinned[0] === true;
         return [];
+      }
+      if (text.includes("insert into events")) {
+        return [{ id: 1, kind: values[0], created_at: "2026-11-15T00:00:00.000Z" }];
       }
       if (text.includes("from watched_repos")) {
         repoSelects += 1;

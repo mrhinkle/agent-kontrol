@@ -109,6 +109,11 @@ describe("B watch beat actor receipts", { skip: !OPT_IN, concurrency: 1 }, () =>
       await sql`drop trigger if exists ak_b_watch_fail_receipt on events`;
       await sql`drop function if exists ak_b_watch_fail_receipt()`;
       await sql`drop table if exists ak_b_watch_fail_source`;
+      await sql`drop trigger if exists ak_b_watch_suppress_beat on watch_beats`;
+      await sql`drop function if exists ak_b_watch_suppress_beat()`;
+      await sql`drop trigger if exists ak_b_watch_suppress_receipt on events`;
+      await sql`drop function if exists ak_b_watch_suppress_receipt()`;
+      await sql`drop table if exists ak_b_watch_suppress_source`;
       await sql`delete from events where kind = 'watch.beat' and detail->>'source' in ('watcher', 'macbook')`;
       await sql`delete from watch_beats where source = 'macbook'`;
       if (priorWatcher) {
@@ -311,6 +316,115 @@ describe("B watch beat actor receipts", { skip: !OPT_IN, concurrency: 1 }, () =>
       await sql`drop trigger if exists ak_b_watch_fail_receipt on events`;
       await sql`drop function if exists ak_b_watch_fail_receipt()`;
       await sql`drop table if exists ak_b_watch_fail_source`;
+    }
+  });
+
+  it("does not audit a beat whose insert or update was suppressed", async () => {
+    const issued = await createCredential({
+      label: `${PREFIX}-suppress-writer`,
+      scopes: ["watch:write"],
+      rate_limit_per_minute: 1000,
+      rate_limit_per_day: 1000,
+    });
+    assert.equal(issued.ok, true);
+    if (!issued.ok) return;
+    bind({ watcher: [issued.credential.id], macbook: [issued.credential.id] });
+    const before = await row("watcher");
+    assert.equal(before.length, 1);
+    const beforeReceipts = (await receipts("watcher")).length;
+    await sql`
+      create or replace function ak_b_watch_suppress_beat() returns trigger
+      language plpgsql as $$
+      begin
+        if new.source = 'watcher' and tg_op = 'UPDATE' then
+          return null;
+        end if;
+        if new.source = 'macbook' and tg_op = 'INSERT' then
+          return null;
+        end if;
+        return new;
+      end;
+      $$
+    `;
+    await sql`drop trigger if exists ak_b_watch_suppress_beat on watch_beats`;
+    await sql`
+      create trigger ak_b_watch_suppress_beat
+      before insert or update on watch_beats
+      for each row execute function ak_b_watch_suppress_beat()
+    `;
+    try {
+      await sql`delete from watch_beats where source = 'macbook'`;
+      await sql`delete from events where kind = 'watch.beat' and detail->>'source' = 'macbook'`;
+      const inserted = await post(beat("macbook", "ok", "insert-canary"), issued.token);
+      assert.equal(inserted.status, 503);
+      const insertBody = await inserted.json() as { code?: string };
+      assert.equal(insertBody.code, "setup_required");
+      assert.equal(JSON.stringify(insertBody).includes("insert-canary"), false);
+      assert.equal((await row("macbook")).length, 0);
+      assert.equal((await receipts("macbook")).length, 0);
+
+      const updated = await post(beat("watcher", "paused", "update-canary"), issued.token);
+      assert.equal(updated.status, 503);
+      const updateBody = await updated.json() as { code?: string };
+      assert.equal(updateBody.code, "setup_required");
+      assert.equal(JSON.stringify(updateBody).includes("update-canary"), false);
+      const stored = await row("watcher");
+      assert.equal(stored[0].status, before[0].status);
+      assert.equal(stored[0].detail, before[0].detail);
+      assert.equal((await receipts("watcher")).length, beforeReceipts);
+    } finally {
+      await sql`drop trigger if exists ak_b_watch_suppress_beat on watch_beats`;
+      await sql`drop function if exists ak_b_watch_suppress_beat()`;
+    }
+  });
+
+  it("rolls a stored beat back when its receipt insert is suppressed", async () => {
+    const issued = await createCredential({
+      label: `${PREFIX}-suppress-receipt`,
+      scopes: ["watch:write"],
+      rate_limit_per_minute: 1000,
+      rate_limit_per_day: 1000,
+    });
+    assert.equal(issued.ok, true);
+    if (!issued.ok) return;
+    bind({ watcher: [issued.credential.id] });
+    const before = await row("watcher");
+    const beforeReceipts = (await receipts("watcher")).length;
+    await sql`create table if not exists ak_b_watch_suppress_source (source text primary key)`;
+    await sql`delete from ak_b_watch_suppress_source`;
+    await sql`insert into ak_b_watch_suppress_source (source) values ('watcher')`;
+    await sql`
+      create or replace function ak_b_watch_suppress_receipt() returns trigger
+      language plpgsql as $$
+      begin
+        if new.kind = 'watch.beat'
+           and new.detail->>'source' = (select source from ak_b_watch_suppress_source) then
+          return null;
+        end if;
+        return new;
+      end;
+      $$
+    `;
+    await sql`drop trigger if exists ak_b_watch_suppress_receipt on events`;
+    await sql`
+      create trigger ak_b_watch_suppress_receipt
+      before insert on events
+      for each row execute function ak_b_watch_suppress_receipt()
+    `;
+    try {
+      const res = await post(beat("watcher", "stale", "receipt-canary"), issued.token);
+      assert.equal(res.status, 503);
+      const body = await res.json() as { code?: string };
+      assert.equal(body.code, "setup_required");
+      assert.equal(JSON.stringify(body).includes("receipt-canary"), false);
+      const stored = await row("watcher");
+      assert.equal(stored[0].status, before[0].status);
+      assert.equal(stored[0].detail, before[0].detail);
+      assert.equal((await receipts("watcher")).length, beforeReceipts);
+    } finally {
+      await sql`drop trigger if exists ak_b_watch_suppress_receipt on events`;
+      await sql`drop function if exists ak_b_watch_suppress_receipt()`;
+      await sql`drop table if exists ak_b_watch_suppress_source`;
     }
   });
 });

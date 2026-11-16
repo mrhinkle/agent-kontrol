@@ -238,6 +238,8 @@ describe("B message acknowledgement actor receipts", { skip: !OPT_IN, concurrenc
         await sql`drop trigger if exists ak_b_messages_fail_receipt on events`;
         await sql`drop function if exists ak_b_messages_fail_receipt()`;
         await sql`drop table if exists ak_b_messages_fail`;
+        await sql`drop trigger if exists ak_b_messages_suppress_receipt on events`;
+        await sql`drop function if exists ak_b_messages_suppress_receipt()`;
         const needle = `${PREFIX}%`;
         await sql`
           delete from events e
@@ -495,6 +497,54 @@ describe("B message acknowledgement actor receipts", { skip: !OPT_IN, concurrenc
       await sql`drop trigger if exists ak_b_messages_fail_receipt on events`;
       await sql`drop function if exists ak_b_messages_fail_receipt()`;
       await sql`drop table if exists ak_b_messages_fail`;
+    }
+  });
+
+  it("rolls an acknowledgement and a dashboard read back when the receipt insert is suppressed", async () => {
+    const keptAck = await plant("suppress-ack-keep", "inbound");
+    assert.equal((await get("suppress-ack-keep", { ack: true, token: LEGACY })).status, 200);
+    const failedAck = await plant("suppress-ack", "inbound");
+    const keptRead = await plant("suppress-read-keep", "outbound");
+    assert.equal((await patch("suppress-read-keep", { token: LEGACY })).status, 200);
+    const failedRead = await plant("suppress-read", "outbound");
+    await sql`
+      create or replace function ak_b_messages_suppress_receipt() returns trigger
+      language plpgsql as $$
+      begin
+        if new.kind in ('messages.ack', 'messages.read') then
+          return null;
+        end if;
+        return new;
+      end;
+      $$
+    `;
+    await sql`drop trigger if exists ak_b_messages_suppress_receipt on events`;
+    await sql`
+      create trigger ak_b_messages_suppress_receipt
+      before insert on events
+      for each row execute function ak_b_messages_suppress_receipt()
+    `;
+    try {
+      const ack = await get("suppress-ack", { ack: true, token: LEGACY });
+      assert.equal(ack.status, 500);
+      const ackBody = await ack.json() as { code?: string };
+      assert.equal(ackBody.code, "internal_error");
+      assert.equal((await messageRow(failedAck)).acked_at, null);
+      assert.equal((await receipts("messages.ack", failedAck)).length, 0);
+      assert.ok((await messageRow(keptAck)).acked_at);
+      assert.equal((await receipts("messages.ack", keptAck)).length, 1);
+
+      const read = await patch("suppress-read", { token: LEGACY });
+      assert.equal(read.status, 500);
+      const readBody = await read.json() as { code?: string };
+      assert.equal(readBody.code, "internal_error");
+      assert.equal((await messageRow(failedRead)).read_by_dashboard_at, null);
+      assert.equal((await receipts("messages.read", failedRead)).length, 0);
+      assert.ok((await messageRow(keptRead)).read_by_dashboard_at);
+      assert.equal((await receipts("messages.read", keptRead)).length, 1);
+    } finally {
+      await sql`drop trigger if exists ak_b_messages_suppress_receipt on events`;
+      await sql`drop function if exists ak_b_messages_suppress_receipt()`;
     }
   });
 

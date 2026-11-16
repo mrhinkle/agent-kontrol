@@ -153,15 +153,14 @@ export async function upsertBeat(
         received_at = clock_timestamp()
       returning source
     `;
-    const stored = rows[0];
-    const sourceId = stored && typeof stored.source === "string" && stored.source.length > 0
-      ? stored.source
-      : src;
-    if (stored && sourceId !== src) throw new Error("watch source missing");
+    const returned = rows.length === 1 ? rows[0]?.source : undefined;
+    if (typeof returned !== "string" || returned.length === 0 || returned !== src) {
+      throw new Error("watch source missing");
+    }
     await insertToolReceipt(tx, {
       kind: "watch.beat",
       title: "Watch beat stored",
-      extra: { operation: "upsert", source: sourceId },
+      extra: { operation: "upsert", source: returned },
     });
   });
 }
