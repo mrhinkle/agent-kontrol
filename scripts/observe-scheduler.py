@@ -14,9 +14,13 @@ parsed by scripts/import-velocity.py. The token is not accepted on argv and is
 not written to the plist, the log, or this source.
 
 Each observation POST has one monotonic deadline for connect, headers, and
-every body read. At that deadline the socket is shut down. The sweep and
-launchctl children run in their own session; a deadline kills that process
-group even after its leader exits, and reading stops at a byte cap.
+every body read. At that deadline the socket is shut down. A framed body
+that http.client has already finished is complete; the closed descriptor is
+not touched again, and a short Content-Length is not a successful body.
+The sweep and launchctl children run in their own session. Pipe EOF does
+not finish a leader that is still running; that leader is waited only until
+the same deadline. A deadline then kills that process group, including
+after the leader exits, and reading stops at a byte cap.
 sweep-once.sh ignores ambient curl configuration, proxies, and redirects, and
 it caps the response body before jq reads it.
 """
@@ -409,8 +413,10 @@ def capture_process(argv, timeout, limit, env):
     """Run argv in a new session and return (kind, stdout, stderr, code).
 
     kind is exited, timeout, oversize, or missing. Reading stops at limit
-    bytes total. A deadline kills the process group, then drains at most
-    half a second without keeping those bytes.
+    bytes total. Pipe EOF does not finish a leader that is still running:
+    that leader is waited only until the monotonic deadline. A deadline
+    kills the process group, including after the leader has exited, then
+    drains at most half a second without keeping those bytes.
     """
     try:
         proc = subprocess.Popen(
@@ -478,6 +484,17 @@ def capture_process(argv, timeout, limit, env):
                 buffers.clear()
                 break
             bucket.extend(chunk)
+    if not timed_out and not oversize and proc.poll() is None:
+        # Both pipes are closed. The leader may still be exiting. Wait only
+        # for the time still left, then classify a timeout if it is running.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+        else:
+            try:
+                proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                timed_out = True
     _stop_group(proc)
     _discard_pipes([proc.stdout, proc.stderr], time.monotonic() + 0.5)
     for stream in (proc.stdout, proc.stderr):
@@ -610,8 +627,38 @@ def _interrupt_socket(sock):
         pass
 
 
+def _socket_open(sock):
+    """True when fileno is still valid. A closed socket raises EBADF on settimeout."""
+    try:
+        fileno = sock.fileno()
+    except OSError:
+        return False
+    return isinstance(fileno, int) and fileno >= 0
+
+
+def _framed_body_complete(response):
+    """True when http.client has already consumed a complete framed body.
+
+    length 0 is a satisfied Content-Length, including one whose final read
+    closed the socket. A chunked body is complete only after the zero chunk
+    closes the reader. An open reader, or a positive length still owed, is
+    not done.
+    """
+    length = getattr(response, "length", None)
+    if length == 0:
+        return True
+    if getattr(response, "chunked", False) and getattr(response, "fp", None) is None:
+        return True
+    return False
+
+
 def _read_limited(response, limit, deadline, box):
-    """Read at most limit+1 bytes. Each recv's timeout is the time still left."""
+    """Read at most limit+1 bytes. Each recv's timeout is the time still left.
+
+    Recognize a finished frame before touching the socket. Newer http.client
+    closes the descriptor when read1 takes the last Content-Length byte, and
+    settimeout on that descriptor is EBADF, not a deadline.
+    """
     if time.monotonic() >= deadline:
         raise TimeoutError
     sock = _response_socket(response)
@@ -620,19 +667,34 @@ def _read_limited(response, limit, deadline, box):
     chunks = []
     total = 0
     while total <= limit:
+        if _framed_body_complete(response):
+            break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError
         if sock is not None:
+            if not _socket_open(sock):
+                if _framed_body_complete(response):
+                    break
+                raise TimeoutError
             try:
                 sock.settimeout(max(0.01, remaining))
             except OSError:
+                if _framed_body_complete(response):
+                    break
                 raise TimeoutError
         try:
             chunk = _pull(response, min(8192, limit + 1 - total))
-        except (socket.timeout, TimeoutError, OSError):
+        except (socket.timeout, TimeoutError):
+            raise TimeoutError
+        except OSError:
+            if _framed_body_complete(response):
+                break
             raise TimeoutError
         if not chunk:
+            length = getattr(response, "length", None)
+            if isinstance(length, int) and length > 0:
+                raise TimeoutError
             break
         chunks.append(chunk)
         total += len(chunk)

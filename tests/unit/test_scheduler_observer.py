@@ -10,6 +10,7 @@ import os
 import pathlib
 import plistlib
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -68,19 +69,83 @@ def domain_text(uid, services, disabled=None):
     return "\n".join(lines) + "\n"
 
 
-def alive(pid):
+def linux_state(pid):
+    """State character from /proc/PID/stat, or None when it cannot be read.
+
+    The read is capped. comm may contain spaces and parentheses, so the state
+    is the byte after the last ')'. Linux kill(pid, 0) is true for a zombie.
+    """
     try:
-        os.kill(pid, 0)
+        fd = os.open("/proc/%d/stat" % int(pid), os.O_RDONLY)
+    except (OSError, TypeError, ValueError):
+        return None
+    try:
+        raw = os.read(fd, 1024)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    end = raw.rfind(b")")
+    if end < 0 or end + 2 >= len(raw) or not raw[end + 2:end + 3].isalpha():
+        return None
+    return raw[end + 2:end + 3].decode("ascii")
+
+
+def alive(pid):
+    """True only when pid can still run. A zombie is not alive."""
+    try:
+        os.kill(int(pid), 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
+    except (OSError, TypeError, ValueError):
+        return False
+    if linux_state(pid) == "Z":
+        return False
+    return True
+
+
+def wait_stopped(pid, seconds=0.5):
+    """Bounded poll until pid is gone or a zombie. A live process stays failed."""
+    deadline = time.monotonic() + seconds
+    while alive(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
     return True
 
 
 def reap(pid):
-    if pid and alive(pid):
-        os.kill(pid, signal.SIGKILL)
+    if not pid:
+        return
+    if alive(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        pass
+
+
+def receipt(outcome="applied", observation_id="1"):
+    return json.dumps({
+        "ok": True,
+        "kind": "sweep.scheduler_job",
+        "outcome": outcome,
+        "observation_id": observation_id,
+        "received_at": "2026-11-16T12:00:00Z",
+    }).encode()
+
+
+def sanitize_process_text(raw):
+    if isinstance(raw, bytes):
+        text = raw.decode("utf-8", "replace")
+    else:
+        text = "" if raw is None else str(raw)
+    return text.replace(TOKEN, "[redacted]")
 
 
 class QuietHandler(http.server.BaseHTTPRequestHandler):
@@ -653,6 +718,83 @@ class TestTransport(unittest.TestCase):
             self.assertGreater(elapsed, 0.75)
             self.assertLess(elapsed, DEADLINE)
 
+    def test_complete_frames_apply_and_short_frames_do_not(self):
+        good = receipt()
+
+        class Length(QuietHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(good)))
+                self.end_headers()
+                self.wfile.write(good)
+
+        class Close(QuietHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.wfile.write(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + good)
+                self.wfile.flush()
+                self.close_connection = True
+
+        class Short(QuietHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                declared = len(good) + 32
+                self.wfile.write(
+                    (b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % declared) + good
+                )
+                self.wfile.flush()
+                try:
+                    self.connection.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+
+        class Partial(QuietHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.wfile.write(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{")
+                self.wfile.flush()
+                self.close_connection = True
+
+        class Oversize(QuietHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                body = b"x" * (obs.MAX_RESPONSE_BYTES + 1)
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        def post(handler, timeout):
+            with serve(handler) as server:
+                endpoint = "http://127.0.0.1:%d/api/ingest" % server.server_port
+                started = time.monotonic()
+                outcome = call_within(
+                    timeout + 1,
+                    lambda: obs.post_observation(endpoint, b"{}", TOKEN, timeout, obs.request_opener()),
+                )
+                return outcome, time.monotonic() - started
+
+        for handler in (Length, Close):
+            outcome, elapsed = post(handler, 2)
+            self.assertEqual(outcome, "applied", handler.__name__)
+            self.assertLess(elapsed, 1.0, handler.__name__)
+
+        outcome, elapsed = post(Short, 2)
+        self.assertEqual(outcome, "lost-response")
+        self.assertLess(elapsed, 1.0)
+
+        outcome, elapsed = post(Partial, 2)
+        self.assertEqual(outcome, "unknown-response")
+        self.assertLess(elapsed, 1.0)
+
+        outcome, elapsed = post(Oversize, 3)
+        self.assertEqual(outcome, "invalid-response")
+        self.assertLess(elapsed, 2.0)
+
     def test_capture_caps_output_and_kills_its_own_group(self):
         started = time.monotonic()
         kind, out, err, _code = obs.capture_process(
@@ -676,9 +818,16 @@ class TestTransport(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             pidfile = root / "child.pid"
+            marker = root / "acted"
             child = root / "child.py"
             parent = root / "parent.py"
-            child.write_text("import os, pathlib, time\npathlib.Path(%r).write_text(str(os.getpid()))\ntime.sleep(30)\n" % str(pidfile))
+            child.write_text(
+                "import os, pathlib, time\n"
+                "pathlib.Path(%r).write_text(str(os.getpid()))\n"
+                "time.sleep(1.15)\n"
+                "pathlib.Path(%r).write_text('acted')\n"
+                "time.sleep(30)\n" % (str(pidfile), str(marker))
+            )
             parent.write_text("import subprocess, sys\nsubprocess.Popen([sys.executable, %r])\n" % str(child))
             started = time.monotonic()
             kind, _out, _err, code = obs.capture_process([sys.executable, str(parent)], 1, 32768, obs.child_env())
@@ -687,22 +836,30 @@ class TestTransport(unittest.TestCase):
             try:
                 self.assertEqual(kind, "timeout")
                 self.assertIsNotNone(pid)
-                self.assertFalse(alive(pid), "descendant still alive")
                 self.assertGreater(elapsed, 0.75)
                 self.assertLess(elapsed, DEADLINE)
+                while time.monotonic() < started + 1.55:
+                    time.sleep(0.02)
+                self.assertFalse(marker.exists(), "descendant acted after capture returned")
+                self.assertTrue(wait_stopped(pid), "descendant still running")
             finally:
                 reap(pid)
 
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             pidfile = root / "grand.pid"
+            marker = root / "acted"
             script = root / "slow.py"
             script.write_text(
                 "#!%s\nimport os, pathlib, subprocess, sys, time\n"
                 "subprocess.Popen([sys.executable, '-c', %r])\n"
                 "time.sleep(30)\n" % (
                     sys.executable,
-                    "import os, pathlib, time; pathlib.Path(%r).write_text(str(os.getpid())); time.sleep(30)" % str(pidfile),
+                    "import os, pathlib, time\n"
+                    "pathlib.Path(%r).write_text(str(os.getpid()))\n"
+                    "time.sleep(1.15)\n"
+                    "pathlib.Path(%r).write_text('acted')\n"
+                    "time.sleep(30)\n" % (str(pidfile), str(marker)),
                 )
             )
             script.chmod(0o700)
@@ -716,12 +873,58 @@ class TestTransport(unittest.TestCase):
             try:
                 self.assertEqual(outcome, "timeout")
                 self.assertIsNotNone(pid)
-                self.assertFalse(alive(pid))
                 self.assertGreater(elapsed, 0.75)
                 self.assertLess(elapsed, DEADLINE)
+                while time.monotonic() < started + 1.55:
+                    time.sleep(0.02)
+                self.assertFalse(marker.exists(), "descendant acted after capture returned")
+                self.assertTrue(wait_stopped(pid), "descendant still running")
                 self.assertNotIn(TOKEN, outcome)
             finally:
                 reap(pid)
+
+    def test_pipe_eof_waits_for_the_leader(self):
+        kind, out, _err, code = obs.capture_process(
+            [sys.executable, "-c", "print('ok')"],
+            1,
+            32768,
+            obs.child_env(),
+        )
+        self.assertEqual((kind, code, out), ("exited", 0, b"ok\n"))
+
+        # dup2 drops the capture pipes (EOF) and leaves the child a live stdout,
+        # so the interpreter can still exit 0 after the pipes are closed.
+        close_pipes = (
+            "import os, time\n"
+            "null = os.open('/dev/null', os.O_WRONLY)\n"
+            "os.dup2(null, 1)\n"
+            "os.dup2(null, 2)\n"
+            "os.close(null)\n"
+        )
+        started = time.monotonic()
+        kind, _out, _err, code = obs.capture_process(
+            [sys.executable, "-c", close_pipes + "time.sleep(0.05)\nraise SystemExit(0)\n"],
+            1,
+            32768,
+            obs.child_env(),
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual((kind, code), ("exited", 0))
+        self.assertGreater(elapsed, 0.04)
+        self.assertLess(elapsed, 0.6)
+
+        started = time.monotonic()
+        kind, _out, _err, code = obs.capture_process(
+            [sys.executable, "-c", close_pipes + "time.sleep(5)\n"],
+            0.3,
+            32768,
+            obs.child_env(),
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(kind, "timeout")
+        self.assertEqual(code, -9)
+        self.assertGreater(elapsed, 0.2)
+        self.assertLess(elapsed, 0.8)
 
     def test_sweep_bounds_body_blocks_redirects_and_hides_the_token(self):
         received = []
@@ -791,12 +994,24 @@ class TestTransport(unittest.TestCase):
             self.assertTrue(all(TOKEN not in arg for arg in argv))
 
         with serve(Target) as target:
-            outcome = obs.run_sweep(
-                {"sweep_once": str(SWEEP), "sweep_timeout": 5},
-                "http://127.0.0.1:%d" % target.server_port,
-                TOKEN,
-            )
-            self.assertEqual(outcome, "0")
+            captured = {}
+            original = obs.capture_process
+
+            def capture(argv, timeout, limit, env):
+                result = original(argv, timeout, limit, env)
+                captured["result"] = result
+                return result
+
+            with patch.object(obs, "capture_process", capture):
+                outcome = obs.run_sweep(
+                    {"sweep_once": str(SWEEP), "sweep_timeout": 5},
+                    "http://127.0.0.1:%d" % target.server_port,
+                    TOKEN,
+                )
+            kind, _out, err, code = captured.get("result", (None, b"", b"", None))
+            detail = "kind=%s code=%s stderr=%s" % (kind, code, sanitize_process_text(err))
+            self.assertNotIn(TOKEN, detail)
+            self.assertEqual(outcome, "0", detail)
             self.assertEqual(len(received), 1)
             self.assertNotIn(TOKEN, outcome)
 
