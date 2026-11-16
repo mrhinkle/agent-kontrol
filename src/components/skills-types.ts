@@ -82,11 +82,22 @@ export interface SkillPatch {
   schedule?: string | null;
 }
 
-/** Counts derived from the API's added/changed/removed arrays. */
+/** One sync diagnostic. `source` is the source id, not stripped for display. */
+export interface SkillSyncDiagnostic {
+  source: string;
+  message: string;
+  severity: "fatal" | "notice";
+}
+
+/** Counts derived from the API's added/changed/removed arrays. Fatal diagnostics come first. */
 export interface SkillSyncResult {
   status: "ok" | "failed" | "busy";
   added: number;
   changed: number;
   removed: number;
-  errors: string[];
+  diagnostics: SkillSyncDiagnostic[];
 }
+
+export type SkillSyncView =
+  | { kind: "request-error"; message: string }
+  | { kind: "result"; result: SkillSyncResult };

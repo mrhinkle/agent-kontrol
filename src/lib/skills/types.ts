@@ -296,6 +296,8 @@ export interface SyncConflict {
 export interface SyncError {
   source: string;
   message: string;
+  /** `fatal` fails the run. `notice` is recorded and does not fail it by itself. */
+  severity: "fatal" | "notice";
 }
 
 export interface SyncResult {

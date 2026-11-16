@@ -21,10 +21,7 @@ function unauthorized(): NextResponse {
 }
 
 export function storeUnavailable(): NextResponse {
-  return NextResponse.json(
-    { error: "credential_store_unavailable" },
-    { status: 503, headers: NO_STORE },
-  );
+  return watchError("credential_store_unavailable");
 }
 
 export function databaseUnavailable(): NextResponse {

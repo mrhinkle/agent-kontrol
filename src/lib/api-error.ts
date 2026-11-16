@@ -143,6 +143,12 @@ export const API_ERRORS = {
     fix: "Set MC_GITHUB_WEBHOOK_SECRET to the GitHub webhook secret, redeploy, then redeliver.",
     retryable: false,
   },
+  credential_store_unavailable: {
+    status: 503,
+    message: "credential_store_unavailable",
+    fix: "Retry the request. The credential store could not be reached. This is not a revoked or expired credential.",
+    retryable: true,
+  },
   internal_error: {
     status: 500,
     message: "Internal error.",

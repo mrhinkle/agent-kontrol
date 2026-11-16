@@ -58,7 +58,7 @@ Collector and operator routes are not in this table. An agent credential cannot 
 
 ### Request limits
 
-Each agent credential has a per-minute and a per-day request limit, 60 and 10,000 by default, editable in Settings. One HTTP request to `/api/mcp` counts once after authentication and the scope check: an `initialize`, a notification, a POST batch, a `GET` that opens the stream, and a `DELETE`. Tool calls are not counted separately; a batch with several `tools/call` messages is one request. A held stream does not count again, and a reconnect is a new request. The minute is the clock minute and the day is the UTC day. Over a limit, the HTTP answer is `429` with `Retry-After` seconds and `{ "code": "rate_limited", "retryable": true, "retry_after", "window", "limit" }`. That is an HTTP status, not a tool result. A quota store error is `503 {"error":"credential_store_unavailable"}`. A credential revoked or expired while its request waited is the usual `401` with `WWW-Authenticate`. `MC_TOKEN` and OAuth are not metered. The REST rules are in [API.md](API.md#request-limits-for-agent-credentials).
+Each agent credential has a per-minute and a per-day request limit, 60 and 10,000 by default, editable in Settings. One HTTP request to `/api/mcp` counts once after authentication and the scope check: an `initialize`, a notification, a POST batch, a `GET` that opens the stream, and a `DELETE`. Tool calls are not counted separately; a batch with several `tools/call` messages is one request. A held stream does not count again, and a reconnect is a new request. The minute is the clock minute and the day is the UTC day. Over a limit, the HTTP answer is `429` with `Retry-After` seconds and `{ "code": "rate_limited", "retryable": true, "retry_after", "window", "limit" }`. That is an HTTP status, not a tool result. A quota store error is `503` with `error` and `code` `credential_store_unavailable`, a `fix`, and `retryable` true. A credential revoked or expired while its request waited is `401` with `error` `invalid_token`, `error_description` `Invalid token`, `code` `unauthorized`, `fix`, `retryable` false, and the same `WWW-Authenticate` challenge. `MC_TOKEN` and OAuth are not metered. The REST rules are in [API.md](API.md#request-limits-for-agent-credentials).
 
 ### What a credential stores
 
@@ -521,7 +521,7 @@ The content SHA is SHA-256 hex over the raw SKILL.md bytes, UTF-8, with no newli
 
 `sha` on a skill row is that content hash. `commit_sha` is the upstream commit at which the content last changed. `upstream.sha` and `upstream.syncedAt` come from the latest finished sync that recorded a non-empty source commit, of any status. A failed sync that still recorded the commit it fetched, including one failed by a parse problem, is the source of that sha. A failed fetch that recorded no commit does not replace an older one. That sha can be newer than a skill's `commit_sha` when a sync found nothing to write.
 
-Reference files are text only. A file over 256 KB, or a file that would push the skill's references over 1 MB, is skipped. A binary file is skipped. Those skips are listed in the sync `errors` and do not by themselves mark the sync failed. A SKILL.md over 1 MB, or a SKILL.md that is not UTF-8 text, marks the sync failed and keeps the stored row. A failed fetch does the same for that source: the rows stay, and they are not reported as removed.
+Reference files are text only. A file over 256 KB, or a file that would push the skill's references over 1 MB, is skipped. A binary file is skipped. Those skips are listed in the sync `errors` with `severity` `notice` and do not by themselves mark the sync failed. A SKILL.md over 1 MB, or a SKILL.md that is not UTF-8 text, marks the sync failed and keeps the stored row. A failed fetch does the same for that source: the rows stay, and they are not reported as removed.
 
 ### REST
 
@@ -561,6 +561,8 @@ One sync at a time. The lease is a `skill_sync_runs` row with `status` `running`
 An id that appears in more than one source is kept by the earlier source (`position` ascending). The other is listed in `conflicts` and is not stored. The same source producing the same id twice keeps the first path.
 
 `status: "failed"` means a source was not fetched, a SKILL.md could not be parsed, or a SKILL.md could not be read. Rows that were written are still listed in `added` and `changed`. A parse problem is not a written row: the existing skill stays out of `added`, `changed`, and `removed`, and a new skill is absent. A conflict, a skipped reference, or an ignored runtime name does not by itself fail the run. Unreadable frontmatter is not stored and is not treated as compatible with every runtime.
+
+A frontmatter value that is one strict JSON object on a single line is stored, including nested objects and arrays. A malformed object is a parse failure. YAML anchors, aliases, and tags stay unreadable. Each `errors[]` entry is `{source, message, severity}`. `severity` is `fatal` or `notice`, and fatal entries are listed first. A notice is a skipped reference or an ignored runtime name. The skills page shows the first fatal cause with its source id, the added, changed, and removed counts, and the remaining diagnostics. Notices alone leave `status` `ok`.
 
 ### Scheduled skills
 

@@ -1,7 +1,11 @@
+import { apiError, type ApiErrorOverrides, type ErrorCode } from "./api-error";
 import { VELOCITY_MAX_BYTES } from "./velocity";
 
 export function velocityJSON(body: unknown, status = 200): Response {
   return Response.json(body, { status, headers: { "Cache-Control": "private, no-store" } });
+}
+export function velocityError(code: ErrorCode, message: string, overrides?: Omit<ApiErrorOverrides, "message">): Response {
+  return privateResponse(apiError(code, { ...overrides, message }));
 }
 export function privateResponse(response: Response): Response {
   response.headers.set("Cache-Control", "private, no-store");

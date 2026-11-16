@@ -2,38 +2,31 @@
 
 import { useState } from "react";
 import { TimeAgo } from "@/components/ui";
-import { countOf, readApiError, shortSha } from "./SkillHelpers";
-import type { SkillSyncResult, SkillUpstream } from "./skills-types";
+import { SkillSyncFeedback, skillSyncView } from "./SkillSyncFeedback";
+import { shortSha } from "./SkillHelpers";
+import type { SkillSyncView, SkillUpstream } from "./skills-types";
 
 const control =
   "rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-gray-200 hover:bg-white/10 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#19d2ff]/70";
 
 export function SkillUpstreamHeader({ upstream, onSynced }: { upstream: SkillUpstream; onSynced: () => void }) {
   const [pending, setPending] = useState(false);
-  const [result, setResult] = useState<SkillSyncResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [view, setView] = useState<SkillSyncView | null>(null);
 
   async function sync() {
     setPending(true);
-    setError(null);
+    setView(null);
     try {
       const res = await fetch("/api/skills/sync", { method: "POST" });
       const body: unknown = await res.json().catch(() => null);
       if (!res.ok) {
-        setResult(null);
-        setError(readApiError(body, `Sync failed (${res.status})`));
+        setView(skillSyncView(false, res.status, body));
         return;
       }
-      const parsed = body && typeof body === "object" ? (body as Record<string, unknown>) : {};
-      const status = parsed.status === "failed" || parsed.status === "busy" ? parsed.status : "ok";
-      const errors = Array.isArray(parsed.errors)
-        ? parsed.errors.flatMap((e) => (e && typeof e === "object" && typeof (e as { message?: unknown }).message === "string" ? [(e as { message: string }).message] : []))
-        : [];
-      setResult({ status, added: countOf(parsed.added), changed: countOf(parsed.changed), removed: countOf(parsed.removed), errors });
+      setView(skillSyncView(true, res.status, body));
       onSynced();
     } catch (e) {
-      setResult(null);
-      setError(e instanceof Error ? e.message : "Sync failed");
+      setView({ kind: "request-error", message: e instanceof Error ? e.message : "Sync failed" });
     } finally {
       setPending(false);
     }
@@ -53,16 +46,7 @@ export function SkillUpstreamHeader({ upstream, onSynced }: { upstream: SkillUps
       <button type="button" className={control} onClick={() => void sync()} disabled={pending}>
         {pending ? "Syncing…" : "Sync now"}
       </button>
-      {result?.status === "ok" && (
-        <span className="mono text-xs text-gray-300">
-          +{result.added} ~{result.changed} −{result.removed}
-        </span>
-      )}
-      {result?.status === "busy" && <span className="text-xs text-[#ffb020]">A sync is already running.</span>}
-      {result?.status === "failed" && (
-        <span className="text-xs text-red-400">Sync failed{result.errors[0] ? `: ${result.errors[0]}` : "."}</span>
-      )}
-      {error && <span className="text-xs text-red-400">{error}</span>}
+      <SkillSyncFeedback view={view} />
       <span className={driftHot ? "font-medium text-[#ffb020]" : "text-gray-600"}>Drift: {upstream.driftCount}</span>
     </div>
   );
