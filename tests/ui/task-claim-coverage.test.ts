@@ -2,7 +2,7 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import { setSqlForTests } from "../../src/lib/db";
-import { claimTaskWithCoverage } from "../../src/lib/store";
+import { claimNextTask, claimTaskWithCoverage } from "../../src/lib/store";
 import { readTaskNoticeObserverHeaders } from "../../src/lib/task-queue-notice";
 import { POST as claimTask } from "../../src/app/api/tasks/claim/route";
 
@@ -349,5 +349,95 @@ describe("bounded claim evidence", () => {
     });
     assert.equal(skipped.task, null);
     assert.equal(skipped.coverage.reason, "no_claim");
+  });
+
+  it("rejects a supplied project that is not an exact lane and writes nothing", async () => {
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_TOKEN = TOKEN;
+    let calls = 0;
+    setSqlForTests(async () => {
+      calls += 1;
+      throw new Error("rejected project must not query");
+    });
+    const headers = { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" };
+    const post = (body: unknown) => claimTask(new Request("http://localhost/api/tasks/claim", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    }));
+    for (const project of [null, "", "agent-kontrol\n", "a".repeat(101), "has space", "/tmp/x"]) {
+      const rejected = await post({ platform: "codex", agent_id: "worker", project });
+      assert.equal(rejected.status, 400, JSON.stringify(project));
+      const body = await rejected.json() as { code: string; fields: Record<string, string> };
+      assert.equal(body.code, "validation_failed");
+      assert.match(body.fields.project, /exact task lane|must be 1-100/);
+    }
+    const missing = await post({ project: "not a lane" });
+    assert.equal(missing.status, 400);
+    assert.equal((await missing.json() as { code: string }).code, "missing_field");
+    const broken = await claimTask(new Request("http://localhost/api/tasks/claim", {
+      method: "POST",
+      headers,
+      body: "{",
+    }));
+    assert.equal(broken.status, 400);
+    assert.equal((await broken.json() as { code: string }).code, "invalid_json");
+    assert.equal(calls, 0);
+    await assert.rejects(
+      () => claimNextTask({ platform: "codex", agent_id: "worker", project: null }),
+      /invalid task project filter/,
+    );
+    await assert.rejects(
+      () => claimTaskWithCoverage({ platform: "codex", agent_id: "worker", project: "agent-kontrol\n", observer: null }),
+      /invalid task project filter/,
+    );
+    assert.equal(calls, 0);
+
+    delete env.DATABASE_URL;
+    const demoRejected = await post({ platform: "codex", agent_id: "worker", project: "" });
+    assert.equal(demoRejected.status, 400);
+    assert.equal((await demoRejected.json() as { code: string }).code, "validation_failed");
+    const demoOmitted = await post({ platform: "codex", agent_id: "worker" });
+    assert.deepEqual(await demoOmitted.json(), { task: null, demo: true });
+    const demoJunk = await claimTask(new Request("http://localhost/api/tasks/claim", {
+      method: "POST",
+      headers,
+      body: "{",
+    }));
+    assert.deepEqual(await demoJunk.json(), { task: null, demo: true });
+  });
+
+  it("forwards an exact project on the candidate query and the guarded update", async () => {
+    env.DATABASE_URL = FIXTURE_URL;
+    env.MC_TOKEN = TOKEN;
+    const seen: { text: string; values: unknown[] }[] = [];
+    setSqlForTests(async (strings, ...values) => {
+      const text = strings.join(" ");
+      seen.push({ text, values: [...values] });
+      const lower = text.toLowerCase();
+      if (lower.includes("from tasks") && lower.includes("status = 'queued'") && !lower.includes("update tasks")) {
+        return [taskRow({ project: "agent-kontrol" })];
+      }
+      if (lower.includes("with changed as")) return [taskRow({ project: "agent-kontrol", status: "claimed" })];
+      return [];
+    });
+    const response = await claimTask(new Request("http://localhost/api/tasks/claim", {
+      method: "POST",
+      headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify({ platform: "codex", agent_id: "worker", project: "agent-kontrol" }),
+    }));
+    assert.equal(response.status, 200);
+    const body = await response.json() as { task: { project: string } };
+    assert.equal(body.task.project, "agent-kontrol");
+    const select = seen.find((call) => call.text.toLowerCase().includes("from tasks") && call.text.toLowerCase().includes("limit"));
+    const update = seen.find((call) => call.text.toLowerCase().includes("with changed as"));
+    assert.ok(select);
+    assert.ok(update);
+    assert.match(select.text, /project =/);
+    assert.match(update.text, /project =/);
+    assert.equal(select.values.includes("agent-kontrol"), true);
+    assert.equal(update.values.includes("agent-kontrol"), true);
+    assert.equal(select.text.toLowerCase().includes("order by priority asc"), true);
+    assert.ok(select.text.toLowerCase().indexOf("project =") < select.text.toLowerCase().indexOf("limit"));
   });
 });
