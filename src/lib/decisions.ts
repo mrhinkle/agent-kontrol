@@ -22,8 +22,10 @@ import { insertToolReceipt } from "./tool-receipt";
  *
  * An actual upsert, force-reopen, or reconcile stores one events receipt in
  * that same transaction. The receipt actor is the authenticated principal.
- * `actor_type` and `actor_id` on the row stay the resolver. A blocked
- * reopen, or a reconcile that changes nothing, stores no receipt.
+ * The upsert label uses the status the locked write replaced, including a
+ * row another transaction committed while this statement waited. `actor_type`
+ * and `actor_id` on the row stay the resolver. A blocked reopen, or a
+ * reconcile that changes nothing, stores no receipt.
  */
 
 export const DECISION_STATUSES = ["open", "decided", "deferred", "withdrawn"] as const;
@@ -1072,9 +1074,12 @@ export async function upsertDecision(
   const optionsJson = input.options == null ? null : JSON.stringify(input.options);
   const labelsJson = input.labels == null ? null : JSON.stringify(input.labels);
   return withTransaction(async (db) => {
+  // Clear first, then let the conflict update store the status it actually
+  // replaced. That update runs only after this statement holds the row lock,
+  // so a resolution committed while we waited is the status we label.
   const rows = await db`
-    with prior as (
-      select status from decisions where key = ${input.key}
+    with cleared as materialized (
+      select set_config('ak.decision_previous_status', '', true) as cleared
     ),
     upserted as (
       insert into decisions (
@@ -1082,13 +1087,14 @@ export async function upsertDecision(
         options, recommended, requested_by, status,
         kind, labels, opened_at, repo_short, github_present,
         first_seen_at, last_seen_at, created_at, updated_at
-      ) values (
+      )
+      select
         ${input.key}, ${input.source}, ${input.repo}, ${input.number}, ${input.url}, ${input.title}, ${input.why},
         ${optionsJson}::jsonb, ${input.recommended}, ${input.requested_by}, 'open',
         ${input.kind}, ${labelsJson}::jsonb, ${input.opened_at}::timestamptz, ${input.repo_short}, ${input.github_present},
         coalesce(${input.first_seen_at}::timestamptz, ${input.opened_at}::timestamptz, now()),
         now(), now(), now()
-      )
+      from cleared
       on conflict (key) do update set
         source = excluded.source,
         repo = coalesce(excluded.repo, decisions.repo),
@@ -1163,7 +1169,10 @@ export async function upsertDecision(
           when decisions.status = 'withdrawn' then null
           else decisions.writeback_lock_at
         end,
-        revision = decisions.revision + 1
+        -- Record the locked row's pre-update status. The added term is zero.
+        revision = decisions.revision
+          + 1
+          + octet_length(set_config('ak.decision_previous_status', decisions.status, true)) * 0
       where not (
         ${input.force} is true
         and decisions.status in ('decided', 'deferred')
@@ -1175,9 +1184,8 @@ export async function upsertDecision(
       )
       returning *
     )
-    select upserted.*, prior.status as previous_status
+    select upserted.*, nullif(current_setting('ak.decision_previous_status', true), '') as previous_status
     from upserted
-    left join prior on true
   `;
   const row = rows[0];
   if (!row) {
