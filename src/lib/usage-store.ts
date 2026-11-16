@@ -4,6 +4,7 @@
  * Fleet headlines are always source=hermes_state (see usage-aggregate.ts).
  */
 import { isConfigured, sql, withTransaction, type SqlTag } from "./db";
+import { insertToolReceipt } from "./tool-receipt";
 import { aggregateUsageFacts } from "./usage-aggregate";
 import { usageIdempotentKey } from "./usage-key";
 import { assertNoContent } from "./usage-privacy";
@@ -11,6 +12,24 @@ import type { UsageFact, UsageIngestInput, UsageSummary } from "./usage-types";
 import type { AccountSnapshot } from "./providers/types";
 import { providerWindowRange, type UsageTimeWindow } from "./usage-window";
 import { demoUsageSummary } from "./demo-usage";
+
+type UsageEvidence = {
+  facts: { id: string; idempotency_key: string }[];
+  snapshot: { id: string; account_id: string; collected_at: string } | null;
+};
+
+function resourceId(value: unknown, label: string): string {
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "number" && Number.isFinite(value)) return String(Math.trunc(value));
+  if (typeof value === "string" && value.trim() !== "") return value.trim();
+  throw new Error(`${label} missing`);
+}
+
+function collectedInstant(value: unknown): string {
+  const date = value instanceof Date ? value : typeof value === "string" ? new Date(value) : null;
+  if (!date || Number.isNaN(date.getTime())) throw new Error("collected_at missing");
+  return date.toISOString();
+}
 
 function num(v: unknown): number {
   const n = Number(v);
@@ -22,7 +41,7 @@ function strOrNull(v: unknown): string | null {
   return String(v);
 }
 
-export async function ingestUsageFacts(input: UsageIngestInput, tx?: SqlTag): Promise<number> {
+export async function ingestUsageFacts(input: UsageIngestInput, tx?: SqlTag, evidence?: UsageEvidence): Promise<number> {
   if (!Array.isArray(input.facts)) throw new Error("facts[] required");
   if (!isConfigured()) {
     // Match progress ingest: accept and drop when DATABASE_URL unset (local demo).
@@ -41,7 +60,7 @@ export async function ingestUsageFacts(input: UsageIngestInput, tx?: SqlTag): Pr
       }
     }
     const key = usageIdempotentKey(raw);
-    await db`
+    const rows = await db`
       insert into usage_facts (
         idempotency_key, source, account_id, profile, session_id, model,
         billing_provider, billing_mode, cron_job_id, cron_job_name, task,
@@ -92,7 +111,15 @@ export async function ingestUsageFacts(input: UsageIngestInput, tx?: SqlTag): Pr
         last_seen_at = excluded.last_seen_at,
         collected_at = excluded.collected_at,
         detail = excluded.detail
+      returning id, idempotency_key
     `;
+    const row = rows[0] as Record<string, unknown> | undefined;
+    if (evidence && row) {
+      evidence.facts.push({
+        id: resourceId(row.id, "usage fact id"),
+        idempotency_key: resourceId(row.idempotency_key, "usage idempotency key"),
+      });
+    }
     written++;
   }
   return written;
@@ -105,13 +132,13 @@ export async function ingestAccountSnapshot(snap: {
   credits_remaining?: number | null;
   quota_detail?: unknown;
   detail?: unknown;
-}, tx?: SqlTag): Promise<void> {
+}, tx?: SqlTag, evidence?: UsageEvidence): Promise<void> {
   if (!isConfigured()) return;
   assertNoContent(snap.detail);
   assertNoContent(snap.quota_detail);
   const db = tx ?? sql();
   const collected_at = snap.collected_at ?? new Date().toISOString();
-  await db`
+  const rows = await db`
     insert into account_snapshots (
       account_id, collected_at, balance_usd, credits_remaining, quota_detail, detail
     ) values (
@@ -127,7 +154,16 @@ export async function ingestAccountSnapshot(snap: {
       credits_remaining = excluded.credits_remaining,
       quota_detail = excluded.quota_detail,
       detail = excluded.detail
+    returning id, account_id, collected_at
   `;
+  const row = rows[0] as Record<string, unknown> | undefined;
+  if (evidence && row) {
+    evidence.snapshot = {
+      id: resourceId(row.id, "account snapshot id"),
+      account_id: resourceId(row.account_id, "account id"),
+      collected_at: collectedInstant(row.collected_at),
+    };
+  }
 }
 
 function rowToFact(row: Record<string, unknown>): UsageFact {
@@ -160,13 +196,33 @@ function rowToFact(row: Record<string, unknown>): UsageFact {
   };
 }
 
-/** Facts and coverage commit together; a failed import cannot certify a partial report. */
+/**
+ * Facts and coverage commit together; a failed import cannot certify a partial report.
+ * The events receipt is in that same transaction and names only the rows this batch wrote.
+ */
 export async function ingestUsageBatch(input: UsageIngestInput & { snapshot?: AccountSnapshot }): Promise<number> {
   if (!isConfigured()) return 0;
   return withTransaction(async (tx) => {
-    const written = await ingestUsageFacts(input, tx);
+    const evidence: UsageEvidence = { facts: [], snapshot: null };
+    const written = await ingestUsageFacts(input, tx, evidence);
     if (written !== input.facts.length) throw new Error("Incomplete usage batch");
-    if (input.snapshot) await ingestAccountSnapshot(input.snapshot, tx);
+    if (input.snapshot) await ingestAccountSnapshot(input.snapshot, tx, evidence);
+    if (written === 0 && !input.snapshot) return written;
+    const factsComplete = evidence.facts.length === written;
+    const snapshotComplete = !input.snapshot || evidence.snapshot !== null;
+    if (!factsComplete || !snapshotComplete) throw new Error("Incomplete usage batch");
+    await insertToolReceipt(tx, {
+      kind: "usage.ingest",
+      title: "Usage facts stored",
+      extra: {
+        operation: "upsert",
+        fact_ids: [...new Set(evidence.facts.map((fact) => fact.id))],
+        idempotency_keys: [...new Set(evidence.facts.map((fact) => fact.idempotency_key))],
+        snapshot_id: evidence.snapshot?.id ?? null,
+        snapshot_account_id: evidence.snapshot?.account_id ?? null,
+        snapshot_collected_at: evidence.snapshot?.collected_at ?? null,
+      },
+    });
     return written;
   });
 }
