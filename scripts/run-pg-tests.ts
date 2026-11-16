@@ -2105,6 +2105,7 @@ async function testRepoCaseIdentity(tag: string): Promise<void> {
     assert.equal(toWatchedRepo(pinnedRepo, [rule], new Date("2026-10-29T00:00:00.000Z")).shown, true,
       "a case-insensitive pin still shows an inactive repository");
   } finally {
+    await sql()`delete from events where kind = 'owners.discover' and detail->>'owner' = ${owner}`;
     await sql()`delete from watched_repos where lower(repo) like ${`${owner.toLowerCase()}/%`}`;
     await sql()`delete from watched_owners where owner = ${owner}`;
   }

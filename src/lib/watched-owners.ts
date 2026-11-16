@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Actor } from "./actor";
 import { isConfigured, sql, withTransaction, type Row } from "./db";
+import { insertToolReceipt } from "./tool-receipt";
 import {
   alignRepoCasing,
   DISCOVERY_WRITE_LOCK,
@@ -157,7 +158,7 @@ export async function replaceWatchedOwners(
     if (expectedVersion !== undefined && expectedVersion !== ownerListVersion(rows.map((r) => ownerFromRow(r)))) {
       return { ok: false, reason: "stale" };
     }
-    await q`
+    const removed = await q`
       with incoming as (
         select * from unnest(
           ${owners.map((o) => o.owner)}::text[],
@@ -180,10 +181,23 @@ export async function replaceWatchedOwners(
           actor_id = excluded.actor_id,
           updated_at = now()
         returning owner
+      ),
+      deleted as (
+        delete from watched_owners w
+        where not exists (select 1 from incoming i where i.owner = w.owner)
+        returning owner
       )
-      delete from watched_owners w
-      where not exists (select 1 from incoming i where i.owner = w.owner)
+      select owner from deleted
     `;
+    const deletedOwners = removed
+      .map((row) => typeof row.owner === "string" ? row.owner : "")
+      .filter((owner) => owner.length > 0)
+      .sort();
+    await insertToolReceipt(q, {
+      kind: "owners.replace",
+      title: "Watched owners replaced",
+      extra: { operation: "replace", deleted_owners: deletedOwners },
+    });
     return { ok: true };
   });
 }
@@ -308,16 +322,20 @@ async function applyOwnerDiscoveryOnce(
     const owned = outcome.failure
       ? []
       : outcome.repos.filter((row) => repoOwner(row.repo) === rule.owner.toLowerCase());
-    await q`
+    const marked = await q`
       update watched_owners set
         last_error = ${visibleError},
         last_error_at = case when ${visibleError}::text is null then null else now() end,
         last_discovered_at = case when ${outcome.failure}::text is null then ${discoveredAt}::timestamptz else last_discovered_at end,
         updated_at = now()
       where owner = ${rule.owner}
+      returning owner
     `;
-    if (outcome.failure || owned.length === 0) return outcome;
-    await q`
+    if (marked.length !== 1 || marked[0]?.owner !== rule.owner) {
+      throw new Error("owner discovery marker was not stored");
+    }
+    if (!outcome.failure && owned.length > 0) {
+      const storedRepos = await q`
     insert into watched_repos (
       repo, label, short, color, blocked_label, position, origin, pinned, hidden, gone,
       is_fork, is_archived, last_activity_at, updated_at
@@ -349,7 +367,24 @@ async function applyOwnerDiscoveryOnce(
       is_archived = excluded.is_archived,
       gone = excluded.gone,
       updated_at = now()
+    returning repo
     `;
+      const returned = new Set(storedRepos.map((row) => String(row.repo)));
+      if (storedRepos.length !== owned.length || owned.some((row) => !returned.has(row.repo))) {
+        throw new Error("owner discovery repos were not stored");
+      }
+    }
+    await insertToolReceipt(q, {
+      kind: "owners.discover",
+      title: outcome.failure ? "Owner discovery error stored" : "Owner discovery stored",
+      extra: {
+        operation: outcome.failure ? "error" : "apply",
+        owner: rule.owner,
+        added: outcome.added,
+        updated: outcome.updated,
+        marked_gone: outcome.markedGone,
+      },
+    });
     return outcome;
   });
 }

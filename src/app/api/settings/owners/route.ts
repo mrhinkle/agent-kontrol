@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { actorFromPrincipal } from "@/lib/actor";
+import { actorFromPrincipal, runWithPrincipal } from "@/lib/actor";
 import { apiError, publicError } from "@/lib/api-error";
 import { deny, resolveApiAccess } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
@@ -120,11 +120,11 @@ export async function PUT(req: Request) {
     if (dry.dryRun) {
       return NextResponse.json(diffOwnerList(asOwnerInput(cur), checked.owners, true));
     }
-    const saved = await replaceWatchedOwners(
+    const saved = await runWithPrincipal(access.principal, () => replaceWatchedOwners(
       checked.owners,
       actorFromPrincipal(access.principal),
       typeof sent === "string" ? sent : undefined,
-    );
+    ));
     if (!saved.ok) {
       if (saved.reason === "stale") return apiError("stale");
       return notReady("Apply supabase/migrations/20261028_watched_owners.sql, then retry the save.");
