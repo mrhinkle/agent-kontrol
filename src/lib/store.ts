@@ -5,7 +5,20 @@ import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } fr
 import { StaleWrite, absentRevision } from "./revision";
 import { writeSessionNote } from "./session-memory";
 import { sql, type SqlTag } from "./db";
-import { containsReservedQueueMarker, ReservedQueueMarkerError, taskNoticeProducerEnabled } from "./task-queue-notice";
+import {
+  QUEUE_EPISODE_SCAN_LIMIT,
+  QUEUE_EPISODE_WINDOW_DAYS,
+  TASK_NOTICE_VERSION,
+  TASK_QUEUE_REPO,
+  TASK_READY_EVENT,
+  containsReservedQueueMarker,
+  decideQueueEvidence,
+  ReservedQueueMarkerError,
+  taskNoticeProducerEnabled,
+  unknownCoverage,
+  type TaskCoverage,
+  type TaskNoticeObserverProof,
+} from "./task-queue-notice";
 import { insertToolReceipt } from "./tool-receipt";
 import { stampSortAt } from "./list-params";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
@@ -626,6 +639,12 @@ function asTask(row: Record<string, unknown>): Task {
   delete extra.receipt_at;
   delete extra.previous_status;
   delete extra.notice_rows;
+  delete extra.scanned_rows;
+  delete extra.queue_episode;
+  delete extra.notice_id;
+  delete extra.notice_at;
+  delete extra.observer_generation;
+  delete extra.measured_at;
   if (receipt) attachReceipt(task, receipt);
   return task;
 }
@@ -1736,6 +1755,169 @@ async function taskRevisionOf(id: number): Promise<string | null> {
   `;
   const revision = rows[0]?.revision;
   return typeof revision === "string" ? revision : null;
+}
+
+function isoTime(value: unknown): string {
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "string" && value.length > 0) return value;
+  throw new Error("coverage clock returned no timestamp");
+}
+
+async function coverageMeasuredAt(): Promise<string> {
+  const rows = await sql()`select clock_timestamp() as measured_at`;
+  return isoTime(rows[0]?.measured_at);
+}
+
+function coverageFromClaimRow(row: Record<string, unknown>): TaskCoverage {
+  const measuredAt = isoTime(row.measured_at);
+  // A failed observer check must not reveal whether an episode or notice exists.
+  if (row.observer_generation == null || row.observer_generation === "") {
+    return unknownCoverage("ineligible_observer", measuredAt);
+  }
+  const scanned = Number(row.scanned_rows ?? 0);
+  const evidence = decideQueueEvidence({
+    scanned: Number.isFinite(scanned) ? scanned : QUEUE_EPISODE_SCAN_LIMIT,
+    scanLimit: QUEUE_EPISODE_SCAN_LIMIT,
+    episodeId: row.queue_episode == null || row.queue_episode === "" ? null : String(row.queue_episode),
+    noticeId: row.notice_id == null || row.notice_id === "" ? null : String(row.notice_id),
+    noticeAt: row.notice_at == null || row.notice_at === "" ? null : isoTime(row.notice_at),
+  });
+  return { ...evidence, measured_at: measuredAt };
+}
+
+/**
+ * Claim one task and, only for an events observer, attach bounded queue evidence.
+ * The lookup is the same statement as the status change. It reads at most
+ * QUEUE_EPISODE_SCAN_LIMIT newest audit rows in the 30-day window
+ * (events_created_idx) and does not fall back to an older episode.
+ * An ineligible observer still claims, with unknown evidence and no ids.
+ */
+export async function claimTaskWithCoverage(input: {
+  platform: string;
+  machine?: string;
+  agent_id: string;
+  observer: TaskNoticeObserverProof | null;
+}): Promise<{ task: Task | null; coverage: TaskCoverage }> {
+  if (!input.observer) {
+    const task = await claimNextTask(input);
+    return { task, coverage: unknownCoverage("ineligible_observer", await coverageMeasuredAt()) };
+  }
+  const observer = input.observer;
+  const db = sql();
+  let candidates: Task[];
+  try {
+    const rows = await db`
+      select * from tasks
+      where status = 'queued'
+        and platform = any(${[input.platform, "any"]}::text[])
+      order by priority asc, created_at asc
+      limit 10
+    `;
+    candidates = (rows as Record<string, unknown>[]).map(asTask);
+  } catch (e) {
+    throw new Error(errMsg(e));
+  }
+
+  const now = new Date().toISOString();
+  const actor = currentActor();
+  const activityActorType = actor?.actor_type ?? null;
+  const activityActorId = actor?.actor_id ?? null;
+  for (const t of candidates) {
+    if (t.machine && input.machine && t.machine !== input.machine) continue;
+    if (t.machine && !input.machine) continue;
+    try {
+      const claimed = await db`
+        with changed as (
+          update tasks set
+            status = 'claimed',
+            assigned_agent = ${input.agent_id},
+            claimed_at = ${now},
+            updated_at = ${now}
+          where id = ${t.id} and status = 'queued'
+          returning *
+        ),
+        logged as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            'task_claimed',
+            'Claimed task #' || changed.id::text || ': ' || coalesce(changed.title, ''),
+            jsonb_build_object(
+              'task_id', changed.id,
+              'tool', 'claim_task',
+              'status', changed.status,
+              'assigned_agent', changed.assigned_agent,
+              'actor_type', ${activityActorType}::text,
+              'actor_id', ${activityActorId}::text
+            )
+          from changed
+          returning id, kind, created_at
+        ),
+        scanned as (
+          select id, created_at, detail
+          from events
+          where created_at >= clock_timestamp() - (${QUEUE_EPISODE_WINDOW_DAYS}::int * interval '1 day')
+          order by created_at desc, id desc
+          limit ${QUEUE_EPISODE_SCAN_LIMIT}
+        ),
+        episode as (
+          select id::text as episode_id, created_at as episode_at
+          from scanned
+          where detail->'_ak_task_queue_v1'->>'task_id' = (select id::text from changed)
+          order by created_at desc, id desc
+          limit 1
+        ),
+        notice as (
+          select g.id::text as notice_id, g.received_at as notice_at
+          from episode ep
+          join gh_events g
+            on g.delivery_id = 'task:ready:' || (select id::text from changed) || ':' || ep.episode_id
+          where g.event = ${TASK_READY_EVENT}
+            and g.repo = ${TASK_QUEUE_REPO}
+            and g.payload->>'v' = ${String(TASK_NOTICE_VERSION)}
+            and g.payload->>'task_id' = (select id::text from changed)
+            and g.payload->>'queue_receipt_id' = ep.episode_id
+        ),
+        observer as (
+          select c.generation::text as generation
+          from event_stream_consumers c
+          join agent_credentials a on a.id = c.credential_id
+          where c.id = ${observer.consumer}
+            and c.credential_id = ${observer.credentialId}
+            and c.enabled
+            and a.revoked_at is null
+            and (a.expires_at is null or a.expires_at > clock_timestamp())
+            and 'events:read' = any(a.scopes)
+            and ${TASK_QUEUE_REPO} = any(c.repos)
+            and ${TASK_READY_EVENT} = any(c.event_types)
+            and c.generation::text = ${observer.generation}
+          for update of c
+        )
+        select
+          changed.*,
+          logged.id as receipt_id,
+          logged.kind as receipt_kind,
+          logged.created_at as receipt_at,
+          (select count(*) from scanned) as scanned_rows,
+          (select episode_id from episode) as queue_episode,
+          (select notice_id from notice) as notice_id,
+          (select notice_at from notice) as notice_at,
+          (select generation from observer) as observer_generation,
+          clock_timestamp() as measured_at
+        from changed
+        left join logged on true
+      `;
+      if (claimed.length > 0) {
+        const row = claimed[0] as Record<string, unknown>;
+        const coverage = coverageFromClaimRow(row);
+        return { task: asTask(row), coverage };
+      }
+    } catch (e) {
+      throw new Error(errMsg(e));
+    }
+  }
+  return { task: null, coverage: unknownCoverage("no_claim", await coverageMeasuredAt()) };
 }
 
 /** Read one task. Callers that confirm a preview use `readTaskForPreview` instead. */

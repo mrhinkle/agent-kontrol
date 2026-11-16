@@ -1,3 +1,5 @@
+import { CONSUMER_ID } from "./events-stream";
+
 /**
  * Internal queue-episode marker and optional task-ready notice (#78).
  *
@@ -36,7 +38,7 @@ export class ReservedQueueMarkerError extends Error {
 }
 
 /** Default off. Only the exact value "1" enables the producer. */
-export function taskNoticeProducerEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+export function taskNoticeProducerEnabled(env: Record<string, string | undefined> = process.env): boolean {
   return env[TASK_NOTICE_PRODUCER_ENV] === "1";
 }
 
@@ -132,4 +134,51 @@ export function decideQueueEvidence(input: {
     notice_at: null,
     reason: "no_episode_in_window",
   };
+}
+
+export interface TaskCoverage {
+  evidence: QueueEvidenceStatus | "unknown";
+  queue_episode: string | null;
+  notice_id: string | null;
+  notice_at: string | null;
+  measured_at: string;
+  reason: string;
+}
+
+/** No episode or notice ids. Used when the observer is not eligible or nothing was claimed. */
+export function unknownCoverage(reason: string, measuredAt: string): TaskCoverage {
+  return {
+    evidence: "unknown",
+    queue_episode: null,
+    notice_id: null,
+    notice_at: null,
+    measured_at: measuredAt,
+    reason,
+  };
+}
+
+const GENERATION_ID = /^(0|[1-9][0-9]{0,18})$/;
+
+/** Proof checked again inside the claim statement. The token itself never reaches that statement. */
+export interface TaskNoticeObserverProof {
+  consumer: string;
+  credentialId: string;
+  generation: string;
+}
+
+/**
+ * The events credential is a separate header. A task bearer is not read here.
+ * Missing or malformed proof is null, which the claim reports as unknown.
+ */
+export function readTaskNoticeObserverHeaders(headers: Headers): { token: string; consumer: string; generation: string } | null {
+  const authorization = headers.get("x-ak-event-authorization");
+  const consumer = headers.get("x-ak-event-consumer");
+  const generation = headers.get("x-ak-event-generation");
+  if (!authorization || !consumer || !generation) return null;
+  const match = /^Bearer\s+(\S+)$/i.exec(authorization.trim());
+  if (!match) return null;
+  const token = match[1];
+  if (!token.startsWith("akc_") || token.length < 12 || token.length > 200) return null;
+  if (!CONSUMER_ID.test(consumer) || !GENERATION_ID.test(generation)) return null;
+  return { token, consumer, generation };
 }

@@ -107,8 +107,11 @@ events. A queue episode is the audit receipt id written when a task enters
 queued, including while notices are off, so a later requeue cannot reuse an
 older notice. The `task-ready` notice is inserted in that same statement only
 when `AK_TASK_NOTICE_PRODUCER` is exactly `1` (unset means off). That flag is
-not set by this tree. Do not claim a coverage percentage or production delivery
-from `fallback_claims` or from synthetic tests.
+not set by this tree. A claim returns queue evidence only when `coverage` is true
+and a separate events credential, consumer, and generation are bound to exactly
+`agent-kontrol/task-queue` and `task-ready`. Otherwise the evidence is unknown
+and the task response is unchanged. Do not claim a coverage percentage or
+production delivery from `fallback_claims` or from synthetic tests.
 
 This source change does not activate any dispatcher, reviewer, scheduler or
 Carmack job. Follow the API consumer setup and existing owner deployment holds.
