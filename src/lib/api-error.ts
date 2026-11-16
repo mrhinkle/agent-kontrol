@@ -328,6 +328,14 @@ function safeCaught(err: unknown): SafeCaught | null {
   if (msg.startsWith("privacy: refusing ")) {
     return { code: "validation_failed", message: msg, fields: { detail: msg } };
   }
+  const reservedMarker = namedError(err, "ReservedQueueMarkerError");
+  if (reservedMarker) {
+    return {
+      code: "validation_failed",
+      message: reservedMarker.message,
+      fields: reservedMarker.fields ?? { detail: reservedMarker.message },
+    };
+  }
   return null;
 }
 

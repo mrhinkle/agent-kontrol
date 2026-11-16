@@ -23,6 +23,7 @@ import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/ide
 import { StaleWrite } from "../src/lib/revision";
 import { readReceipt } from "../src/lib/activity";
 import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview, findAgent, deleteMemory, slugify } from "../src/lib/store";
+import { testTaskQueueNotices } from "./pg-task-notice-tests";
 import { updateTaskForTool } from "../src/lib/dry-run-actions";
 import { runWithActor } from "../src/lib/actor";
 import { GET as getRepoSettings, PUT as putRepoSettings } from "../src/app/api/settings/repos/route";
@@ -137,6 +138,7 @@ async function main() {
   const untouched = await updateTask({ id: actorTask.id, result: "still mine" });
   assert.equal(untouched.actor_id, `${tag}-actor`);
   assert.equal(untouched.result, "still mine");
+  await testTaskQueueNotices();
 
   const absentKey = `${tag}/absent`;
   const raced = await Promise.allSettled([
@@ -2369,8 +2371,11 @@ async function testDecisionWritebackHardening(tag: string) {
 /**
  * An empty configured database reports the stored-list version, so the first
  * save that sends it is not stale. The dry run diffs that empty list. A
- * receipt insert that fails rolls the replace back. A normal write leaves
- * one receipt and the new list. REST PUT still writes no receipt.
+ * receipt insert that fails rolls the replace back. A normal MCP write leaves
+ * one receipt and the new list. REST PUT writes one receipt for that saved
+ * list. This harness unsets the dashboard password and MC_TOKEN, so the
+ * stored actor is null. A dry run writes none. A direct replace that does
+ * not pass a receipt writes none.
  */
 async function testRepoSettingsVersionAndReceipt(tag: string): Promise<void> {
   const digits = tag.replace(/\D/g, "").slice(-8);
@@ -2390,9 +2395,9 @@ async function testRepoSettingsVersionAndReceipt(tag: string): Promise<void> {
   const savedToken = process.env.MC_TOKEN;
   delete process.env.MC_DASHBOARD_PASSWORD;
   delete process.env.MC_TOKEN;
-  const detailOf = (value: unknown): { version?: string; tool?: string; actor_id?: string } => {
-    if (typeof value === "string") return JSON.parse(value) as { version?: string; tool?: string; actor_id?: string };
-    if (value && typeof value === "object") return value as { version?: string; tool?: string; actor_id?: string };
+  const detailOf = (value: unknown): { version?: string; tool?: string; actor_type?: string | null; actor_id?: string | null } => {
+    if (typeof value === "string") return JSON.parse(value) as { version?: string; tool?: string; actor_type?: string | null; actor_id?: string | null };
+    if (value && typeof value === "object") return value as { version?: string; tool?: string; actor_type?: string | null; actor_id?: string | null };
     return {};
   };
   const dropTrigger = async () => {
@@ -2487,6 +2492,11 @@ async function testRepoSettingsVersionAndReceipt(tag: string): Promise<void> {
     assert.equal(restDiff.would_write, true);
     assert.equal(restDiff.changes.some((change) => change.op === "remove"), false);
     assert.equal(restDiff.changes.some((change) => change.op === "add" && change.summary.includes(repoB)), true);
+    const previewEvents = await sql()`
+      select count(*)::int as n from events
+      where kind = 'set_watched_repos' and id > ${floorId}::bigint
+    `;
+    assert.equal(Number(previewEvents[0].n), 0, "a REST dry run writes no receipt");
     const restPut = await putRepoSettings(new Request("http://localhost/api/settings/repos", {
       method: "PUT",
       headers: { "content-type": "application/json" },
@@ -2494,15 +2504,26 @@ async function testRepoSettingsVersionAndReceipt(tag: string): Promise<void> {
     }));
     const restText = await restPut.text();
     assert.equal(restPut.status, 200, restText);
-    const restSaved = JSON.parse(restText) as { source: string; repos: { repo: string }[]; version: string };
+    const restSaved = JSON.parse(restText) as { source: string; repos: { repo: string }[]; version: string; receipt?: unknown };
     assert.equal(restSaved.source, "database");
     assert.deepEqual(restSaved.repos.map((item) => item.repo), [repoB]);
     assert.notEqual(restSaved.version, gotBody.version);
+    assert.equal(restSaved.receipt, undefined, "REST still returns the settings document");
     const restEvents = await sql()`
-      select count(*)::int as n from events
+      select id::text as id, kind, title, detail
+      from events
       where kind = 'set_watched_repos' and id > ${floorId}::bigint
+      order by id asc
     `;
-    assert.equal(Number(restEvents[0].n), 0, "REST PUT writes no receipt");
+    assert.equal(restEvents.length, 1, "REST PUT writes one receipt for the saved list");
+    const restDetail = detailOf(restEvents[0].detail);
+    assert.equal(String(restEvents[0].kind), "set_watched_repos");
+    assert.equal(String(restEvents[0].title), "Watched repos replaced");
+    assert.equal(restDetail.tool, "set_watched_repos");
+    assert.equal(restDetail.actor_type, null);
+    assert.equal(restDetail.actor_id, null);
+    assert.equal(restDetail.version, restSaved.version);
+    await sql()`delete from events where id = ${String(restEvents[0].id)}::bigint`;
     await sql()`delete from watched_repos where repo = ${repoB}`;
 
     await replaceWatchedRepos([row(repoA, shortA, "Kept")]);
@@ -2514,6 +2535,7 @@ async function testRepoSettingsVersionAndReceipt(tag: string): Promise<void> {
       select count(*)::int as n from events
       where kind = 'set_watched_repos' and id > ${floorId}::bigint
     `;
+    assert.equal(Number(eventsBeforeFail[0].n), 0, "a direct replace without a receipt writes none");
     await sql()`
       create or replace function ak_test_fail_repo_event()
       returns trigger
