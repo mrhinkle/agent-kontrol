@@ -252,6 +252,153 @@ class DispatcherStreamTests(unittest.TestCase):
             thread.join(timeout=2)
 
 
+def task_ready(notice="20", task="9", episode="4", extra=None):
+    cursor = "reviewer:" + notice
+    payload = {"v": 1, "task_id": task, "queue_receipt_id": episode, "platform": "codex", "machine": "box"}
+    if extra:
+        payload.update(extra)
+    value = {"id": cursor, "event": "task-ready", "payload": payload}
+    return ("id: " + cursor + "\nevent: github\ndata: " + json.dumps(value) + "\n\n").encode()
+
+
+def notified(**over):
+    coverage = {
+        "evidence": "notified",
+        "reason": "exact_notice",
+        "queue_episode": "4",
+        "notice_id": "20",
+        "notice_at": "2026-11-15T00:00:00+00:00",
+        "measured_at": "2026-11-15T00:02:00+00:00",
+    }
+    coverage.update(over)
+    return coverage
+
+
+class FallbackObservationTests(unittest.TestCase):
+    def setUp(self):
+        self.previous_poll = dispatcher.POLL
+        dispatcher.POLL = 20
+
+    def tearDown(self):
+        dispatcher.POLL = self.previous_poll
+
+    def opened(self):
+        client, wake = DispatcherStreamTests().client()
+        client._consume(io.BytesIO(b'event: observation\ndata: {"baseline":"15","generation":"4"}\n\n'))
+        return client, wake
+
+    def test_observation_does_not_advance_or_wake(self):
+        client, wake = self.opened()
+        self.assertIsNone(client.cursor)
+        self.assertEqual(client.notices.proof(), "4")
+        self.assertEqual(client.notices.baseline, "15")
+        self.assertEqual(wake.wait(0), {"fallback"})
+
+    def test_malformed_observation_invalidates_without_clearing_eviction(self):
+        client, _wake = self.opened()
+        client.notices.evicted_through = 8
+        client._consume(io.BytesIO(b'event: observation\ndata: {"baseline":"01","generation":"4","title":"secret"}\n\n'))
+        self.assertIsNone(client.notices.proof())
+        self.assertEqual(client.notices.evicted_through, 8)
+        self.assertIsNone(client.cursor)
+
+    def test_exact_accept_is_received_and_replay_is_idempotent(self):
+        client, wake = self.opened()
+        client._consume(io.BytesIO(task_ready()))
+        client._consume(io.BytesIO(task_ready()))
+        self.assertEqual(client.cursor, "reviewer:20")
+        self.assertEqual(wake.wait(0), {"event"})
+        self.assertEqual(len(client.notices._items), 1)
+        label, reason = client.notices.classify_claim("fallback", {"fallback"}, notified(), 9)
+        self.assertEqual((label, reason), ("received", "exact_notice"))
+
+    def test_withheld_notice_after_the_interval_is_one_fallback_before_notice(self):
+        client, _wake = self.opened()
+        label, reason = client.notices.classify_claim("fallback", {"fallback"}, notified(), 9)
+        self.assertEqual((label, reason), ("fallback_before_notice", "notice_absent_at_claim"))
+        client.notices.accept("4", "20", "9", "4")
+        again, again_reason = client.notices.classify_claim("fallback", {"fallback"}, notified(), 9)
+        self.assertEqual((again, again_reason), ("received", "exact_notice"))
+
+    def test_short_interval_baseline_and_unnotified_stay_unknown(self):
+        client, _wake = self.opened()
+        short = notified(measured_at="2026-11-15T00:00:30+00:00")
+        self.assertEqual(client.notices.classify_claim("fallback", {"fallback"}, short, 9)[0], "unknown")
+        self.assertEqual(client.notices.classify_claim("fallback", {"fallback"}, notified(notice_id="15"), 9)[1], "before_baseline")
+        absent = {"evidence": "unnotified_or_expired", "reason": "notice_absent", "queue_episode": "4", "notice_id": None, "notice_at": None, "measured_at": "2026-11-15T00:02:00+00:00"}
+        self.assertEqual(client.notices.classify_claim("fallback", {"fallback"}, absent, 9), ("unknown", "notice_absent"))
+        truncated = {"evidence": "unknown_history", "reason": "audit_window_truncated", "queue_episode": None, "notice_id": None, "notice_at": None, "measured_at": "2026-11-15T00:02:00+00:00"}
+        self.assertEqual(client.notices.classify_claim("fallback", {"fallback"}, truncated, 9)[1], "audit_window_truncated")
+
+    def test_capacity_mixed_and_disconnect_are_unknown(self):
+        client, _wake = self.opened()
+        self.assertEqual(client.notices.classify_claim("capacity", {"capacity"}, notified(), 9), ("unknown", "capacity"))
+        self.assertEqual(client.notices.classify_claim("event", {"event", "fallback"}, notified(), 9), ("unknown", "mixed"))
+        self.assertEqual(dispatcher.coverage_for_disconnected("reconcile", {"startup"}), ("unknown", "reconcile"))
+        client._consume(io.BytesIO(b"event: cursor_expired\ndata: {}\n\n"))
+        self.assertIsNone(client.cursor)
+        self.assertIsNone(client.notices.proof())
+        self.assertEqual(client.notices.classify_claim("fallback", {"fallback"}, notified(), 9), ("unknown", "missing_baseline"))
+
+    def test_eviction_and_new_generation_cannot_become_a_miss(self):
+        client, _wake = self.opened()
+        for number in range(100, 100 + dispatcher.NOTICE_CACHE_LIMIT + 1):
+            client.notices.accept("4", str(number), "9", "4")
+        self.assertGreater(client.notices.evicted_through, 0)
+        evicted = str(client.notices.evicted_through)
+        label, reason = client.notices.classify_claim("fallback", {"fallback"}, notified(notice_id=evicted, queue_episode="4"), 9)
+        self.assertEqual((label, reason), ("unknown", "evicted"))
+        boundary = client.notices.evicted_through
+        client._consume(io.BytesIO(b'event: observation\ndata: {"baseline":"900","generation":"5"}\n\n'))
+        self.assertEqual(client.notices.proof(), "5")
+        self.assertEqual(client.notices.evicted_through, boundary)
+        self.assertEqual(client.notices.classify_claim("fallback", {"fallback"}, notified(notice_id=evicted), 9)[1], "evicted")
+        restarted, _wake = DispatcherStreamTests().client()
+        self.assertIsNone(restarted.notices.proof())
+        self.assertEqual(restarted.notices.evicted_through, 0)
+
+    def test_bad_task_ready_ends_the_epoch_and_claim_headers_follow_the_observation(self):
+        client, _wake = self.opened()
+        bare, bare_headers = dispatcher.task_claim_request("codex", None)
+        self.assertEqual(set(bare), {"platform", "machine", "agent_id"})
+        self.assertIsNone(bare_headers)
+        body, headers = dispatcher.task_claim_request("codex", client)
+        self.assertEqual(body["coverage"], True)
+        self.assertNotIn("akc_test", json.dumps(body))
+        self.assertEqual(headers["X-AK-Event-Authorization"], "Bearer akc_test")
+        self.assertEqual(headers["X-AK-Event-Consumer"], "reviewer")
+        self.assertEqual(headers["X-AK-Event-Generation"], "4")
+        client._consume(io.BytesIO(task_ready(extra={"title": "secret"})))
+        self.assertIsNone(client.notices.proof())
+        self.assertNotIn("secret", json.dumps(client.notices._items))
+        quiet, quiet_headers = dispatcher.task_claim_request("codex", client)
+        self.assertNotIn("coverage", quiet)
+        self.assertIsNone(quiet_headers)
+
+    def test_event_header_does_not_replace_the_task_bearer(self):
+        captured = {}
+
+        class Response:
+            def read(self):
+                return b"{}"
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                return False
+
+        def opener(req, timeout=30):
+            captured["authorization"] = req.get_header("Authorization")
+            captured["event"] = req.get_header("X-ak-event-authorization")
+            captured["timeout"] = timeout
+            return Response()
+
+        with patch.object(dispatcher, "MC_URL", "https://example.test"), patch.object(dispatcher, "MC_TOKEN", "task-token"), patch.object(dispatcher.urllib.request, "urlopen", opener):
+            dispatcher.api("/api/tasks/claim", {"platform": "codex", "coverage": True}, headers={"X-AK-Event-Authorization": "Bearer akc_test"})
+        self.assertEqual(captured["authorization"], "Bearer task-token")
+        self.assertEqual(captured["event"], "Bearer akc_test")
+        self.assertNotIn("akc_test", json.dumps({"platform": "codex", "coverage": True}))
+
+
 def client_limit():
     return dispatcher.EventStreamWake.MAX_FRAME + 1
 

@@ -46,7 +46,10 @@ export async function runEventStreamTests(): Promise<void> {
     assert.equal(foreignCursor.status, 403);
 
     let generation = await acquireStream(a, ca.credential.id);
-    assert.deepEqual(await readStreamBatch(a, ca.credential.id, generation, "0"), { expired: false, events: [] });
+    const opened = await readStreamBatch(a, ca.credential.id, generation, "0");
+    assert.equal(opened.expired, false);
+    assert.deepEqual(opened.events, []);
+    assert.match(String(opened.baseline), /^(?:0|[1-9][0-9]{0,18})$/);
     const insert = async (suffix: string, event = "status", eventRepo = repo) => {
       const out = await insertGhEvent({ delivery_id: `${prefix}-${suffix}`, event, repo: eventRepo, payload: { marker: suffix } });
       assert.ok(out.stored);
@@ -86,9 +89,22 @@ export async function runEventStreamTests(): Promise<void> {
       { headers: { authorization: `Bearer ${ca.token}` } }));
     assert.equal(stream.status, 200);
     const reader = stream.body!.getReader();
-    const frame = new TextDecoder().decode((await reader.read()).value);
-    assert.match(frame, new RegExp(`id: ${a}:${second}`));
-    assert.doesNotMatch(frame, /other-repo|other-type/);
+    let wireText = "";
+    for (let chunk = 0; chunk < 4 && !wireText.includes(`id: ${a}:${second}`); chunk += 1) {
+      const next = await reader.read();
+      if (next.done) break;
+      wireText += new TextDecoder().decode(next.value);
+    }
+    const observationEnd = wireText.indexOf("\n\n");
+    const observation = wireText.slice(0, observationEnd);
+    assert.match(observation, /^event: observation\ndata: /);
+    assert.doesNotMatch(observation, /^id:/m);
+    const observed = JSON.parse(observation.split("data: ")[1]);
+    assert.match(observed.baseline, /^(?:0|[1-9][0-9]{0,18})$/);
+    assert.match(observed.generation, /^(?:0|[1-9][0-9]{0,18})$/);
+    assert.equal(Object.keys(observed).sort().join(), "baseline,generation");
+    assert.match(wireText.slice(observationEnd), new RegExp(`id: ${a}:${second}`));
+    assert.doesNotMatch(wireText, /other-repo|other-type/);
     await reader.cancel();
 
     // Exercise the review findings through the actual route and held transport.

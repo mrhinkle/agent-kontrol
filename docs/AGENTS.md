@@ -103,7 +103,7 @@ While connected, fallback polling is no more frequent than every 60 seconds
 (`max(MC_POLL_SECONDS, 60)`). While unavailable it keeps the existing poll interval.
 Claim logs distinguish event/capacity/fallback/reconciliation and count raw
 `fallback_claims` with stream health. These counts are not proof of causally missed
-events. A queue episode is the audit receipt id written when a task enters
+events. After an observation baseline, a fallback-only claim is `fallback_before_notice` only for the current episode whose notice is after that baseline, was not accepted before the claim, and had at least the connected poll interval to arrive; restart, disconnect, eviction, and every other trigger stay unknown. A queue episode is the audit receipt id written when a task enters
 queued, including while notices are off, so a later requeue cannot reuse an
 older notice. The `task-ready` notice is inserted in that same statement only
 when `AK_TASK_NOTICE_PRODUCER` is exactly `1` (unset means off). That flag is

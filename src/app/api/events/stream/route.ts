@@ -27,7 +27,10 @@ export async function GET(req: Request): Promise<Response> {
     const position = cursorPosition(consumer, queryCursor ?? headerCursor);
     const generation = await acquireStream(consumer, access.principal.id);
     const first = await readStreamBatch(consumer, access.principal.id, generation, position);
-    return eventStreamResponse({ consumer, position, generation, credential: access.principal.id, signal: req.signal, first });
+    return eventStreamResponse({
+      consumer, position, generation, credential: access.principal.id, signal: req.signal, first,
+      baseline: first.baseline,
+    });
   } catch (e) {
     const known = e instanceof EventStreamError;
     return Response.json({ error: known ? e.code : "stream_unavailable" }, { status: known ? e.status : 503 });

@@ -109,7 +109,7 @@ export async function acquireStream(consumer: string, credential: string): Promi
 }
 
 export interface StreamEvent { id: string; event: string; payload: Record<string, unknown> }
-export interface StreamBatch { expired: boolean; events: StreamEvent[] }
+export interface StreamBatch { expired: boolean; events: StreamEvent[]; baseline?: string }
 
 /** Serialize each enqueue with binding updates and credential revocation. */
 async function enqueueStreamFrame(consumer: string, credential: string, generation: string, enqueue: () => void): Promise<void> {
@@ -140,10 +140,17 @@ export async function readStreamBatch(consumer: string, credential: string, gene
         throw new EventStreamError("foreign_cursor", 403);
       }
     }
+    // Primary key only. The SHARE lock already excludes an insert that has not
+    // committed, so this high-water mark is the observation baseline.
+    const mark = await tx`select coalesce(max(id), 0)::text as baseline from gh_events`;
     const rows = await tx`select id::text as id, event, payload from gh_events
       where id > ${position}::bigint and repo = any(${c.repos}::text[])
       and event = any(${c.event_types}::text[]) order by gh_events.id limit ${STREAM_BATCH}`;
-    return { expired: false, events: rows.map(r => ({ id: String(r.id), event: String(r.event), payload: r.payload })) };
+    return {
+      expired: false,
+      baseline: String(mark[0]?.baseline ?? "0"),
+      events: rows.map(r => ({ id: String(r.id), event: String(r.event), payload: r.payload })),
+    };
   });
 }
 
@@ -168,7 +175,7 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
 /** Bounded transport; options are internal/test inputs, never request parameters. */
 export function eventStreamResponse(opts: {
   consumer: string; position: string; generation: string; credential: string; signal: AbortSignal;
-  first: StreamBatch; read?: typeof readStreamBatch; pollMs?: number; heartbeatMs?: number; lifetimeMs?: number;
+  first: StreamBatch; baseline?: string; read?: typeof readStreamBatch; pollMs?: number; heartbeatMs?: number; lifetimeMs?: number;
   enqueue?: (push: () => void) => Promise<void>;
 }): Response {
   const stop = new AbortController();
@@ -204,6 +211,13 @@ export function eventStreamResponse(opts: {
       try {
         let batch = opts.first;
         let lastHeartbeat = Date.now();
+        const baseline = opts.baseline;
+        if (!batch.expired && baseline != null
+          && /^(?:0|[1-9][0-9]{0,18})$/.test(baseline)
+          && /^(?:0|[1-9][0-9]{0,18})$/.test(opts.generation)) {
+          const observation = `event: observation\ndata: ${JSON.stringify({ baseline, generation: opts.generation })}\n\n`;
+          if (!await send(observation)) return;
+        }
         while (!stop.signal.aborted) {
           if (batch.expired) {
             terminal('event: cursor_expired\ndata: {"reconcile":true}\n\n');
