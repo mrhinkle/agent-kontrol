@@ -416,6 +416,66 @@ describe("sanitizeErrorMessage", () => {
     assert.equal(words.length, 301);
     assert.equal(words.includes("npg_"), false);
   });
+
+  // CodeRabbit re-review of PR #157 at dffdab6 (outside-diff comment).
+  it("redacts a key spelled with JSON unicode escapes as its plain spelling", () => {
+    assert.equal(
+      sanitizeErrorMessage('{"pass\\u0077ord":"SECa RETb","message":"after"}'),
+      '{"password"=[redacted],"message":"after"}',
+    );
+    assert.equal(
+      sanitizeErrorMessage('{"tok\\u0065n":null,"message":"password authentication failed"}'),
+      '{"token"=[redacted],"message":"password authentication failed"}',
+    );
+    assert.equal(sanitizeErrorMessage("via npg\\u005fSECaRETb then"), "via [redacted] then");
+    assert.equal(sanitizeErrorMessage("sent \\u0042earer SECaRETb upstream"), "sent Bearer [redacted] upstream");
+    // Only key characters are decoded. An escaped quote, backslash, space or
+    // marker stays as written, so it cannot end a quoted value early.
+    const others = "caf\\u00e9 \\u0022quoted\\u0022 \\uE000 \\u005c tab\\u0009";
+    assert.equal(sanitizeErrorMessage(others), others);
+    assert.equal(
+      sanitizeErrorMessage('{"password":"a\\u0022b c","message":"after"}'),
+      '{"password"=[redacted],"message":"after"}',
+    );
+
+    const keys = [
+      "password", "PGPASSWORD", "db_password", "passwd", "pwd", "secret", "token",
+      "api_key", "apikey", "credential", "private_key", "authorization", "cookie",
+    ];
+    const values: unknown[] = ["SECa RETb", null, 123, { access: "SECa RETb" }, ["SECa RETb"]];
+    const escape = (char: string, upper: boolean): string => {
+      const hex = char.charCodeAt(0).toString(16).padStart(4, "0");
+      return `\\u${upper ? hex.toUpperCase() : hex}`;
+    };
+    let checked = 0;
+    for (const key of keys) {
+      // Each character escaped on its own (lower- and upper-case hex), then all of them.
+      const spellings = [...key].map((char, i) => key.slice(0, i) + escape(char, i % 2 === 1) + key.slice(i + 1));
+      spellings.push([...key].map((char) => escape(char, false)).join(""));
+      for (const spelled of spellings) {
+        const inputs: Array<[string, string]> = [];
+        for (const value of values) {
+          const fields = { [key]: value, message: "after" };
+          const json = JSON.stringify(fields);
+          const pretty = JSON.stringify(fields, null, 2);
+          inputs.push([json, json], [pretty, pretty], [JSON.stringify({ msg: json }), json]);
+        }
+        const kv = JSON.stringify({ msg: `${key}=SECaRETb next` });
+        inputs.push([kv, kv]);
+        for (const [plain, source] of inputs) {
+          const escaped = plain === source
+            ? plain.split(`"${key}"`).join(`"${spelled}"`).split(`${key}=`).join(`${spelled}=`)
+            : JSON.stringify({ msg: source.split(`"${key}"`).join(`"${spelled}"`) });
+          assert.notEqual(escaped, plain);
+          const out = sanitizeErrorMessage(escaped);
+          assert.equal(/SECa|RETb/.test(out), false, `${JSON.stringify(escaped)} -> ${out}`);
+          assert.equal(out, sanitizeErrorMessage(plain), JSON.stringify(escaped));
+          checked += 1;
+        }
+      }
+    }
+    assert.equal(checked, 1840);
+  });
 });
 
 describe("describeDbError", () => {

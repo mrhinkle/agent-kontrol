@@ -6,7 +6,8 @@ import { redactText } from "./traces";
  * Logged: the error name, the Postgres SQLSTATE or driver error code (`code`),
  * and the message with connection URLs, `user:password@` pairs, `password=`
  * pairs, Neon passwords (`npg_…`), bearer tokens, agent credentials (`akc_…`)
- * and other obvious secrets replaced, collapsed to one line and capped. The
+ * and other obvious secrets replaced (a key spelled with JSON `\uXXXX` escapes
+ * counts as its plain spelling), collapsed to one line and capped. The
  * `cause` and the Neon driver's `sourceError` are followed a few levels, so a
  * wrapped connection failure still shows the driver's code.
  *
@@ -81,6 +82,23 @@ const NEON_PASSWORD = /npg_\S*/g;
 const BEARER = new RegExp(String.raw`\bBearer\s+${TO_WHITESPACE}`, "gi");
 const AGENT_CREDENTIAL = /akc_\S*/g;
 const SAFE_CODE = /^[A-Za-z0-9_]{1,40}$/;
+// A JSON `\uXXXX` escape inside a key (`pass\u0077ord`, or `pass\\u0077ord` in
+// JSON inside JSON) is decoded first, so the message is redacted as if it had
+// been written without it. Only a character that can sit in a key or a token
+// prefix (a letter, a digit, `_`, `.`, `-`) is decoded. Decoding a quote, a
+// backslash or a space would move where a value ends, valid JSON never escapes
+// its structural `:` `,` `}` `]`, and the marker U+E000 stays unforgeable. The
+// backslashes before the `u` go with it; the lookbehind starts a match only at
+// the first of them, so matching stays linear.
+const KEY_ESCAPE = /(?<!\\)\\+u([0-9a-fA-F]{4})/g;
+const KEY_CHAR = /^[A-Za-z0-9_.-]$/;
+
+function decodeKeyEscapes(text: string): string {
+  return text.replace(KEY_ESCAPE, (escape: string, hex: string) => {
+    const char = String.fromCharCode(Number.parseInt(hex, 16));
+    return KEY_CHAR.test(char) ? char : escape;
+  });
+}
 
 /** Removes secrets and URLs from an error message and caps its length. */
 export function sanitizeErrorMessage(message: string, max: number = MAX_MESSAGE): string {
@@ -95,7 +113,7 @@ export function sanitizeErrorMessage(message: string, max: number = MAX_MESSAGE)
   // where its own secret ends (quoted values, literals under a quoted key,
   // nested values, malformed literals under a quoted key, header lines) runs first, then BEARER and SECRET_WORD, and
   // only then URL_LIKE and USERINFO.
-  const cleaned = bounded
+  const cleaned = decodeKeyEscapes(bounded)
     .replace(QUOTED_PAIR, `$1$2=${DONE}`)
     .replace(LITERAL_PAIR, `$1$2=${DONE}`)
     .replace(NESTED_PAIR, `$1$2=${DONE}`)
