@@ -98,7 +98,8 @@ function install(rows: StoredRepo[]) {
     if (text.includes("update watched_owners")) {
       const stamp = values.find((value) => typeof value === "string" && value.includes("T"));
       if (typeof stamp === "string") owners[0].last_discovered_at = stamp;
-      return [];
+      const owner = values[values.length - 1];
+      return typeof owner === "string" ? [{ owner }] : [];
     }
     if (text.includes("insert into watched_repos") && text.includes("fields_overridden")) {
       inserts += 1;
@@ -159,7 +160,7 @@ function install(rows: StoredRepo[]) {
           position: rows.length,
         }));
       });
-      return [];
+      return names.map((name) => ({ repo: name }));
     }
     if (text.includes("update watched_repos")) {
       const repo = values.find((value) => typeof value === "string" && value.includes("/"));
