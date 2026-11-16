@@ -2347,7 +2347,7 @@ export function openApiDocument(): Json {
           tags: ["skills"],
           summary: "Mirror skill sources from GitHub.",
           description:
-            "Operator route. An agent credential is denied. Omit the body, or send {trigger:manual}, for a manual run. A scheduler sends {trigger:scheduled} with MC_TOKEN. status in the body is ok, failed, or busy. failed means a source or a SKILL.md could not be evaluated. It is not a deletion. busy writes nothing. With no database the body is a no-op note and no sync is claimed.",
+            "Operator route. An agent credential is denied. Omit the body, or send {trigger:manual}, for a manual run. A scheduler sends {trigger:scheduled} with MC_TOKEN. status in the body is ok, failed, or busy. failed means a source or a SKILL.md could not be evaluated. It is not a deletion. busy writes nothing. With no database the body is a no-op note and no sync is claimed. errors entries have source, message, and severity (fatal or notice). Fatal entries come first. A skipped reference or an ignored runtime name is a notice and does not by itself fail the run. A single-line strict JSON object in frontmatter is accepted.",
           security: cookieOrBearer,
           requestBody: body({
             type: "object",

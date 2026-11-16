@@ -544,4 +544,76 @@ describe("skill sync", { concurrency: false }, () => {
     assert.deepEqual(back.added.map((row) => row.id), ["alpha"]);
     assert.equal(skillsMemory.skills[0]?.removed_at, null);
   });
+
+  it("keeps a reference-size skip as a notice on a successful sync", async () => {
+    const result = await syncSkills({
+      trigger: "manual",
+      fetcher: fetcher({
+        "master-skills": {
+          commit_sha: "a".repeat(40),
+          files: [md("skills/alpha", "one")],
+          skipped: [{ path: "skills/ui-ux-pro-max/data/google-fonts.csv", reason: "over 256 KB" }],
+        },
+      }),
+    });
+    assert.equal(result.status, "ok");
+    assert.equal(result.added[0]?.id, "alpha");
+    assert.equal(result.changed.length, 0);
+    assert.equal(result.removed.length, 0);
+    assert.equal(result.errors.length, 1);
+    assert.equal(result.errors[0]?.severity, "notice");
+    assert.equal(result.errors[0]?.source, "master-skills");
+    assert.equal(result.errors[0]?.message, "skills/ui-ux-pro-max/data/google-fonts.csv skipped (over 256 KB)");
+    assert.equal(result.errors.some((item) => item.severity === "fatal"), false);
+  });
+
+  it("lists a leading reference skip after a later parse failure", async () => {
+    await syncSkills({
+      trigger: "manual",
+      fetcher: fetcher({
+        "master-skills": { commit_sha: "a".repeat(40), files: [md("skills/alpha", "stay")] },
+      }),
+    });
+    const before = structuredClone(skillsMemory.skills.find((row) => row.id === "alpha"));
+    const result = await syncSkills({
+      trigger: "manual",
+      fetcher: fetcher({
+        "master-skills": {
+          commit_sha: "b".repeat(40),
+          files: [
+            { path: "skills/alpha/SKILL.md", content: "---\nname: alpha\nmetadata: {not json}\n---\nreplaced\n" },
+            md("skills/beta", "new", 'metadata: {"hermes": {"tags": ["one"]}}\n'),
+            { path: "skills/broken/SKILL.md", content: '---\nname: broken\nmetadata: {"a": 1,}\n---\nnope\n' },
+          ],
+          skipped: [{ path: "skills/ui-ux-pro-max/data/google-fonts.csv", reason: "over 256 KB" }],
+        },
+      }),
+    });
+    assert.equal(result.status, "failed");
+    assert.equal(result.errors[0]?.severity, "fatal");
+    assert.equal(result.errors[0]?.source, "master-skills");
+    assert.equal(result.errors[0]?.message, "skills/alpha/SKILL.md: malformed frontmatter object");
+    const firstNotice = result.errors.findIndex((item) => item.severity === "notice");
+    const lastFatal = result.errors.findLastIndex((item) => item.severity === "fatal");
+    assert.equal(firstNotice > lastFatal, true);
+    assert.equal(
+      result.errors.some(
+        (item) =>
+          item.severity === "notice" &&
+          item.source === "master-skills" &&
+          item.message === "skills/ui-ux-pro-max/data/google-fonts.csv skipped (over 256 KB)",
+      ),
+      true,
+    );
+    assert.equal(
+      result.errors.some((item) => item.severity === "fatal" && item.message === "skills/broken/SKILL.md: malformed frontmatter object"),
+      true,
+    );
+    assert.deepEqual(skillsMemory.skills.find((row) => row.id === "alpha"), before);
+    assert.equal(skillsMemory.skills.some((row) => row.id === "broken"), false);
+    assert.equal(result.added.some((row) => row.id === "beta"), true);
+    assert.equal(result.changed.some((row) => row.id === "alpha"), false);
+    assert.equal(result.removed.includes("alpha"), false);
+    assert.deepEqual(skillsMemory.skills.find((row) => row.id === "beta")?.frontmatter.metadata, { hermes: { tags: ["one"] } });
+  });
 });
