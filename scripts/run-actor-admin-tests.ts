@@ -25,6 +25,9 @@ async function main(): Promise<void> {
   const { testSkillSync } = await import("./actor-admin-sync-tests");
   await testSkillSync();
   console.log("actor-admin sync: ok");
+  const { testSkillDrift } = await import("./actor-admin-drift-tests");
+  await testSkillDrift();
+  console.log("actor-admin drift: ok");
 }
 
 main().then(

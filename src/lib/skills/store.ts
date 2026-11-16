@@ -1,6 +1,6 @@
 import { activityDetail } from "../activity";
 import { currentActor } from "../actor";
-import { sql, type Row } from "../db";
+import { sql, withTransaction, type Row } from "../db";
 import {
   flagsFromStored,
   isTrigger,
@@ -182,6 +182,9 @@ export const SKILL_SYNC_KINDS = {
 } as const;
 
 export const SKILL_SYNC_LEASE_ACTOR = { actor_type: "agent" as const, actor_id: "skill-sync-lease" };
+
+/** One drift report. The host string in the row is a label, not this actor. */
+export const SKILL_DRIFT_KIND = "skill_drift_report";
 
 const RECEIPT_FAULT_AGENT = "ak-actor-admin-receipt-fault";
 let receiptFaultKinds: Set<string> | null = null;
@@ -656,14 +659,37 @@ function asDriftEntries(value: unknown): { name: string; sha: string }[] {
 }
 
 export async function upsertDrift(row: DriftRow): Promise<void> {
-  await db()`
-    /* sk:upsert-drift */
-    insert into skill_drift (host, dir, reported_at, entries)
-    values (${row.host}, ${row.dir}, ${row.reported_at}::timestamptz, ${JSON.stringify(row.entries)}::jsonb)
-    on conflict (host, dir) do update set
-      reported_at = excluded.reported_at,
-      entries = excluded.entries
-  `;
+  const detail = callerDetail(SKILL_DRIFT_KIND, {
+    operation: "drift_report",
+    host: row.host,
+    dir: row.dir,
+    reported_at: row.reported_at,
+    count: row.entries.length,
+  });
+  await withTransaction(async (q) => {
+    const rows = await q`
+      with written as (
+        /* sk:upsert-drift */
+        insert into skill_drift (host, dir, reported_at, entries)
+        values (${row.host}, ${row.dir}, ${row.reported_at}::timestamptz, ${JSON.stringify(row.entries)}::jsonb)
+        on conflict (host, dir) do update set
+          reported_at = excluded.reported_at,
+          entries = excluded.entries
+        returning host
+      ),
+      receipt as (
+        insert into events (agent_id, session_id, kind, title, detail)
+        select ${receiptAgent(SKILL_DRIFT_KIND)}, null, ${SKILL_DRIFT_KIND}, ${"Recorded a skill drift report"},
+          ${detail}::jsonb
+        from written
+        returning id
+      )
+      select
+        (select count(*)::int from written) as wrote,
+        (select count(*)::int from receipt) as receipted
+    `;
+    assertCountedReceipt(rows[0], "wrote", 1);
+  });
 }
 
 export async function digestRuns(sinceIso: string): Promise<RunRecord[]> {

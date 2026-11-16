@@ -177,6 +177,7 @@ function markerOf(text: string): string | null {
 
 const skillsSql: SqlTag = async (strings, ...values) => {
   const text = strings.join(" ");
+  if (/^\s*(begin|commit|rollback)\s*$/i.test(text)) return [];
   if (text.includes("insert into spans")) return spans(values);
   const marker = markerOf(text);
   if (!marker) throw new Error(`unhandled skills sql: ${text.replace(/\s+/g, " ").slice(0, 240)}`);
