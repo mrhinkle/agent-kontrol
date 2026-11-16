@@ -614,6 +614,90 @@ describe("decision actor receipts", { skip: !OPT_IN, concurrency: 1 }, () => {
     }
   });
 
+  it("labels a force-reopen from the status locked after a concurrent resolution", async () => {
+    for (const [n, status] of [[21, "decided"], [24, "deferred"]] as const) {
+      const seeded = await post(decisionBody(n, { title: "open", why: null, requested_by: null }), { token: LEGACY });
+      assert.equal(seeded.status, 200);
+      const before = await receiptsForKey(key(n));
+      const response = await whileInsertWaits(
+        (locker) => locker.query(
+          "update decisions set status = $2, decision = 'concurrent resolution', actor_type = 'human', actor_id = 'concurrent-resolver' where key = $1",
+          [key(n), status],
+        ),
+        () => post(decisionBody(n, { title: "reopened", why: LEAK, force: true }), { token: LEGACY }),
+      );
+      assert.equal(response.status, 200);
+      const body = await response.json() as { decision: { status: string; actor_id: string | null; decision: string | null } };
+      assert.equal(body.decision.status, "open");
+      assert.equal(body.decision.actor_id, null);
+      assert.equal(body.decision.decision, null);
+      const row = await decisionRows(key(n));
+      assert.equal(row[0].status, "open");
+      assert.equal(row[0].actor_id, null);
+      assert.equal(row[0].decision, null);
+      const proof = await receiptsForKey(key(n));
+      assert.equal(proof.length, before.length + 1);
+      assert.equal(proof.at(-1)?.kind, "decision.force_reopen");
+      const detail = detailOf(proof.at(-1)!);
+      assert.equal(detail.operation, "force_reopen");
+      assert.equal(detail.actor_type, "agent");
+      assert.equal(detail.actor_id, LEGACY_ACTOR_ID);
+      assert.equal(detail.status, "open");
+      assert.equal(detail.key, key(n));
+      assertNoLeak(detail);
+    }
+  });
+
+  it("labels a force-reopen when the conflicting row is inserted while the upsert waits", async () => {
+    assert.equal((await decisionRows(key(22))).length, 0);
+    const response = await whileInsertWaits(
+      async (locker) => {
+        await locker.query(
+          `insert into decisions (
+             key, source, repo, number, title, status, decision, actor_type, actor_id, decided_by, decided_at
+           ) values ($1, 'github-label', $2, 22, 'born decided', 'decided', 'concurrent resolution', 'human', 'concurrent-resolver', 'concurrent-resolver', now())`,
+          [key(22), REPO],
+        );
+      },
+      () => post(decisionBody(22, { title: "reopened", why: LEAK, force: true }), { token: LEGACY }),
+    );
+    assert.equal(response.status, 200);
+    const row = await decisionRows(key(22));
+    assert.equal(row[0].status, "open");
+    assert.equal(row[0].actor_id, null);
+    assert.equal(row[0].decision, null);
+    const proof = await receiptsForKey(key(22));
+    assert.equal(proof.length, 1);
+    assert.equal(proof[0].kind, "decision.force_reopen");
+    const detail = detailOf(proof[0]);
+    assert.equal(detail.operation, "force_reopen");
+    assert.equal(detail.actor_id, LEGACY_ACTOR_ID);
+    assert.notEqual(detail.actor_id, "concurrent-resolver");
+    assertNoLeak(detail);
+  });
+
+  it("keeps a waited force upsert as an upsert when the locked row is still open", async () => {
+    const seeded = await post(decisionBody(23, { title: "open", why: null, requested_by: null }), { token: LEGACY });
+    assert.equal(seeded.status, 200);
+    const before = await receiptsForKey(key(23));
+    const response = await whileInsertWaits(
+      (locker) => locker.query("update decisions set title = 'held open' where key = $1", [key(23)]),
+      () => post(decisionBody(23, { title: "still open", why: LEAK, force: true }), { token: LEGACY }),
+    );
+    assert.equal(response.status, 200);
+    const row = await decisionRows(key(23));
+    assert.equal(row[0].status, "open");
+    assert.equal(row[0].actor_id, null);
+    const proof = await receiptsForKey(key(23));
+    assert.equal(proof.length, before.length + 1);
+    assert.equal(proof.at(-1)?.kind, "decision.upsert");
+    const detail = detailOf(proof.at(-1)!);
+    assert.equal(detail.operation, "upsert");
+    assert.equal(detail.status, "open");
+    assert.equal(detail.actor_id, LEGACY_ACTOR_ID);
+    assertNoLeak(detail);
+  });
+
   it("answers demo mode without writing when the database is unset", async () => {
     const beforeRows = await sql`select count(*)::int as n from decisions where repo = ${REPO}`;
     const beforeEvents = await sql`
@@ -637,6 +721,46 @@ describe("decision actor receipts", { skip: !OPT_IN, concurrency: 1 }, () => {
     assert.equal(afterEvents[0].n, beforeEvents[0].n);
   });
 });
+
+async function waitForInsertLock(pool: import("pg").Pool): Promise<boolean> {
+  const until = Date.now() + 3000;
+  while (Date.now() < until) {
+    const check = await pool.query<{ n: number }>(
+      "select count(*)::int as n from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock' and query like '%insert into decisions%' and pid <> pg_backend_pid()",
+    );
+    if (Number(check.rows[0]?.n) > 0) return true;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return false;
+}
+
+/** Hold a conflicting row lock, prove the upsert statement is the waiter, then commit. */
+async function whileInsertWaits(
+  block: (locker: import("pg").PoolClient) => Promise<unknown>,
+  start: () => Promise<Response>,
+): Promise<Response> {
+  const { Pool } = await import("pg");
+  const pool = new Pool({ connectionString: actorDecisionsFixture().url });
+  const locker = await pool.connect();
+  let pending: Promise<Response> | undefined;
+  try {
+    await locker.query("begin");
+    await block(locker);
+    pending = start();
+    assert.equal(await waitForInsertLock(pool), true, "decision upsert reached the conflicting row lock");
+    await locker.query("commit");
+    const response = await pending;
+    pending = undefined;
+    return response;
+  } finally {
+    if (pending) {
+      await locker.query("rollback").catch(() => undefined);
+      await pending.catch(() => undefined);
+    }
+    locker.release();
+    await pool.end();
+  }
+}
 
 async function installReceiptTrigger(mode: "fail" | "suppress", which: string) {
   await sql`drop trigger if exists ak_dec_fail_receipt on events`;
