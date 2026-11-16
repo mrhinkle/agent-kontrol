@@ -5,6 +5,7 @@ import { activityDetail, readReceipt, withReceipt } from "@/lib/activity";
 import { apiError, errorBody, memoryKeyError, toolResultFromCaught, type McpToolResult } from "@/lib/api-error";
 import { secretsMatch, verifyAccessToken } from "@/lib/authcrypto";
 import { resolveAgentCredential } from "@/lib/credentials";
+import { enrichMcpResponse, noteInitialCredentialStoreOutage, runWithMcpRequest } from "@/lib/mcp-protocol";
 import { chargeCredentialRequest, rateLimitedResponse } from "@/lib/credential-rate-limit";
 import { isConfigured } from "@/lib/db";
 import {
@@ -729,11 +730,18 @@ async function verifyToken(_req: Request, bearerToken?: string) {
     };
   }
 
-  // 2. Per-agent credential. Unknown, revoked, expired, or a store error
-  //    returns undefined: the same 401 + WWW-Authenticate as any other
-  //    bad bearer. Do not fall through to OAuth.
+  // 2. Per-agent credential. Unknown, revoked, or expired returns undefined:
+  //    the same 401 + WWW-Authenticate as any other bad bearer. A store
+  //    outage also returns undefined, and records that fact for this request
+  //    only so the response wrapper can classify it as 503. Do not fall
+  //    through to OAuth, and do not throw: mcp-handler would report a throw
+  //    as Invalid token.
   if (bearerToken.startsWith("akc_")) {
     const resolved = await resolveAgentCredential(bearerToken);
+    if (resolved.status === "unavailable") {
+      noteInitialCredentialStoreOutage();
+      return undefined;
+    }
     if (resolved.status !== "ok") return undefined;
     return {
       token: bearerToken,
@@ -846,4 +854,8 @@ const authed = withMcpAuth(
   },
 );
 
-export { authed as GET, authed as POST, authed as DELETE };
+async function serve(req: Request): Promise<Response> {
+  return runWithMcpRequest(async () => enrichMcpResponse(await authed(req)));
+}
+
+export { serve as GET, serve as POST, serve as DELETE };
