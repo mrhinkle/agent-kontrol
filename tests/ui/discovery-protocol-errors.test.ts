@@ -159,11 +159,17 @@ describe("owner discovery item teaching", () => {
       if (text.includes("from watched_repos")) return [quietRow()];
       if (text.includes("update watched_owners")) {
         updates.push(values);
-        return [];
+        const owner = values[values.length - 1];
+        return typeof owner === "string" ? [{ owner }] : [];
       }
       if (text.includes("insert into watched_repos")) {
         inserts.push(values);
-        return [];
+        const repos = values[0];
+        return Array.isArray(repos) ? repos.map((repo) => ({ repo: String(repo) })) : [];
+      }
+      if (text.includes("insert into events")) {
+        const kind = typeof values[0] === "string" ? values[0] : "";
+        return kind ? [{ id: 1, kind, created_at: "2026-11-15T00:00:00.000Z" }] : [];
       }
       return [];
     });
@@ -312,10 +318,14 @@ describe("owner discovery item teaching", () => {
     assert.deepEqual(unreadyBody.results[0].marked_gone, []);
 
     let inserts = 0;
-    setSqlForTests(async (strings) => {
+    setSqlForTests(async (strings, ...values) => {
       const text = strings.join(" ").replace(/\s+/g, " ").trim().toLowerCase();
       if (text === "begin" || text === "commit" || text === "rollback") return [];
       if (text.includes("from watched_owners") && !text.includes("update")) return [ownerRow("acme", 30, null)];
+      if (text.includes("update watched_owners")) {
+        const owner = values[values.length - 1];
+        return typeof owner === "string" ? [{ owner }] : [];
+      }
       if (text.includes("insert into watched_repos")) {
         inserts += 1;
         const err = new Error('duplicate key value violates unique constraint "watched_repos_short_key"');
@@ -381,10 +391,18 @@ describe("owner discovery item teaching", () => {
     let storedError: unknown = null;
     setSqlForTests(async (strings, ...values) => {
       const text = strings.join(" ").replace(/\s+/g, " ").toLowerCase();
-      if (text.includes("from watched_owners")) {
+      if (text.includes("insert into events")) {
+        const kind = typeof values[0] === "string" ? values[0] : "";
+        return kind ? [{ id: 1, kind, created_at: "2026-11-15T00:00:00.000Z" }] : [];
+      }
+      if (text.includes("from watched_owners") && !text.includes("update")) {
         return [ownerRow("acme", 30, null, storedError)];
       }
-      if (text.includes("update watched_owners")) storedError = values[0];
+      if (text.includes("update watched_owners")) {
+        storedError = values[0];
+        const owner = values[values.length - 1];
+        return typeof owner === "string" ? [{ owner }] : [];
+      }
       if (text.includes("insert into watched_repos")) repoWrites += 1;
       return [];
     });
