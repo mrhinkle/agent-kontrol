@@ -18,6 +18,7 @@
 
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { isConfigured, sql } from "./db";
+import { describeDbError } from "./db-error";
 import { isScope, SCOPES, type Scope } from "./scopes";
 import {
   DEFAULT_REQUESTS_PER_DAY,
@@ -294,7 +295,7 @@ async function noteUse(id: string): Promise<void> {
   } catch (e) {
     // The credential was already checked. A failed timestamp must not turn
     // a read the caller was allowed to make into an error.
-    console.error("[credentials] last_used_at update failed", id, e instanceof Error ? e.name : "error");
+    console.error("[credentials] last_used_at update failed", id, describeDbError(e));
   }
 }
 
@@ -454,7 +455,7 @@ export async function resolveAgentCredential(token: string): Promise<ResolveResu
   try {
     row = await findByHash(hash);
   } catch (e) {
-    console.error("[credentials] lookup failed", e instanceof Error ? e.name : "error");
+    console.error("[credentials] lookup failed", describeDbError(e));
     return { status: "unavailable" };
   }
   const stored = row?.token_hash ?? DUMMY_HASH;
