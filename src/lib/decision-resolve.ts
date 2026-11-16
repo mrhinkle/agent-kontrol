@@ -298,11 +298,13 @@ function text(value: string): McpToolResult {
 }
 
 /**
- * Receipt after the decision row is stored. Validation, stale, conflict, and
- * writeback_in_progress return before this. A test store, or no database,
- * uses the same in-memory events list as the other demo write tools.
+ * Receipt after resolve stores the decision row. request_decision returns the
+ * receipt upsertDecision commits with the row, so this is not called twice.
+ * Validation, stale, conflict, and writeback_in_progress return before this.
+ * A test store, or no database, uses the same in-memory events list as the
+ * other demo write tools.
  */
-async function receiptFor(kind: "request_decision" | "resolve_decision", decision: Decision): Promise<Receipt | null> {
+async function receiptFor(kind: "resolve_decision", decision: Decision): Promise<Receipt | null> {
   const title = decision.title.slice(0, 200);
   const extra = { decision_id: decision.id, key: decision.key, status: decision.status };
   if (!isConfigured() || usingDecisionTestStore()) return recordDemoActivity(kind, title, extra);
@@ -356,9 +358,11 @@ export async function requestDecisionTool(args: {
     first_seen_at: null,
     github_present: null,
     force: false,
-  });
-  const receipt = await receiptFor("request_decision", result.decision);
-  return withReceipt(JSON.stringify({ status_held: result.status_held, decision: result.decision }), receipt);
+  }, "request");
+  return withReceipt(
+    JSON.stringify({ status_held: result.status_held, decision: result.decision }),
+    result.receipt ?? null,
+  );
 }
 
 export async function listDecisionsTool(args: {

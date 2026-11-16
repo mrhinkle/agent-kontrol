@@ -1,3 +1,4 @@
+import type { Receipt } from "./activity";
 import { isConfigured, sql, withTransaction, type SqlTag } from "./db";
 import { recordDemoActivity } from "./demo-store";
 import { insertToolReceipt } from "./tool-receipt";
@@ -18,9 +19,19 @@ import { insertToolReceipt } from "./tool-receipt";
  * (`opened_at` only when it is still null). Until then `shape=brief` lists
  * the repo in `incomplete_repos` and does not guess a kind, labels, age, or
  * short name. `scripts/morning-brief.sh` keeps that repo's GitHub sweep.
+ *
+ * An actual upsert, force-reopen, or reconcile stores one events receipt in
+ * that same transaction. The receipt actor is the authenticated principal.
+ * `actor_type` and `actor_id` on the row stay the resolver. A blocked
+ * reopen, or a reconcile that changes nothing, stores no receipt.
  */
 
 export const DECISION_STATUSES = ["open", "decided", "deferred", "withdrawn"] as const;
+
+/** Events kinds for collector writes. Resolver columns are not these actors. */
+export const DECISION_UPSERT_RECEIPT = "decision.upsert";
+export const DECISION_FORCE_REOPEN_RECEIPT = "decision.force_reopen";
+export const DECISION_RECONCILE_RECEIPT = "decision.reconcile";
 
 /**
  * How long a write-back may hold `writeback_lock`. Neon HTTP cannot keep a
@@ -1003,25 +1014,64 @@ export interface UpsertResult {
   status_held: boolean;
   /** True when force reopen was refused because an unexpired write-back claim holds the row. */
   writeback_in_progress?: boolean;
+  /**
+   * Set when this call stored a receipt with the row. Absent or null when
+   * the write was refused or the in-memory collector path has no events table.
+   * `request_decision` returns this instead of inserting a second receipt.
+   */
+  receipt?: Receipt | null;
 }
 
-export async function upsertDecision(input: UpsertInput): Promise<UpsertResult> {
+/** `request` keeps the tool name on the receipt. The route uses `collector`. */
+export type DecisionUpsertOrigin = "collector" | "request";
+
+function decisionResourceId(value: unknown): string {
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return String(value);
+  if (typeof value === "string" && /^[1-9]\d*$/.test(value)) return value;
+  throw new Error("decision id missing");
+}
+
+function upsertReceiptSpec(
+  origin: DecisionUpsertOrigin,
+  forceReopen: boolean,
+  decision: Decision,
+): { kind: string; title: string; extra: Record<string, unknown> } {
+  const operation = origin === "request" ? "request" : forceReopen ? "force_reopen" : "upsert";
+  const extra = {
+    operation,
+    decision_id: decisionResourceId(decision.id),
+    key: decision.key,
+    source: decision.source,
+    status: decision.status,
+  };
+  if (origin === "request") return { kind: "request_decision", title: "Decision requested", extra };
+  if (forceReopen) return { kind: DECISION_FORCE_REOPEN_RECEIPT, title: "Decision reopened", extra };
+  return { kind: DECISION_UPSERT_RECEIPT, title: "Decision upserted", extra };
+}
+
+export async function upsertDecision(
+  input: UpsertInput,
+  origin: DecisionUpsertOrigin = "collector",
+): Promise<UpsertResult> {
   const now = nowIso();
   if (testStore) {
     const stored = await testStore.upsert(input);
     const decision = presentDecision(stored.row, now);
     if (stored.writeback_in_progress) {
-      return { decision, status_held: false, writeback_in_progress: true };
+      return { decision, status_held: false, writeback_in_progress: true, receipt: null };
     }
     const previous = stored.previous_status;
     const held =
       (previous === "decided" && decision.status === "decided") ||
       (previous === "deferred" && decision.status === "deferred");
-    return { decision, status_held: held };
+    if (origin !== "request") return { decision, status_held: held, receipt: null };
+    const spec = upsertReceiptSpec(origin, false, decision);
+    return { decision, status_held: held, receipt: recordDemoActivity(spec.kind, spec.title, spec.extra) };
   }
-  const db = sql();
   const optionsJson = input.options == null ? null : JSON.stringify(input.options);
   const labelsJson = input.labels == null ? null : JSON.stringify(input.labels);
+  return withTransaction(async (db) => {
   const rows = await db`
     with prior as (
       select status from decisions where key = ${input.key}
@@ -1139,7 +1189,7 @@ export async function upsertDecision(input: UpsertInput): Promise<UpsertResult> 
       && (blocked.status === "decided" || blocked.status === "deferred")
       && writebackLockUnexpired(blocked.writeback_lock, blocked.writeback_lock_at)
     ) {
-      return { decision: presentDecision(blocked, now), status_held: false, writeback_in_progress: true };
+      return { decision: presentDecision(blocked, now), status_held: false, writeback_in_progress: true, receipt: null };
     }
     throw new Error("decision upsert returned no row");
   }
@@ -1148,7 +1198,13 @@ export async function upsertDecision(input: UpsertInput): Promise<UpsertResult> 
   const held =
     (previous === "decided" && decision.status === "decided") ||
     (previous === "deferred" && decision.status === "deferred");
-  return { decision, status_held: held };
+  const forceReopen = input.force
+    && (previous === "decided" || previous === "deferred")
+    && decision.status === "open";
+  const spec = upsertReceiptSpec(origin, forceReopen, decision);
+  const receipt = await insertToolReceipt(db, spec);
+  return { decision, status_held: held, receipt };
+  });
 }
 
 export interface ReconcileResult {
@@ -1159,30 +1215,51 @@ export interface ReconcileResult {
 /**
  * Mark GitHub rows for one repo that were not in this sweep.
  * The issue closed or lost the label, so open, deferred, and decided rows
- * become withdrawn. The stored decision text, decided_by, and decided_at stay.
- * A row already withdrawn with github_present false is left alone.
+ * become withdrawn. The stored decision text, decided_by, decided_at, and
+ * resolver actor columns stay. A row already withdrawn with github_present
+ * false is left alone. Changed ids get one receipt; zero rows get none.
  */
 export async function reconcileDecisions(input: ReconcileInput): Promise<ReconcileResult> {
-  const db = sql();
   const seenJson = JSON.stringify(input.seen_keys);
-  const rows = await db`
-    update decisions
-    set
-      github_present = false,
-      updated_at = now(),
-      revision = revision + 1,
-      status = case when status in ('open', 'deferred', 'decided') then 'withdrawn' else status end,
-      defer_until = case when status in ('open', 'deferred') then null else defer_until end
-    where source = ${input.source}
-      and repo = ${input.repo}
-      and not (key in (select jsonb_array_elements_text(${seenJson}::jsonb)))
-      and (github_present is distinct from false or status in ('open', 'deferred', 'decided'))
-    returning id, status
-  `;
-  return {
-    reconciled: rows.length,
-    withdrawn: rows.filter((row) => row.status === "withdrawn").length,
-  };
+  return withTransaction(async (db) => {
+    const rows = await db`
+      update decisions
+      set
+        github_present = false,
+        updated_at = now(),
+        revision = revision + 1,
+        status = case when status in ('open', 'deferred', 'decided') then 'withdrawn' else status end,
+        defer_until = case when status in ('open', 'deferred') then null else defer_until end
+      where source = ${input.source}
+        and repo = ${input.repo}
+        and not (key in (select jsonb_array_elements_text(${seenJson}::jsonb)))
+        and (github_present is distinct from false or status in ('open', 'deferred', 'decided'))
+      returning id, key, status
+    `;
+    const reconciled = rows.length;
+    const withdrawn = rows.filter((row) => row.status === "withdrawn").length;
+    if (reconciled === 0) return { reconciled, withdrawn };
+    const changed = rows.map((row) => ({
+      id: decisionResourceId(row.id),
+      key: typeof row.key === "string" ? row.key : "",
+    }));
+    if (changed.some((row) => row.key.length === 0)) throw new Error("decision key missing");
+    changed.sort((a, b) => Number(a.id) - Number(b.id));
+    await insertToolReceipt(db, {
+      kind: DECISION_RECONCILE_RECEIPT,
+      title: "Decisions reconciled",
+      extra: {
+        operation: "reconcile",
+        decision_ids: changed.map((row) => row.id),
+        keys: changed.map((row) => row.key),
+        source: input.source,
+        repo: input.repo,
+        reconciled,
+        withdrawn,
+      },
+    });
+    return { reconciled, withdrawn };
+  });
 }
 
 export async function patchDecision(id: number, input: PatchInput): Promise<Decision | null> {
