@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { PATCH as patchRepos, PUT as putRepos } from "../../src/app/api/settings/repos/route";
 import { DASHBOARD_ACTOR_ID, LEGACY_ACTOR_ID } from "../../src/lib/actor";
 import { authCookieValue } from "../../src/lib/authcrypto";
-import { createCredential, resetCredentialsForTests } from "../../src/lib/credentials";
+import { CREDENTIAL_ADMIN_KINDS, createCredential, resetCredentialsForTests } from "../../src/lib/credentials";
 import { setSqlForTests, type Row } from "../../src/lib/db";
 import { listVersion, toWatchedRepo, trackedFromRow } from "../../src/lib/watched-repos";
 import { fakeQuotaSql } from "./quota-fake";
@@ -265,11 +265,18 @@ describe("actor coverage for repo replace and pin", { concurrency: false }, () =
     const credential = await createCredential({ label: "coverage", scopes: ["memory:write"] });
     assert.equal(credential.ok, true);
     if (!credential.ok) throw new Error("credential was not issued");
+    assert.match(credential.token, /^akc_/);
+    const setup = events();
+    assert.equal(setup.length, 1);
+    assert.ok(setup[0].values.includes(CREDENTIAL_ADMIN_KINDS.create));
+    assert.equal(calls.some((call) => /watched_repos/.test(call.text.toLowerCase())), false);
+    calls.length = 0;
     const denied = await putRepos(jsonReq("http://x/api/settings/repos", {
       repos: [REPO],
     }, { authorization: `Bearer ${credential.token}` }));
     assert.equal(denied.status, 403, await denied.clone().text());
     assert.equal(events().length, 0);
+    assert.equal(calls.some((call) => /insert into watched_repos|update watched_repos|delete from watched_repos/.test(call.text.toLowerCase())), false);
 
     calls.length = 0;
     throwOnReceipt = true;
