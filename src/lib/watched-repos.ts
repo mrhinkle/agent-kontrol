@@ -396,10 +396,14 @@ async function writeReplacedRepos(q: SqlTag, repos: RepoInput[], resets: Tracked
  * pass its version check and then drop this flag. Pin and hide are part of
  * the list version, so a real change makes the next replace with the old
  * version stale.
+ *
+ * `receipt`, when passed, is inserted in this same transaction only after the
+ * update matches a row. A missing repo writes nothing, including no receipt.
  */
 export async function setRepoOverride(
   repo: string,
   patch: { pinned?: boolean; hidden?: boolean },
+  receipt?: RepoWriteReceipt,
 ): Promise<boolean> {
   return withTransaction(async (q) => {
     await q`select pg_advisory_xact_lock(${DISCOVERY_WRITE_LOCK}::bigint)`;
@@ -411,6 +415,19 @@ export async function setRepoOverride(
       where lower(repo) = lower(${repo})
       returning repo
     `;
-    return rows.length > 0;
+    if (rows.length === 0) return false;
+    if (receipt) {
+      await insertToolReceipt(q, {
+        kind: receipt.kind,
+        title: receipt.title,
+        extra: {
+          ...receipt.extra,
+          repo,
+          ...(patch.pinned !== undefined ? { pinned: patch.pinned } : {}),
+          ...(patch.hidden !== undefined ? { hidden: patch.hidden } : {}),
+        },
+      });
+    }
+    return true;
   });
 }
