@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { runWithPrincipal } from "@/lib/actor";
 import { apiError, publicError } from "@/lib/api-error";
 import { deny, resolveApiAccess } from "@/lib/auth";
 import { decisionPersistenceOn, parseDecisionId } from "@/lib/decisions";
@@ -63,7 +64,10 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   }
   if (!decisionPersistenceOn()) return NextResponse.json({ ok: true, demo: true });
   try {
-    const outcome = await retryDecisionWriteback(id, { updatedAt: expectedUpdatedAt, revision: expectedRevision });
+    const outcome = await runWithPrincipal(access.principal, () => retryDecisionWriteback(id, {
+      updatedAt: expectedUpdatedAt,
+      revision: expectedRevision,
+    }));
     if (!outcome.ok) {
       return apiError(outcome.code, { message: outcome.message, fields: outcome.fields });
     }

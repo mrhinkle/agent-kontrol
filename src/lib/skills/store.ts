@@ -1,4 +1,6 @@
-import { sql } from "../db";
+import { activityDetail } from "../activity";
+import { currentActor } from "../actor";
+import { sql, withTransaction, type Row } from "../db";
 import {
   flagsFromStored,
   isTrigger,
@@ -170,6 +172,45 @@ export function isUuid(value: string): boolean {
   return UUID_TEXT.test(value);
 }
 
+/** Receipt kinds for a skill sync. The lease expiry actor is the server, not the caller. */
+export const SKILL_SYNC_KINDS = {
+  acquire: "skill_sync_acquire",
+  upsert: "skill_sync_upsert",
+  remove: "skill_sync_remove",
+  finish: "skill_sync_finish",
+  leaseExpire: "skill_sync_lease_expire",
+} as const;
+
+export const SKILL_SYNC_LEASE_ACTOR = { actor_type: "agent" as const, actor_id: "skill-sync-lease" };
+
+/** One drift report. The host string in the row is a label, not this actor. */
+export const SKILL_DRIFT_KIND = "skill_drift_report";
+
+const RECEIPT_FAULT_AGENT = "ak-actor-admin-receipt-fault";
+let receiptFaultKinds: Set<string> | null = null;
+
+/** Missing agent id, so the events insert fails the foreign key and rolls the statement back. */
+export function setSkillReceiptFaultForTests(kinds: readonly string[] | null): void {
+  receiptFaultKinds = kinds && kinds.length > 0 ? new Set(kinds) : null;
+}
+
+function receiptAgent(kind: string): string | null {
+  return receiptFaultKinds?.has(kind) ? RECEIPT_FAULT_AGENT : null;
+}
+
+function callerDetail(kind: string, extra: Record<string, unknown>): string {
+  return JSON.stringify(activityDetail(kind, currentActor(), extra));
+}
+
+function assertCountedReceipt(row: Row | undefined, wroteKey: string, expected?: number): void {
+  if (!row || !Object.prototype.hasOwnProperty.call(row, "receipted")) return;
+  const wrote = Number(row[wroteKey] ?? 0);
+  const receipted = Number(row.receipted ?? 0);
+  if (expected !== undefined && wrote !== expected) throw new Error("skill receipt was not stored");
+  if (wrote === receipted) return;
+  throw new Error("skill receipt was not stored");
+}
+
 /**
  * Insert or replace one skill only while `runId` is still the running sync.
  * `for share` locks the lease row in this same statement. Without the lock,
@@ -219,12 +260,27 @@ export async function upsertSkill(row: SkillRecord, runId: string): Promise<void
         removed_at = null,
         synced_at = excluded.synced_at
       returning id
+    ),
+    receipt as (
+      insert into events (agent_id, session_id, kind, title, detail)
+      select ${receiptAgent(SKILL_SYNC_KINDS.upsert)}, null, ${SKILL_SYNC_KINDS.upsert}, ${"Upserted a skill"},
+        ${callerDetail(SKILL_SYNC_KINDS.upsert, {
+          operation: "upsert",
+          run_id: runId,
+          skill_id: row.id,
+          source_id: row.source_id,
+          source_revision: row.commit_sha,
+        })}::jsonb
+      from written
+      returning id
     )
     select
       (select count(*)::int from owner) as owned,
-      (select count(*)::int from written) as wrote
+      (select count(*)::int from written) as wrote,
+      (select count(*)::int from receipt) as receipted
   `;
   if (Number(rows[0]?.owned ?? 0) < 1) throw new SyncLeaseLost();
+  assertCountedReceipt(rows[0], "wrote");
 }
 
 /** Mark one skill removed only while `runId` is still the running sync. Same lease-row lock as upsertSkill. */
@@ -243,12 +299,25 @@ export async function markSkillRemoved(id: string, at: string, runId: string): P
         and removed_at is null
         and exists (select 1 from owner)
       returning id
+    ),
+    receipt as (
+      insert into events (agent_id, session_id, kind, title, detail)
+      select ${receiptAgent(SKILL_SYNC_KINDS.remove)}, null, ${SKILL_SYNC_KINDS.remove}, ${"Removed a skill"},
+        ${callerDetail(SKILL_SYNC_KINDS.remove, {
+          operation: "remove",
+          run_id: runId,
+          skill_id: id,
+        })}::jsonb
+      from written
+      returning id
     )
     select
       (select count(*)::int from owner) as owned,
-      (select count(*)::int from written) as wrote
+      (select count(*)::int from written) as wrote,
+      (select count(*)::int from receipt) as receipted
   `;
   if (Number(rows[0]?.owned ?? 0) < 1) throw new SyncLeaseLost();
+  assertCountedReceipt(rows[0], "wrote");
 }
 
 function isUniqueViolation(err: unknown): boolean {
@@ -273,20 +342,51 @@ export async function beginSyncRun(input: {
   startedAt: string;
   staleBefore: string;
 }): Promise<boolean> {
-  await db()`
+  const expireKind = SKILL_SYNC_KINDS.leaseExpire;
+  const expireDetail = JSON.stringify(activityDetail(expireKind, SKILL_SYNC_LEASE_ACTOR, { operation: "lease_expire" }));
+  const expired = await db()`
     /* sk:expire-sync */
-    update skill_sync_runs
-    set status = 'failed',
-      finished_at = ${input.startedAt}::timestamptz,
-      error = 'sync lease expired'
-    where status = 'running' and started_at < ${input.staleBefore}::timestamptz
+    with expired as (
+      update skill_sync_runs
+      set status = 'failed',
+        finished_at = ${input.startedAt}::timestamptz,
+        error = 'sync lease expired'
+      where status = 'running' and started_at < ${input.staleBefore}::timestamptz
+      returning id
+    ),
+    receipt as (
+      insert into events (agent_id, session_id, kind, title, detail)
+      select ${receiptAgent(expireKind)}, null, ${expireKind}, ${"Expired a skill sync lease"},
+        (${expireDetail}::jsonb || jsonb_build_object('run_id', expired.id::text))
+      from expired
+      returning id
+    )
+    select
+      (select count(*)::int from expired) as expired,
+      (select count(*)::int from receipt) as receipted
   `;
+  assertCountedReceipt(expired[0], "expired");
+  const acquireKind = SKILL_SYNC_KINDS.acquire;
   try {
-    await db()`
+    const started = await db()`
       /* sk:begin-sync */
-      insert into skill_sync_runs (id, started_at, finished_at, trigger, status, summary, error)
-      values (${input.id}::uuid, ${input.startedAt}::timestamptz, null, ${input.trigger}, 'running', null, null)
+      with written as (
+        insert into skill_sync_runs (id, started_at, finished_at, trigger, status, summary, error)
+        values (${input.id}::uuid, ${input.startedAt}::timestamptz, null, ${input.trigger}, 'running', null, null)
+        returning id
+      ),
+      receipt as (
+        insert into events (agent_id, session_id, kind, title, detail)
+        select ${receiptAgent(acquireKind)}, null, ${acquireKind}, ${"Acquired a skill sync run"},
+          ${callerDetail(acquireKind, { operation: "acquire", run_id: input.id, trigger: input.trigger })}::jsonb
+        from written
+        returning id
+      )
+      select
+        (select count(*)::int from written) as wrote,
+        (select count(*)::int from receipt) as receipted
     `;
+    assertCountedReceipt(started[0], "wrote", 1);
     return true;
   } catch (err) {
     if (isUniqueViolation(err)) return false;
@@ -307,23 +407,38 @@ export async function finishSyncRun(input: {
   error: string | null;
   finishedAt: string;
 }): Promise<boolean> {
+  const kind = SKILL_SYNC_KINDS.finish;
   const rows = await db()`
     /* sk:finish-sync */
-    update skill_sync_runs as target
-    set finished_at = ${input.finishedAt}::timestamptz,
-      status = ${input.status},
-      summary = ${JSON.stringify(input.summary)}::jsonb,
-      error = ${input.error}
-    from (
-      select id
-      from skill_sync_runs
-      where id = ${input.id}::uuid and status = 'running'
-      for update
-    ) as owner
-    where target.id = owner.id
-    returning target.id
+    with updated as (
+      update skill_sync_runs as target
+      set finished_at = ${input.finishedAt}::timestamptz,
+        status = ${input.status},
+        summary = ${JSON.stringify(input.summary)}::jsonb,
+        error = ${input.error}
+      from (
+        select id
+        from skill_sync_runs
+        where id = ${input.id}::uuid and status = 'running'
+        for update
+      ) as owner
+      where target.id = owner.id
+      returning target.id
+    ),
+    receipt as (
+      insert into events (agent_id, session_id, kind, title, detail)
+      select ${receiptAgent(kind)}, null, ${kind}, ${"Finished a skill sync run"},
+        ${callerDetail(kind, { operation: "finish", run_id: input.id, status: input.status })}::jsonb
+      from updated
+      returning id
+    )
+    select updated.id,
+      (select count(*)::int from receipt) as receipted
+    from updated
   `;
-  return rows.length > 0;
+  if (rows.length === 0) return false;
+  assertCountedReceipt(rows[0], "receipted", 1);
+  return true;
 }
 
 export interface SyncRunRow {
@@ -544,14 +659,37 @@ function asDriftEntries(value: unknown): { name: string; sha: string }[] {
 }
 
 export async function upsertDrift(row: DriftRow): Promise<void> {
-  await db()`
-    /* sk:upsert-drift */
-    insert into skill_drift (host, dir, reported_at, entries)
-    values (${row.host}, ${row.dir}, ${row.reported_at}::timestamptz, ${JSON.stringify(row.entries)}::jsonb)
-    on conflict (host, dir) do update set
-      reported_at = excluded.reported_at,
-      entries = excluded.entries
-  `;
+  const detail = callerDetail(SKILL_DRIFT_KIND, {
+    operation: "drift_report",
+    host: row.host,
+    dir: row.dir,
+    reported_at: row.reported_at,
+    count: row.entries.length,
+  });
+  await withTransaction(async (q) => {
+    const rows = await q`
+      with written as (
+        /* sk:upsert-drift */
+        insert into skill_drift (host, dir, reported_at, entries)
+        values (${row.host}, ${row.dir}, ${row.reported_at}::timestamptz, ${JSON.stringify(row.entries)}::jsonb)
+        on conflict (host, dir) do update set
+          reported_at = excluded.reported_at,
+          entries = excluded.entries
+        returning host
+      ),
+      receipt as (
+        insert into events (agent_id, session_id, kind, title, detail)
+        select ${receiptAgent(SKILL_DRIFT_KIND)}, null, ${SKILL_DRIFT_KIND}, ${"Recorded a skill drift report"},
+          ${detail}::jsonb
+        from written
+        returning id
+      )
+      select
+        (select count(*)::int from written) as wrote,
+        (select count(*)::int from receipt) as receipted
+    `;
+    assertCountedReceipt(rows[0], "wrote", 1);
+  });
 }
 
 export async function digestRuns(sinceIso: string): Promise<RunRecord[]> {

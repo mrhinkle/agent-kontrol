@@ -12,6 +12,13 @@ export interface SyncOptions {
   fetcher?: SkillSnapshotFetcher;
 }
 
+let fetcherForTests: SkillSnapshotFetcher | null = null;
+
+/** Synthetic snapshots for tests. Production leaves this unset and reads GitHub. */
+export function setSyncFetcherForTests(fetcher: SkillSnapshotFetcher | null): void {
+  fetcherForTests = fetcher;
+}
+
 /**
  * Mirror enabled sources.
  *
@@ -110,7 +117,7 @@ async function leaseLost(): Promise<SyncResult> {
 }
 
 async function runSync(options: SyncOptions, started: Date, runId: string): Promise<Applied> {
-  const fetcher = options.fetcher ?? createGitHubFetcher();
+  const fetcher = options.fetcher ?? fetcherForTests ?? createGitHubFetcher();
   const sources = await listSources();
   const existing = await listSkillRows();
   const added: SyncSkillRef[] = [];

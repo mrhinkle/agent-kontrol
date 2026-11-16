@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
+import { actorFromPrincipal, runWithActor } from "@/lib/actor";
 import { apiError, publicError } from "@/lib/api-error";
-import { enforceApi } from "@/lib/auth";
+import { deny, resolveApiAccess } from "@/lib/auth";
 import { isConfigured } from "@/lib/db";
 import { parseDriftBody, recordDrift } from "@/lib/skills/drift-report";
 
@@ -15,8 +16,8 @@ export const dynamic = "force-dynamic";
  */
 
 export async function POST(req: Request) {
-  const denied = await enforceApi(req);
-  if (denied) return denied;
+  const access = await resolveApiAccess(req);
+  if (!access.ok) return deny(access);
   let body: unknown;
   try {
     body = await req.json();
@@ -29,7 +30,7 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; drift report not stored." });
   }
   try {
-    const result = await recordDrift(parsed);
+    const result = await runWithActor(actorFromPrincipal(access.principal), () => recordDrift(parsed));
     return NextResponse.json({ ok: true, ...result });
   } catch (err) {
     return publicError("[skills] drift failed", err);

@@ -229,6 +229,7 @@ function delay(ms: number): Promise<void> {
 async function claimRevision(
   id: number,
   revision: number,
+  attribute = false,
 ): Promise<{ ok: true; token: string; revision: number } | { ok: false; outcome: WritebackOutcome }> {
   const deadline = Date.now() + writebackLockWaitMs;
   while (Date.now() < deadline) {
@@ -243,7 +244,7 @@ async function claimRevision(
     }
     await delay(25);
   }
-  const stamped = await setDecisionWriteback(id, "not_written", revision, null);
+  const stamped = await setDecisionWriteback(id, "not_written", revision, null, attribute);
   if (!stamped) return { ok: false, outcome: { status: "superseded" } };
   return { ok: false, outcome: { status: "not_written", reason: "write-back busy" } };
 }
@@ -305,13 +306,15 @@ async function postDecision(
  */
 export async function writeDecisionBack(
   row: Pick<Decision, "id" | "key" | "actor_id" | "decided_at" | "decision" | "revision">,
+  options?: { attribute?: boolean },
 ): Promise<WritebackOutcome> {
   const target = githubTargetFromKey(row.key);
   if (!target) return { status: "no_target" };
   const client = activeClient();
   const revision = row.revision;
-  if (!client || !processLockEnabled) return publish(row.id, revision, client, target, row);
-  return withLocalLock(row.key, () => publish(row.id, revision, client, target, row));
+  const attribute = options?.attribute === true;
+  if (!client || !processLockEnabled) return publish(row.id, revision, client, target, row, attribute);
+  return withLocalLock(row.key, () => publish(row.id, revision, client, target, row, attribute));
 }
 
 async function publish(
@@ -320,8 +323,9 @@ async function publish(
   client: GitHubWriteClient | null,
   target: { repo: string; number: number },
   row: Pick<Decision, "actor_id" | "decided_at" | "decision">,
+  attribute = false,
 ): Promise<WritebackOutcome> {
-  const claimed = await claimRevision(id, revision);
+  const claimed = await claimRevision(id, revision, attribute);
   if (!claimed.ok) return claimed.outcome;
   const token = claimed.token;
   const heldRevision = claimed.revision;
@@ -331,7 +335,7 @@ async function publish(
       : { status: "not_written" as const, reason: "no token" };
     if (outcome.status === "superseded") return outcome;
     const stamp = outcome.status === "written" ? "written" : "not_written";
-    const stamped = await setDecisionWriteback(id, stamp, heldRevision, token);
+    const stamped = await setDecisionWriteback(id, stamp, heldRevision, token, attribute);
     if (!stamped) return { status: "superseded" };
     return outcome;
   } finally {
