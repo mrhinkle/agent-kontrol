@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { randomUUID } from "node:crypto";
+import { actorOperationsFixture, confirmActorOperationsFixture } from "./fixture";
 
 /**
  * Progress ingest actor receipts. Opt in with AK_ACTOR_OPERATIONS_FIXTURE=1.
@@ -9,7 +10,6 @@ import { randomUUID } from "node:crypto";
  * loads it. The fixture URL is fixed; ambient DATABASE_URL is not used.
  */
 const OPT_IN = process.env.AK_ACTOR_OPERATIONS_FIXTURE === "1";
-const FIXTURE_URL = "postgres://ak_backlog_test@127.0.0.1:65438/ak_actor_operations";
 const LEGACY = "actor-ops-progress-legacy";
 const PREFIX = `bprog-${randomUUID().slice(0, 8)}`;
 
@@ -65,7 +65,8 @@ function detailOf(row: Record<string, unknown>): Record<string, unknown> {
 describe("B progress ingest actor receipts", { skip: !OPT_IN, concurrency: 1 }, () => {
   before(async () => {
     if (process.env.AK_ACTOR_OPERATIONS_FIXTURE !== "1") return;
-    env.DATABASE_URL = FIXTURE_URL;
+    const fixture = actorOperationsFixture();
+    env.DATABASE_URL = fixture.url;
     env.MC_DB_DRIVER = "pg";
     env.NODE_ENV = "test";
     env.MC_TOKEN = LEGACY;
@@ -75,7 +76,7 @@ describe("B progress ingest actor receipts", { skip: !OPT_IN, concurrency: 1 }, 
     sql = db.sql();
     postProgress = route.POST;
     createCredential = credentials.createCredential as typeof createCredential;
-    await sql`select 1 as ok`;
+    await confirmActorOperationsFixture(sql, fixture.database);
   });
 
   after(async () => {
@@ -270,7 +271,7 @@ describe("B progress ingest actor receipts", { skip: !OPT_IN, concurrency: 1 }, 
       assert.equal(body.demo, true);
       assert.equal(body.written, undefined);
     } finally {
-      env.DATABASE_URL = FIXTURE_URL;
+      env.DATABASE_URL = actorOperationsFixture().url;
     }
     const afterSnaps = await sql`select count(*)::int as n from repo_snapshots where repo like ${PREFIX + "/%"}`;
     const afterEvents = await sql`select count(*)::int as n from events where kind = 'progress.ingest' and detail->>'repo' like ${PREFIX + "/%"}`;

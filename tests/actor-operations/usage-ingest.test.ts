@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { randomUUID } from "node:crypto";
+import { actorOperationsFixture, confirmActorOperationsFixture } from "./fixture";
 import { usageIdempotentKey } from "../../src/lib/usage-key";
 import type { UsageFact } from "../../src/lib/usage-types";
 
@@ -11,7 +12,6 @@ import type { UsageFact } from "../../src/lib/usage-types";
  * loads it. The fixture URL is fixed; ambient DATABASE_URL is not used.
  */
 const OPT_IN = process.env.AK_ACTOR_OPERATIONS_FIXTURE === "1";
-const FIXTURE_URL = "postgres://ak_backlog_test@127.0.0.1:65438/ak_actor_operations";
 const LEGACY = "actor-ops-usage-legacy";
 const PREFIX = `busage-${randomUUID().slice(0, 8)}`;
 
@@ -97,7 +97,8 @@ function detailOf(row: Record<string, unknown>): Record<string, unknown> {
 describe("B usage ingest actor receipts", { skip: !OPT_IN, concurrency: 1 }, () => {
   before(async () => {
     if (process.env.AK_ACTOR_OPERATIONS_FIXTURE !== "1") return;
-    env.DATABASE_URL = FIXTURE_URL;
+    const fixture = actorOperationsFixture();
+    env.DATABASE_URL = fixture.url;
     env.MC_DB_DRIVER = "pg";
     env.NODE_ENV = "test";
     env.MC_TOKEN = LEGACY;
@@ -107,7 +108,7 @@ describe("B usage ingest actor receipts", { skip: !OPT_IN, concurrency: 1 }, () 
     sql = db.sql();
     postUsage = route.POST;
     createCredential = credentials.createCredential as typeof createCredential;
-    await sql`select 1 as ok`;
+    await confirmActorOperationsFixture(sql, fixture.database);
   });
 
   after(async () => {
@@ -359,7 +360,7 @@ describe("B usage ingest actor receipts", { skip: !OPT_IN, concurrency: 1 }, () 
       assert.equal(body.demo, true);
       assert.equal(body.written, undefined);
     } finally {
-      env.DATABASE_URL = FIXTURE_URL;
+      env.DATABASE_URL = actorOperationsFixture().url;
     }
     const afterFacts = await sql`select count(*)::int as n from usage_facts where account_id like ${PREFIX + "%"}`;
     const afterEvents = await sql`select count(*)::int as n from events where kind = 'usage.ingest' and detail::text like ${"%" + PREFIX + "%"}`;
