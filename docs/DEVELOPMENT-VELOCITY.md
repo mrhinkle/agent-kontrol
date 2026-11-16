@@ -14,7 +14,7 @@ Fleet means and quantiles pool individual samples. Median uses the midpoint; p90
 
 ## Capture format and conversion
 
-The shared validator in `src/lib/velocity.ts` defines schema version 1 and method `observed-development-velocity-v1.0`. It runs both in the browser's local preview and at server ingest. A capture contains scope, complete calendar-day window, reporting timezone, capture timestamp/kind, source hashes, inventory completeness and repository measurements. Daily buckets must reconcile with period totals. CI coverage and success samples must reconcile with the created-PR count. Invalid counts, duplicate repositories, unsupported methods, future captures, partial-day windows and out-of-scope repositories are rejected.
+The shared validator in `src/lib/velocity.ts` defines schema version 1 and method `observed-development-velocity-v1.0`. It runs in the browser's local preview, the local preview command, and at server ingest. A capture contains scope, complete calendar-day window, reporting timezone, capture timestamp/kind, source hashes, inventory completeness and repository measurements. Daily buckets must reconcile with period totals. CI coverage and success samples must reconcile with the created-PR count. Invalid counts, duplicate repositories, unsupported methods, future captures, partial-day windows and out-of-scope repositories are rejected.
 
 Convert a private versioned evidence artifact without uploading it:
 
@@ -25,6 +25,28 @@ python3 scripts/convert-velocity.py /private/evidence.json /private/capture.json
 The converter verifies source summaries against individual PR/deployment observations and hashes the input bytes and evidence manifest. It does not fetch evidence files or verify their contents against the manifest; retain the original evidence alongside its receipt. The compact payload omits PR titles, authors and workflow logs. Do not commit real captures or inventories to a public repository.
 
 On the Velocity page, **Preview capture** reads the file into page memory only. It does not upload it, use localStorage, or save a draft. **Save to dashboard** performs the authenticated import. Closing the preview discards the local state. The page's filter controls affect only the repository table, not fleet totals.
+
+The same preview is available as a local read. It takes one JSON capture of at most 2 MB, validates it with `parseVelocity`, and prints `summarizeVelocity` for that normalized snapshot. It needs no credentials, configuration, or dashboard URL.
+
+```sh
+pnpm exec tsx scripts/preview-velocity.ts /private/capture.json
+```
+
+Success writes one JSON object to stdout and exits 0. The object is pretty-printed with two spaces and has two keys, in order:
+
+- `preview`: the object returned by `parseVelocity`. Owners and repositories are lowercased and sorted, samples are sorted, and instants are canonical ISO strings.
+- `summary`: the object returned by `summarizeVelocity(preview)`. This is the same fleet rollup the Velocity page shows for that capture. A single file is a preview, not a stored baseline and not a trend.
+
+Failure writes one JSON object to stderr and exits 1. The object keeps `error` and adds `code`, `cause`, `fix`, and `retryable`, in that order. `retryable` is false for every code: the same arguments fail again until the caller changes them. The fix says what to change.
+
+- `usage` — missing, empty, or extra arguments. `error` is `Usage: pnpm exec tsx scripts/preview-velocity.ts CAPTURE.json`. `cause` is `The command needs exactly one capture path.` `fix` is `Run pnpm exec tsx scripts/preview-velocity.ts CAPTURE.json with one local JSON file.`
+- `read` — the path could not be opened, read, or closed as a file. A directory is this code. `error` is `Capture file could not be read.` `cause` is `The path could not be opened, read, or closed as a file.` `fix` is `Pass a readable regular file and run the command again.` Open, read, and close failures use these fixed sentences. They do not include the path, an operating-system code, or an exception message.
+- `oversize` — the file is larger than 2 MB. `error` is `Capture exceeds the 2 MB limit.` `cause` is `The file is larger than 2 MB.` `fix` is `Pass a capture of at most 2 MB and run the command again.`
+- `utf8` — the bytes are not UTF-8. `error` is `Capture is not valid UTF-8 JSON.` `cause` is `The file is not valid UTF-8.` `fix` is `Save the capture as UTF-8 JSON and run the command again.`
+- `json` — the bytes are UTF-8 but `JSON.parse` rejects them. `error` is the same sentence as `utf8`. `cause` is `The file is valid UTF-8 but is not JSON.` `fix` is `Correct the JSON syntax and run the command again.`
+- `validation` — `parseVelocity` rejects the value. `error` and `cause` are both that validator message, truncated to 240 characters, the same limit as the page notice. `fix` is `Correct the capture so it matches the shared velocity contract, then run the command again.`
+
+`oversize` and `utf8` are decided while reading. `json` and `validation` run only after the bytes are in memory. A close failure does not replace those four results. It is reported as `read` only when the bytes parsed and the shared validator accepted them. A read failure is never labeled `validation`. The failure text omits the file path and the raw capture. The command does not write the capture, create an output file, or call `POST /api/velocity/ingest`.
 
 ## API and history
 

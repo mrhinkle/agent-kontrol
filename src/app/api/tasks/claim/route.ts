@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { enforceApi } from "@/lib/auth";
+import { runWithPrincipal } from "@/lib/actor";
+import { deny, resolveApiAccess } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { claimNextTask, report } from "@/lib/store";
@@ -14,8 +15,8 @@ export const maxDuration = 30;
  * queue is empty for that platform.
  */
 export async function POST(req: Request) {
-  const denied = await enforceApi(req);
-  if (denied) return denied;
+  const access = await resolveApiAccess(req);
+  if (!access.ok) return deny(access);
   if (!isConfigured()) {
     return NextResponse.json({ task: null, demo: true });
   }
@@ -31,22 +32,27 @@ export async function POST(req: Request) {
     if (!body.agent_id) fields.agent_id = "agent_id is required";
     return apiError("missing_field", { message: "platform and agent_id are required", fields });
   }
+  const platform = body.platform;
+  const agentId = body.agent_id;
   try {
-    const task = await claimNextTask({
-      platform: body.platform,
-      machine: body.machine,
-      agent_id: body.agent_id,
-    });
-    if (task) {
-      await report({
-        agent_id: body.agent_id,
-        platform: body.platform,
+    const task = await runWithPrincipal(access.principal, async () => {
+      const claimed = await claimNextTask({
+        platform,
         machine: body.machine,
-        kind: "status",
-        title: `Claimed task #${task.id}: ${task.title}`,
-        detail: { task_id: task.id },
+        agent_id: agentId,
       });
-    }
+      if (claimed) {
+        await report({
+          agent_id: agentId,
+          platform,
+          machine: body.machine,
+          kind: "status",
+          title: `Claimed task #${claimed.id}: ${claimed.title}`,
+          detail: { task_id: claimed.id },
+        });
+      }
+      return claimed;
+    });
     return NextResponse.json({ task });
   } catch (e) {
     return publicError("[tasks] claim failed", e);
