@@ -1,3 +1,4 @@
+import type { McpServerOptions } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpHandler, getPublicOrigin, withMcpAuth } from "mcp-handler";
 import { z } from "zod";
 import { currentActor, runWithPrincipal } from "@/lib/actor";
@@ -5,6 +6,7 @@ import { activityDetail, readReceipt, withReceipt } from "@/lib/activity";
 import { apiError, errorBody, memoryKeyError, toolResultFromCaught, type McpToolResult } from "@/lib/api-error";
 import { secretsMatch, verifyAccessToken } from "@/lib/authcrypto";
 import { resolveAgentCredential } from "@/lib/credentials";
+import { enrichMcpResponse, MCP_MAX_TOOL_INPUT_ELEMENTS, noteInitialCredentialStoreOutage, runWithMcpRequest } from "@/lib/mcp-protocol";
 import { chargeCredentialRequest, rateLimitedResponse } from "@/lib/credential-rate-limit";
 import { isConfigured } from "@/lib/db";
 import {
@@ -57,6 +59,10 @@ async function guardTool(label: string, run: () => Promise<McpToolResult>): Prom
  * can report what it's doing, see what the rest of the fleet is doing,
  * and read/write shared memory.
  */
+const mcpServerOptions: McpServerOptions = {
+  maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS,
+};
+
 const handler = createMcpHandler(
   (server) => {
     server.registerTool(
@@ -701,7 +707,7 @@ const handler = createMcpHandler(
       async (args) => guardTool("set_watched_repos", () => setWatchedReposTool(args)),
     );
   },
-  {},
+  mcpServerOptions,
   {
     basePath: "/api",
     maxDuration: 60,
@@ -729,11 +735,18 @@ async function verifyToken(_req: Request, bearerToken?: string) {
     };
   }
 
-  // 2. Per-agent credential. Unknown, revoked, expired, or a store error
-  //    returns undefined: the same 401 + WWW-Authenticate as any other
-  //    bad bearer. Do not fall through to OAuth.
+  // 2. Per-agent credential. Unknown, revoked, or expired returns undefined:
+  //    the same 401 + WWW-Authenticate as any other bad bearer. A store
+  //    outage also returns undefined, and records that fact for this request
+  //    only so the response wrapper can classify it as 503. Do not fall
+  //    through to OAuth, and do not throw: mcp-handler would report a throw
+  //    as Invalid token.
   if (bearerToken.startsWith("akc_")) {
     const resolved = await resolveAgentCredential(bearerToken);
+    if (resolved.status === "unavailable") {
+      noteInitialCredentialStoreOutage();
+      return undefined;
+    }
     if (resolved.status !== "ok") return undefined;
     return {
       token: bearerToken,
@@ -846,4 +859,8 @@ const authed = withMcpAuth(
   },
 );
 
-export { authed as GET, authed as POST, authed as DELETE };
+async function serve(req: Request): Promise<Response> {
+  return runWithMcpRequest(async () => enrichMcpResponse(await authed(req)));
+}
+
+export { serve as GET, serve as POST, serve as DELETE };
