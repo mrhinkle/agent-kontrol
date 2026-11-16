@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { enforceApi } from "@/lib/auth";
+import { runWithPrincipal } from "@/lib/actor";
+import { deny, resolveApiAccess } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { diffTaskUpdate, readDryRun, readExpectedRevision, refusedDryRun } from "@/lib/dry-run";
@@ -22,8 +23,8 @@ export const maxDuration = 30;
  * or the route answers 409 stale_write and writes nothing.
  */
 export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }> }) {
-  const denied = await enforceApi(req);
-  if (denied) return denied;
+  const access = await resolveApiAccess(req);
+  if (!access.ok) return deny(access);
   if (!isConfigured()) {
     let peeked: {
       dry_run?: unknown;
@@ -81,21 +82,22 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
       );
     }
     if (revision.revision === undefined) return NextResponse.json({ ok: true, demo: true });
+    const expectedRevision = revision.revision;
     const { id } = await ctx.params;
     const taskId = Number(id);
     if (!Number.isFinite(taskId)) {
       return apiError("validation_failed", { message: "invalid task id", fields: { id: "invalid task id" } });
     }
     try {
-      const task = await demoUpdateTaskGuarded({
+      const task = await runWithPrincipal(access.principal, () => demoUpdateTaskGuarded({
         id: taskId,
         status: peeked.status,
         result: peeked.result,
         cost_usd: peeked.cost_usd,
         session_id: peeked.session_id,
         assigned_agent: peeked.assigned_agent,
-        expected_revision: revision.revision,
-      });
+        expected_revision: expectedRevision,
+      }));
       return NextResponse.json({ ok: true, demo: true, applied: true, task });
     } catch (e) {
       return publicError("[tasks] update failed", e);
@@ -149,16 +151,27 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
       if (!preview) return apiError("task_not_found");
       return NextResponse.json(preview);
     }
-    const { dry_run: _ignored, expected_revision: _revision, ...patch } = body;
-    const task = await updateTask({ id: taskId, ...patch, expected_revision: revision.revision });
-    if (body.status && body.agent_id) {
-      await report({
-        agent_id: body.agent_id,
-        kind: body.status === "failed" ? "error" : "status",
-        title: `Task #${task.id} → ${body.status}: ${task.title}`,
-        detail: { task_id: task.id, cost_usd: body.cost_usd },
+    const task = await runWithPrincipal(access.principal, async () => {
+      // Body actor, eventKind, and activityTool are not the authenticated actor.
+      const updated = await updateTask({
+        id: taskId,
+        status: body.status,
+        result: body.result,
+        cost_usd: body.cost_usd,
+        session_id: body.session_id,
+        assigned_agent: body.assigned_agent,
+        expected_revision: revision.revision,
       });
-    }
+      if (body.status && body.agent_id) {
+        await report({
+          agent_id: body.agent_id,
+          kind: body.status === "failed" ? "error" : "status",
+          title: `Task #${updated.id} → ${body.status}: ${updated.title}`,
+          detail: { task_id: updated.id, cost_usd: body.cost_usd },
+        });
+      }
+      return updated;
+    });
     return NextResponse.json({ ok: true, task });
   } catch (e) {
     return publicError("[tasks] update failed", e);

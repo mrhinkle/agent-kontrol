@@ -640,6 +640,7 @@ function asTask(row: Record<string, unknown>): Task {
   delete extra.receipt_at;
   delete extra.previous_status;
   delete extra.notice_rows;
+  delete extra.notice_gate;
   delete extra.scanned_rows;
   delete extra.queue_episode;
   delete extra.notice_id;
@@ -1604,10 +1605,11 @@ export async function updateTask(input: {
             actor_type = case when ${hasActor} then ${actorType} else actor_type end,
             actor_id = case when ${hasActor} then ${actorId} else actor_id end
           from (
-            select id, status from tasks where id = ${input.id} for update
+            select id, status, ${notify}::boolean as notify
+            from tasks where id = ${input.id} for update
           ) as previous
           where t.id = previous.id
-          returning t.*, previous.status as previous_status
+          returning t.*, previous.status as previous_status, previous.notify as notice_gate
         ),
         logged as (
           insert into events (agent_id, session_id, kind, title, detail)
@@ -1648,7 +1650,7 @@ export async function updateTask(input: {
             )
           from changed
           join logged on true
-          where ${notify}::boolean
+          where changed.notice_gate
             and changed.status = 'queued'
             and changed.previous_status is distinct from 'queued'
           returning id
@@ -1676,11 +1678,12 @@ export async function updateTask(input: {
             actor_type = case when ${hasActor} then ${actorType} else actor_type end,
             actor_id = case when ${hasActor} then ${actorId} else actor_id end
           from (
-            select id, status from tasks where id = ${input.id} for update
+            select id, status, ${notify}::boolean as notify
+            from tasks where id = ${input.id} for update
           ) as previous
           where t.id = previous.id
             and md5(t::text) = ${expected}
-          returning t.*, previous.status as previous_status
+          returning t.*, previous.status as previous_status, previous.notify as notice_gate
         ),
         logged as (
           insert into events (agent_id, session_id, kind, title, detail)
@@ -1721,7 +1724,7 @@ export async function updateTask(input: {
             )
           from changed
           join logged on true
-          where ${notify}::boolean
+          where changed.notice_gate
             and changed.status = 'queued'
             and changed.previous_status is distinct from 'queued'
           returning id

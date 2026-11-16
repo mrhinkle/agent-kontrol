@@ -422,8 +422,8 @@ describe("queue episode and atomic notice", () => {
       assert.doesNotMatch(noticeSlice(text), /title|description|result|token|prompt/);
       assert.equal(call.values.includes("secret-title"), false);
     }
-    assert.equal(seen[0].values.at(-1), false);
-    assert.equal(seen[1].values.at(-1), true);
+    assert.deepEqual(seen[0].values.slice(-6), [false, 7, "task_requeued", "requeue_task", null, null]);
+    assert.deepEqual(seen[1].values.slice(-7), [true, 7, "abc", "task_updated", "update_task", null, null]);
     assert.match(seen[1].text, /md5\(t::text\)/);
     for (const task of [unguarded, guarded]) {
       const published = JSON.stringify(task);
