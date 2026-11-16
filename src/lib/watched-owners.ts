@@ -4,9 +4,11 @@ import { isConfigured, sql, withTransaction, type Row } from "./db";
 import {
   alignRepoCasing,
   DISCOVERY_WRITE_LOCK,
+  discoveryFailureSummary,
   planDiscovery,
   repoIdentity,
   repoOwner,
+  type DiscoveryFailureCode,
   type DiscoveryOutcome,
   type DiscoverySweep,
   type GhListedRepo,
@@ -35,6 +37,8 @@ export interface DiscoveryRequest {
   truncated?: boolean;
   /** Collector clock time taken just before `gh repo list`. */
   sweptAt?: string | null;
+  /** Set where the request was classified. Absent on a listing the planner still has to judge. */
+  failureCode?: DiscoveryFailureCode;
 }
 
 function iso(value: unknown): string | null {
@@ -200,19 +204,27 @@ export function ruleOf(owner: StoredOwner): OwnerRule {
 export function sweepOf(request: DiscoveryRequest): DiscoverySweep {
   const sweptAt = request.sweptAt ?? null;
   if (!request.ok) {
-    return { repos: null, error: request.error?.trim() || "gh repo list failed", truncated: false, sweptAt };
+    return {
+      repos: null,
+      error: request.error?.trim() || "gh repo list failed",
+      truncated: false,
+      sweptAt,
+      failureCode: request.failureCode ?? "collection_failed",
+    };
   }
   return {
     repos: request.repos ?? [],
     error: request.error ?? null,
     truncated: request.truncated === true,
     sweptAt,
+    failureCode: null,
   };
 }
 
-function unchanged(existing: TrackedRepo[], failure: string): DiscoveryOutcome {
+function unchanged(existing: TrackedRepo[], failure: string, failureCode: DiscoveryFailureCode): DiscoveryOutcome {
   return {
     failure,
+    failureCode,
     warning: null,
     repos: existing.map((row) => ({ ...row })),
     added: [],
@@ -258,14 +270,15 @@ function sameDiscoveryRule(rule: OwnerRule, stored: StoredOwner): boolean {
     && stored.includeArchived === rule.includeArchived;
 }
 
-function skippedOutcome(existing: TrackedRepo[], skipped: DiscoverySkip): DiscoveryApplyOutcome {
-  return { ...unchanged(existing, `skipped: ${skipped}`), skipped };
+function skippedOutcome(existing: TrackedRepo[], skipped: Exclude<DiscoverySkip, "stale">): DiscoveryApplyOutcome {
+  return { ...unchanged(existing, discoveryFailureSummary(skipped), skipped), skipped };
 }
 
 /** A stale sweep is not a failure. It writes nothing and keeps the newer stamp. */
 function staleOutcome(existing: TrackedRepo[]): DiscoveryApplyOutcome {
   return {
     failure: null,
+    failureCode: null,
     warning: null,
     repos: existing.map((row) => ({ ...row })),
     added: [],
