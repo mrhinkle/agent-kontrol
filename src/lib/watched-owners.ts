@@ -197,11 +197,15 @@ export async function replaceWatchedOwners(
       .map((row) => typeof row.owner === "string" ? row.owner : "")
       .filter((owner) => owner.length > 0)
       .sort();
-    await insertToolReceipt(q, {
-      kind: "owners.replace",
-      title: "Watched owners replaced",
-      extra: { operation: "replace", deleted_owners: deletedOwners },
-    });
+    // Added and retained rows already store the configuring actor. An events
+    // receipt exists only for owners this statement actually deleted.
+    if (deletedOwners.length > 0) {
+      await insertToolReceipt(q, {
+        kind: "owners.replace",
+        title: "Watched owners replaced",
+        extra: { operation: "replace", deleted_owners: deletedOwners },
+      });
+    }
     return { ok: true };
   });
 }

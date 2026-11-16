@@ -235,22 +235,19 @@ describe("B owner discovery and replacement receipts", { skip: !OPT_IN, concurre
     const saved = await put([...withoutMine(before.owners), ownerBody(KEPT), ownerBody(DROPPED)], before.version, LEGACY);
     assert.equal(saved.status, 200, JSON.stringify(await saved.clone().json()));
     const kept = await ownerRow(KEPT);
+    const dropped = await ownerRow(DROPPED);
     assert.equal(kept?.actor_type, "agent");
     assert.equal(kept?.actor_id, "mc-token");
+    assert.equal(dropped?.actor_type, "agent");
+    assert.equal(dropped?.actor_id, "mc-token");
     const afterSave = await replaceReceipts();
-    const proof = addedSince(beforeReceipts, afterSave);
-    assert.equal(proof.length, 1);
-    assert.equal(proof[0].detail.actor_id, "mc-token");
-    assert.equal(proof[0].detail.tool, "owners.replace");
-    assert.deepEqual(proof[0].detail.deleted_owners, []);
-    assert.equal(JSON.stringify(proof[0].detail).includes("forged-actor-label"), false);
-    assert.equal(JSON.stringify(proof[0].detail).includes(KEPT), false);
+    assert.equal(addedSince(beforeReceipts, afterSave).length, 0);
 
     const stale = await put([...withoutMine(before.owners), ownerBody(KEPT, 7)], before.version, LEGACY);
     assert.equal(stale.status, 409);
     assert.equal((await ownerRow(KEPT))?.actor_id, "mc-token");
     assert.equal((await ownerRow(KEPT))?.actor_type, "agent");
-    assert.equal((await replaceReceipts()).length, beforeReceipts.length + 1);
+    assert.equal((await replaceReceipts()).length, beforeReceipts.length);
 
     const current = await settings();
     const removed = await put(withoutMine(current.owners), current.version, LEGACY);
@@ -276,12 +273,9 @@ describe("B owner discovery and replacement receipts", { skip: !OPT_IN, concurre
       const row = await ownerRow(OPEN);
       assert.equal(row?.actor_type, null);
       assert.equal(row?.actor_id, null);
-      const proof = addedSince(beforeReceipts, await replaceReceipts());
-      assert.equal(proof.length, 1);
-      assert.equal(proof[0].detail.actor_type ?? null, null);
-      assert.equal(proof[0].detail.actor_id ?? null, null);
-      assert.equal(JSON.stringify(proof[0].detail).includes("operator"), false);
-      assert.equal(JSON.stringify(proof[0].detail).includes("forged"), false);
+      assert.equal(addedSince(beforeReceipts, await replaceReceipts()).length, 0);
+      assert.equal(JSON.stringify(row).includes("operator"), false);
+      assert.equal(JSON.stringify(row).includes("forged"), false);
     } finally {
       env.MC_TOKEN = LEGACY;
     }
