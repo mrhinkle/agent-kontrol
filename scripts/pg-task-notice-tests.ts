@@ -237,6 +237,45 @@ export async function testTaskQueueNotices(): Promise<void> {
     assert.equal(boundedClaim.coverage.evidence, "notified");
     assert.equal(boundedClaim.coverage.queue_episode, boundedMarkers[0].id);
     assert.ok(readDelta < expiredRows / 2, `episode scan read ${readDelta} index tuples after inserting ${expiredRows} expired rows`);
+    const explained = await sql()`explain (analyze, format json)
+      with cutoff as materialized (
+        select statement_timestamp() - (30::int * interval '1 day') as ts
+      )
+      select e.id from events e
+      where e.created_at >= (select ts from cutoff)
+      order by e.created_at desc
+      limit 500`;
+    const planRoot = explained[0]["QUERY PLAN"] as { Plan: Record<string, unknown> }[];
+    const planNodes: Record<string, unknown>[] = [];
+    const walkPlan = (node: Record<string, unknown>) => {
+      planNodes.push(node);
+      for (const child of (node.Plans as Record<string, unknown>[] | undefined) ?? []) walkPlan(child);
+    };
+    walkPlan(planRoot[0].Plan);
+    const indexScan = planNodes.find((node) => node["Index Name"] === "events_created_idx");
+    assert.ok(indexScan, "bounded slice did not use events_created_idx");
+    assert.match(String(indexScan["Index Cond"] ?? ""), /created_at/);
+    const removed = planNodes.reduce((sum, node) => sum + Number(node["Rows Removed by Filter"] ?? 0), 0);
+    assert.ok(removed < expiredRows, `plan removed ${removed} expired rows by filter`);
+    await sql()`insert into events (kind, detail, created_at)
+      select 'ak78-filler', '{}'::jsonb, statement_timestamp() + interval '6 hours'
+      from generate_series(1, ${600})`;
+    const tiedPlan = await sql()`explain (analyze, format json)
+      select e.id from events e
+      where e.created_at >= statement_timestamp() - interval '30 days'
+      order by e.created_at desc
+      limit 500`;
+    const tiedRoot = tiedPlan[0]["QUERY PLAN"] as { Plan: Record<string, unknown> }[];
+    const tiedNodes: Record<string, unknown>[] = [];
+    const walkTied = (node: Record<string, unknown>) => {
+      tiedNodes.push(node);
+      for (const child of (node.Plans as Record<string, unknown>[] | undefined) ?? []) walkTied(child);
+    };
+    walkTied(tiedRoot[0].Plan);
+    const tiedScan = tiedNodes.find((node) => node["Index Name"] === "events_created_idx");
+    assert.ok(tiedScan, "equal-timestamp slice did not use events_created_idx");
+    assert.ok(Number(tiedScan["Actual Rows"] ?? 0) <= 500, `equal-timestamp scan read ${String(tiedScan["Actual Rows"])} rows`);
+    await sql()`delete from events where kind = 'ak78-filler'`;
 
     const requeuedTask = await make("requeue-latest");
     await updateTask({ id: requeuedTask.id, status: "failed" });
@@ -365,6 +404,9 @@ export async function testTaskQueueNotices(): Promise<void> {
       assert.equal(outcome, "rejected");
       const status = await sql()`select status from tasks where id = ${timeoutTask.id}`;
       assert.equal(status[0].status, "queued");
+      const claimedReceipts = await sql()`select count(*)::int as n from events
+        where kind = 'task_claimed' and detail->>'task_id' = ${String(timeoutTask.id)}`;
+      assert.equal(Number(claimedReceipts[0].n), 0, "a lock timeout must not commit a claim");
     } finally {
       await timeoutHolder.query("rollback").catch(() => undefined);
       await timeoutHolder.end();
