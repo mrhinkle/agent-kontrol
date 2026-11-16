@@ -32,17 +32,19 @@ export async function POST(req: Request) {
     if (!body.agent_id) fields.agent_id = "agent_id is required";
     return apiError("missing_field", { message: "platform and agent_id are required", fields });
   }
+  const platform = body.platform;
+  const agentId = body.agent_id;
   try {
     const task = await runWithPrincipal(access.principal, async () => {
       const claimed = await claimNextTask({
-        platform: body.platform,
+        platform,
         machine: body.machine,
-        agent_id: body.agent_id,
+        agent_id: agentId,
       });
       if (claimed) {
         await report({
-          agent_id: body.agent_id,
-          platform: body.platform,
+          agent_id: agentId,
+          platform,
           machine: body.machine,
           kind: "status",
           title: `Claimed task #${claimed.id}: ${claimed.title}`,

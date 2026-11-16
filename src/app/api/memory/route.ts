@@ -133,13 +133,14 @@ export async function POST(req: Request) {
     if (revision.revision === undefined) {
       return NextResponse.json({ ok: true, demo: true, applied: false, note: "DATABASE_URL not set; note not stored." });
     }
+    const expectedRevision = revision.revision;
     try {
       const item = await runWithPrincipal(access.principal, () => demoRememberGuarded({
         content: input.content,
         key: input.key,
         tags: input.tags,
         agent_id: typeof input.agent_id === "string" ? input.agent_id : undefined,
-        expected_revision: revision.revision,
+        expected_revision: expectedRevision,
       }));
       return NextResponse.json({ ok: true, demo: true, applied: true, item });
     } catch (e) {

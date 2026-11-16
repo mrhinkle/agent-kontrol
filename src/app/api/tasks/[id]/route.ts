@@ -75,6 +75,7 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
       );
     }
     if (revision.revision === undefined) return NextResponse.json({ ok: true, demo: true });
+    const expectedRevision = revision.revision;
     const { id } = await ctx.params;
     const taskId = Number(id);
     if (!Number.isFinite(taskId)) {
@@ -88,7 +89,7 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
         cost_usd: peeked.cost_usd,
         session_id: peeked.session_id,
         assigned_agent: peeked.assigned_agent,
-        expected_revision: revision.revision,
+        expected_revision: expectedRevision,
       }));
       return NextResponse.json({ ok: true, demo: true, applied: true, task });
     } catch (e) {
