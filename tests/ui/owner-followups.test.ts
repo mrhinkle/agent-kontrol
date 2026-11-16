@@ -92,6 +92,9 @@ function install(rows: StoredRepo[]) {
   setSqlForTests(async (strings, ...values) => {
     const text = strings.join(" ").replace(/\s+/g, " ").trim().toLowerCase();
     if (text === "begin" || text === "commit" || text === "rollback" || text.includes("pg_advisory_xact_lock")) return [];
+    if (text.includes("insert into events")) {
+      return [{ id: 1, kind: values[0], created_at: "2026-11-15T00:00:00.000Z" }];
+    }
     if (text.includes("update watched_owners")) {
       const stamp = values.find((value) => typeof value === "string" && value.includes("T"));
       if (typeof stamp === "string") owners[0].last_discovered_at = stamp;

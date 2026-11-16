@@ -570,7 +570,11 @@ describe("settings MCP tools", { concurrency: false }, () => {
     assert.equal(saved.source, "database");
     assert.deepEqual(saved.repos.map((row) => row.repo), ["acme/rest"]);
     assert.notEqual(saved.version, body.version);
-    assert.equal(store.events.length, 0);
+    assert.equal(store.events.length, 1);
+    const receipt = JSON.parse(store.events[0]?.detail ?? "{}") as { actor_type: string | null; actor_id: string | null; tool: string };
+    assert.equal(receipt.tool, "set_watched_repos");
+    assert.equal(receipt.actor_type, null);
+    assert.equal(receipt.actor_id, null);
     assert.equal(store.writes(), 1);
   });
 

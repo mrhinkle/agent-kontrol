@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { enforceApi } from "@/lib/auth";
+import { runWithPrincipal } from "@/lib/actor";
+import { deny, enforceApi, resolveApiAccess } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { diffRepoList, readDryRun } from "@/lib/dry-run";
@@ -76,8 +77,8 @@ export async function GET(req: Request) {
 }
 
 export async function PUT(req: Request) {
-  const denied = await enforceApi(req);
-  if (denied) return denied;
+  const access = await resolveApiAccess(req);
+  if (!access.ok) return deny(access);
   let body: unknown;
   try {
     body = await req.json();
@@ -135,7 +136,11 @@ export async function PUT(req: Request) {
     }
     // A mismatch above is enough for a dry run. A real save checks again
     // under the discovery write lock, after a pin or hide may have landed.
-    const saved = await replaceWatchedRepos(checked.repos, typeof sent === "string" ? sent : undefined);
+    const saved = await runWithPrincipal(access.principal, () => replaceWatchedRepos(
+      checked.repos,
+      typeof sent === "string" ? sent : undefined,
+      { kind: "set_watched_repos", title: "Watched repos replaced" },
+    ));
     if (!saved.ok) return apiError("stale");
     return NextResponse.json(await current());
   } catch (e) {
@@ -159,8 +164,8 @@ function repoNotFound(): Response {
 }
 
 export async function PATCH(req: Request) {
-  const denied = await enforceApi(req);
-  if (denied) return denied;
+  const access = await resolveApiAccess(req);
+  if (!access.ok) return deny(access);
   let body: unknown;
   try {
     body = await req.json();
@@ -246,7 +251,11 @@ export async function PATCH(req: Request) {
       });
     }
     // The row can vanish between the read above and the locked update (a concurrent PUT).
-    if (!(await setRepoOverride(repo, patch))) return repoNotFound();
+    const saved = await runWithPrincipal(access.principal, () => setRepoOverride(repo, patch, {
+      kind: "set_repo_override",
+      title: "Repo pin or hide updated",
+    }));
+    if (!saved) return repoNotFound();
     return NextResponse.json(await current());
   } catch (e) {
     return failure(e, "save settings");
