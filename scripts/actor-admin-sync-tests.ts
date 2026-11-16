@@ -26,6 +26,7 @@ import {
   upsertSkill,
 } from "../src/lib/skills/store";
 import { setSyncFetcherForTests } from "../src/lib/skills/sync";
+import { assertActorAdminFixture } from "./actor-admin-fixture";
 import { ALL_RUNTIMES, type SkillRecord } from "../src/lib/skills/types";
 
 const PASSWORD = "actor-admin-test-password";
@@ -34,18 +35,8 @@ const CANARY = "CANARY-SKILL-BODY-do-not-audit";
 const KINDS = Object.values(SKILL_SYNC_KINDS);
 const env = process.env as Record<string, string | undefined>;
 
-function assertFixture(): void {
-  const raw = process.env.DATABASE_URL;
-  if (!raw) throw new Error("DATABASE_URL is not the actor admin fixture");
-  const url = new URL(raw);
-  if (
-    url.hostname !== "127.0.0.1" ||
-    url.port !== "65438" ||
-    url.username !== "ak_backlog_test" ||
-    url.pathname !== "/ak_actor_admin"
-  ) {
-    throw new Error("refusing to run skill sync tests outside ak_actor_admin");
-  }
+function assertFixture(): string {
+  return assertActorAdminFixture(process.env.DATABASE_URL);
 }
 
 function skillDoc(id: string, body: string): { path: string; content: string } {
@@ -538,7 +529,7 @@ async function fence(sourceId: string): Promise<void> {
     insert into skill_sync_runs (id, started_at, finished_at, trigger, status, summary, error)
     values (${runId}::uuid, now() - interval '11 minutes', null, 'manual', 'running', null, null)
   `;
-  const holder = new Client({ connectionString: process.env.DATABASE_URL });
+  const holder = new Client({ connectionString: assertFixture() });
   await holder.connect();
   let settled = false;
   try {

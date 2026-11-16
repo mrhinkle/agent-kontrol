@@ -20,6 +20,7 @@ import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypt
 import { activityDetail } from "./activity";
 import { currentActor } from "./actor";
 import { isConfigured, sql, withTransaction, type Row } from "./db";
+import { recordDemoActivity } from "./demo-store";
 import { describeDbError } from "./db-error";
 import { isScope, SCOPES, type Scope } from "./scopes";
 import {
@@ -125,6 +126,20 @@ function receiptAgent(kind: string): string | null {
 
 function receiptDetail(kind: string, extra: Record<string, unknown>): string {
   return JSON.stringify(activityDetail(kind, currentActor(), extra));
+}
+
+/**
+ * Demo mode has no events table. The same safe metadata goes into the
+ * process-local activity list, under the actor already installed by the
+ * dashboard route. A recording failure removes the credential change.
+ */
+function recordMemoryAdmin(kind: string, title: string, extra: Record<string, unknown>, undo: () => void): void {
+  try {
+    recordDemoActivity(kind, title, extra);
+  } catch (error) {
+    undo();
+    throw error;
+  }
 }
 
 /** A fake SQL tag returns no row. A real write returns counts and must pair them. */
@@ -379,10 +394,17 @@ export async function createCredential(input: {
     quota: emptyQuota(),
   };
   if (!isConfigured()) {
-    // Demo mode keeps the row in process memory. There is no events table,
-    // and an open dashboard is not an authenticated actor, so this path
-    // does not invent a receipt.
     memory.push(row);
+    recordMemoryAdmin(CREDENTIAL_ADMIN_KINDS.create, "Created a credential", {
+      operation: "create",
+      credential_id: row.id,
+      scopes: row.scopes,
+      rate_limit_per_minute: row.rate_limit_per_minute,
+      rate_limit_per_day: row.rate_limit_per_day,
+    }, () => {
+      const index = memory.findIndex((item) => item.id === row.id);
+      if (index >= 0) memory.splice(index, 1);
+    });
     return { ok: true, credential: toPublic(row), token: minted.token };
   }
   const kind = CREDENTIAL_ADMIN_KINDS.create;
@@ -449,8 +471,15 @@ export async function revokeCredential(id: string): Promise<PublicCredential | n
   const stamp = new Date(credentialNow()).toISOString();
   if (!isConfigured()) {
     const row = memory.find((item) => item.id === id);
-    if (!row) return null;
-    if (!row.revoked_at) row.revoked_at = stamp;
+    if (!row || row.revoked_at) return row ? toPublic(row) : null;
+    const previous = row.revoked_at;
+    row.revoked_at = stamp;
+    recordMemoryAdmin(CREDENTIAL_ADMIN_KINDS.revoke, "Revoked a credential", {
+      operation: "revoke",
+      credential_id: id,
+    }, () => {
+      row.revoked_at = previous;
+    });
     return toPublic(row);
   }
   const kind = CREDENTIAL_ADMIN_KINDS.revoke;
@@ -519,12 +548,22 @@ export async function updateCredentialLimits(input: {
   if (!isConfigured()) {
     const row = memory.find((item) => item.id === input.id);
     if (!row) return null;
-    if (input.rate_limit_per_minute !== null && input.rate_limit_per_minute !== row.rate_limit_per_minute) {
-      row.rate_limit_per_minute = input.rate_limit_per_minute;
-    }
-    if (input.rate_limit_per_day !== null && input.rate_limit_per_day !== row.rate_limit_per_day) {
-      row.rate_limit_per_day = input.rate_limit_per_day;
-    }
+    const previousMinute = row.rate_limit_per_minute;
+    const previousDay = row.rate_limit_per_day;
+    const nextMinute = input.rate_limit_per_minute ?? previousMinute;
+    const nextDay = input.rate_limit_per_day ?? previousDay;
+    if (nextMinute === previousMinute && nextDay === previousDay) return toPublic(row);
+    row.rate_limit_per_minute = nextMinute;
+    row.rate_limit_per_day = nextDay;
+    recordMemoryAdmin(CREDENTIAL_ADMIN_KINDS.limits, "Updated credential limits", {
+      operation: "limits",
+      credential_id: input.id,
+      rate_limit_per_minute: { from: previousMinute, to: nextMinute },
+      rate_limit_per_day: { from: previousDay, to: nextDay },
+    }, () => {
+      row.rate_limit_per_minute = previousMinute;
+      row.rate_limit_per_day = previousDay;
+    });
     return toPublic(row);
   }
   return withTransaction(async (q) => {

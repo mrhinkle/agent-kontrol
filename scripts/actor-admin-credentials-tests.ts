@@ -14,22 +14,14 @@ import {
   updateCredentialLimits,
 } from "../src/lib/credentials";
 import { sql } from "../src/lib/db";
+import { demoListActivity, resetDemoStoreForTests } from "../src/lib/demo-store";
+import { assertActorAdminFixture } from "./actor-admin-fixture";
 
 const PASSWORD = "actor-admin-test-password";
 const KINDS = Object.values(CREDENTIAL_ADMIN_KINDS);
 
-function assertFixture(): void {
-  const raw = process.env.DATABASE_URL;
-  if (!raw) throw new Error("DATABASE_URL is not the actor admin fixture");
-  const url = new URL(raw);
-  if (
-    url.hostname !== "127.0.0.1" ||
-    url.port !== "65438" ||
-    url.username !== "ak_backlog_test" ||
-    url.pathname !== "/ak_actor_admin"
-  ) {
-    throw new Error("refusing to run credential admin tests outside ak_actor_admin");
-  }
+function assertFixture(): string {
+  return assertActorAdminFixture(process.env.DATABASE_URL);
 }
 
 const env = process.env as Record<string, string | undefined>;
@@ -226,7 +218,7 @@ export async function testCredentialAdmin(): Promise<void> {
     `;
     assert.equal(Number(missingEvents[0].n), 0);
 
-    const holder = new Client({ connectionString: process.env.DATABASE_URL });
+    const holder = new Client({ connectionString: assertFixture() });
     await holder.connect();
     let limitsSettled = false;
     try {
@@ -360,21 +352,72 @@ export async function testCredentialAdmin(): Promise<void> {
     env.NODE_ENV = "test";
     delete process.env.DATABASE_URL;
     resetCredentialsForTests();
+    resetDemoStoreForTests();
     const demo = await post({ label: "demo-open", scopes: ["fleet:read"], actor_id: "forged-actor-canary" });
     assert.equal(demo.status, 200);
-    const demoBody = await demo.json() as { credential: { id: string; token: string } };
+    const demoBody = await demo.json() as { credential: { id: string; token: string; token_prefix: string } };
     assert.match(demoBody.credential.token, /^akc_/);
+    const demoActivity = await demoListActivity({ actor: null, kind: CREDENTIAL_ADMIN_KINDS.create, since: null, until: null });
+    assert.equal(demoActivity.length, 1);
+    assert.equal(demoActivity[0]?.actor_type, null);
+    assert.equal(demoActivity[0]?.actor_id, null);
+    assert.equal(demoActivity[0]?.detail?.credential_id, demoBody.credential.id);
+    const demoText = JSON.stringify(demoActivity[0]?.detail);
+    assertNoSecret(demoText, demoBody.credential.token, "token");
+    assertNoSecret(demoText, demoBody.credential.token_prefix, "prefix");
+    assertNoSecret(demoText, "demo-open", "label");
+    assertNoSecret(demoText, "forged-actor-canary", "forged actor");
     process.env.DATABASE_URL = saved.DATABASE_URL;
     const demoEvents = await receiptsFor(demoBody.credential.id);
-    assert.equal(demoEvents.length, 0, "demo mode does not invent an events receipt");
+    assert.equal(demoEvents.length, 0, "demo mode does not invent a PostgreSQL events receipt");
     const demoStored = await credentialRow(demoBody.credential.id);
     assert.equal(demoStored, null);
     resetCredentialsForTests();
+    resetDemoStoreForTests();
+
+    delete process.env.DATABASE_URL;
+    env.MC_DASHBOARD_PASSWORD = PASSWORD;
+    const humanDemo = await post({
+      label: "demo-human",
+      scopes: ["fleet:read"],
+      actor_id: "forged-actor-canary",
+    }, { cookie });
+    assert.equal(humanDemo.status, 200);
+    const humanDemoBody = await humanDemo.json() as { credential: { id: string; token: string; token_prefix: string } };
+    assert.equal((await patch({ id: humanDemoBody.credential.id, rate_limit_per_minute: 17 }, { cookie })).status, 200);
+    assert.equal((await patch({ id: humanDemoBody.credential.id, rate_limit_per_minute: 17 }, { cookie })).status, 200);
+    assert.equal((await del({ id: humanDemoBody.credential.id }, { cookie })).status, 200);
+    assert.equal((await del({ id: humanDemoBody.credential.id }, { cookie })).status, 200);
+    assert.equal((await del({ id: "missing-demo-credential" }, { cookie })).status, 404);
+    const humanActivity = await demoListActivity({ actor: null, kind: null, since: null, until: null });
+    const demoHumanReceipts = humanActivity.filter((row) => row.kind.startsWith("credential_"));
+    assert.deepEqual(demoHumanReceipts.map((row) => row.kind).sort(), [
+      CREDENTIAL_ADMIN_KINDS.create,
+      CREDENTIAL_ADMIN_KINDS.limits,
+      CREDENTIAL_ADMIN_KINDS.revoke,
+    ]);
+    for (const row of demoHumanReceipts) {
+      assert.equal(row.actor_type, "human");
+      assert.equal(row.actor_id, DASHBOARD_ACTOR_ID);
+      const text = JSON.stringify(row.detail);
+      assertNoSecret(text, humanDemoBody.credential.token, "token");
+      assertNoSecret(text, humanDemoBody.credential.token_prefix, "prefix");
+      assertNoSecret(text, cookie, "cookie");
+      assertNoSecret(text, "demo-human", "label");
+      assertNoSecret(text, "forged-actor-canary", "forged actor");
+    }
+    process.env.DATABASE_URL = saved.DATABASE_URL;
+    assert.equal((await receiptsFor(humanDemoBody.credential.id)).length, 0);
+    assert.equal(await credentialRow(humanDemoBody.credential.id), null);
+    delete process.env.MC_DASHBOARD_PASSWORD;
+    resetCredentialsForTests();
+    resetDemoStoreForTests();
 
     assert.equal(await countEvents(), baseline + 5, "three creates, one limits edit, and one revoke");
   } finally {
     setCredentialReceiptFaultForTests(null);
     resetCredentialsForTests();
+    resetDemoStoreForTests();
     restoreEnv(saved);
     if (createdIds.length > 0) {
       await sql()`delete from events where detail->>'credential_id' = any(${createdIds}::text[])`;
