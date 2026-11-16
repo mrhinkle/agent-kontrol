@@ -1,13 +1,15 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { setSqlForTests, type Row } from "../../src/lib/db";
-import { planDiscovery, type GhListedRepo, type OwnerRule, type TrackedRepo } from "../../src/lib/owner-discovery";
+import { discoveryFailureSummary, planDiscovery, type GhListedRepo, type OwnerRule, type TrackedRepo } from "../../src/lib/owner-discovery";
 import { POST as postDiscover } from "../../src/app/api/settings/owners/discover/route";
+import { GET as getOwners } from "../../src/app/api/settings/owners/route";
 
 /**
  * Issue #52 Q6 owner-discovery item teaching. Real discover route and the
  * planner. Synthetic SQL only. Codes come from the branch that failed, not
- * from the collector's sentence.
+ * from the collector's sentence. The public failure text is that code's
+ * fixed summary, never the collector diagnostic.
  */
 
 const env = process.env as Record<string, string | undefined>;
@@ -15,6 +17,10 @@ const KEYS = ["DATABASE_URL", "NODE_ENV", "MC_TOKEN", "MC_DASHBOARD_PASSWORD", "
 const saved = Object.fromEntries(KEYS.map((key) => [key, env[key]]));
 const FIXTURE_URL = "postgresql://discovery-test.invalid/none";
 const SECRET = "password=discovery-probe-secret";
+const COLLECTOR_SECRET = "SYNTHETIC-COLLECTOR-PRIVATE-VALUE";
+const COLLECTION = discoveryFailureSummary("collection_failed");
+const EMPTY = discoveryFailureSummary("empty_listing");
+const INVALID = discoveryFailureSummary("invalid_listing");
 const SWEPT = "2026-11-15T12:00:00.000Z";
 const PUSHED = "2026-11-01T00:00:00.000Z";
 
@@ -106,22 +112,24 @@ function assertFailed(item: Item, expected: { code: string; error: string; retry
 describe("owner discovery item teaching", () => {
   it("classifies planner failures at the branch that failed", () => {
     const existing = [tracked({ repo: "acme/app" })];
-    const collected = planDiscovery(existing, RULE, { repos: null, error: "HTTP 403 from the collector", failureCode: null }, new Date(SWEPT));
-    assert.equal(collected.failure, "HTTP 403 from the collector");
+    const collected = planDiscovery(existing, RULE, { repos: null, error: `HTTP 403 from the collector password=${COLLECTOR_SECRET}`, failureCode: null }, new Date(SWEPT));
+    assert.equal(collected.failure, COLLECTION);
+    assert.equal(collected.failure?.includes(COLLECTOR_SECRET), false);
     assert.equal(collected.failureCode, "collection_failed");
     assert.equal(collected.added.length, 0);
     assert.equal(collected.markedGone.length, 0);
 
-    const misleading = planDiscovery(existing, RULE, { repos: [], error: "gh repo list failed" }, new Date(SWEPT));
-    assert.equal(misleading.failure, "gh repo list failed");
+    const misleading = planDiscovery(existing, RULE, { repos: [], error: `gh repo list failed password=${COLLECTOR_SECRET}` }, new Date(SWEPT));
+    assert.equal(misleading.failure, EMPTY);
+    assert.equal(misleading.failure?.includes(COLLECTOR_SECRET), false);
     assert.equal(misleading.failureCode, "empty_listing");
 
     const unnamed = planDiscovery(existing, RULE, { repos: null, error: "   " }, new Date(SWEPT));
-    assert.equal(unnamed.failure, "gh repo list failed");
+    assert.equal(unnamed.failure, COLLECTION);
     assert.equal(unnamed.failureCode, "collection_failed");
 
     const unsafe = planDiscovery(existing, RULE, { repos: [repo("app"), repo("bad name")], error: null }, new Date(SWEPT));
-    assert.equal(unsafe.failure, "gh repo list included a repo name that is not safe to store");
+    assert.equal(unsafe.failure, INVALID);
     assert.equal(unsafe.failureCode, "invalid_listing");
     assert.deepEqual(unsafe.repos.map((row) => row.gone), existing.map((row) => row.gone));
 
@@ -194,25 +202,25 @@ describe("owner discovery item teaching", () => {
 
     assertFailed(byOwner.get("emptyo")!, {
       code: "empty_listing",
-      error: "gh repo list failed",
+      error: EMPTY,
       retryable: true,
       fix: "Retry the tick with the repositories the collector found. An empty list is not a completed sweep.",
     });
     assertFailed(byOwner.get("bado")!, {
       code: "invalid_listing",
-      error: "a repo name was not safe to store",
+      error: INVALID,
       retryable: false,
       fix: "Correct the listing and send the tick again. A value that is not safe to store was not applied.",
     });
     assertFailed(byOwner.get("downo")!, {
       code: "collection_failed",
-      error: "HTTP 403",
+      error: COLLECTION,
       retryable: true,
       fix: "Retry the tick after the collector can list repositories. This sweep did not change tracked repos.",
     });
     assertFailed(byOwner.get("prose")!, {
       code: "collection_failed",
-      error: "gh repo list returned no repos",
+      error: COLLECTION,
       retryable: true,
       fix: "Retry the tick after the collector can list repositories. This sweep did not change tracked repos.",
     });
@@ -258,9 +266,11 @@ describe("owner discovery item teaching", () => {
       assert.doesNotMatch(written, new RegExp(`${owner}/`));
     }
     const storedErrors = updates.map((values) => values[0]);
-    assert.ok(storedErrors.includes("HTTP 403"));
-    assert.ok(storedErrors.includes("gh repo list returned no repos"));
-    assert.ok(storedErrors.includes("gh repo list failed"));
+    assert.equal(storedErrors.filter((value) => value === COLLECTION).length, 2);
+    assert.ok(storedErrors.includes(EMPTY));
+    assert.ok(storedErrors.includes(INVALID));
+    assert.equal(storedErrors.includes("HTTP 403"), false);
+    assert.equal(storedErrors.includes("gh repo list failed"), false);
     assert.equal(storedErrors.includes("collection_failed"), false);
     assert.equal(storedErrors.includes("empty_listing"), false);
     assert.equal(updates.length, 6, "success, warning, and four listing failures record last_error; skips do not");
@@ -364,15 +374,54 @@ describe("owner discovery item teaching", () => {
     assert.doesNotMatch(blownText, /discovery-probe-secret/);
     assert.equal(blownText.includes("\"ok\":true"), false);
   });
+
+  it("does not copy a collector diagnostic into the item, last_error, or owner inventory", async () => {
+    env.DATABASE_URL = FIXTURE_URL;
+    let repoWrites = 0;
+    let storedError: unknown = null;
+    setSqlForTests(async (strings, ...values) => {
+      const text = strings.join(" ").replace(/\s+/g, " ").toLowerCase();
+      if (text.includes("from watched_owners")) {
+        return [ownerRow("acme", 30, null, storedError)];
+      }
+      if (text.includes("update watched_owners")) storedError = values[0];
+      if (text.includes("insert into watched_repos")) repoWrites += 1;
+      return [];
+    });
+
+    const res = await discover([
+      sweep("acme", {
+        ok: false,
+        error: `gh failed password=${COLLECTOR_SECRET}`,
+        failureCode: "owner_removed",
+      }),
+    ]);
+    assert.equal(res.status, 200);
+    const body = await res.json() as { results: Item[] };
+    const item = body.results[0]!;
+    assert.equal(item.code, "collection_failed");
+    assert.equal(item.error, COLLECTION);
+    assert.equal(item.cause, COLLECTION);
+    assert.equal(repoWrites, 0);
+    assert.equal(storedError, COLLECTION);
+
+    const readback = await getOwners(new Request("http://localhost/api/settings/owners"));
+    assert.equal(readback.status, 200);
+    const ownerBody = await readback.json() as { owners: { last_error: string | null }[] };
+    assert.equal(ownerBody.owners[0]?.last_error, COLLECTION);
+    const leaked = JSON.stringify({ item, storedError, owners: ownerBody.owners });
+    assert.equal(leaked.includes(COLLECTOR_SECRET), false);
+    assert.equal(leaked.includes("owner_removed"), false);
+  });
 });
 
-function ownerRow(owner: string, activity: number, discovered: string | null): Row {
+function ownerRow(owner: string, activity: number, discovered: string | null, lastError: unknown = null): Row {
   return {
     owner,
     activity_days: activity,
     include_forks: false,
     include_archived: false,
-    last_error: null,
+    last_error: lastError,
     last_error_at: null,
     last_discovered_at: discovered,
     actor_type: null,

@@ -67,9 +67,26 @@ export type DiscoveryFailureCode =
   | "owner_removed"
   | "rule_changed";
 
+/**
+ * Public text for a failed sweep. Selected from the code, so a collector
+ * diagnostic is never copied into the response or `last_error`.
+ */
+const FAILURE_SUMMARY: Record<DiscoveryFailureCode, string> = {
+  collection_failed: "The collector did not complete the repository listing.",
+  empty_listing: "gh repo list returned no repos",
+  invalid_listing: "gh repo list included a repo name that is not safe to store",
+  owner_removed: "skipped: owner_removed",
+  rule_changed: "skipped: rule_changed",
+};
+
+export function discoveryFailureSummary(code: DiscoveryFailureCode): string {
+  return FAILURE_SUMMARY[code];
+}
+
 export interface DiscoverySweep {
   /** null when `gh` failed. An empty array is also a failure. */
   repos: GhListedRepo[] | null;
+  /** Collector diagnostic. Not copied into the outcome, the response, or `last_error`. */
   error: string | null;
   /** The list was cut at the cap. Seen repos update; absent repos are not marked gone. */
   truncated?: boolean;
@@ -324,16 +341,17 @@ export function planDiscovery(
 ): DiscoveryOutcome {
   const ownerKey = owner.owner.toLowerCase();
   if (sweep.repos === null) {
-    return untouched(existing, sweep.error?.trim() || "gh repo list failed", sweep.failureCode ?? "collection_failed");
+    const code = sweep.failureCode ?? "collection_failed";
+    return untouched(existing, discoveryFailureSummary(code), code);
   }
   if (sweep.repos.length === 0) {
-    return untouched(existing, sweep.error?.trim() || "gh repo list returned no repos", "empty_listing");
+    return untouched(existing, discoveryFailureSummary("empty_listing"), "empty_listing");
   }
 
   const listed = [...sweep.repos].sort((a, b) => a.name.localeCompare(b.name));
   for (const item of listed) {
     if (typeof item.name !== "string" || !NAME_RE.test(item.name) || item.name.length > 100) {
-      return untouched(existing, "gh repo list included a repo name that is not safe to store", "invalid_listing");
+      return untouched(existing, discoveryFailureSummary("invalid_listing"), "invalid_listing");
     }
   }
 

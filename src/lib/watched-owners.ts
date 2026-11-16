@@ -4,6 +4,7 @@ import { isConfigured, sql, withTransaction, type Row } from "./db";
 import {
   alignRepoCasing,
   DISCOVERY_WRITE_LOCK,
+  discoveryFailureSummary,
   planDiscovery,
   repoIdentity,
   repoOwner,
@@ -270,7 +271,7 @@ function sameDiscoveryRule(rule: OwnerRule, stored: StoredOwner): boolean {
 }
 
 function skippedOutcome(existing: TrackedRepo[], skipped: Exclude<DiscoverySkip, "stale">): DiscoveryApplyOutcome {
-  return { ...unchanged(existing, `skipped: ${skipped}`, skipped), skipped };
+  return { ...unchanged(existing, discoveryFailureSummary(skipped), skipped), skipped };
 }
 
 /** A stale sweep is not a failure. It writes nothing and keeps the newer stamp. */
