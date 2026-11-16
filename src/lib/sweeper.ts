@@ -1,4 +1,5 @@
 import { sql, withTransaction, type Row, type SqlTag } from "./db";
+import { isTaskLane } from "./task-lane";
 import { insertGhEvent } from "./gh-events";
 import { briefConfig } from "./progress-config";
 import { dbInstant } from "./sweep-clock";
@@ -361,19 +362,34 @@ async function evaluateConsumers(tx: SqlTag, now: string): Promise<DomainOutput>
         and e.principal_kind is not null
         and (e.principal_kind, e.principal_id) in (select k, i from unnest(${kinds}::text[], ${ids}::text[]) as r(k, i))
     `;
-    const queue = row.queue as { type?: string; platform?: string; machine?: string | null; queue?: string };
+    const queue = row.queue as { type?: string; platform?: string; machine?: string | null; project?: unknown; queue?: string };
     let ready: Tri = null;
     let queueEvidence: Record<string, unknown> = { type: queue.type ?? null };
     if (queue.type === "tasks") {
-      const counted = await tx`
-        select count(*)::int as n from tasks
-        where status = 'queued'
-          and platform = any(${[String(queue.platform), "any"]}::text[])
-          and (machine is null or machine = ${queue.machine ?? null}::text)
-      `;
-      const n = Number(counted[0].n);
+      // Same eligibility as claimNextTask. A missing project counts every lane.
+      // A stored project that is not a lane counts nothing, so it cannot become an unfiltered claim.
+      const projectSupplied = Object.prototype.hasOwnProperty.call(queue, "project");
+      const lane = isTaskLane(queue.project) ? queue.project : null;
+      const projectOk = projectSupplied && lane !== null;
+      let n = 0;
+      if (!projectSupplied || projectOk) {
+        const counted = await tx`
+          select count(*)::int as n from tasks
+          where status = 'queued'
+            and platform = any(${[String(queue.platform), "any"]}::text[])
+            and (machine is null or machine = ${queue.machine ?? null}::text)
+            and (${projectOk}::boolean = false or project = ${lane}::text)
+        `;
+        n = Number(counted[0].n);
+      }
       ready = n > 0;
-      queueEvidence = { type: "tasks", platform: queue.platform, machine: queue.machine ?? null, queued: n };
+      queueEvidence = {
+        type: "tasks",
+        platform: queue.platform,
+        machine: queue.machine ?? null,
+        ...(projectOk && lane !== null ? { project: lane } : {}),
+        queued: n,
+      };
     } else if (queue.type === "collector" && queue.queue) {
       const q = await tx`
         select queue, complete, ready_count, raw_count, received_at, stale_after_minutes, empty_since, last_observation_id::text as obs

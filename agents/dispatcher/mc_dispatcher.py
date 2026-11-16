@@ -33,6 +33,7 @@ Config via environment (or ~/.claude/mission-control.env, read by main() only):
   MC_GROK_ARGS           extra args for grok
   MC_EVENT_CONSUMER      optional, explicitly registered event consumer id
   MC_EVENT_TOKEN         optional events:read akc_ credential (never MC_TOKEN)
+  MC_TASK_PROJECT        optional exact task lane on every claim (unset claims any project)
 
 An opt-in outbound SSE listener wakes the normal atomic claim path. While
 connected the fallback poll is max(MC_POLL_SECONDS, 60); when unavailable it
@@ -796,8 +797,23 @@ def _elapsed_seconds(notice_at: object, measured_at: object) -> float | None:
     return (end - start).total_seconds()
 
 
+def configured_task_project() -> str | None:
+    """Exact lane for every claim. Unset means unfiltered. Blank or invalid refuses, and the value is not logged."""
+    if "MC_TASK_PROJECT" not in os.environ:
+        return None
+    value = os.environ["MC_TASK_PROJECT"]
+    if not isinstance(value, str) or LANE_RE.fullmatch(value) is None:
+        raise ValueError(
+            "MC_TASK_PROJECT must be an exact task lane: 1-100 characters of letters, digits, and . _ : / -"
+        )
+    return value
+
+
 def task_claim_request(platform: str, stream: EventStreamWake | None) -> tuple[dict, dict | None, tuple[int, str, str] | None]:
     body = {"platform": platform, "machine": HOSTNAME, "agent_id": f"{platform}-{HOSTNAME}"}
+    project = configured_task_project()
+    if project is not None:
+        body["project"] = project
     observed = stream.notices.snapshot() if stream is not None else None
     if observed is None:
         return body, None, None
@@ -992,6 +1008,11 @@ def main() -> None:
     platforms = detect_platforms()
     if not platforms:
         print("No agent CLIs found (claude / codex / grok). Set MC_PLATFORMS or install one.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        configured_task_project()
+    except ValueError as e:
+        print(f"[mc] {e}", file=sys.stderr)
         sys.exit(1)
 
     print(f"[mc] dispatcher on {HOSTNAME} serving: {', '.join(platforms)} (workdir {WORKDIR})")

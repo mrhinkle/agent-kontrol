@@ -297,6 +297,135 @@ export async function testSweeper(tag: string, applyCanonicalSchema: () => Promi
       assert.equal((await inbox("consumer-silent", `consumer:${fresh}`)).at(-1)?.event, "consumer-silent-cleared");
     }
 
+    // Exact project filter. A chatterbuilt-shaped row on this platform is the
+    // shape of queued #40 (project chatterbuilt, machine marks-mac-mini, reviewer
+    // codex) and must not make this consumer ready or add to its count.
+    {
+      const projectPlatform = `${tag}-lane`;
+      const filteredId = `${tag}-lane-c`;
+      const openId = `${tag}-lane-all`;
+      const agentId = `${tag}-lane-a`;
+      const filteredKey = `consumer:${filteredId}`;
+      const openKey = `consumer:${openId}`;
+      const queueOf = (run: SweepRun, key: string) => {
+        const entity = check(run, "consumer-silent").entities.find((item) => item.entity_key === key);
+        assert.ok(entity, key);
+        const detail = entity.detail as { queue?: { queued?: number; project?: string; type?: string } };
+        assert.ok(detail?.queue, key);
+        return detail.queue;
+      };
+      const queuedOnLane = async (project: string | null) => {
+        const rows = await sql()`
+          select count(*)::int as n from tasks
+          where status = 'queued'
+            and platform = any(${[projectPlatform, "any"]}::text[])
+            and machine is null
+            and (${project === null}::boolean or project = ${project}::text)
+        `;
+        return Number(rows[0].n);
+      };
+      const beforeConsumers = Number((await sql()`select count(*)::int as n from sweep_consumers`)[0].n);
+      const reporters = [{ kind: "legacy", id: "mc-token" }];
+      for (const project of [null, "", "agent-kontrol\n", "a".repeat(101)]) {
+        const bad = await register({
+          id: `${tag}-lane-bad`,
+          agent_ids: [agentId],
+          reporters,
+          queue: { type: "tasks", platform: projectPlatform, project },
+          max_silence_hours: 168,
+        });
+        assert.equal(bad.status, 400, JSON.stringify(project));
+      }
+      const collector = await register({
+        id: `${tag}-lane-col`,
+        agent_ids: [agentId],
+        reporters,
+        queue: { type: "collector", queue: `issues:${tag}/lane`, project: "agent-kontrol" },
+        max_silence_hours: 168,
+      });
+      assert.equal(collector.status, 400);
+      assert.equal(Number((await sql()`select count(*)::int as n from sweep_consumers`)[0].n), beforeConsumers);
+
+      const registered = await register({
+        id: filteredId,
+        agent_ids: [agentId],
+        reporters,
+        queue: { type: "tasks", platform: projectPlatform, project: "agent-kontrol" },
+        max_silence_hours: 168,
+      });
+      assert.equal(registered.status, 200, JSON.stringify(registered.body));
+      const opened = await register({
+        id: openId,
+        agent_ids: [agentId],
+        reporters,
+        queue: { type: "tasks", platform: projectPlatform },
+        max_silence_hours: 168,
+      });
+      assert.equal(opened.status, 200, JSON.stringify(opened.body));
+      let run = await runSweep();
+      const baselineFiltered = queueOf(run, filteredKey).queued;
+      const baselineOpen = queueOf(run, openKey).queued;
+      assert.equal(baselineFiltered, await queuedOnLane("agent-kontrol"));
+      assert.equal(baselineOpen, await queuedOnLane(null));
+      assert.equal(baselineFiltered, 0, "leftover queued rows would hide the project filter");
+      assert.equal(baselineOpen, 0, "leftover queued rows would hide the unfiltered count");
+      assert.equal(verdictOf(run, "consumer-silent", filteredKey), "clear");
+      assert.equal("project" in (queueOf(run, openKey) as object), false);
+
+      const insertLane = async (project: string, machine: string | null, copies: number) => {
+        await sql()`
+          insert into tasks (title, project, platform, machine, priority, status, reviewer_platform)
+          select ${`${tag} lane`}, ${project}, ${projectPlatform}, ${machine}, 1, 'queued', 'codex'
+          from generate_series(1, ${copies}::int)
+        `;
+      };
+      await insertLane("chatterbuilt", null, 11);
+      await insertLane("chatterbuilt", "marks-mac-mini", 11);
+      await insertLane("agent-kontrol-extra", null, 1);
+      await insertLane("Agent-Kontrol", null, 1);
+      await insertLane("agent-kontrol", "marks-mac-mini", 1);
+      run = await runSweep();
+      assert.equal(queueOf(run, filteredKey).queued, 0, "unrelated and wrong-machine rows are not this lane");
+      assert.equal(queueOf(run, filteredKey).project, "agent-kontrol");
+      assert.equal(queueOf(run, openKey).queued, 13, "the unfiltered consumer still counts every unpinned project");
+      assert.equal(verdictOf(run, "consumer-silent", filteredKey), "clear");
+      assert.equal(verdictOf(run, "consumer-silent", openKey), "clear");
+      assert.equal((await inbox("consumer-silent", filteredKey)).length, 0);
+      assert.equal((await inbox("consumer-silent", openKey)).length, 0);
+
+      await insertLane("agent-kontrol", null, 1);
+      run = await runSweep();
+      assert.equal(queueOf(run, filteredKey).queued, 1);
+      assert.equal(queueOf(run, openKey).queued, 14);
+      assert.equal(verdictOf(run, "consumer-silent", filteredKey), "clear", "ready work inside the silence window emits nothing");
+      assert.equal((await inbox("consumer-silent", filteredKey)).length, 0);
+
+      await register({
+        id: filteredId,
+        agent_ids: [agentId],
+        reporters,
+        queue: { type: "tasks", platform: projectPlatform, project: "agent-kontrol" },
+        max_silence_hours: 168,
+        enabled: false,
+      });
+      await register({
+        id: openId,
+        agent_ids: [agentId],
+        reporters,
+        queue: { type: "tasks", platform: projectPlatform },
+        max_silence_hours: 168,
+        enabled: false,
+      });
+      await sql()`
+        update tasks set status = 'cancelled', updated_at = now()
+        where platform = ${projectPlatform} and status = 'queued'
+      `;
+      run = await runSweep();
+      assert.equal(verdictOf(run, "consumer-silent", filteredKey), "clear");
+      assert.equal((await inbox("consumer-silent", filteredKey)).length, 0);
+      assert.equal((await inbox("consumer-silent", openKey)).length, 0);
+    }
+
     // ---------------------------------------------- scheduler pauses
     const job = `${tag}-job`.toLowerCase();
     const jobKey = `job:mini/${job}`;

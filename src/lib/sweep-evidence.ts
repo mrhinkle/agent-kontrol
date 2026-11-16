@@ -1,6 +1,7 @@
 import type { Provenance } from "./actor";
 import { withTransaction, type Row, type SqlTag } from "./db";
 import { slugify } from "./store";
+import { isTaskLane } from "./task-lane";
 import { dbInstant } from "./sweep-clock";
 import { DEFAULT_SILENCE_HOURS, DEFAULT_STALE_MINUTES, SWEEP_CONDITIONS, ms, repoKey } from "./sweep-logic";
 
@@ -489,7 +490,9 @@ export interface ConsumerRegistration {
   id: string;
   agent_ids: string[];
   reporters: { kind: (typeof PRINCIPAL_KINDS)[number]; id: string }[];
-  queue: { type: "tasks"; platform: string; machine: string | null } | { type: "collector"; queue: string };
+  queue:
+    | { type: "tasks"; platform: string; machine: string | null; project?: string }
+    | { type: "collector"; queue: string };
   scheduler: { source: string; job_id: string } | null;
   enabled: boolean;
   max_silence_hours: number;
@@ -501,8 +504,9 @@ const CONSUMER_FIELDS = ["id", "agent_ids", "reporters", "queue", "scheduler", "
  * agent_ids are the slugs report() stores. reporters are the authenticated
  * principals whose work events count: an agent_id alone proves nothing. A
  * tasks queue is ready work as claimNextTask sees it (queued, this platform
- * or any, and unpinned or pinned to this machine). A collector queue names a
- * sweep.queue observation.
+ * or any, and unpinned or pinned to this machine). Optional project is an
+ * exact case-sensitive lane. Omitting it counts every project. A collector
+ * queue names a sweep.queue observation and rejects project.
  */
 export function checkConsumerRegistration(body: unknown): Checked<ConsumerRegistration> {
   if (!isObject(body)) return { ok: false, fields: { body: "Send a JSON object." } };
@@ -543,8 +547,17 @@ export function checkConsumerRegistration(body: unknown): Checked<ConsumerRegist
   if (rawQueue) {
     const type = rawQueue.type;
     if (type === "tasks") {
-      const q = r.child("queue", rawQueue, ["type", "platform", "machine"]);
-      queue = { type: "tasks", platform: q.ident("platform"), machine: q.text("machine", 100) };
+      const q = r.child("queue", rawQueue, ["type", "platform", "machine", "project"]);
+      const platform = q.ident("platform");
+      const machine = q.text("machine", 100);
+      let project: string | undefined;
+      if (q.has("project")) {
+        const rawProject = q.raw("project");
+        if (!isTaskLane(rawProject)) {
+          q.fail("project", "must be an exact task lane: 1-100 characters of letters, digits, and . _ : / -, with no trailing newline.");
+        } else project = rawProject;
+      }
+      queue = project === undefined ? { type: "tasks", platform, machine } : { type: "tasks", platform, machine, project };
       r.merge(q);
     } else if (type === "collector") {
       const q = r.child("queue", rawQueue, ["type", "queue"]);
