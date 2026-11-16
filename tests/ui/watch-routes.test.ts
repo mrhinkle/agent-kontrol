@@ -213,7 +213,14 @@ describe("watch routes", () => {
     });
     const res = await post("akc_not_a_stored_credential_value", BEAT);
     assert.equal(res.status, 503);
-    assert.deepEqual(await res.json(), { error: "credential_store_unavailable" });
+    assert.equal(res.headers.get("cache-control"), "no-store");
+    const unavailable = await res.json() as Record<string, unknown>;
+    assert.equal(unavailable.error, "credential_store_unavailable");
+    assert.equal(unavailable.code, "credential_store_unavailable");
+    assert.equal(unavailable.retryable, true);
+    assert.equal(typeof unavailable.fix, "string");
+    assert.equal(JSON.stringify(unavailable).includes("db down"), false);
+    assert.deepEqual(Object.keys(unavailable).sort(), ["code", "error", "fix", "retryable"]);
     assert.equal(inserts, 0);
   });
 

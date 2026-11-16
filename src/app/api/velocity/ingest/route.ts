@@ -1,10 +1,11 @@
 import { requireTrustedWriter } from "@/lib/auth";
 import { apiError } from "@/lib/api-error";
 import { actorFromPrincipal } from "@/lib/actor";
+import { describeDbError } from "@/lib/db-error";
 import { isConfigured } from "@/lib/db";
 import { parseVelocity } from "@/lib/velocity";
 import { insertVelocity } from "@/lib/velocity-store";
-import { privateResponse, readVelocityJSON, velocityJSON, VelocityBodyError } from "@/lib/velocity-http";
+import { privateResponse, readVelocityJSON, velocityError, velocityJSON, VelocityBodyError } from "@/lib/velocity-http";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -14,7 +15,9 @@ export async function POST(req: Request) {
   if (!access.ok) return privateResponse(access.response);
   const origin = req.headers.get("origin");
   if ((access.principal.kind === "session" || origin !== null) && origin !== new URL(req.url).origin) {
-    return velocityJSON({ error: "Import must come from this dashboard." }, 403);
+    return velocityError("forbidden", "Import must come from this dashboard.", {
+      fix: "Open this dashboard and import from that page.",
+    });
   }
   let snapshot;
   try { snapshot = parseVelocity(await readVelocityJSON(req)); }
@@ -25,9 +28,24 @@ export async function POST(req: Request) {
     }
     return privateResponse(apiError("validation_failed", { message: "Capture does not match the supported benchmark contract. Preview the file to inspect validation details." }));
   }
-  if (!isConfigured()) return velocityJSON({ error: "Benchmark history storage is not configured. This capture was not saved." }, 503);
+  if (!isConfigured()) {
+    return velocityError("setup_required", "Benchmark history storage is not configured. This capture was not saved.", {
+      fix: "Set DATABASE_URL and install the velocity history storage, then send the same capture again.",
+    });
+  }
   const actor = actorFromPrincipal(access.principal);
-  if (!actor) return velocityJSON({ error: "Authenticated operator or collector required." }, 403);
+  if (!actor) {
+    return velocityError("forbidden", "Authenticated operator or collector required.", {
+      fix: "Sign in to the dashboard or send Authorization: Bearer with MC_TOKEN.",
+    });
+  }
   try { return velocityJSON({ ok: true, ...await insertVelocity(snapshot, actor) }); }
-  catch { return velocityJSON({ error: "The capture could not be saved. Retry the same file after history storage is available; identical imports are safe to repeat." }, 503); }
+  catch (e) {
+    console.error("[velocity] insert failed", describeDbError(e));
+    return velocityError("internal_error", "The capture could not be saved. Retry the same file after history storage is available; identical imports are safe to repeat.", {
+      status: 503,
+      retryable: true,
+      fix: "Retry the same file after history storage is available. An identical import does not create a second row.",
+    });
+  }
 }

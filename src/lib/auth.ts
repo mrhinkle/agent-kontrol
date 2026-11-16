@@ -40,9 +40,9 @@ export type Access =
   | { ok: false; status: 401; body: ReturnType<typeof errorBody> }
   | { ok: false; status: 403; body: ScopeErrorBody }
   | { ok: false; status: 429; body: ReturnType<typeof rateLimitedBody>; retryAfter: number }
-  | { ok: false; status: 503; body: { error: "credential_store_unavailable" } };
+  | { ok: false; status: 503; body: ReturnType<typeof errorBody> };
 
-const STORE_UNAVAILABLE: Access = { ok: false, status: 503, body: { error: "credential_store_unavailable" } };
+const STORE_UNAVAILABLE: Access = { ok: false, status: 503, body: errorBody("credential_store_unavailable") };
 const UNAUTHORIZED: Access = { ok: false, status: 401, body: errorBody("unauthorized") };
 
 export function deny(access: Exclude<Access, { ok: true }>): Response {
