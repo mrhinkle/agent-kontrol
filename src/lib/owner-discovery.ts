@@ -59,6 +59,14 @@ export interface OwnerRule {
   includeArchived: boolean;
 }
 
+/** Why a sweep must not change tracked repos. Not derived from collector prose. */
+export type DiscoveryFailureCode =
+  | "collection_failed"
+  | "empty_listing"
+  | "invalid_listing"
+  | "owner_removed"
+  | "rule_changed";
+
 export interface DiscoverySweep {
   /** null when `gh` failed. An empty array is also a failure. */
   repos: GhListedRepo[] | null;
@@ -70,11 +78,15 @@ export interface DiscoverySweep {
    * than the stored `last_discovered_at` is stale and must not write.
    */
   sweptAt?: string | null;
+  /** Set by the caller that already classified a failed sweep. */
+  failureCode?: DiscoveryFailureCode | null;
 }
 
 export interface DiscoveryOutcome {
   /** Set when the sweep must not change tracked repos. */
   failure: string | null;
+  /** Stable class for `failure`. Null when the sweep applied, including a warning or a stale skip. */
+  failureCode: DiscoveryFailureCode | null;
   /** Set when the sweep applied, but the operator should still see a problem. */
   warning: string | null;
   repos: TrackedRepo[];
@@ -292,8 +304,16 @@ export function planOverrideResets<T extends {
     }));
 }
 
-function untouched(existing: TrackedRepo[], failure: string): DiscoveryOutcome {
-  return { failure, warning: null, repos: existing.map((row) => ({ ...row })), added: [], updated: [], markedGone: [] };
+function untouched(existing: TrackedRepo[], failure: string, failureCode: DiscoveryFailureCode): DiscoveryOutcome {
+  return {
+    failure,
+    failureCode,
+    warning: null,
+    repos: existing.map((row) => ({ ...row })),
+    added: [],
+    updated: [],
+    markedGone: [],
+  };
 }
 
 export function planDiscovery(
@@ -304,16 +324,16 @@ export function planDiscovery(
 ): DiscoveryOutcome {
   const ownerKey = owner.owner.toLowerCase();
   if (sweep.repos === null) {
-    return untouched(existing, sweep.error?.trim() || "gh repo list failed");
+    return untouched(existing, sweep.error?.trim() || "gh repo list failed", sweep.failureCode ?? "collection_failed");
   }
   if (sweep.repos.length === 0) {
-    return untouched(existing, sweep.error?.trim() || "gh repo list returned no repos");
+    return untouched(existing, sweep.error?.trim() || "gh repo list returned no repos", "empty_listing");
   }
 
   const listed = [...sweep.repos].sort((a, b) => a.name.localeCompare(b.name));
   for (const item of listed) {
     if (typeof item.name !== "string" || !NAME_RE.test(item.name) || item.name.length > 100) {
-      return untouched(existing, "gh repo list included a repo name that is not safe to store");
+      return untouched(existing, "gh repo list included a repo name that is not safe to store", "invalid_listing");
     }
   }
 
@@ -394,5 +414,5 @@ export function planDiscovery(
   const warning = sweep.truncated
     ? `gh repo list hit the ${DISCOVERY_LIST_CAP}-repo cap; repos absent from this page were not marked gone`
     : null;
-  return { failure: null, warning, repos, added, updated, markedGone };
+  return { failure: null, failureCode: null, warning, repos, added, updated, markedGone };
 }
