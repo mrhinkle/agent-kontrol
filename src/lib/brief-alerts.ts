@@ -341,6 +341,7 @@ async function readMerges(settings: BriefSettings, now: Date): Promise<MergeRead
       select repo, collected_at, detail
       from repo_snapshots
       where lower(repo) = any(${names}::text[])
+        and kind <> 'activity'
         and collected_at <= ${nowIso}::timestamptz
         and collected_at >= ${toSecondIso(since)}::timestamptz
       order by lower(repo), collected_at desc

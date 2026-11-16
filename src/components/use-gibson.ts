@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { aggregate, type ProgressPayload, type TasksPayload } from "@/lib/gibson-derive";
+import { aggregate, type ProgressPayload } from "@/lib/gibson-derive";
+import { fetchGibsonTasks } from "@/lib/gibson-fetch";
 import type { GibsonSceneModel } from "@/lib/gibson-types";
 import type { FleetResponse } from "@/lib/types";
 
@@ -47,17 +48,13 @@ export function useGibson(): { model: GibsonSceneModel | null; error: string | n
       if (inFlight) return;
       inFlight = true;
       try {
-        const [fleetResponse, tasksResponse, progress] = await Promise.all([
+        const [fleetResponse, tasks, progress] = await Promise.all([
           fetch("/api/fleet", { cache: "no-store" }),
-          fetch("/api/tasks?status=all&limit=400", { cache: "no-store" }),
+          fetchGibsonTasks(),
           loadProgress(),
         ]);
         if (!fleetResponse.ok) throw new Error(`fleet API ${fleetResponse.status}`);
-        if (!tasksResponse.ok) throw new Error(`tasks API ${tasksResponse.status}`);
-        const [fleet, tasks] = (await Promise.all([fleetResponse.json(), tasksResponse.json()])) as [
-          FleetResponse,
-          TasksPayload,
-        ];
+        const fleet = await fleetResponse.json() as FleetResponse;
         if (alive) {
           setModel(aggregate({ fleet, tasks, progress }));
           setError(null);

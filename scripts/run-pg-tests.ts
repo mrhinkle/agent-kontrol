@@ -15,6 +15,9 @@ import type { BriefSettings } from "../src/lib/progress-config";
 import { sql, withTransaction } from "../src/lib/db";
 import { insertGhEvent, signBody } from "../src/lib/gh-events";
 import { testSweeper } from "./pg-sweeper-tests";
+import { testProviderCosts } from "./pg-provider-costs-tests";
+import { testVelocityStore } from "./pg-velocity-tests";
+import { testProgressActivity } from "./pg-progress-activity-tests";
 import { EVENT_FIXTURES, PING_PAYLOAD } from "../tests/ui/gh-event-fixtures";
 import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
 import { StaleWrite } from "../src/lib/revision";
@@ -25,7 +28,7 @@ import { runWithActor } from "../src/lib/actor";
 import { GET as getRepoSettings, PUT as putRepoSettings } from "../src/app/api/settings/repos/route";
 import { readRepoSettings } from "../src/lib/settings-read";
 import { getSettingsTool, setWatchedReposTool } from "../src/lib/settings-tools";
-import { getWatchedRepos, listVersion, replaceWatchedRepos, setRepoOverride } from "../src/lib/watched-repos";
+import { getWatchedRepos, listVersion, loadTrackedRepos, replaceWatchedRepos, setRepoOverride, toWatchedRepo } from "../src/lib/watched-repos";
 import { applyOwnerDiscovery } from "../src/lib/watched-owners";
 import type { RepoConfig } from "../src/lib/progress-config";
 import { getTrace, listTraces, pruneSpans, upsertSpans } from "../src/lib/trace-store";
@@ -200,21 +203,25 @@ async function main() {
   assert.equal((await getWatchedRepos(fallback)).source, "file");
   await testRepoSettingsVersionAndReceipt(tag);
 
+  // Span timestamps are relative to now: fixed dates age out of the retention window and break "recent spans are kept".
+  const spanBase = new Date(Date.now() - 2 * 86400_000);
+  spanBase.setUTCHours(12, 0, 0, 0);
+  const spanAt = (sec: number) => new Date(spanBase.getTime() + sec * 1000).toISOString();
   // Traces: upsert merges an open span with its close, lists summarize, prune removes old rows.
   const traceId = randomUUID().replace(/-/g, "");
   const mk = (id: string, parent: string | null, over: Partial<SpanInput> = {}): SpanInput => ({
     trace_id: traceId, span_id: id, parent_span_id: parent, agent_id: `${tag}-agent`, session_id: "s1", name: id,
-    kind: "tool", status: "unset", status_message: null, started_at: "2026-10-09T12:00:00.000Z", ended_at: null,
+    kind: "tool", status: "unset", status_message: null, started_at: spanAt(0), ended_at: null,
     attributes: { a: 1 }, model: null, input_tokens: null, output_tokens: null, cost_usd: null, ...over,
   });
   await upsertSpans([mk("00000000000000a1", null, { kind: "session", name: "session" }), mk("00000000000000a2", "00000000000000a1")]);
-  await upsertSpans([mk("00000000000000a2", null, { status: "error", status_message: "bad", ended_at: "2026-10-09T12:00:02.000Z", attributes: { b: "x" }, input_tokens: 10, output_tokens: 5, cost_usd: 0.25 })]);
+  await upsertSpans([mk("00000000000000a2", null, { status: "error", status_message: "bad", ended_at: spanAt(2), attributes: { b: "x" }, input_tokens: 10, output_tokens: 5, cost_usd: 0.25 })]);
   const stored = await getTrace(traceId);
   assert.equal(stored.length, 2);
   const child = stored.find((s) => s.span_id === "00000000000000a2")!;
   assert.equal(child.parent_span_id, "00000000000000a1", "a later write without a parent keeps the stored parent");
   assert.equal(child.status, "error");
-  assert.equal(child.ended_at, "2026-10-09T12:00:02.000Z");
+  assert.equal(child.ended_at, spanAt(2));
   assert.deepEqual(child.attributes, { a: 1, b: "x" }, "attributes merge");
   assert.equal(child.input_tokens, 10);
   assert.equal(child.cost_usd, 0.25);
@@ -226,13 +233,13 @@ async function main() {
   assert.equal(summary.root_name, "session");
   assert.equal(summary.output_tokens, 5);
   assert.equal((await listTraces({ agent: `${tag}-agent`, errorsOnly: true })).length, 1);
-  assert.equal((await listTraces({ agent: `${tag}-agent`, before: "2026-10-09T11:00:00.000Z" })).length, 0, "before filters by start time");
+  assert.equal((await listTraces({ agent: `${tag}-agent`, before: spanAt(-3600) })).length, 0, "before filters by start time");
   // Out-of-order and retried updates are monotonic: the later end and a failure survive a stale "ok".
-  await upsertSpans([mk("00000000000000a2", "00000000000000a1", { status: "ok", ended_at: "2026-10-09T12:00:01.000Z", attributes: { c: "late" } })]);
+  await upsertSpans([mk("00000000000000a2", "00000000000000a1", { status: "ok", ended_at: spanAt(1), attributes: { c: "late" } })]);
   const afterStale = (await getTrace(traceId)).find((s) => s.span_id === "00000000000000a2")!;
   assert.equal(afterStale.status, "error", "a stale ok cannot erase an error");
   assert.equal(afterStale.status_message, "bad");
-  assert.equal(afterStale.ended_at, "2026-10-09T12:00:02.000Z", "a stale end cannot shorten a span");
+  assert.equal(afterStale.ended_at, spanAt(2), "a stale end cannot shorten a span");
   assert.equal(afterStale.attributes.c, "late", "attributes still merge");
   // Always a different id from traceId: flip the last hex digit, so the test cannot collide with itself.
   const oldTrace = traceId.slice(0, 31) + (traceId.endsWith("0") ? "1" : "0");
@@ -377,6 +384,9 @@ async function main() {
   await testCredentialQuotas(tag);
   await testGhEvents(tag);
   await testSweeper(tag, applyCanonicalSchema);
+  await testVelocityStore();
+  await testProgressActivity();
+  await testProviderCosts();
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
 }
@@ -2030,7 +2040,7 @@ async function testZeroMergeCaseFold(tag: string): Promise<void> {
   }
 }
 
-/** Case-insensitive repo identity and a swept_at activity cutoff, on real SQL. */
+/** Case-insensitive identity, complete inventory, and active-view cutoff on real SQL. */
 async function testRepoCaseIdentity(tag: string): Promise<void> {
   const slug = tag.replace(/\D/g, "").slice(-10);
   const owner = `pgc${slug}`;
@@ -2051,6 +2061,7 @@ async function testRepoCaseIdentity(tag: string): Promise<void> {
           { name: "App", pushedAt: "2026-01-15T00:00:00.000Z", isFork: false, isArchived: false },
           { name: brand, pushedAt: "2026-01-01T00:00:00.000Z", isFork: false, isArchived: false },
           { name: `Old${slug}`, pushedAt: "2025-12-31T23:59:59.999Z", isFork: false, isArchived: false },
+          { name: `Never${slug}`, pushedAt: null, isFork: false, isArchived: false },
         ],
         error: null,
         sweptAt: "2026-01-31T00:00:00.000Z",
@@ -2067,7 +2078,20 @@ async function testRepoCaseIdentity(tag: string): Promise<void> {
     const names = rows.map((row) => String(row.repo));
     assert.deepEqual(names.filter((name) => name.toLowerCase() === stored.toLowerCase()), [stored]);
     assert.ok(names.includes(`${owner}/${brand}`), `expected GitHub casing, saw ${names.join(", ")}`);
-    assert.equal(names.some((name) => name.toLowerCase().includes("old")), false);
+    assert.deepEqual(new Set(names), new Set([
+      stored, `${owner}/${brand}`, `${owner}/Old${slug}`, `${owner}/Never${slug}`,
+    ]), "old and never-pushed repositories persist without duplicating case variants");
+    const tracked = (await loadTrackedRepos()).filter((repo) => repo.repo.startsWith(`${owner}/`));
+    assert.equal(tracked.find((repo) => repo.repo === stored)?.origin, "manual");
+    const rule = { owner, activityDays: 30, includeForks: false, includeArchived: false };
+    const shownAt = (at: string) => tracked
+      .map((repo) => toWatchedRepo(repo, [rule], new Date(at)))
+      .filter((repo) => repo.shown)
+      .map((repo) => repo.repo);
+    assert.deepEqual(new Set(shownAt("2026-01-31T00:00:00.000Z")), new Set([stored, `${owner}/${brand}`]),
+      "the active view includes the boundary day and excludes older or never-pushed auto repositories");
+    assert.deepEqual(shownAt("2026-10-29T00:00:00.000Z"), [],
+      "the active view uses current time instead of the older sweep timestamp");
     const pinned = await setRepoOverride(stored.toUpperCase(), { pinned: true });
     assert.equal(pinned, true);
     const after = await sql()`
@@ -2076,6 +2100,10 @@ async function testRepoCaseIdentity(tag: string): Promise<void> {
     assert.equal(after.length, 1);
     assert.equal(after[0]?.repo, stored);
     assert.equal(after[0]?.pinned, true);
+    const pinnedRepo = (await loadTrackedRepos()).find((repo) => repo.repo === stored);
+    assert.ok(pinnedRepo);
+    assert.equal(toWatchedRepo(pinnedRepo, [rule], new Date("2026-10-29T00:00:00.000Z")).shown, true,
+      "a case-insensitive pin still shows an inactive repository");
   } finally {
     await sql()`delete from watched_repos where lower(repo) like ${`${owner.toLowerCase()}/%`}`;
     await sql()`delete from watched_owners where owner = ${owner}`;

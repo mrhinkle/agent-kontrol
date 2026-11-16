@@ -3,6 +3,7 @@ export const USAGE_SOURCES = [
   "provider_api",
   "subscription_fee",
   "quota_snapshot",
+  "claude_code",
 ] as const;
 
 export type UsageSource = (typeof USAGE_SOURCES)[number];
@@ -70,7 +71,7 @@ export interface UsageSummary {
   fleet: {
     paid_cost_usd: number;
     shadow_cost_usd: number;
-    subscription_fees_usd: number;
+    subscription_fees_usd: number | null;
     input_tokens: number;
     output_tokens: number;
     cache_read_tokens: number;
@@ -89,6 +90,10 @@ export interface UsageSummary {
     reconcile_delta_pct: number | null;
     note: string;
   };
+  providers?: ProviderCostSummary[];
+  provider_window?: { since: string; until: string };
+  claude?: ClaudeUsageSummary;
+  grok?: GrokUsageSummary;
   collected_at: string | null;
   /** True only when DATABASE_URL is unset — never in production Neon reads. */
   demo?: boolean;
@@ -98,4 +103,39 @@ export interface UsageSummary {
   setup_message?: string;
   /** Selected rolling window label when resolved via ?window=. */
   window_label?: string | null;
+}
+
+export interface ProviderCostSummary {
+  account_id: string;
+  label: string;
+  cost_usd: number | null;
+  coverage: "complete" | "partial" | "unverified" | "missing";
+  collected_at: string | null;
+  data_refreshed_at: string | null;
+  credits_remaining: number | null;
+  rows: number;
+  note: string;
+  daily: { date: string; cost_usd: number | null }[];
+}
+
+export interface ClaudeUsageSummary {
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  reported_estimate_usd: number | null;
+  unpriced_requests: number;
+  subscription_fees_usd: number | null;
+  fee_records: number;
+  billing_modes: { subscription: number; api: number; unknown: number };
+  machines: { account_id: string; collected_at: string; status: "complete" | "partial" | "unverified"; since: string | null; until: string | null }[];
+}
+
+export interface GrokUsageSummary {
+  subscription_fees_usd: number | null;
+  fee_records: number;
+  openrouter_cost_usd: number | null;
+  openrouter_coverage: ProviderCostSummary["coverage"];
+  local_usage_status: "unavailable";
 }

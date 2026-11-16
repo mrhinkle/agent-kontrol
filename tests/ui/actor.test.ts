@@ -250,7 +250,7 @@ describe("actor attribution", { concurrency: false }, () => {
     assert.equal(currentActor(), null);
   });
 
-  it("keeps actor columns nullable in the schema", () => {
+  it("keeps legacy actor columns nullable and requires private benchmark attribution", () => {
     const schema = fs.readFileSync("supabase/schema.sql", "utf8");
     const migration = fs.readFileSync("supabase/migrations/20261025_actor.sql", "utf8");
     for (const source of [schema, migration]) {
@@ -259,8 +259,15 @@ describe("actor attribution", { concurrency: false }, () => {
       assert.match(source, /alter table tasks add column if not exists actor_type text;/);
       assert.match(source, /alter table tasks add column if not exists actor_id text;/);
     }
-    assert.doesNotMatch(schema, /actor_type text not null/);
-    assert.doesNotMatch(schema, /actor_id text not null/);
+    // Historical/dev-open writes retain their nullable attribution. The new
+    // private capture routes reject dev-open and always supply a trusted actor.
+    const benchmark = schema.match(/create table if not exists velocity_benchmarks \([\s\S]*?\n\);/);
+    assert.ok(benchmark);
+    assert.match(benchmark[0], /actor_type text not null/);
+    assert.match(benchmark[0], /actor_id text not null/);
+    const legacySchema = schema.replace(benchmark[0], "");
+    assert.doesNotMatch(legacySchema, /actor_type text not null/);
+    assert.doesNotMatch(legacySchema, /actor_id text not null/);
   });
 
   it("records credential A on a task even when the body claims another created_by", async () => {

@@ -2,7 +2,8 @@ import { sql } from "./db";
 import { REPOS, THRESHOLDS, windowDays, type TimeWindow } from "./progress-config";
 import type { SkillsDigest } from "./progress-types";
 import { stallMinutes } from "./skills/clock";
-import { getWatchedRepos, visibleOnBoard } from "./watched-repos";
+import { getWatchedRepos } from "./watched-repos";
+import { ACTIVITY_FRESH_MS, ACTIVITY_WINDOW_MS, progressActivity, progressEligible } from "./progress-activity";
 import type {
   Alert,
   FleetTotals,
@@ -34,7 +35,7 @@ export interface SnapshotInput {
 }
 
 /** Documented `kind` values for POST /api/progress/ingest. The route stores any string. */
-export const PROGRESS_INGEST_KINDS = ["tick", "daily", "backfill"] as const;
+export const PROGRESS_INGEST_KINDS = ["tick", "daily", "backfill", "activity"] as const;
 
 export interface IngestInput {
   collected_at?: string;
@@ -60,7 +61,7 @@ export async function ingestSnapshots(input: IngestInput): Promise<number> {
 
   for (const r of input.repos) {
     if (!r.repo) continue;
-    await db`
+    const rows = await db`
       insert into repo_snapshots (
         repo, label, collected_at, kind,
         open_issues, open_prs, blocked_issues,
@@ -90,8 +91,10 @@ export async function ingestSnapshots(input: IngestInput): Promise<number> {
         review_rounds = excluded.review_rounds,
         no_verdict_rate = excluded.no_verdict_rate,
         detail = excluded.detail
+      where (repo_snapshots.kind = 'activity') = (excluded.kind = 'activity')
+      returning repo
     `;
-    written++;
+    written += rows.length;
   }
   return written;
 }
@@ -126,8 +129,8 @@ function toSnapshot(row: Row): RepoSnapshot {
  *
  * Backfilled rows carry only the cumulative counters — GitHub cannot tell you
  * retroactively how deep the queue was on a past Tuesday — so they must not win
- * "latest" just by having a later timestamp than the last tick. `open_issues is
- * not null` is the marker of a row that actually swept the repo.
+ * "latest" just by having a later timestamp than the last tick. Activity-only
+ * rows are separate too. A failed detailed tick stays visible as missing data.
  *
  * `distinct on (lower(repo))` folds case variants of one `owner/name` onto the
  * newest live row. The map key is that lowercased name.
@@ -137,8 +140,8 @@ async function latestPerRepo(): Promise<Map<string, RepoSnapshot>> {
   const rows = (await db`
     select distinct on (lower(repo)) *
     from repo_snapshots
-    where open_issues is not null
-    order by lower(repo), collected_at desc
+    where kind not in ('activity', 'backfill')
+    order by lower(repo), collected_at desc, id desc
   `) as Row[];
   return new Map(rows.map((r) => [String(r.repo).toLowerCase(), toSnapshot(r)]));
 }
@@ -149,7 +152,7 @@ async function baselinePerRepo(ts: string): Promise<Map<string, RepoSnapshot>> {
   const rows = (await db`
     select distinct on (lower(repo)) *
     from repo_snapshots
-    where collected_at <= ${ts}
+    where collected_at <= ${ts} and kind <> 'activity'
     order by lower(repo), collected_at desc
   `) as Row[];
   return new Map(rows.map((r) => [String(r.repo).toLowerCase(), toSnapshot(r)]));
@@ -170,6 +173,8 @@ async function dailyHistory(sinceIso: string): Promise<HistoryPoint[]> {
     from repo_snapshots
     where collected_at >= ${sinceIso}
       and total_issues_created is not null
+      and total_issues_closed is not null
+      and kind <> 'activity'
     order by lower(repo), (collected_at at time zone 'utc')::date, collected_at desc
   `) as Row[];
 
@@ -194,11 +199,22 @@ async function dailyHistory(sinceIso: string): Promise<HistoryPoint[]> {
  */
 function alignHistoryRepos(history: HistoryPoint[], watched: { repo: string }[]): HistoryPoint[] {
   const canon = new Map(watched.map((cfg) => [cfg.repo.toLowerCase(), cfg.repo]));
-  return history.map((point) => {
+  return history.filter((point) => canon.has(point.repo.toLowerCase())).map((point) => {
     const repo = canon.get(point.repo.toLowerCase());
     if (!repo || repo === point.repo) return point;
     return { ...point, repo };
   });
+}
+
+/** Keep failed scans visible separately from the last known successful observation. */
+async function activityPerRepo(successOnly = false): Promise<Map<string, RepoSnapshot>> {
+  const rows = await sql()`
+    select distinct on (lower(repo)) * from repo_snapshots
+    where kind = 'activity'
+      and (${successOnly}::boolean = false or detail->'activity'->>'status' = 'complete')
+    order by lower(repo), collected_at desc, id desc
+  `;
+  return new Map(rows.map((row) => [String(row.repo).toLowerCase(), toSnapshot(row)]));
 }
 
 /** Agent spend inside the window, from the existing task ledger. */
@@ -350,7 +366,10 @@ export function buildAlerts(
 
 export async function progress(window: TimeWindow): Promise<Omit<ProgressResponse, "demo" | "generated_at">> {
   const days = windowDays(window);
-  const latest = await latestPerRepo();
+  const wallClock = Date.now();
+  const [latest, activityLatest, activitySuccess, inventory] = await Promise.all([
+    latestPerRepo(), activityPerRepo(), activityPerRepo(true), getWatchedRepos(REPOS),
+  ]);
 
   const lastSync =
     [...latest.values()].map((s) => s.collected_at).sort().pop() ?? null;
@@ -373,10 +392,27 @@ export async function progress(window: TimeWindow): Promise<Omit<ProgressRespons
   const targetMs = anchor.getTime() - days * 86_400_000;
   const slackMs = Math.max(6 * 3_600_000, days * 86_400_000 * 0.2);
 
-  const watched = (await getWatchedRepos(REPOS)).repos.filter(visibleOnBoard);
+  const eligible = inventory.repos.filter(progressEligible);
+  const selections = new Map(eligible.map((cfg) => {
+    const key = cfg.repo.toLowerCase();
+    return [key, progressActivity(cfg, latest.get(key), activityLatest.get(key), activitySuccess.get(key), wallClock)];
+  }));
+  const watched = eligible.filter((cfg) => selections.get(cfg.repo.toLowerCase())?.shown);
+  const incomplete = eligible.flatMap((cfg) => {
+    const status = selections.get(cfg.repo.toLowerCase())!.activity.status;
+    return status === "fresh" ? [] : [{ repo: cfg.repo, status }];
+  });
+  const coverage = {
+    evaluated_at: new Date(wallClock).toISOString(),
+    cutoff: new Date(wallClock - ACTIVITY_WINDOW_MS).toISOString(),
+    tracked_repos: inventory.repos.length, eligible_repos: eligible.length,
+    checked_repos: eligible.length - incomplete.length, shown_repos: watched.length,
+    incomplete, discovery_errors: inventory.discoveryErrors ?? [],
+  };
   const namedHistory = alignHistoryRepos(history, watched);
   const repos: RepoProgress[] = watched.map((cfg) => {
     const now = latest.get(cfg.repo.toLowerCase());
+    const selection = selections.get(cfg.repo.toLowerCase())!;
     const then = baseline.get(cfg.repo.toLowerCase());
     const thenUsable = then !== undefined && targetMs - new Date(then.collected_at).getTime() <= slackMs;
     if (thenUsable && then && (!baselineAt || then.collected_at > baselineAt)) baselineAt = then.collected_at;
@@ -404,13 +440,17 @@ export async function progress(window: TimeWindow): Promise<Omit<ProgressRespons
     // and say plainly that it isn't the window that was asked for.
     if (merged === null || closed === null || opened === null) {
       if (days > 1) windowComplete = false;
-      merged = merged ?? now?.merged_prs_24h ?? 0;
-      closed = closed ?? now?.issues_closed_24h ?? 0;
-      opened = opened ?? now?.issues_opened_24h ?? 0;
+      merged = merged ?? now?.merged_prs_24h ?? null;
+      closed = closed ?? now?.issues_closed_24h ?? null;
+      opened = opened ?? now?.issues_opened_24h ?? null;
     }
 
-    const openIssues = now?.open_issues ?? 0;
+    const openIssues = selection.open_issues;
     const blocked = now?.blocked_issues ?? null;
+    const metricAge = now ? wallClock - Date.parse(now.collected_at) : Infinity;
+    const metricsComplete = merged !== null && closed !== null && opened !== null &&
+      metricAge >= 0 && metricAge <= ACTIVITY_FRESH_MS;
+    if (!metricsComplete) windowComplete = false;
 
     return {
       repo: cfg.repo,
@@ -418,32 +458,39 @@ export async function progress(window: TimeWindow): Promise<Omit<ProgressRespons
       short: cfg.short,
       color: cfg.color,
       open_issues: openIssues,
-      open_prs: now?.open_prs ?? 0,
+      open_prs: selection.open_prs,
       blocked_issues: blocked,
       blocked_label: cfg.blockedLabel,
-      blocked_ratio: blocked !== null && openIssues > 0 ? blocked / openIssues : null,
+      blocked_ratio: blocked !== null && openIssues !== null && openIssues > 0 ? blocked / openIssues : null,
       merged_prs: merged,
       issues_closed: closed,
       issues_opened: opened,
-      net_backlog: opened - closed,
+      net_backlog: opened === null || closed === null ? null : opened - closed,
       review_rounds: now?.review_rounds ?? null,
       no_verdict_rate: now?.no_verdict_rate ?? null,
       lane_mix: now?.detail?.lane_mix ?? {},
       stalled_prs: now?.detail?.stalled_prs ?? [],
       last_collected_at: now?.collected_at ?? null,
+      activity: selection.activity,
+      metrics_complete: metricsComplete,
     };
   });
 
   const laneMix: Record<string, number> = {};
   for (const r of repos) mergeLaneMix(laneMix, r.lane_mix);
 
+  const measured = repos.filter((r) => r.merged_prs !== null && r.issues_closed !== null && r.issues_opened !== null);
+  const sum = (values: (number | null)[]) => {
+    const known = values.filter((value): value is number => value !== null);
+    return known.length ? known.reduce((a, b) => a + b, 0) : null;
+  };
   const totals: FleetTotals = {
-    merged_prs: repos.reduce((a, r) => a + r.merged_prs, 0),
-    issues_closed: repos.reduce((a, r) => a + r.issues_closed, 0),
-    issues_opened: repos.reduce((a, r) => a + r.issues_opened, 0),
-    net_backlog: repos.reduce((a, r) => a + r.net_backlog, 0),
-    open_issues: repos.reduce((a, r) => a + r.open_issues, 0),
-    open_prs: repos.reduce((a, r) => a + r.open_prs, 0),
+    merged_prs: sum(measured.map((r) => r.merged_prs)),
+    issues_closed: sum(measured.map((r) => r.issues_closed)),
+    issues_opened: sum(measured.map((r) => r.issues_opened)),
+    net_backlog: sum(measured.map((r) => r.net_backlog)),
+    open_issues: sum(repos.map((r) => r.open_issues)),
+    open_prs: sum(repos.map((r) => r.open_prs)),
     spend_usd: spend,
     lane_mix: laneMix,
   };
@@ -462,11 +509,12 @@ export async function progress(window: TimeWindow): Promise<Omit<ProgressRespons
     last_sync: lastSync,
     baseline_at: baselineAt,
     // 24h needs no baseline — the collector measures it directly each tick.
-    window_complete: days === 1 ? lastSync !== null : windowComplete && baselineAt !== null,
+    window_complete: windowComplete && (days === 1 ? lastSync !== null : baselineAt !== null),
+    coverage,
     repos,
     totals,
     history: namedHistory,
-    alerts: buildAlerts(repos, namedHistory, skills?.stalled ?? []),
+    alerts: buildAlerts(repos.filter((r) => r.metrics_complete !== false), namedHistory, skills?.stalled ?? []),
     ...(skills ? { skills } : {}),
   };
 }

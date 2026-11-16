@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { enforceApi } from "@/lib/auth";
+import { describeDbError } from "@/lib/db-error";
 import { WatchBeatError, upsertBeat } from "@/lib/watch";
 import {
   WATCH_BODY_MAX_BYTES,
@@ -78,7 +79,7 @@ export async function POST(req: Request) {
         fields: { beat_at: "beat_at must be a finite RFC 3339 timestamp with an explicit offset." },
       });
     }
-    console.error("[watch] beat write failed", err instanceof Error ? err.name : "error");
+    console.error("[watch] beat write failed", describeDbError(err));
     return databaseUnavailable();
   }
 
