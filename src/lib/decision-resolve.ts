@@ -253,7 +253,12 @@ export async function resolveDecision(input: ResolveBody & { id: number; actor: 
  * One follow handles a retry that lost the race to a failed stamp and still
  * needs to post. A reopen is not followed.
  */
-async function afterWrite(row: Decision, write: WritebackOutcome, follows = 0): Promise<ResolveOutcome> {
+async function afterWrite(
+  row: Decision,
+  write: WritebackOutcome,
+  follows = 0,
+  attribute = false,
+): Promise<ResolveOutcome> {
   const current = await getDecision(row.id);
   const visible = current ?? row;
   if (write.status === "no_target") return { ok: true, decision: visible };
@@ -264,7 +269,7 @@ async function afterWrite(row: Decision, write: WritebackOutcome, follows = 0): 
     && visible.writeback !== "written"
     && visible.revision !== row.revision
   ) {
-    return afterWrite(visible, await writeDecisionBack(visible), follows + 1);
+    return afterWrite(visible, await writeDecisionBack(visible, { attribute }), follows + 1, attribute);
   }
   return { ok: true, decision: visible };
 }
@@ -285,7 +290,7 @@ export async function retryDecisionWriteback(
       fields: { status: "Only a decided row can be written back." },
     };
   }
-  return afterWrite(row, await writeDecisionBack(row));
+  return afterWrite(row, await writeDecisionBack(row, { attribute: true }), 0, true);
 }
 
 function text(value: string): McpToolResult {
