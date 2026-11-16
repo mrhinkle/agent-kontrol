@@ -19,16 +19,58 @@ if [[ "$MC_TOKEN" == *[[:cntrl:]]* ]]; then
   echo "sweep-once: MC_TOKEN must not contain control characters" >&2
   exit 1
 fi
-AUTH_HEADER="$(umask 077; mktemp)"
-trap 'rm -f "$AUTH_HEADER"' EXIT
+# Same bound as observe-scheduler.py MAX_SWEEP_CAPTURE. Bytes past this are
+# not written and are not given to jq. This is a transfer cap, not a retention rule.
+MAX_BODY=262144
+umask 077
+WORKDIR="$(mktemp -d)"
+AUTH_HEADER="$WORKDIR/auth"
+BODY_FILE="$WORKDIR/body"
+FIFO="$WORKDIR/body.fifo"
+trap 'rm -rf "$WORKDIR"' EXIT
 printf 'Authorization: Bearer %s\n' "$MC_TOKEN" >"$AUTH_HEADER"
+: >"$BODY_FILE"
+mkfifo -m 0600 "$FIFO"
 
-if ! body="$(curl -fsS -m 60 -X POST -H "@$AUTH_HEADER" "${MC_URL%/}/api/sweep")"; then
+# Hold a write end so a curl that exits before opening the fifo cannot leave
+# the reader blocked, and so the reader sees EOF only after curl has finished.
+python3 -c '
+import sys
+fifo, dest, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
+total = 0
+with open(fifo, "rb") as src, open(dest, "wb") as out:
+    while True:
+        buf = src.read(8192)
+        if not buf:
+            break
+        if total + len(buf) > limit:
+            raise SystemExit(86)
+        out.write(buf)
+        total += len(buf)
+' "$FIFO" "$BODY_FILE" "$MAX_BODY" &
+reader=$!
+exec 3>"$FIFO"
+
+# -q must be first so curlrc cannot enable location or a proxy. --noproxy
+# covers the environment. --proto-redir takes its value as the next argument;
+# the installed curl rejects the joined --proto-redir=-all form. Redirects are
+# not followed. Only HTTP 200 within the body cap is a result.
+set +e
+http_code="$(curl -q --noproxy '*' --max-redirs 0 --proto-redir '-all' -sS -m 60 \
+  -o "$FIFO" -w '%{http_code}' -X POST -H "@$AUTH_HEADER" "${MC_URL%/}/api/sweep")"
+curl_status=$?
+exec 3>&-
+wait "$reader"
+reader_status=$?
+set -e
+if [[ "$curl_status" -ne 0 || "$reader_status" -ne 0 || "$http_code" != "200" ]]; then
   echo "sweep-once: POST /api/sweep failed" >&2
   exit 1
 fi
 
-jq . <<<"$body"
-if jq -e '(.checks | any(.state == "unknown")) or .retention.state != "ok"' >/dev/null <<<"$body"; then
+if ! jq . <"$BODY_FILE"; then
+  exit 1
+fi
+if jq -e '(.checks | any(.state == "unknown")) or .retention.state != "ok"' >/dev/null <"$BODY_FILE"; then
   exit 2
 fi

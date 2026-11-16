@@ -1,0 +1,16 @@
+{
+  "enabled": false,
+  "target_origin": "https://fleet.peripety.com",
+  "agent_id": "mini-observer",
+  "source": "mini-launchd",
+  "stale_after_minutes": 30,
+  "jobs": [
+    "com.missioncontrol.progress-collector",
+    "com.peripety.neuro-independent-review"
+  ],
+  "domain": "user",
+  "secret_file": null,
+  "state_dir": null,
+  "sweep_once": null,
+  "launchctl": null
+}
