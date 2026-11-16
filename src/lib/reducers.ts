@@ -869,16 +869,15 @@ async function updateOneLocked(ctx: HandlerCtx, number: number): Promise<ChildOu
         await saveChild(ctx, key, number, "dropped", "stale_head", { ...child.steps, terminal: true, pending_merge: undefined }, attempts, pinned);
         return { kind: "dropped", emit: null };
       }
-      let moved = false;
+      let afterError: GhPull | null | undefined;
       try {
-        const afterError = await github.getPull(repo, number);
-        moved = !afterError || !sameSha(afterError.headSha, pinned);
+        afterError = await github.getPull(repo, number);
       } catch {
-        moved = false;
+        afterError = undefined;
       }
-      if (moved) {
-        await saveChild(ctx, key, number, "dropped", "stale_head", { ...child.steps, terminal: true, pending_merge: undefined }, attempts, null);
-        return { kind: "dropped", emit: null };
+      // The write may have landed. A moved head does not prove it, so keep the linked child and retry the cap.
+      if (afterError !== undefined && (!afterError || !sameSha(afterError.headSha, pinned))) {
+        return holdUnconfirmedMerge(ctx, key, number, child, afterError?.headSha ?? null);
       }
       const reason = error instanceof GitHubCallError ? error.reason : error instanceof GitHubListTruncatedError ? "issue_list_truncated" : "error";
       const retryAfter = error instanceof GitHubCallError ? error.retryAfterSeconds : null;

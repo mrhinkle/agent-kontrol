@@ -24,6 +24,7 @@ import {
   memoryTransitionStore,
   sqlReducerLock,
   sqlTransitionStore,
+  type TransitionRow,
 } from "../../src/lib/reducer-store";
 import {
   blockedByIssueNumbers,
@@ -774,25 +775,61 @@ describe("reducer failure cases", () => {
     const lost = harness();
     const lostPr = pull();
     let lostMerges = 0;
+    let lostReviews = 0;
     lost.github.getRepo = async () => ({ defaultBranch: "main" });
     lost.github.listOpenPulls = async () => [lostPr];
     lost.github.branchProtected = async () => false;
-    lost.github.getPull = async () => pull({ headSha: lostPr.headSha });
+    lost.github.getPull = async () => pull({
+      headSha: lostPr.headSha,
+      mergeableState: lostPr.headSha === NEW ? "clean" : "behind",
+    });
     lost.github.mergeBaseIntoPull = async () => {
       lostMerges += 1;
       lostPr.headSha = NEW;
       throw new GitHubCallError(0, "http", null);
     };
-    lost.github.requestReviewers = async () => { throw new Error("must not re-request after a lost merge"); };
-    await reduceEvent(event({
+    lost.github.requestReviewers = async () => { lostReviews += 1; };
+    const lostDelivery = event({
       event: "push", action: "", number: null, head_sha: MAIN, delivery_id: "lost-merge",
       payload: { ref: "refs/heads/main", sender: { login: "octocat" } },
-    }), lost.deps);
-    await reduceEvent(event({
-      event: "push", action: "", number: null, head_sha: MAIN, delivery_id: "lost-merge",
-      payload: { ref: "refs/heads/main", sender: { login: "octocat" } },
-    }), lost.deps);
+    });
+    const firstLost = await reduceEvent(lostDelivery, lost.deps);
+    const lostChild = lost.store.rows().find((row) => row.reducer === "update-branch" && row.transition_key.endsWith(A));
+    assert.equal(firstLost.outcome, "failed");
     assert.equal(lostMerges, 1);
+    assert.equal(lostReviews, 0);
+    assert.ok(lostChild);
+    assert.equal(lostChild.status, "failed");
+    assert.equal(lostChild.reason, "merge_unconfirmed");
+    assert.equal(lostChild.steps.pending_merge, A);
+    assert.equal(firstLost.row?.steps.children?.["7"], lostChild.transition_key);
+    assert.equal(lost.store.rows().some((row) => row.reason === "stale_head"), false);
+    assert.equal(lost.store.rows().some((row) => row.reason === "up_to_date"), false);
+    const earlyLost = await reduceEvent(lostDelivery, lost.deps);
+    assert.equal(earlyLost.replay, true);
+    assert.equal(lostMerges, 1);
+    assert.equal(lostReviews, 0);
+    let latestLost = firstLost;
+    for (let attempt = 1; attempt < 5; attempt += 1) {
+      const when = latestLost.row?.steps.next_attempt_at;
+      assert.ok(when);
+      lost.setNow(Date.parse(when) + 1);
+      latestLost = await reduceEvent(lostDelivery, lost.deps);
+      assert.equal(latestLost.outcome, "failed");
+      assert.equal(lostMerges, 1);
+      assert.equal(lostReviews, 0);
+      const sameChild: TransitionRow | undefined = lost.store.rows().find((row) => row.transition_key.endsWith(A));
+      assert.equal(sameChild?.reason, "merge_unconfirmed");
+      assert.equal(sameChild?.steps.pending_merge, A);
+    }
+    assert.equal(latestLost.attempts, 5);
+    assert.equal(latestLost.row?.steps.terminal, true);
+    assert.equal(lost.store.rows().filter((row) => row.reducer === "update-branch").length, 1);
+    const stoppedLost = await reduceEvent(lostDelivery, lost.deps);
+    assert.equal(stoppedLost.replay, true);
+    assert.equal(stoppedLost.outcome, "failed");
+    assert.equal(lostMerges, 1);
+    assert.equal(lostReviews, 0);
   });
 
   it("F14 releases the lock on throw and replaces an expired holder", async () => {
