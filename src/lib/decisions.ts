@@ -1,4 +1,6 @@
-import { isConfigured, sql } from "./db";
+import { isConfigured, sql, withTransaction, type SqlTag } from "./db";
+import { recordDemoActivity } from "./demo-store";
+import { insertToolReceipt } from "./tool-receipt";
 
 /**
  * The decisions queue.
@@ -859,21 +861,31 @@ export async function decisionWritebackLocked(id: number): Promise<boolean> {
   return row != null && writebackLockUnexpired(row.writeback_lock, row.writeback_lock_at);
 }
 
+/**
+ * Stamp `written` or `not_written` on one decided revision.
+ * `attribute` is only for the retry route. A matching stamp then stores
+ * `decision_writeback` in the same transaction, with id, status, and the
+ * new revision. The resolve path leaves this false so its existing
+ * `resolve_decision` receipt stays the only one. Zero rows write nothing.
+ */
 export async function setDecisionWriteback(
   id: number,
   writeback: "written" | "not_written",
   revision: number,
   token: string | null,
+  attribute = false,
 ): Promise<Decision | null> {
   if (!Number.isSafeInteger(revision) || revision < 0) return null;
   const now = nowIso();
   if (testStore) {
     const row = await testStore.setWriteback(id, writeback, revision, token);
-    return row ? presentDecision(row, now) : null;
+    if (!row) return null;
+    const decision = presentDecision(row, now);
+    if (attribute) recordWritebackReceipt(decision, writeback);
+    return decision;
   }
-  const db = sql();
-  const rows = token
-    ? await db`
+  const stamp = (q: SqlTag) => token
+    ? q`
         update decisions
         set writeback = ${writeback},
             revision = revision + 1,
@@ -886,7 +898,7 @@ export async function setDecisionWriteback(
           and writeback_lock = ${token}
         returning *
       `
-    : await db`
+    : q`
         update decisions
         set writeback = ${writeback},
             revision = revision + 1,
@@ -900,7 +912,29 @@ export async function setDecisionWriteback(
           )
         returning *
       `;
-  return rows[0] ? presentDecision(rows[0], now) : null;
+  if (!attribute) {
+    const rows = await stamp(sql());
+    return rows[0] ? presentDecision(rows[0], now) : null;
+  }
+  return withTransaction(async (q) => {
+    const rows = await stamp(q);
+    if (!rows[0]) return null;
+    const decision = presentDecision(rows[0], now);
+    await insertToolReceipt(q, {
+      kind: "decision_writeback",
+      title: "Decision write-back stamped",
+      extra: writebackReceiptExtra(decision, writeback),
+    });
+    return decision;
+  });
+}
+
+function writebackReceiptExtra(decision: Decision, writeback: "written" | "not_written"): Record<string, unknown> {
+  return { decision_id: decision.id, writeback, revision: decision.revision };
+}
+
+function recordWritebackReceipt(decision: Decision, writeback: "written" | "not_written"): void {
+  recordDemoActivity("decision_writeback", "Decision write-back stamped", writebackReceiptExtra(decision, writeback));
 }
 
 export async function listDecisions(query: {
