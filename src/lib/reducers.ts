@@ -16,6 +16,7 @@ import {
   sqlReducerLock,
   sqlTransitionStore,
   type ReducerLock,
+  type RecoveredMerge,
   type TransitionRow,
   type TransitionStatus,
   type TransitionSteps,
@@ -550,11 +551,14 @@ async function handleIssuesClosed(ctx: HandlerCtx): Promise<Act> {
           await ctx.deps.github.removeLabel(repo, issue.number, label);
         } catch (error) {
           dependents[String(issue.number)] = prior;
-          await persist(ctx, "half_done", error instanceof GitHubCallError ? error.reason : "error", {
+          const reason = error instanceof GitHubCallError ? error.reason : "error";
+          const retryAfter = error instanceof GitHubCallError ? error.retryAfterSeconds : null;
+          const until = new Date(ctx.deps.now() + nextBackoffSeconds(Math.max(ctx.attempts, 1), retryAfter) * 1000).toISOString();
+          await persist(ctx, "half_done", reason, {
             dependents,
             deliveries: addDelivery(ctx.existing?.steps.deliveries, ctx.event.delivery_id),
           });
-          return { status: "half_done", reason: error instanceof GitHubCallError ? error.reason : "error", emitted, steps: { dependents } };
+          return { status: "half_done", reason, emitted, steps: { dependents }, retryAt: until };
         }
         prior.unlabel = true;
         dependents[String(issue.number)] = prior;
@@ -593,6 +597,98 @@ async function saveChild(
     return inserted.row;
   }
   return ctx.deps.store.update(key, { status, reason, steps, attempts, head_sha: head }, at);
+}
+
+function parentActSteps(ctx: HandlerCtx, children: Record<string, string>): TransitionSteps {
+  const steps: TransitionSteps = { children };
+  if (ctx.existing && Object.prototype.hasOwnProperty.call(ctx.existing.steps, "recovered_merges")) {
+    steps.recovered_merges = ctx.existing.steps.recovered_merges;
+  }
+  return steps;
+}
+
+function recoveredMerge(ctx: HandlerCtx, number: number): RecoveredMerge | null {
+  const fact = ctx.existing?.steps.recovered_merges?.[String(number)];
+  if (!fact?.child_key || !fact.pinned_head || !Array.isArray(fact.reviewers)) return null;
+  return fact;
+}
+
+function stageRecoveredMerge(ctx: HandlerCtx, number: number, fact: RecoveredMerge): void {
+  if (!ctx.existing) return;
+  const recovered_merges = { ...(ctx.existing.steps.recovered_merges ?? {}), [String(number)]: fact };
+  ctx.existing = { ...ctx.existing, steps: { ...ctx.existing.steps, recovered_merges } };
+}
+
+/** The loaded parent row is the durable link. Memory staged before a failed update is not. */
+async function linkChild(ctx: HandlerCtx, number: number, childKey: string): Promise<void> {
+  if (!ctx.existing) throw new Error("parent_link_missing");
+  const id = String(number);
+  const children = { ...(ctx.existing.steps.children ?? {}) };
+  if (children[id] === childKey) return;
+  children[id] = childKey;
+  ctx.existing = { ...ctx.existing, steps: { ...ctx.existing.steps, children } };
+  const saved = await ctx.deps.store.update(ctx.key, {
+    status: ctx.existing.status,
+    reason: ctx.existing.reason,
+    steps: ctx.existing.steps,
+    attempts: ctx.existing.attempts,
+  }, new Date(ctx.deps.now()).toISOString());
+  ctx.existing = saved;
+}
+
+async function persistParent(ctx: HandlerCtx): Promise<void> {
+  if (!ctx.existing) throw new Error("parent_missing");
+  const saved = await ctx.deps.store.update(ctx.key, {
+    status: ctx.existing.status,
+    reason: ctx.existing.reason,
+    steps: ctx.existing.steps,
+    attempts: ctx.existing.attempts,
+  }, new Date(ctx.deps.now()).toISOString());
+  ctx.existing = saved;
+}
+
+async function repairRecoveredCheckpoint(
+  ctx: HandlerCtx,
+  key: string,
+  number: number,
+  child: TransitionRow,
+  fact: RecoveredMerge,
+): Promise<TransitionRow> {
+  const completed = [...(child.steps.completed ?? [])];
+  if (!completed.includes("merge")) completed.push("merge");
+  const steps: TransitionSteps = {
+    ...child.steps,
+    completed,
+    reviewers: fact.reviewers,
+    pending_merge: undefined,
+    pinned_head: fact.pinned_head,
+    terminal: false,
+  };
+  delete steps.next_attempt_at;
+  return saveChild(ctx, key, number, "half_done", "awaiting_new_head", steps, Math.max(child.attempts, 1), fact.pinned_head);
+}
+
+/** Head moved, but no stored merge return proves it was this reducer. Do not merge again or mark it current. */
+async function holdUnconfirmedMerge(
+  ctx: HandlerCtx,
+  key: string,
+  number: number,
+  child: TransitionRow,
+  liveHead: string | null,
+): Promise<ChildOutcome> {
+  const attempts = Math.max(child.attempts, 1);
+  const terminal = attempts >= REDUCER_MAX_ATTEMPTS;
+  const until = new Date(ctx.deps.now() + nextBackoffSeconds(attempts, null) * 1000).toISOString();
+  const steps: TransitionSteps = {
+    ...child.steps,
+    pinned_head: child.steps.pinned_head ?? child.steps.pending_merge,
+    pending_merge: child.steps.pending_merge,
+    terminal,
+  };
+  if (terminal) delete steps.next_attempt_at;
+  else steps.next_attempt_at = until;
+  await saveChild(ctx, key, number, "failed", "merge_unconfirmed", steps, attempts, liveHead);
+  return { kind: "retry", emit: null, until: terminal ? undefined : until, key };
 }
 
 async function recordEcho(ctx: HandlerCtx, repo: string, number: number, newSha: string): Promise<void> {
@@ -641,6 +737,18 @@ async function resumeRemembered(ctx: HandlerCtx, number: number, key: string): P
   if (child.status === "done" || child.status === "dropped" || child.status === "skipped") {
     return { kind: child.status === "done" ? "done" : "dropped", emit: childEmit(child), key };
   }
+  const fact = recoveredMerge(ctx, number);
+  if (fact?.child_key === key) {
+    if (waiting(child, ctx.deps)) return { kind: "retry", emit: null, until: child.steps.next_attempt_at, key };
+    const row = mergeRecorded(child) ? child : await repairRecoveredCheckpoint(ctx, key, number, child, fact);
+    const outcome = await resumeAfterMerge(ctx, key, number, row, fact.pinned_head);
+    return { ...outcome, key };
+  }
+  if (child.reason === "merge_unconfirmed") {
+    if (waiting(child, ctx.deps)) return { kind: "retry", emit: null, until: child.steps.next_attempt_at, key };
+    const live = await ctx.deps.github.getPull(ctx.event.repo!, number);
+    return holdUnconfirmedMerge(ctx, key, number, child, live?.headSha ?? null);
+  }
   if (child.status === "failed" && (child.steps.terminal === true || child.attempts >= REDUCER_MAX_ATTEMPTS)) {
     return { kind: "dropped", emit: null, key };
   }
@@ -650,17 +758,11 @@ async function resumeRemembered(ctx: HandlerCtx, number: number, key: string): P
   if (child.steps.pending_merge) {
     const live = await ctx.deps.github.getPull(ctx.event.repo!, number);
     if (!live || !sameSha(live.headSha, child.steps.pending_merge)) {
-      await saveChild(ctx, key, number, "dropped", "stale_head", {
-        ...child.steps,
-        terminal: true,
-        pending_merge: undefined,
-        pinned_head: pinned,
-      }, child.attempts, live?.headSha ?? null);
-      return { kind: "dropped", emit: null, key };
+      return holdUnconfirmedMerge(ctx, key, number, child, live?.headSha ?? null);
     }
     return null;
   }
-  if (child.status === "half_done" && (child.steps.completed ?? []).includes("merge")) {
+  if (mergeRecorded(child) && !reviewersRecorded(child)) {
     const outcome = await resumeAfterMerge(ctx, key, number, child, pinned);
     return { ...outcome, key };
   }
@@ -687,16 +789,24 @@ async function updateOneLocked(ctx: HandlerCtx, number: number): Promise<ChildOu
   if (child && (child.status === "done" || child.status === "dropped" || child.status === "skipped")) {
     return { kind: child.status === "done" ? "done" : "dropped", emit: childEmit(child) };
   }
+  if (child?.reason === "merge_unconfirmed") {
+    if (waiting(child, ctx.deps)) return { kind: "retry", emit: null, until: child.steps.next_attempt_at };
+    return holdUnconfirmedMerge(ctx, key, number, child, first.headSha);
+  }
   if (child && child.status === "failed" && (child.steps.terminal === true || child.attempts >= REDUCER_MAX_ATTEMPTS)) {
     return { kind: "dropped", emit: null };
   }
   if (child && waiting(child, ctx.deps)) return { kind: "retry", emit: null, until: child.steps.next_attempt_at };
 
   if (child?.steps.pending_merge && !sameSha(first.headSha, child.steps.pending_merge)) {
-    await saveChild(ctx, key, number, "dropped", "stale_head", { ...child.steps, terminal: true, pending_merge: undefined }, child.attempts, first.headSha);
-    return { kind: "dropped", emit: null };
+    const fact = recoveredMerge(ctx, number);
+    if (fact?.child_key === key) {
+      const row = mergeRecorded(child) ? child : await repairRecoveredCheckpoint(ctx, key, number, child, fact);
+      return resumeAfterMerge(ctx, key, number, row, fact.pinned_head);
+    }
+    return holdUnconfirmedMerge(ctx, key, number, child, first.headSha);
   }
-  if (child?.status === "half_done" && (child.steps.completed ?? []).includes("merge")) {
+  if (child && mergeRecorded(child) && !reviewersRecorded(child)) {
     return resumeAfterMerge(ctx, key, number, child, pinned);
   }
 
@@ -751,6 +861,7 @@ async function updateOneLocked(ctx: HandlerCtx, number: number): Promise<ChildOu
       reviewers: first.reviewers,
       deliveries: addDelivery(child?.steps.deliveries, ctx.event.delivery_id),
     }, attempts, pinned);
+    await linkChild(ctx, number, key);
     try {
       await github.mergeBaseIntoPull(repo, number, pinned);
     } catch (error) {
@@ -776,17 +887,84 @@ async function updateOneLocked(ctx: HandlerCtx, number: number): Promise<ChildOu
       return { kind: "retry", emit: null, until };
     }
     completed.push("merge");
+    // Echo insert and the post-merge read are fallible. The parent link is already
+    // durable. The completed merge, captured reviewers, and pinned head have to land
+    // before those calls. A failed checkpoint keeps the successful return on the parent.
+    const reviewers = child?.steps.reviewers ?? first.reviewers;
+    const checkpoint: TransitionSteps = {
+      ...(child?.steps ?? {}),
+      completed: [...completed],
+      reviewers,
+      pending_merge: undefined,
+      pinned_head: pinned,
+      terminal: false,
+    };
+    delete checkpoint.next_attempt_at;
+    try {
+      child = await saveChild(ctx, key, number, "half_done", "awaiting_new_head", checkpoint, attempts, pinned);
+    } catch {
+      stageRecoveredMerge(ctx, number, { child_key: key, reviewers, pinned_head: pinned });
+      try {
+        await persistParent(ctx);
+      } catch {
+        // Returned parent steps are the second write. If that fails too, the return stays unproven.
+      }
+      const until = new Date(ctx.deps.now() + nextBackoffSeconds(Math.max(attempts, 1), null) * 1000).toISOString();
+      return { kind: "retry", emit: null, until, key };
+    }
   }
 
-  const after = await github.getPull(repo, number);
+  const reviewers = child?.steps.reviewers ?? first.reviewers;
+  let after: GhPull | null;
+  try {
+    after = await github.getPull(repo, number);
+  } catch {
+    return { kind: "half", emit: null, key };
+  }
   if (!after || sameSha(after.headSha, pinned)) {
     await saveChild(ctx, key, number, "half_done", "awaiting_new_head", {
-      completed, reviewers: first.reviewers, pending_merge: undefined, pinned_head: pinned, terminal: false,
+      completed, reviewers, pending_merge: undefined, pinned_head: pinned, terminal: false,
     }, attempts, pinned);
     return { kind: "half", emit: null, key };
   }
-  await recordEcho(ctx, repo, number, after.headSha);
-  return finishReviewers(ctx, key, number, completed, attempts, after, first.reviewers, pinned);
+  const echoed = await recordEchoOrRetry(ctx, key, number, completed, attempts, after, reviewers, pinned);
+  if (echoed) return echoed;
+  return finishReviewers(ctx, key, number, completed, attempts, after, reviewers, pinned);
+}
+
+async function recordEchoOrRetry(
+  ctx: HandlerCtx,
+  key: string,
+  number: number,
+  completed: string[],
+  attempts: number,
+  after: GhPull,
+  reviewers: string[],
+  pinned: string,
+): Promise<ChildOutcome | null> {
+  try {
+    await recordEcho(ctx, ctx.event.repo!, number, after.headSha);
+    return null;
+  } catch (error) {
+    const until = new Date(ctx.deps.now() + nextBackoffSeconds(Math.max(attempts, 1), failureReason(error).retryAfter) * 1000).toISOString();
+    await saveChild(ctx, key, number, "half_done", "awaiting_new_head", {
+      completed: [...completed],
+      reviewers,
+      pending_merge: undefined,
+      pinned_head: pinned,
+      terminal: false,
+      next_attempt_at: until,
+    }, attempts, after.headSha);
+    return { kind: "retry", emit: null, until, key };
+  }
+}
+
+function mergeRecorded(row: TransitionRow): boolean {
+  return (row.steps.completed ?? []).includes("merge");
+}
+
+function reviewersRecorded(row: TransitionRow): boolean {
+  return (row.steps.completed ?? []).includes("reviewers");
 }
 
 async function resumeAfterMerge(ctx: HandlerCtx, key: string, number: number, child: TransitionRow, pinned: string): Promise<ChildOutcome> {
@@ -796,9 +974,13 @@ async function resumeAfterMerge(ctx: HandlerCtx, key: string, number: number, ch
   if (!after || sameSha(after.headSha, pinnedHead)) {
     return { kind: "half", emit: null, key };
   }
-  await recordEcho(ctx, ctx.event.repo!, number, after.headSha);
   const reviewers = child.steps.reviewers ?? after.reviewers;
-  return finishReviewers(ctx, key, number, [...(child.steps.completed ?? [])], child.attempts, after, reviewers, pinnedHead);
+  const attempts = child.status === "failed"
+    ? Math.min(REDUCER_MAX_ATTEMPTS, child.attempts + 1)
+    : child.attempts;
+  const echoed = await recordEchoOrRetry(ctx, key, number, [...(child.steps.completed ?? [])], attempts, after, reviewers, pinnedHead);
+  if (echoed) return echoed;
+  return finishReviewers(ctx, key, number, [...(child.steps.completed ?? [])], attempts, after, reviewers, pinnedHead);
 }
 
 async function finishReviewers(
@@ -820,8 +1002,19 @@ async function finishReviewers(
       completed.push("reviewers");
     } catch (error) {
       const reason = error instanceof GitHubCallError ? error.reason : "error";
-      await saveChild(ctx, key, number, "half_done", reason, { ...doneSteps, completed: [...completed], reviewers }, attempts, after.headSha);
-      return { kind: "half", emit: null, key };
+      const retryAfter = error instanceof GitHubCallError ? error.retryAfterSeconds : null;
+      const used = Math.min(REDUCER_MAX_ATTEMPTS, Math.max(attempts, 1));
+      const terminal = used >= REDUCER_MAX_ATTEMPTS;
+      const until = new Date(ctx.deps.now() + nextBackoffSeconds(used, retryAfter) * 1000).toISOString();
+      const steps: TransitionSteps = {
+        ...doneSteps,
+        completed: [...completed],
+        reviewers,
+        terminal,
+      };
+      if (!terminal) steps.next_attempt_at = until;
+      await saveChild(ctx, key, number, "failed", reason, steps, used, after.headSha);
+      return { kind: "retry", emit: null, until: terminal ? undefined : until, key };
     }
   }
   await saveChild(ctx, key, number, "done", null, {
@@ -843,7 +1036,19 @@ async function handlePush(ctx: HandlerCtx): Promise<Act> {
   let until: string | undefined;
   for (const pull of pulls) {
     if (pull.baseRef !== info.defaultBranch) continue;
-    const outcome = await updateOne(ctx, pull.number);
+    let outcome: ChildOutcome;
+    try {
+      outcome = await updateOne(ctx, pull.number);
+    } catch (error) {
+      if (ctx.dry) throw error;
+      retry = true;
+      const retryAfter = failureReason(error).retryAfter;
+      const failUntil = new Date(ctx.deps.now() + nextBackoffSeconds(Math.max(ctx.attempts, 1), retryAfter) * 1000).toISOString();
+      if (!until || failUntil > until) until = failUntil;
+      const linked = ctx.existing?.steps.children?.[String(pull.number)];
+      if (linked) children[String(pull.number)] = linked;
+      continue;
+    }
     if (outcome.key) children[String(pull.number)] = outcome.key;
     if (outcome.emit) emitted.push(outcome.emit);
     if (outcome.kind === "retry") {
@@ -853,10 +1058,44 @@ async function handlePush(ctx: HandlerCtx): Promise<Act> {
       half = true;
     }
   }
-  const steps = { children };
+  if (ctx.existing?.steps.children) Object.assign(children, ctx.existing.steps.children);
+  const steps = parentActSteps(ctx, children);
   if (retry) return { status: "failed", reason: "child_retry", emitted, retryAt: until, steps };
   if (half) return { status: "half_done", reason: "awaiting_reviewers", emitted, steps };
   return { status: "done", reason: null, emitted, steps };
+}
+
+async function recordClosedPreReadFailure(
+  deps: ReducerDeps,
+  key: string,
+  id: string,
+  event: ReducerEvent,
+  prior: TransitionRow | null,
+  error: unknown,
+): Promise<ReduceResult> {
+  const { reason, retryAfter } = failureReason(error);
+  const attempts = Math.min(REDUCER_MAX_ATTEMPTS, (prior?.attempts ?? 0) + 1);
+  const terminal = attempts >= REDUCER_MAX_ATTEMPTS;
+  const steps: TransitionSteps = {
+    ...(prior?.steps ?? {}),
+    deliveries: addDelivery(prior?.steps.deliveries, event.delivery_id),
+    terminal,
+  };
+  if (terminal) delete steps.next_attempt_at;
+  else steps.next_attempt_at = new Date(deps.now() + nextBackoffSeconds(attempts, retryAfter) * 1000).toISOString();
+  const atFail = new Date(deps.now()).toISOString();
+  const patch = { status: "failed" as const, reason, steps, attempts, head_sha: event.head_sha };
+  if (!prior) {
+    const inserted = await deps.store.insert({
+      transition_key: key,
+      reducer: id.slice(0, 80),
+      repo: (event.repo as string).toLowerCase(),
+      number: event.number,
+      ...patch,
+    }, atFail);
+    if (inserted.inserted) return fromRow(inserted.row, false);
+  }
+  return fromRow(await deps.store.update(key, patch, atFail), false);
 }
 
 async function closedMissing(id: string, event: ReducerEvent, github: ReducerGitHub): Promise<boolean> {
@@ -989,8 +1228,15 @@ export async function reduceEvent(event: ReducerEvent, deps: ReducerDeps): Promi
     if (existing && waiting(existing, deps)) return fromRow(existing, true);
 
     if (id === "pull_request.closed" || id === "issues.closed") {
-      const missing = await closedMissing(id, event, deps.github);
-      if (missing) return noState();
+      try {
+        const missing = await closedMissing(id, event, deps.github);
+        if (missing) return noState();
+      } catch (error) {
+        // The attempt counter is persisted below this read. A throw here used to
+        // reuse the saved attempt, so a 503 on getIssue/getPull stayed at 1.
+        if (deps.mode !== "on") throw error;
+        return recordClosedPreReadFailure(deps, key, id, event, existing && !isEchoRow(existing) ? existing : null, error);
+      }
     }
 
     const attempts = deps.mode === "dry"
@@ -1054,9 +1300,11 @@ export async function reduceEvent(event: ReducerEvent, deps: ReducerDeps): Promi
       }
       return fromRow(await deps.store.update(key, draft, at), false);
     }
-    const terminal = act.status === "done" || act.status === "dropped" || act.status === "skipped" || (act.status === "failed" && attempts >= REDUCER_MAX_ATTEMPTS);
+    const unblockRetry = id === "issues.closed" && act.status === "half_done" && act.reason != null;
+    const status: TransitionStatus = unblockRetry && attempts >= REDUCER_MAX_ATTEMPTS ? "failed" : act.status;
+    const terminal = status === "done" || status === "dropped" || status === "skipped" || (status === "failed" && attempts >= REDUCER_MAX_ATTEMPTS);
     steps.terminal = terminal;
-    if (!terminal && (act.status === "failed" || act.retryAt)) {
+    if (!terminal && (status === "failed" || act.retryAt || unblockRetry)) {
       const backoffAt = deps.now() + nextBackoffSeconds(attempts, null) * 1000;
       const requested = act.retryAt ? Date.parse(act.retryAt) : backoffAt;
       steps.next_attempt_at = new Date(Math.max(backoffAt, Number.isFinite(requested) ? requested : backoffAt)).toISOString();
@@ -1064,7 +1312,7 @@ export async function reduceEvent(event: ReducerEvent, deps: ReducerDeps): Promi
       delete steps.next_attempt_at;
     }
     const saved = await deps.store.update(key, {
-      status: act.status,
+      status,
       reason: act.reason,
       steps,
       attempts,

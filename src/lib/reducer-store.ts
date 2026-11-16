@@ -21,6 +21,13 @@ export interface DependentStep {
   unlabel?: boolean;
 }
 
+/** A merge GitHub already accepted, whose child checkpoint row did not land. */
+export interface RecoveredMerge {
+  child_key: string;
+  reviewers: string[];
+  pinned_head: string;
+}
+
 export interface TransitionSteps {
   deliveries?: string[];
   terminal?: boolean;
@@ -39,6 +46,11 @@ export interface TransitionSteps {
   pinned_head?: string;
   /** Child transition keys a push already started, keyed by pull number. */
   children?: Record<string, string>;
+  /**
+   * Pulls whose update-branch merge returned success and whose child
+   * checkpoint write did not. Keyed by pull number. A moved head is not this.
+   */
+  recovered_merges?: Record<string, RecoveredMerge>;
 }
 
 export interface TransitionRow {

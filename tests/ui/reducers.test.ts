@@ -13,6 +13,7 @@ import {
   GitHubListTruncatedError,
   installationAuthorizer,
   normalizePem,
+  retryAfterSeconds,
   type GhIssue,
   type GhPull,
 } from "../../src/lib/github-read";
@@ -430,6 +431,13 @@ describe("reducer failure cases", () => {
     assert.match(bodies[0], /agent-kontrol-reducer:v1/);
     assert.match(bodies[0], /Unblocked: #15 closed\./);
     assert.equal(labelCalls, 1);
+    assert.ok(first.row?.steps.next_attempt_at);
+    const tooSoon = await reduceEvent(event({
+      event: "issues", action: "closed", number: 15, head_sha: null, delivery_id: "unblock",
+    }), h.deps);
+    assert.equal(tooSoon.replay, true);
+    assert.equal(labelCalls, 1);
+    h.setNow(Date.parse(first.row.steps.next_attempt_at) + 1);
 
     labelFails = false;
     const second = await reduceEvent(event({
@@ -739,8 +747,22 @@ describe("reducer failure cases", () => {
       event: "push", action: "", number: null, head_sha: MAIN, delivery_id: "review",
       payload: { ref: "refs/heads/main", sender: { login: "octocat" } },
     }), review.deps);
-    assert.equal(half.outcome, "half_done");
+    assert.equal(half.outcome, "failed");
+    assert.equal(half.reason, "child_retry");
     assert.equal(merges, 1);
+    const reviewChild = review.store.rows().find((row) => row.reducer === "update-branch");
+    assert.equal(reviewChild?.status, "failed");
+    assert.equal(reviewChild?.reason, "http");
+    assert.deepEqual(reviewChild?.steps.completed, ["merge"]);
+    assert.notEqual(reviewChild?.reason, "awaiting_new_head");
+    assert.ok(half.row?.steps.next_attempt_at);
+    const earlyReview = await reduceEvent(event({
+      event: "push", action: "", number: null, head_sha: MAIN, delivery_id: "review",
+      payload: { ref: "refs/heads/main", sender: { login: "octocat" } },
+    }), review.deps);
+    assert.equal(earlyReview.replay, true);
+    assert.equal(reviewCalls, 1);
+    review.setNow(Date.parse(half.row.steps.next_attempt_at) + 1);
     const done = await reduceEvent(event({
       event: "push", action: "", number: null, head_sha: MAIN, delivery_id: "review",
       payload: { ref: "refs/heads/main", sender: { login: "octocat" } },
@@ -926,6 +948,801 @@ describe("reducer failure cases", () => {
     }), truncated.deps);
     assert.equal(capped.reason, "issue_list_truncated");
   });
+
+  it("backs off a partial removeLabel failure and fails the transition at the cap", async () => {
+    const h = harness();
+    const bodies: string[] = [];
+    let labelCalls = 0;
+    h.github.getIssue = async (_repo, number) => {
+      if (number === 15) return issue({ number: 15, state: "closed" });
+      return issue({ number, body: "Blocked by #15", labels: ["blocked"] });
+    };
+    h.github.listOpenIssues = async () => [
+      issue({ number: 12, body: "Blocked by #15", labels: ["blocked"] }),
+      issue({ number: 13, body: "Blocked by #15", labels: ["blocked"] }),
+    ];
+    h.github.listComments = async () => bodies.map((body) => ({ body }));
+    h.github.comment = async (_repo, _number, body) => { bodies.push(body); };
+    h.github.removeLabel = async (_repo, number) => {
+      labelCalls += 1;
+      if (number === 13) throw new GitHubCallError(500, "http", null);
+    };
+    const closed = event({
+      event: "issues", action: "closed", number: 15, head_sha: null, delivery_id: "partial-label",
+    });
+    let previousWait = 0;
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const before = labelCalls;
+      const result = await reduceEvent(closed, h.deps);
+      assert.equal(bodies.length, 2);
+      const dependents = result.row?.steps.dependents ?? {};
+      assert.equal(dependents["12"]?.unlabel, true);
+      assert.notEqual(dependents["13"]?.unlabel, true);
+      if (attempt < 5) {
+        assert.equal(result.outcome, "half_done");
+        assert.equal(result.row?.steps.terminal, false);
+        const when = result.row?.steps.next_attempt_at;
+        assert.ok(when);
+        const wait = Date.parse(when) - h.deps.now();
+        assert.ok(wait >= 30_000);
+        assert.ok(wait > previousWait);
+        previousWait = wait;
+        const early = await reduceEvent(closed, h.deps);
+        assert.equal(early.replay, true);
+        assert.equal(labelCalls, before + (attempt === 1 ? 2 : 1));
+        h.setNow(Date.parse(when) + 1);
+      } else {
+        assert.equal(result.outcome, "failed");
+        assert.equal(result.attempts, 5);
+        assert.equal(result.reason, "http");
+        assert.equal(result.row?.steps.terminal, true);
+        assert.equal(result.row?.steps.next_attempt_at, undefined);
+        assert.equal(labelCalls, before + 1);
+      }
+    }
+    const listed = await h.store.listTerminalFailures();
+    const lines = formatReducerFailureLines(listed);
+    assert.match(lines.join("\n"), /acme\/app #15  issues\.closed  http  attempts=5/);
+    const stopped = await reduceEvent(closed, h.deps);
+    assert.equal(stopped.replay, true);
+    assert.equal(bodies.length, 2);
+    assert.equal(labelCalls, 6);
+  });
+
+  it("holds a partial removeLabel error for Retry-After when that is longer than backoff", async () => {
+    const h = harness();
+    const bodies: string[] = [];
+    let labelCalls = 0;
+    h.github.getIssue = async (_repo, number) => {
+      if (number === 15) return issue({ number: 15, state: "closed" });
+      return issue({ number, body: "Blocked by #15", labels: ["blocked"] });
+    };
+    h.github.listOpenIssues = async () => [
+      issue({ number: 12, body: "Blocked by #15", labels: ["blocked"] }),
+      issue({ number: 13, body: "Blocked by #15", labels: ["blocked"] }),
+    ];
+    h.github.listComments = async () => bodies.map((body) => ({ body }));
+    h.github.comment = async (_repo, _number, body) => { bodies.push(body); };
+    h.github.removeLabel = async (_repo, number) => {
+      labelCalls += 1;
+      if (number === 13) throw new GitHubCallError(429, "rate_limit", 900);
+    };
+    const closed = event({
+      event: "issues", action: "closed", number: 15, head_sha: null, delivery_id: "retry-after-900",
+    });
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const before = labelCalls;
+      const result = await reduceEvent(closed, h.deps);
+      assert.equal(bodies.length, 2);
+      const dependents = result.row?.steps.dependents ?? {};
+      assert.equal(dependents["12"]?.unlabel, true);
+      assert.equal(dependents["12"]?.comment, true);
+      assert.notEqual(dependents["13"]?.unlabel, true);
+      assert.equal(result.reason, "rate_limit");
+      if (attempt < 5) {
+        assert.equal(result.outcome, "half_done");
+        assert.equal(result.row?.steps.terminal, false);
+        const when = result.row?.steps.next_attempt_at;
+        assert.ok(when);
+        assert.equal(Date.parse(when) - h.deps.now(), 900_000);
+        const atBugWindow = h.deps.now() + 30_000;
+        h.setNow(atBugWindow);
+        const tooSoon = await reduceEvent(closed, h.deps);
+        assert.equal(tooSoon.replay, true);
+        assert.equal(labelCalls, before + (attempt === 1 ? 2 : 1));
+        h.setNow(Date.parse(when) - 1);
+        const stillEarly = await reduceEvent(closed, h.deps);
+        assert.equal(stillEarly.replay, true);
+        assert.equal(labelCalls, before + (attempt === 1 ? 2 : 1));
+        h.setNow(Date.parse(when) + 1);
+      } else {
+        assert.equal(result.outcome, "failed");
+        assert.equal(result.attempts, 5);
+        assert.equal(result.row?.steps.terminal, true);
+        assert.equal(result.row?.steps.next_attempt_at, undefined);
+        assert.equal(labelCalls, before + 1);
+      }
+    }
+    const listed = await h.store.listTerminalFailures();
+    const lines = formatReducerFailureLines(listed);
+    assert.match(lines.join("\n"), /acme\/app #15  issues\.closed  rate_limit  attempts=5/);
+    const stopped = await reduceEvent(closed, h.deps);
+    assert.equal(stopped.replay, true);
+    assert.equal(labelCalls, 6);
+    assert.equal(bodies.length, 2);
+
+    const floor = harness();
+    let floorWrites = 0;
+    floor.github.getIssue = async (_repo, number) => issue({
+      number, state: number === 15 ? "closed" : "open", body: "Blocked by #15", labels: ["blocked"],
+    });
+    floor.github.listOpenIssues = async () => [issue({ number: 12, body: "Blocked by #15", labels: ["blocked"] })];
+    floor.github.listComments = async () => [];
+    floor.github.comment = async () => {};
+    floor.github.removeLabel = async () => {
+      floorWrites += 1;
+      throw new GitHubCallError(429, "rate_limit", 10);
+    };
+    const short = event({
+      event: "issues", action: "closed", number: 15, head_sha: null, delivery_id: "retry-after-floor",
+    });
+    const held = await reduceEvent(short, floor.deps);
+    const heldUntil = held.row?.steps.next_attempt_at;
+    assert.ok(heldUntil);
+    assert.equal(Date.parse(heldUntil) - floor.deps.now(), 30_000);
+    floor.setNow(floor.deps.now() + 10_000);
+    const beforeFloor = await reduceEvent(short, floor.deps);
+    assert.equal(beforeFloor.replay, true);
+    assert.equal(floorWrites, 1);
+    floor.setNow(Date.parse(heldUntil) + 1);
+    await reduceEvent(short, floor.deps);
+    assert.equal(floorWrites, 2);
+  });
+
+  function pushDelivery(delivery: string) {
+    return event({
+      event: "push", action: "", number: null, head_sha: MAIN, delivery_id: delivery,
+      payload: { ref: "refs/heads/main", sender: { login: "octocat" } },
+    });
+  }
+
+  it("keeps awaiting_new_head until the merged head is visible, then requests reviewers once", async () => {
+    const h = harness();
+    const pr = pull();
+    let merges = 0;
+    let reviews = 0;
+    let visible = false;
+    h.github.getRepo = async () => ({ defaultBranch: "main" });
+    h.github.listOpenPulls = async () => [pr];
+    h.github.branchProtected = async () => false;
+    h.github.getPull = async () => pull({ headSha: visible ? NEW : A, reviewers: ["octocat"] });
+    h.github.mergeBaseIntoPull = async () => { merges += 1; };
+    h.github.requestReviewers = async () => { reviews += 1; };
+    const waitingHead = await reduceEvent(pushDelivery("wait-head"), h.deps);
+    assert.equal(waitingHead.outcome, "half_done");
+    assert.equal(waitingHead.reason, "awaiting_reviewers");
+    const child = h.store.rows().find((row) => row.reducer === "update-branch");
+    assert.equal(child?.reason, "awaiting_new_head");
+    assert.deepEqual(child?.steps.completed, ["merge"]);
+    assert.equal(merges, 1);
+    assert.equal(reviews, 0);
+    visible = true;
+    const done = await reduceEvent(pushDelivery("wait-head"), h.deps);
+    assert.equal(done.outcome, "done");
+    assert.equal(merges, 1);
+    assert.equal(reviews, 1);
+    assert.deepEqual(done.emitted, ["update-branch"]);
+  });
+
+  it("checkpoints the merge and child key when the post-merge read throws", async () => {
+    const h = harness();
+    const pr = pull();
+    let reads = 0;
+    let merges = 0;
+    let reviews = 0;
+    h.github.getRepo = async () => ({ defaultBranch: "main" });
+    h.github.listOpenPulls = async () => [pr];
+    h.github.branchProtected = async () => false;
+    h.github.getPull = async () => {
+      reads += 1;
+      if (reads === 3) throw new GitHubCallError(503, "http", null);
+      return pull({ headSha: pr.headSha, reviewers: ["octocat"] });
+    };
+    h.github.mergeBaseIntoPull = async () => {
+      merges += 1;
+      pr.headSha = NEW;
+    };
+    h.github.requestReviewers = async () => { reviews += 1; };
+    const first = await reduceEvent(pushDelivery("post-read"), h.deps);
+    assert.equal(first.outcome, "half_done");
+    assert.equal(merges, 1);
+    assert.equal(reviews, 0);
+    const child = h.store.rows().find((row) => row.reducer === "update-branch");
+    assert.ok(child);
+    assert.equal(child.reason, "awaiting_new_head");
+    assert.deepEqual(child.steps.completed, ["merge"]);
+    assert.equal(child.steps.pending_merge, undefined);
+    assert.equal(first.row?.steps.children?.["7"], child.transition_key);
+    const second = await reduceEvent(pushDelivery("post-read"), h.deps);
+    assert.equal(second.outcome, "done");
+    assert.equal(merges, 1);
+    assert.equal(reviews, 1);
+    assert.equal(second.row?.steps.children?.["7"], child.transition_key);
+    const finished = h.store.rows().find((row) => row.transition_key === child.transition_key);
+    assert.equal(finished?.status, "done");
+    assert.equal(finished?.reason, null);
+    assert.equal(finished?.steps.completed?.includes("reviewers"), true);
+    assert.notEqual(finished?.reason, "stale_head");
+  });
+
+  it("keeps the merged child when the echo insert fails and requests the original reviewers once", async () => {
+    const h = harness();
+    const pr = pull();
+    let phase: "before" | "after" = "before";
+    let merges = 0;
+    let reviews = 0;
+    let failedEcho = false;
+    let checkpointAtPostRead: { completed?: string[]; reviewers?: string[]; pinned_head?: string; pending_merge?: string; key?: string; parent?: string } | undefined;
+    const original = ["octocat", "hubot"];
+    h.github.getRepo = async () => ({ defaultBranch: "main" });
+    h.github.listOpenPulls = async () => [pr];
+    h.github.branchProtected = async () => false;
+    h.github.getPull = async () => {
+      if (phase === "after" && !checkpointAtPostRead) {
+        const child = h.store.rows().find((row) => row.reducer === "update-branch");
+        const parent = h.store.rows().find((row) => row.reducer === "push");
+        checkpointAtPostRead = {
+          completed: child?.steps.completed,
+          reviewers: child?.steps.reviewers,
+          pinned_head: child?.steps.pinned_head,
+          pending_merge: child?.steps.pending_merge,
+          key: child?.transition_key,
+          parent: parent?.steps.children?.["7"],
+        };
+      }
+      return pull({
+        headSha: phase === "after" ? NEW : A,
+        mergeableState: phase === "after" ? "clean" : "behind",
+        reviewers: phase === "after" ? ["other"] : original,
+      });
+    };
+    h.github.mergeBaseIntoPull = async () => {
+      merges += 1;
+      phase = "after";
+      pr.headSha = NEW;
+    };
+    h.github.requestReviewers = async (_repo, _number, reviewers) => {
+      reviews += 1;
+      assert.deepEqual(reviewers, original);
+    };
+    const realInsert = h.store.insert.bind(h.store);
+    h.deps.store = {
+      get: (key) => h.store.get(key),
+      update: (key, patch, at) => h.store.update(key, patch, at),
+      listTerminalFailures: () => h.store.listTerminalFailures(),
+      insert: async (row, at) => {
+        if (row.reason === "caused_by" && !failedEcho) {
+          failedEcho = true;
+          throw new Error("one transient DB statement failure");
+        }
+        return realInsert(row, at);
+      },
+    };
+    const delivery = pushDelivery("echo-checkpoint");
+    const first = await reduceEvent(delivery, h.deps);
+    assert.equal(first.outcome, "failed");
+    assert.equal(first.reason, "child_retry");
+    assert.equal(merges, 1);
+    assert.equal(reviews, 0);
+    assert.ok(checkpointAtPostRead);
+    assert.deepEqual(checkpointAtPostRead.completed, ["merge"]);
+    assert.deepEqual(checkpointAtPostRead.reviewers, original);
+    assert.equal(checkpointAtPostRead.pinned_head, A);
+    assert.equal(checkpointAtPostRead.pending_merge, undefined);
+    assert.equal(checkpointAtPostRead.parent, checkpointAtPostRead.key);
+    const child = h.store.rows().find((row) => row.reducer === "update-branch");
+    assert.ok(child);
+    assert.equal(child.transition_key.endsWith(A), true);
+    assert.equal(child.status, "half_done");
+    assert.deepEqual(child.steps.completed, ["merge"]);
+    assert.deepEqual(child.steps.reviewers, original);
+    assert.equal(child.steps.pinned_head, A);
+    assert.equal(child.steps.pending_merge, undefined);
+    assert.equal(first.row?.steps.children?.["7"], child.transition_key);
+    assert.equal(h.store.rows().filter((row) => row.reducer === "update-branch").length, 1);
+    const when = first.row?.steps.next_attempt_at;
+    assert.ok(when);
+    h.setNow(h.deps.now() + 1_000);
+    const early = await reduceEvent(delivery, h.deps);
+    assert.equal(early.replay, true);
+    assert.equal(merges, 1);
+    assert.equal(reviews, 0);
+    h.setNow(Date.parse(when) + 1);
+    const next = await reduceEvent(delivery, h.deps);
+    assert.equal(next.outcome, "done");
+    assert.equal(merges, 1);
+    assert.equal(reviews, 1);
+    assert.equal(next.row?.steps.children?.["7"], child.transition_key);
+    const finished = h.store.rows().find((row) => row.transition_key === child.transition_key);
+    assert.equal(finished?.status, "done");
+    assert.deepEqual(finished?.steps.completed, ["merge", "reviewers"]);
+    assert.deepEqual(finished?.steps.reviewers, original);
+    assert.equal(finished?.steps.pinned_head, A);
+    assert.equal(h.store.rows().filter((row) => row.reducer === "update-branch").length, 1);
+  });
+
+  it("repairs the original child when the merge checkpoint update fails once", async () => {
+    const h = harness();
+    const pr = pull();
+    let phase: "before" | "after" = "before";
+    let merges = 0;
+    let reviews = 0;
+    let checkpointFailed = false;
+    const original = ["octocat", "hubot"];
+    const seen = () => pull({
+      headSha: phase === "after" ? NEW : A,
+      mergeableState: phase === "after" ? "clean" : "behind",
+      reviewers: phase === "after" ? ["other"] : original,
+    });
+    h.github.getRepo = async () => ({ defaultBranch: "main" });
+    h.github.listOpenPulls = async () => [pr];
+    h.github.branchProtected = async () => false;
+    h.github.getPull = async () => seen();
+    h.github.mergeBaseIntoPull = async () => {
+      merges += 1;
+      phase = "after";
+      pr.headSha = NEW;
+    };
+    h.github.requestReviewers = async (_repo, _number, reviewers) => {
+      reviews += 1;
+      assert.deepEqual(reviewers, original);
+    };
+    const realUpdate = h.store.update.bind(h.store);
+    h.deps.store = {
+      get: (key) => h.store.get(key),
+      insert: (row, at) => h.store.insert(row, at),
+      listTerminalFailures: () => h.store.listTerminalFailures(),
+      update: async (key, patch, at) => {
+        if (key.startsWith("update-branch:") && patch.steps?.completed?.includes("merge") && !checkpointFailed) {
+          checkpointFailed = true;
+          throw new Error("single transient checkpoint UPDATE failure");
+        }
+        return realUpdate(key, patch, at);
+      },
+    };
+    const delivery = pushDelivery("checkpoint-update");
+    const first = await reduceEvent(delivery, h.deps);
+    const old = h.store.rows().find((row) => row.reducer === "update-branch" && row.transition_key.endsWith(A));
+    assert.equal(first.outcome, "failed");
+    assert.equal(merges, 1);
+    assert.equal(reviews, 0);
+    assert.ok(old);
+    assert.equal(old.status, "started");
+    assert.deepEqual(old.steps.completed ?? [], []);
+    assert.equal(old.steps.pending_merge, A);
+    assert.equal(first.row?.steps.children?.["7"], old.transition_key);
+    assert.deepEqual(first.row?.steps.recovered_merges?.["7"], {
+      child_key: old.transition_key,
+      reviewers: original,
+      pinned_head: A,
+    });
+    assert.equal(h.store.rows().some((row) => row.reason === "up_to_date"), false);
+    const when = first.row?.steps.next_attempt_at;
+    assert.ok(when);
+    h.setNow(h.deps.now() + 1_000);
+    const early = await reduceEvent(delivery, h.deps);
+    assert.equal(early.replay, true);
+    assert.equal(merges, 1);
+    assert.equal(reviews, 0);
+    h.setNow(Date.parse(when) + 1);
+    const next = await reduceEvent(delivery, h.deps);
+    assert.equal(next.outcome, "done");
+    assert.equal(merges, 1);
+    assert.equal(reviews, 1);
+    assert.equal(next.row?.steps.children?.["7"], old.transition_key);
+    const finished = h.store.rows().find((row) => row.transition_key === old.transition_key);
+    assert.equal(finished?.status, "done");
+    assert.deepEqual(finished?.steps.completed, ["merge", "reviewers"]);
+    assert.deepEqual(finished?.steps.reviewers, original);
+    assert.equal(finished?.steps.pending_merge, undefined);
+    assert.equal(finished?.steps.pinned_head, A);
+    assert.equal(h.store.rows().filter((row) => row.reducer === "update-branch").length, 1);
+    assert.equal(h.store.rows().some((row) => row.reason === "up_to_date"), false);
+  });
+
+  it("does not merge until the parent child-link update succeeds", async () => {
+    const h = harness();
+    const pr = pull();
+    let merges = 0;
+    let reviews = 0;
+    let linkFailed = false;
+    h.github.getRepo = async () => ({ defaultBranch: "main" });
+    h.github.listOpenPulls = async () => [pr];
+    h.github.branchProtected = async () => false;
+    h.github.getPull = async () => pull({ headSha: pr.headSha, mergeableState: merges === 0 ? "behind" : "clean" });
+    h.github.mergeBaseIntoPull = async () => {
+      merges += 1;
+      pr.headSha = NEW;
+    };
+    h.github.requestReviewers = async () => { reviews += 1; };
+    const realUpdate = h.store.update.bind(h.store);
+    h.deps.store = {
+      get: (key) => h.store.get(key),
+      insert: (row, at) => h.store.insert(row, at),
+      listTerminalFailures: () => h.store.listTerminalFailures(),
+      update: async (key, patch, at) => {
+        if (key.startsWith("push:") && patch.steps?.children?.["7"] && !linkFailed) {
+          linkFailed = true;
+          throw new Error("single transient parent-link UPDATE failure");
+        }
+        return realUpdate(key, patch, at);
+      },
+    };
+    const delivery = pushDelivery("parent-link");
+    const first = await reduceEvent(delivery, h.deps);
+    assert.equal(first.outcome, "failed");
+    assert.equal(merges, 0);
+    assert.equal(reviews, 0);
+    const when = first.row?.steps.next_attempt_at;
+    assert.ok(when);
+    h.setNow(h.deps.now() + 1_000);
+    const early = await reduceEvent(delivery, h.deps);
+    assert.equal(early.replay, true);
+    assert.equal(merges, 0);
+    assert.equal(reviews, 0);
+    h.setNow(Date.parse(when) + 1);
+    const next = await reduceEvent(delivery, h.deps);
+    assert.equal(next.outcome, "done");
+    assert.equal(merges, 1);
+    assert.equal(reviews, 1);
+  });
+
+  it("stays failed when a successful merge cannot be stored on the parent", async () => {
+    const h = harness();
+    const pr = pull();
+    let phase: "before" | "after" = "before";
+    let merges = 0;
+    let reviews = 0;
+    let checkpointFailed = false;
+    const seen = () => pull({
+      headSha: phase === "after" ? NEW : A,
+      mergeableState: phase === "after" ? "clean" : "behind",
+    });
+    h.github.getRepo = async () => ({ defaultBranch: "main" });
+    h.github.listOpenPulls = async () => [pr];
+    h.github.branchProtected = async () => false;
+    h.github.getPull = async () => seen();
+    h.github.mergeBaseIntoPull = async () => {
+      merges += 1;
+      phase = "after";
+      pr.headSha = NEW;
+    };
+    h.github.requestReviewers = async () => { reviews += 1; };
+    const realUpdate = h.store.update.bind(h.store);
+    h.deps.store = {
+      get: (key) => h.store.get(key),
+      insert: (row, at) => h.store.insert(row, at),
+      listTerminalFailures: () => h.store.listTerminalFailures(),
+      update: async (key, patch, at) => {
+        if (key.startsWith("update-branch:") && patch.steps?.completed?.includes("merge") && !checkpointFailed) {
+          checkpointFailed = true;
+          throw new Error("single transient checkpoint UPDATE failure");
+        }
+        if (key.startsWith("push:") && patch.steps && Object.prototype.hasOwnProperty.call(patch.steps, "recovered_merges")) {
+          throw new Error("recovery parent update failed");
+        }
+        return realUpdate(key, patch, at);
+      },
+    };
+    const delivery = pushDelivery("merge-unconfirmed");
+    const first = await reduceEvent(delivery, h.deps);
+    const old = h.store.rows().find((row) => row.reducer === "update-branch" && row.transition_key.endsWith(A));
+    assert.equal(first.outcome, "failed");
+    assert.notEqual(first.outcome, "done");
+    assert.equal(merges, 1);
+    assert.equal(reviews, 0);
+    assert.ok(old);
+    assert.equal(old.status, "started");
+    assert.equal(old.steps.pending_merge, A);
+    assert.equal(first.row?.steps.children?.["7"], old.transition_key);
+    assert.equal(first.row?.steps.recovered_merges, undefined);
+    assert.equal(h.store.rows().some((row) => row.reason === "up_to_date"), false);
+    const when = first.row?.steps.next_attempt_at;
+    assert.ok(when);
+    h.setNow(Date.parse(when) + 1);
+    const next = await reduceEvent(delivery, h.deps);
+    const held = h.store.rows().find((row) => row.transition_key === old.transition_key);
+    assert.equal(next.outcome, "failed");
+    assert.notEqual(next.outcome, "done");
+    assert.equal(merges, 1);
+    assert.equal(reviews, 0);
+    assert.equal(held?.reason, "merge_unconfirmed");
+    assert.equal(held?.steps.pending_merge, A);
+    assert.equal(next.row?.steps.children?.["7"], old.transition_key);
+    assert.equal(h.store.rows().filter((row) => row.reducer === "update-branch").length, 1);
+    assert.equal(h.store.rows().some((row) => row.reason === "up_to_date"), false);
+    const againAt = next.row?.steps.next_attempt_at;
+    assert.ok(againAt);
+    h.setNow(Date.parse(againAt) + 1);
+    const third = await reduceEvent(delivery, h.deps);
+    assert.equal(third.outcome, "failed");
+    assert.equal(merges, 1);
+    assert.equal(reviews, 0);
+    assert.equal(h.store.rows().find((row) => row.transition_key === old.transition_key)?.reason, "merge_unconfirmed");
+    assert.equal(h.store.rows().some((row) => row.reason === "up_to_date"), false);
+  });
+
+  it("backs off reviewer request failures until the morning brief can see the cap", async () => {
+    const h = harness();
+    const pr = pull();
+    let merges = 0;
+    let reviews = 0;
+    h.github.getRepo = async () => ({ defaultBranch: "main" });
+    h.github.listOpenPulls = async () => [pr];
+    h.github.branchProtected = async () => false;
+    h.github.getPull = async () => pull({ headSha: pr.headSha, reviewers: ["octocat"] });
+    h.github.mergeBaseIntoPull = async () => { merges += 1; pr.headSha = NEW; };
+    h.github.requestReviewers = async () => {
+      reviews += 1;
+      throw new GitHubCallError(500, "http", null);
+    };
+    const delivery = pushDelivery("review-cap");
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const result = await reduceEvent(delivery, h.deps);
+      const child = h.store.rows().find((row) => row.reducer === "update-branch");
+      assert.ok(child);
+      assert.equal(child.status, "failed");
+      assert.equal(child.reason, "http");
+      assert.deepEqual(child.steps.completed, ["merge"]);
+      assert.equal(merges, 1);
+      assert.equal(reviews, attempt);
+      assert.equal(result.outcome, "failed");
+      assert.equal(result.reason, "child_retry");
+      if (attempt < 5) {
+        assert.equal(child.steps.terminal, false);
+        const when = result.row?.steps.next_attempt_at;
+        assert.ok(when);
+        assert.ok(Date.parse(when) - h.deps.now() >= 30_000);
+        const early = await reduceEvent(delivery, h.deps);
+        assert.equal(early.replay, true);
+        assert.equal(reviews, attempt);
+        h.setNow(Date.parse(when) + 1);
+      } else {
+        assert.equal(child.attempts, 5);
+        assert.equal(child.steps.terminal, true);
+        assert.equal(result.attempts, 5);
+        assert.equal(result.row?.steps.terminal, true);
+      }
+    }
+    const listed = await h.store.listTerminalFailures();
+    const lines = formatReducerFailureLines(listed);
+    assert.match(lines.join("\n"), /update-branch  http  attempts=5/);
+    const stopped = await reduceEvent(delivery, h.deps);
+    assert.equal(stopped.replay, true);
+    assert.equal(reviews, 5);
+    assert.equal(merges, 1);
+  });
+
+  it("keeps an earlier child key when a later pull read throws", async () => {
+    const h = harness();
+    const first = pull({ number: 7, headSha: A });
+    const second = pull({ number: 8, headSha: B, headRef: "other" });
+    let merges = 0;
+    h.github.getRepo = async () => ({ defaultBranch: "main" });
+    h.github.listOpenPulls = async () => [first, second];
+    h.github.branchProtected = async () => false;
+    h.github.getPull = async (_repo, number) => {
+      if (number === 8) throw new GitHubCallError(503, "http", null);
+      return pull({ number, headSha: first.headSha, reviewers: ["octocat"] });
+    };
+    h.github.mergeBaseIntoPull = async () => {
+      merges += 1;
+      first.headSha = NEW;
+    };
+    h.github.requestReviewers = async () => {};
+    const delivery = pushDelivery("sibling");
+    const result = await reduceEvent(delivery, h.deps);
+    assert.equal(result.outcome, "failed");
+    assert.equal(result.reason, "child_retry");
+    assert.equal(merges, 1);
+    const child = h.store.rows().find((row) => row.number === 7 && row.reducer === "update-branch");
+    assert.ok(child);
+    assert.equal(result.row?.steps.children?.["7"], child.transition_key);
+    assert.equal(result.row?.steps.children?.["8"], undefined);
+    const when = result.row?.steps.next_attempt_at;
+    assert.ok(when);
+    const early = await reduceEvent(delivery, h.deps);
+    assert.equal(early.replay, true);
+    assert.equal(merges, 1);
+    h.setNow(Date.parse(when) + 1);
+    const again = await reduceEvent(delivery, h.deps);
+    assert.equal(again.outcome, "failed");
+    assert.equal(merges, 1);
+    assert.equal(again.row?.steps.children?.["7"], child.transition_key);
+  });
+
+  it("does not turn a dry-run child read failure into a successful plan", async () => {
+    const h = harness("dry");
+    h.github.getRepo = async () => ({ defaultBranch: "main" });
+    h.github.listOpenPulls = async () => [pull({ number: 7 }), pull({ number: 8, headSha: B, headRef: "other" })];
+    h.github.branchProtected = async () => false;
+    h.github.getPull = async (_repo, number) => {
+      if (number === 8) throw new GitHubCallError(503, "http", null);
+      return pull();
+    };
+    h.github.mergeBaseIntoPull = async () => { throw new Error("dry must not merge"); };
+    const result = await reduceEvent(pushDelivery("dry-child"), h.deps);
+    assert.equal(result.outcome, "failed");
+    assert.equal(result.reason, "http");
+    assert.equal(result.row?.steps.planned, undefined);
+    assert.deepEqual(result.emitted, []);
+  });
+
+  it("counts a closed pre-read failure once per eligible retry until the brief shows the cap", async () => {
+    const h = harness();
+    let reads = 0;
+    h.github.getIssue = async () => {
+      reads += 1;
+      throw new GitHubCallError(503, "http", null);
+    };
+    const delivery = event({
+      event: "issues",
+      action: "closed",
+      number: 15,
+      head_sha: null,
+      delivery_id: "closed-initial-read-failure",
+    });
+    const attempts: number[] = [];
+    for (let i = 0; i < 5; i += 1) {
+      const result = await reduceEvent(delivery, h.deps);
+      attempts.push(result.attempts);
+      assert.equal(result.outcome, "failed");
+      assert.equal(result.reason, "http");
+      assert.equal(result.replay, false);
+      assert.equal(reads, i + 1);
+      if (i < 4) {
+        assert.equal(result.row?.steps.terminal, false);
+        const when = result.row?.steps.next_attempt_at;
+        assert.ok(when);
+        const waitMs = Date.parse(when) - h.deps.now();
+        assert.ok(waitMs >= nextBackoffSeconds(i + 1, null) * 1000);
+        const early = await reduceEvent(delivery, h.deps);
+        assert.equal(early.replay, true);
+        assert.equal(early.attempts, i + 1);
+        assert.equal(reads, i + 1);
+        h.setNow(Date.parse(when) + 1);
+      }
+    }
+    assert.deepEqual(attempts, [1, 2, 3, 4, 5]);
+    const row = h.store.rows()[0];
+    assert.equal(row?.status, "failed");
+    assert.equal(row?.attempts, 5);
+    assert.equal(row?.steps.terminal, true);
+    assert.equal(row?.steps.next_attempt_at, undefined);
+    const stopped = await reduceEvent(delivery, h.deps);
+    assert.equal(stopped.replay, true);
+    assert.equal(stopped.attempts, 5);
+    assert.equal(reads, 5);
+    const listed = await h.store.listTerminalFailures();
+    assert.equal(listed.length, 1);
+    const brief = assembleBrief({
+      generatedAt: "2026-11-15T20:00:00Z",
+      windowHours: 24,
+      repoSource: "config",
+      stuckPrHours: 48,
+      staleIssueDays: 21,
+      coordinator: { configured: false, agent_id: null },
+      repos: [],
+      reducerFailures: listed,
+    });
+    const text = formatBriefText(brief, { decisionLabels: [] });
+    assert.match(text, /REDUCER FAILURES \(1\) — retry cap reached/);
+    assert.match(text, /acme\/app #15  issues\.closed  http  attempts=5/);
+
+    const absent = harness();
+    absent.github.getIssue = async () => null;
+    const missing = await reduceEvent(event({
+      event: "issues", action: "closed", number: 15, head_sha: null, delivery_id: "closed-absent",
+    }), absent.deps);
+    assert.equal(missing.outcome, "no_state");
+    assert.equal(absent.store.rows().length, 0);
+
+    const reopened = harness();
+    reopened.github.getIssue = async () => issue({ number: 15, state: "open" });
+    const open = await reduceEvent(event({
+      event: "issues", action: "closed", number: 15, head_sha: null, delivery_id: "closed-reopened",
+    }), reopened.deps);
+    assert.equal(open.outcome, "no_state");
+    assert.equal(reopened.store.rows().length, 0);
+
+    const pulls = harness();
+    let pullReads = 0;
+    pulls.github.getPull = async () => {
+      pullReads += 1;
+      throw new GitHubCallError(503, "http", null);
+    };
+    const pullEvent = event({ action: "closed", delivery_id: "closed-pull-read-failure" });
+    const firstPull = await reduceEvent(pullEvent, pulls.deps);
+    assert.equal(firstPull.attempts, 1);
+    assert.equal(firstPull.outcome, "failed");
+    assert.equal(firstPull.reason, "http");
+    const pullWhen = firstPull.row?.steps.next_attempt_at;
+    assert.ok(pullWhen);
+    const pullEarly = await reduceEvent(pullEvent, pulls.deps);
+    assert.equal(pullEarly.replay, true);
+    assert.equal(pullReads, 1);
+    pulls.setNow(Date.parse(pullWhen) + 1);
+    const secondPull = await reduceEvent(pullEvent, pulls.deps);
+    assert.equal(secondPull.attempts, 2);
+    assert.equal(secondPull.replay, false);
+    assert.equal(pullReads, 2);
+  });
+
+  it("requires both a check run and a commit status when they share a required name", async () => {
+    const cases: Array<{
+      name: string;
+      check: string | null | "omit";
+      status: string | "omit";
+      conclusion: string;
+      emitted: string[];
+    }> = [
+      { name: "check success hides status failure", check: "success", status: "failure", conclusion: "failure", emitted: [] },
+      { name: "status success hides check failure", check: "failure", status: "success", conclusion: "failure", emitted: [] },
+      { name: "pending status", check: "success", status: "pending", conclusion: "pending", emitted: [] },
+      { name: "pending check", check: null, status: "success", conclusion: "pending", emitted: [] },
+      { name: "both green", check: "success", status: "success", conclusion: "success", emitted: ["contexts-green"] },
+      { name: "check only success", check: "success", status: "omit", conclusion: "success", emitted: ["contexts-green"] },
+      { name: "status only success", check: "omit", status: "success", conclusion: "success", emitted: ["contexts-green"] },
+      { name: "check only failure", check: "failure", status: "omit", conclusion: "failure", emitted: [] },
+      { name: "status only pending", check: "omit", status: "pending", conclusion: "pending", emitted: [] },
+    ];
+    for (const sample of cases) {
+      const h = harness();
+      const fetchImpl: typeof fetch = async (input) => {
+        const target = String(input);
+        let data: unknown = {};
+        if (target.includes("/check-runs")) {
+          data = sample.check === "omit"
+            ? { check_runs: [] }
+            : { check_runs: [{ name: "ci", conclusion: sample.check }] };
+        } else if (target.endsWith("/status")) {
+          data = sample.status === "omit"
+            ? { statuses: [] }
+            : { statuses: [{ context: "ci", state: sample.status }] };
+        } else if (target.endsWith("/protection")) {
+          data = { required_status_checks: { contexts: ["ci"], checks: [{ context: "ci", app_id: null }] } };
+        } else if (target.endsWith("/pulls/7")) {
+          data = {
+            number: 7,
+            state: "open",
+            head: { sha: A, ref: "feature", repo: { full_name: "acme/app" } },
+            base: { ref: "main", repo: { full_name: "acme/app" } },
+            mergeable: true,
+            mergeable_state: "blocked",
+          };
+        }
+        return new Response(JSON.stringify(data), { status: 200 });
+      };
+      const read = githubReadClient(
+        { tokenFor: async () => ({ token: "fixture-token", botLogin: BOT }) },
+        fetchImpl,
+        () => h.deps.now(),
+      );
+      const conclusions = await read.checkConclusions("acme/app", A);
+      assert.deepEqual(conclusions, { ci: sample.conclusion }, sample.name);
+      h.deps.github = read as unknown as ReducerGitHub;
+      const result = await reduceEvent(event({
+        event: "check_suite",
+        action: "completed",
+        number: 7,
+        head_sha: A,
+        delivery_id: `same-name-${sample.name}`,
+      }), h.deps);
+      assert.equal(result.outcome, "done", sample.name);
+      assert.deepEqual(result.emitted, sample.emitted, sample.name);
+      assert.equal(result.reason, sample.emitted.length === 0 ? "checks_not_green" : null, sample.name);
+    }
+  });
 });
 
 describe("github installation client", () => {
@@ -940,6 +1757,27 @@ describe("github installation client", () => {
     assert.equal(limited?.reason, "rate_limit");
     assert.equal(limited?.retryAfterSeconds, 90);
     assert.equal(normalizePem("a\\nb"), "a\nb");
+
+    const reset = String(Math.floor(now / 1000) + 120);
+    const openQuota = new Headers({ "x-ratelimit-remaining": "40", "x-ratelimit-reset": reset });
+    assert.equal(retryAfterSeconds(openQuota, now), null);
+    const ordinary = classifyGitHubResponse(500, "boom", openQuota, now);
+    assert.equal(ordinary?.reason, "http");
+    assert.equal(ordinary?.retryAfterSeconds, null);
+    const exhausted = new Headers({ "x-ratelimit-remaining": "0", "x-ratelimit-reset": reset });
+    assert.equal(retryAfterSeconds(exhausted, now), 120);
+    const primary = classifyGitHubResponse(403, "API rate limit exceeded for installation", exhausted, now);
+    assert.equal(primary?.reason, "rate_limit");
+    assert.equal(primary?.retryAfterSeconds, 120);
+    const hinted = new Headers({
+      "retry-after": "15",
+      "x-ratelimit-remaining": "40",
+      "x-ratelimit-reset": reset,
+    });
+    assert.equal(retryAfterSeconds(hinted, now), 15);
+    const secondary = classifyGitHubResponse(403, "You have exceeded a secondary rate limit", hinted, now);
+    assert.equal(secondary?.reason, "rate_limit");
+    assert.equal(secondary?.retryAfterSeconds, 15);
   });
 
   it("uses the installation token and sends only expected_head_sha", async () => {

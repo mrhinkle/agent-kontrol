@@ -130,7 +130,11 @@ export function repoPath(repo: string): string {
   return `${encodeURIComponent(repo.slice(0, slash))}/${encodeURIComponent(repo.slice(slash + 1))}`;
 }
 
-/** Seconds from Retry-After (delta or HTTP-date) or X-RateLimit-Reset, when either is set. */
+/**
+ * Seconds from Retry-After (delta or HTTP-date).
+ * X-RateLimit-Reset is the primary-window end and is present on ordinary responses,
+ * so it counts only when X-RateLimit-Remaining is 0.
+ */
 export function retryAfterSeconds(headers: Headers, nowMs: number): number | null {
   const retry = headers.get("retry-after");
   if (retry) {
@@ -139,6 +143,7 @@ export function retryAfterSeconds(headers: Headers, nowMs: number): number | nul
     const when = Date.parse(trimmed);
     if (Number.isFinite(when)) return Math.max(0, Math.ceil((when - nowMs) / 1000));
   }
+  if (headers.get("x-ratelimit-remaining")?.trim() !== "0") return null;
   const reset = headers.get("x-ratelimit-reset");
   if (reset && /^\d+$/.test(reset.trim())) {
     return Math.max(0, Number(reset.trim()) - Math.floor(nowMs / 1000));
@@ -306,6 +311,19 @@ function asIssue(value: unknown): GhIssue | null {
   };
 }
 
+/**
+ * A required name is green only when every source that reported it succeeded.
+ * GitHub requires both the check run and the commit status when both exist.
+ * One source alone keeps that source's conclusion, including a null check as pending.
+ */
+function stricterConclusion(check: string, status: string): string {
+  if (check === "success" && status === "success") return "success";
+  if (check === "success") return status;
+  if (status === "success") return check;
+  if (check === "pending") return status;
+  return check;
+}
+
 export function githubReadClient(
   auth: GitHubAuthorizer,
   fetchImpl: typeof fetch,
@@ -408,7 +426,8 @@ export function githubReadClient(
       return [...new Set(names)];
     },
     async checkConclusions(repo, sha) {
-      const out: Record<string, string> = {};
+      const checks: Record<string, string> = {};
+      const statuses: Record<string, string> = {};
       const runs = interpret(
         await call(repo, "GET", `/repos/${repoPath(repo)}/commits/${encodeURIComponent(sha)}/check-runs?per_page=100`),
         false,
@@ -419,7 +438,7 @@ export function githubReadClient(
           const name = (run as { name?: unknown }).name;
           const conclusion = (run as { conclusion?: unknown }).conclusion;
           if (typeof name !== "string") continue;
-          out[name] = typeof conclusion === "string" ? conclusion : "pending";
+          checks[name] = typeof conclusion === "string" ? conclusion : "pending";
         }
       }
       const status = interpret(
@@ -431,8 +450,17 @@ export function githubReadClient(
           if (!item || typeof item !== "object") continue;
           const context = (item as { context?: unknown }).context;
           const state = (item as { state?: unknown }).state;
-          if (typeof context === "string" && typeof state === "string" && out[context] == null) out[context] = state;
+          if (typeof context !== "string" || typeof state !== "string") continue;
+          if (statuses[context] == null) statuses[context] = state;
         }
+      }
+      const out: Record<string, string> = {};
+      for (const name of new Set([...Object.keys(checks), ...Object.keys(statuses)])) {
+        const check = checks[name];
+        const commitStatus = statuses[name];
+        if (check != null && commitStatus != null) out[name] = stricterConclusion(check, commitStatus);
+        else if (check != null) out[name] = check;
+        else if (commitStatus != null) out[name] = commitStatus;
       }
       return out;
     },
