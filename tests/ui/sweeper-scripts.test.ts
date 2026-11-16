@@ -94,7 +94,7 @@ describe("sweeper shell credential transport", () => {
     assert.equal(r.calls[0].argv.includes("--noproxy"), true);
     assert.equal(r.calls[0].argv.includes("--max-redirs"), true);
     const redir = r.calls[0].argv.indexOf("--proto-redir");
-    assert.equal(r.calls[0].argv[redir + 1], "-all");
+    assert.equal(r.calls[0].argv[redir + 1], "-http,-https");
     assert.equal(JSON.parse(r.out).retention.state, "ok");
   });
 

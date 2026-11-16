@@ -52,11 +52,13 @@ reader=$!
 exec 3>"$FIFO"
 
 # -q must be first so curlrc cannot enable location or a proxy. --noproxy
-# covers the environment. --proto-redir takes its value as the next argument;
-# the installed curl rejects the joined --proto-redir=-all form. Redirects are
-# not followed. Only HTTP 200 within the body cap is a result.
+# covers the environment. curl 8.18 refuses an empty --proto-redir set, so
+# -all fails before the request. curl 8.7.1 rejects the joined
+# --proto-redir=-all form. -http,-https is a separate argument that both
+# accept, and it disables HTTP and HTTPS redirects. --max-redirs 0 does not
+# follow a redirect. Only HTTP 200 within the body cap is a result.
 set +e
-http_code="$(curl -q --noproxy '*' --max-redirs 0 --proto-redir '-all' -sS -m 60 \
+http_code="$(curl -q --noproxy '*' --max-redirs 0 --proto-redir '-http,-https' -sS -m 60 \
   -o "$FIFO" -w '%{http_code}' -X POST -H "@$AUTH_HEADER" "${MC_URL%/}/api/sweep")"
 curl_status=$?
 exec 3>&-
