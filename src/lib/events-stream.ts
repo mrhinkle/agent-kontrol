@@ -90,7 +90,8 @@ async function binding(tx: SqlTag, consumer: string, credential: string) {
   return rows[0];
 }
 
-async function boundedTransaction<T>(run: (tx: SqlTag) => Promise<T>): Promise<T> {
+/** Same bounds as a stream read: one second to take the locks, three for the statement. */
+export async function boundedTransaction<T>(run: (tx: SqlTag) => Promise<T>): Promise<T> {
   return withTransaction(async tx => {
     await tx`set local lock_timeout = '1s'`;
     await tx`set local statement_timeout = '3s'`;

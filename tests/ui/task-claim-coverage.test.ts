@@ -204,6 +204,7 @@ describe("bounded claim evidence", () => {
       const text = strings.join(" ").replace(/\s+/g, " ").trim();
       seen.push({ text, values });
       const lower = text.toLowerCase();
+      if (lower === "begin" || lower === "commit" || lower === "rollback" || lower.startsWith("set local ")) return [];
       if (lower.includes("clock_timestamp") && !lower.includes("with changed")) {
         return [{ measured_at: "2026-11-15T00:03:00.000Z" }];
       }
@@ -239,9 +240,11 @@ describe("bounded claim evidence", () => {
     const sql = statement.text.toLowerCase();
     assert.equal(sql.split("join gh_events").length - 1, 1);
     assert.equal(sql.includes("insert into gh_events"), false);
-    assert.match(sql, /order by created_at desc, id desc/);
+    assert.match(sql, /order by s\.created_at desc, s\.id desc/);
+    assert.match(sql, /statement_timestamp\(\)/);
+    assert.doesNotMatch(sql, /clock_timestamp\(\) -/);
     assert.match(sql, /task:ready:/);
-    assert.match(sql, /for update of c/);
+    assert.match(sql, /for update of c for share of a/);
     assert.match(sql, /events:read/);
     assert.equal(sql.split("limit 1").length - 1 >= 1, true);
     const notice = sql.slice(sql.indexOf("join gh_events"));

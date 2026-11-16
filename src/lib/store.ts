@@ -5,6 +5,7 @@ import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } fr
 import { StaleWrite, absentRevision } from "./revision";
 import { writeSessionNote } from "./session-memory";
 import { sql, type SqlTag } from "./db";
+import { boundedTransaction } from "./events-stream";
 import {
   QUEUE_EPISODE_SCAN_LIMIT,
   QUEUE_EPISODE_WINDOW_DAYS,
@@ -1587,13 +1588,14 @@ export async function updateTask(input: {
     // Activity binds are after the task predicate. A zero-row update inserts
     // no event, because the insert selects from the updated rows only.
     // previous.status is locked in this statement so a queue episode is
-    // allocated only on a real transition into queued.
+    // allocated only on a real transition into queued. The kept value is
+    // t.status: previous also exposes status, and a bare status is ambiguous.
     if (expected === undefined) {
       rows = await db`
         with changed as (
           update tasks as t set
             updated_at = ${now},
-            status = case when ${hasStatus} then ${status} else status end,
+            status = case when ${hasStatus} then ${status} else t.status end,
             completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
             result = case when ${hasResult} then ${input.result ?? null} else result end,
             cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
@@ -1665,7 +1667,7 @@ export async function updateTask(input: {
         with changed as (
           update tasks t set
             updated_at = ${now},
-            status = case when ${hasStatus} then ${status} else status end,
+            status = case when ${hasStatus} then ${status} else t.status end,
             completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
             result = case when ${hasResult} then ${input.result ?? null} else result end,
             cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
@@ -1826,7 +1828,15 @@ export async function claimTaskWithCoverage(input: {
     if (t.machine && input.machine && t.machine !== input.machine) continue;
     if (t.machine && !input.machine) continue;
     try {
-      const claimed = await db`
+      // The scan cutoff is statement_timestamp(), which is stable for this
+      // statement, so the created_at index can stop at the window. A volatile
+      // clock_timestamp() made the same LIMIT read every older row. The slice
+      // follows that index only. An id tie on the oldest timestamp is used
+      // only when the slice holds the whole tie; otherwise that edge is
+      // unknown and is not replaced by an older episode. The observer locks
+      // the consumer, then shares the credential, matching the stream binding.
+      const claimed = await boundedTransaction(async (tx) => {
+      const rows = await tx`
         with changed as (
           update tasks set
             status = 'claimed',
@@ -1854,18 +1864,45 @@ export async function claimTaskWithCoverage(input: {
           from changed
           returning id, kind, created_at
         ),
-        scanned as (
-          select id, created_at, detail
-          from events
-          where created_at >= clock_timestamp() - (${QUEUE_EPISODE_WINDOW_DAYS}::int * interval '1 day')
-          order by created_at desc, id desc
+        cutoff as materialized (
+          select statement_timestamp() - (${QUEUE_EPISODE_WINDOW_DAYS}::int * interval '1 day') as ts
+        ),
+        slice as (
+          select e.id, e.created_at, e.detail
+          from events e
+          where e.created_at >= (select ts from cutoff)
+          order by e.created_at desc
           limit ${QUEUE_EPISODE_SCAN_LIMIT}
         ),
+        bounds as (
+          select count(*)::int as n, min(created_at) as edge from slice
+        ),
+        edge_open as (
+          select case
+            when b.n < ${QUEUE_EPISODE_SCAN_LIMIT} then false
+            else exists (
+              select 1
+              from events e
+              where e.created_at = b.edge
+                and e.id not in (select s.id from slice s where s.created_at = b.edge)
+            )
+          end as open
+          from bounds b
+        ),
+        usable as (
+          select s.id, s.created_at, s.detail
+          from slice s
+          cross join bounds b
+          cross join edge_open o
+          where b.n < ${QUEUE_EPISODE_SCAN_LIMIT}
+            or not o.open
+            or s.created_at > b.edge
+        ),
         episode as (
-          select id::text as episode_id, created_at as episode_at
-          from scanned
-          where detail->'_ak_task_queue_v1'->>'task_id' = (select id::text from changed)
-          order by created_at desc, id desc
+          select s.id::text as episode_id, s.created_at as episode_at
+          from usable s
+          where s.detail->'_ak_task_queue_v1'->>'task_id' = (select id::text from changed)
+          order by s.created_at desc, s.id desc
           limit 1
         ),
         notice as (
@@ -1892,14 +1929,14 @@ export async function claimTaskWithCoverage(input: {
             and ${TASK_QUEUE_REPO} = any(c.repos)
             and ${TASK_READY_EVENT} = any(c.event_types)
             and c.generation::text = ${observer.generation}
-          for update of c
+          for update of c for share of a
         )
         select
           changed.*,
           logged.id as receipt_id,
           logged.kind as receipt_kind,
           logged.created_at as receipt_at,
-          (select count(*) from scanned) as scanned_rows,
+          (select count(*) from slice) as scanned_rows,
           (select episode_id from episode) as queue_episode,
           (select notice_id from notice) as notice_id,
           (select notice_at from notice) as notice_at,
@@ -1908,6 +1945,31 @@ export async function claimTaskWithCoverage(input: {
         from changed
         left join logged on true
       `;
+      const bound = rows[0] as Record<string, unknown> | undefined;
+      // A second statement takes a new snapshot. Skip it when the claim
+      // already withheld the binding, so a mismatched consumer is not locked
+      // again. When the claim held the locks, this rechecks the credential
+      // and consumer before commit and drops ids if either changed.
+      if (bound && bound.observer_generation != null && bound.observer_generation !== "") {
+        const still = await tx`
+          select c.generation::text as generation
+          from event_stream_consumers c
+          join agent_credentials a on a.id = c.credential_id
+          where c.id = ${observer.consumer}
+            and c.credential_id = ${observer.credentialId}
+            and c.enabled
+            and a.revoked_at is null
+            and (a.expires_at is null or a.expires_at > clock_timestamp())
+            and 'events:read' = any(a.scopes)
+            and ${TASK_QUEUE_REPO} = any(c.repos)
+            and ${TASK_READY_EVENT} = any(c.event_types)
+            and c.generation::text = ${observer.generation}
+          for update of c for share of a
+        `;
+        if (!still.length) bound.observer_generation = null;
+      }
+      return rows;
+      });
       if (claimed.length > 0) {
         const row = claimed[0] as Record<string, unknown>;
         const coverage = coverageFromClaimRow(row);
