@@ -4,7 +4,7 @@ import { activityRow, attachReceipt, receiptFromParts, type ActivityRow, type Re
 import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } from "./idempotency";
 import { StaleWrite, absentRevision } from "./revision";
 import { writeSessionNote } from "./session-memory";
-import { sql, type SqlTag } from "./db";
+import { sql, withTransaction, type SqlTag } from "./db";
 import { insertToolReceipt } from "./tool-receipt";
 import { stampSortAt } from "./list-params";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
@@ -58,6 +58,17 @@ export function slugify(input: string): string {
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+function messageResourceId(value: unknown): string {
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "number" && Number.isInteger(value) && value > 0) return String(value);
+  if (typeof value === "string" && /^[1-9]\d*$/.test(value)) return value;
+  throw new Error("message id missing");
+}
+
+function sortMessageIds(ids: string[]): string[] {
+  return [...ids].sort((a, b) => a.length - b.length || (a < b ? -1 : a > b ? 1 : 0));
 }
 
 function isUniqueViolation(e: unknown): boolean {
@@ -1063,16 +1074,29 @@ export async function fetchMessages(input: {
     const now = new Date().toISOString();
     const ids = msgs.map((m) => m.id);
     try {
-      await db`
-        update messages
-        set delivered_at = coalesce(delivered_at, ${now}), acked_at = ${now}
-        where id = any(${ids}::bigint[])
-      `;
-      msgs = msgs.map((m) => ({
-        ...m,
-        delivered_at: m.delivered_at ?? now,
-        acked_at: now,
-      }));
+      const written = await withTransaction(async (tx) => {
+        const rows = await tx`
+          update messages
+          set delivered_at = coalesce(delivered_at, ${now}), acked_at = ${now}
+          where id = any(${ids}::bigint[])
+            and acked_at is null
+          returning id
+        `;
+        const updated = sortMessageIds(rows.map((row) => messageResourceId(row.id)));
+        if (updated.length === 0) return updated;
+        await insertToolReceipt(tx, {
+          kind: "messages.ack",
+          title: "Messages acknowledged",
+          extra: { operation: "ack", message_ids: updated },
+        });
+        return updated;
+      });
+      const stamped = new Set(written);
+      msgs = msgs.map((m) => (
+        stamped.has(String(m.id))
+          ? { ...m, delivered_at: m.delivered_at ?? now, acked_at: now }
+          : m
+      ));
     } catch (e) {
       throw new Error(errMsg(e));
     }
@@ -1101,23 +1125,36 @@ export async function listConversation(input: {
   }
 }
 
-/** Operator opens the drawer — clear unread on outbound replies. */
+/**
+ * Operator opens the drawer — clear unread on outbound replies.
+ * The timestamp update and its actor receipt commit together. Zero matches
+ * store no receipt. agent_id selects the conversation; it is not the actor.
+ */
 export async function markConversationRead(input: {
   agent_id: string;
 }): Promise<number> {
-  const db = sql();
   const agentId = slugify(input.agent_id);
   const now = new Date().toISOString();
   try {
-    const rows = await db`
-      update messages
-      set read_by_dashboard_at = ${now}
-      where agent_id = ${agentId}
-        and direction = 'outbound'
-        and read_by_dashboard_at is null
-      returning id
-    `;
-    return rows.length;
+    const written = await withTransaction(async (tx) => {
+      const rows = await tx`
+        update messages
+        set read_by_dashboard_at = ${now}
+        where agent_id = ${agentId}
+          and direction = 'outbound'
+          and read_by_dashboard_at is null
+        returning id
+      `;
+      const updated = sortMessageIds(rows.map((row) => messageResourceId(row.id)));
+      if (updated.length === 0) return updated;
+      await insertToolReceipt(tx, {
+        kind: "messages.read",
+        title: "Messages marked read",
+        extra: { operation: "read", message_ids: updated },
+      });
+      return updated;
+    });
+    return written.length;
   } catch (e) {
     throw new Error(errMsg(e));
   }
