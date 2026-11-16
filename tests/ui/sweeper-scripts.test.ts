@@ -25,8 +25,11 @@ function run(script: string, reply = "ok", token = TOKEN, extra: string[] = []) 
     fs.writeFileSync(path.join(bin, "curl"), String.raw`#!/usr/bin/env node
 const fs = require("node:fs");
 const argv = process.argv.slice(2);
-const i = argv.findIndex(a => a === "-H" || a === "--header");
-const h = i < 0 ? null : argv[i + 1];
+const flag = (name) => {
+  const i = argv.indexOf(name);
+  return i < 0 ? null : argv[i + 1];
+};
+const h = flag("-H") || flag("--header");
 const file = h && h.startsWith("@") ? h.slice(1) : null;
 fs.appendFileSync(process.env.CURL_AUDIT, JSON.stringify({
   argv, file,
@@ -34,18 +37,28 @@ fs.appendFileSync(process.env.CURL_AUDIT, JSON.stringify({
   mode: file ? fs.statSync(file).mode & 0o777 : null,
 }) + "\n");
 if (process.env.CURL_REPLY === "curl-fail") process.exit(22);
-if (process.env.CURL_REPLY === "invalid-json") { console.log("invalid-json"); process.exit(0); }
 const url = argv[argv.length - 1];
-if (url.endsWith("/api/settings/repos")) console.log(JSON.stringify({ repos: [] }));
-else if (url.endsWith("/api/fleet")) console.log(JSON.stringify({ agents: [], events: [] }));
-else if (url.includes("/api/decisions?")) console.log(JSON.stringify({ demo: false, decisions: [], incomplete_repos: [] }));
-else if (url.endsWith("/api/sweep")) console.log(JSON.stringify({
+let body;
+if (process.env.CURL_REPLY === "invalid-json") body = "invalid-json";
+else if (process.env.CURL_REPLY === "redirect") body = "REDIRECT-BODY";
+else if (url.endsWith("/api/settings/repos")) body = JSON.stringify({ repos: [] });
+else if (url.endsWith("/api/fleet")) body = JSON.stringify({ agents: [], events: [] });
+else if (url.includes("/api/decisions?")) body = JSON.stringify({ demo: false, decisions: [], incomplete_repos: [] });
+else if (url.endsWith("/api/sweep")) body = JSON.stringify({
   checks: [{ state: process.env.CURL_REPLY === "unknown" ? "unknown" : "ok" }],
   retention: { state: "ok" },
   paused: { measured: true, generated_at: "2026-10-31T00:00:00Z", jobs_total: 0,
     jobs: [], truncated: false, counts: { held: 0, unexplained: 0, expired: 0, unknown: 0 } },
-}));
+});
 else process.exit(3);
+const outFlag = flag("-o");
+if (outFlag && outFlag !== "-") fs.writeFileSync(outFlag, body);
+else console.log(body);
+const writeOut = flag("-w");
+if (writeOut) {
+  const code = process.env.CURL_REPLY === "redirect" ? "302" : "200";
+  process.stdout.write(writeOut.split("%{http_code}").join(code));
+}
 `, { mode: 0o700 });
     const args = script === "morning-brief.sh" ? ["--json", "--config", config, ...extra] : extra;
     const result = spawnSync("bash", [path.join(scripts, script), ...args], {
@@ -77,7 +90,20 @@ describe("sweeper shell credential transport", () => {
     const r = run("sweep-once.sh");
     assert.equal(r.status, 0, r.err);
     assert.equal(r.calls.length, 1);
+    assert.equal(r.calls[0].argv[0], "-q");
+    assert.equal(r.calls[0].argv.includes("--noproxy"), true);
+    assert.equal(r.calls[0].argv.includes("--max-redirs"), true);
+    const redir = r.calls[0].argv.indexOf("--proto-redir");
+    assert.equal(r.calls[0].argv[redir + 1], "-http,-https");
     assert.equal(JSON.parse(r.out).retention.state, "ok");
+  });
+
+  it("rejects a non-200 sweep response without printing the body", () => {
+    const r = run("sweep-once.sh", "redirect");
+    assert.equal(r.status, 1);
+    assert.equal(r.calls.length, 1);
+    assert.equal(r.out.includes("REDIRECT-BODY"), false);
+    assert.match(r.err, /POST \/api\/sweep failed/);
   });
 
   it("preserves one-shot curl failure status and removes the header", () => {
