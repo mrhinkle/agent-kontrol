@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.peripety.agent-kontrol-observer</string>
+  <key>Comment</key>
+  <string>INERT TEMPLATE. Do not bootstrap this plist. A later owner approval may install it for user markhinkle at ~/Library/LaunchAgents with StartInterval 300. The program only observes; it must not be pointed at the watched jobs.</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/markhinkle/.local/lib/agent-kontrol-observer/observe-scheduler.py</string>
+    <string>--config</string>
+    <string>/Users/markhinkle/.local/state/agent-kontrol-observer/observer.config.json</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
