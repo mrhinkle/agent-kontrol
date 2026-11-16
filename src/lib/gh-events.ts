@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { sql, type SqlTag } from "./db";
+import { isReservedTaskDeliveryId, isReservedTaskEvent } from "./task-queue-notice";
 
 /**
  * GitHub webhook inbox (#77).
@@ -121,12 +122,13 @@ export async function readBoundedBody(req: Request, max: number): Promise<Bounde
 export function isWebhookDeliveryId(value: string | null): value is string {
   return typeof value === "string"
     && WEBHOOK_DELIVERY_ID.test(value)
-    && !value.startsWith(SYNTHETIC_DELIVERY_PREFIX);
+    && !value.startsWith(SYNTHETIC_DELIVERY_PREFIX)
+    && !isReservedTaskDeliveryId(value);
 }
 
 /** A webhook event header: lowercase letters and underscores, at most 64. */
 export function isEventHeader(value: string | null): value is string {
-  return typeof value === "string" && EVENT_HEADER.test(value);
+  return typeof value === "string" && EVENT_HEADER.test(value) && !isReservedTaskEvent(value);
 }
 
 export function isAcceptedEvent(event: string): event is GhAcceptedEvent {
@@ -297,6 +299,9 @@ function checkInput(input: GhEventInsert): void {
   }
   if (typeof event !== "string" || event.length === 0 || event.length > EVENT_NAME_MAX || CONTROL.test(event)) {
     throw new GhEventInputError(`event must be 1 to ${EVENT_NAME_MAX} characters with no control characters.`);
+  }
+  if (isReservedTaskDeliveryId(deliveryId) || isReservedTaskEvent(event)) {
+    throw new GhEventInputError("The internal task queue notice is not writable through this function.");
   }
   if (!isPlainObject(payload)) throw new GhEventInputError("payload must be a JSON object.");
   if (input.number != null && positiveInt(input.number) === null) {

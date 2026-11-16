@@ -5,6 +5,7 @@ import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } fr
 import { StaleWrite, absentRevision } from "./revision";
 import { writeSessionNote } from "./session-memory";
 import { sql, type SqlTag } from "./db";
+import { containsReservedQueueMarker, ReservedQueueMarkerError, taskNoticeProducerEnabled } from "./task-queue-notice";
 import { insertToolReceipt } from "./tool-receipt";
 import { stampSortAt } from "./list-params";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
@@ -77,6 +78,9 @@ function rethrowStore(e: unknown): never {
  * writes store null provenance, which consumer liveness does not count.
  */
 export async function report(input: ReportInput, opts?: { principal?: Principal | null }): Promise<Receipt | null> {
+  if (containsReservedQueueMarker(input.detail) || containsReservedQueueMarker(input)) {
+    throw new ReservedQueueMarkerError();
+  }
   const db = sql();
   const provenance = provenanceFromPrincipal(opts && "principal" in opts ? opts.principal : currentPrincipal());
   const principalKind = provenance?.principal_kind ?? null;
@@ -620,6 +624,8 @@ function asTask(row: Record<string, unknown>): Task {
   delete extra.receipt_id;
   delete extra.receipt_kind;
   delete extra.receipt_at;
+  delete extra.previous_status;
+  delete extra.notice_rows;
   if (receipt) attachReceipt(task, receipt);
   return task;
 }
@@ -1169,6 +1175,7 @@ async function insertTask(
 ): Promise<Task | null> {
   const db = sql();
   const actor = actorFields(input.actor);
+  const notify = taskNoticeProducerEnabled();
   try {
     const rows = claim
       ? await db`
@@ -1219,10 +1226,32 @@ async function insertTask(
                 'tool', 'create_task',
                 'actor_type', w.actor_type,
                 'actor_id', w.actor_id,
-                'task_id', w.id::text
+                'task_id', w.id::text,
+                '_ak_task_queue_v1', jsonb_build_object('task_id', w.id::text)
               )
             from w
             returning id, kind, created_at
+          ),
+          notice as (
+            insert into gh_events (delivery_id, event, action, repo, number, head_sha, payload)
+            select
+              'task:ready:' || w.id::text || ':' || e.id::text,
+              'task-ready',
+              null,
+              'agent-kontrol/task-queue',
+              null,
+              null,
+              jsonb_build_object(
+                'v', 1,
+                'task_id', w.id::text,
+                'queue_receipt_id', e.id::text,
+                'platform', w.platform,
+                'machine', w.machine
+              )
+            from w
+            join e on true
+            where ${notify}::boolean
+            returning id
           ),
           stored as (
             update idempotency_keys as k
@@ -1240,6 +1269,7 @@ async function insertTask(
               and k.claim_token = ${claim.token}
               and exists (select 1 from w)
               and exists (select 1 from e)
+              and (select count(*) from notice) >= 0
             returning k.response
           )
           select response from stored
@@ -1275,12 +1305,35 @@ async function insertTask(
                 'tool', 'create_task',
                 'actor_type', w.actor_type,
                 'actor_id', w.actor_id,
-                'task_id', w.id::text
+                'task_id', w.id::text,
+                '_ak_task_queue_v1', jsonb_build_object('task_id', w.id::text)
               )
             from w
             returning id, kind, created_at
+          ),
+          notice as (
+            insert into gh_events (delivery_id, event, action, repo, number, head_sha, payload)
+            select
+              'task:ready:' || w.id::text || ':' || e.id::text,
+              'task-ready',
+              null,
+              'agent-kontrol/task-queue',
+              null,
+              null,
+              jsonb_build_object(
+                'v', 1,
+                'task_id', w.id::text,
+                'queue_receipt_id', e.id::text,
+                'platform', w.platform,
+                'machine', w.machine
+              )
+            from w
+            join e on true
+            where ${notify}::boolean
+            returning id
           )
-          select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+          select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at,
+            (select count(*) from notice) as notice_rows
           from w, e
         `;
     const row = claim ? responseRow(rows as Record<string, unknown>[]) : rows[0] as Record<string, unknown> | undefined;
@@ -1508,15 +1561,18 @@ export async function updateTask(input: {
   const activityTool = input.activityTool ?? "update_task";
   const activityActorType = activity?.actor_type ?? null;
   const activityActorId = activity?.actor_id ?? null;
+  const notify = taskNoticeProducerEnabled();
 
   let rows: Record<string, unknown>[] = [];
   try {
     // Activity binds are after the task predicate. A zero-row update inserts
     // no event, because the insert selects from the updated rows only.
+    // previous.status is locked in this statement so a queue episode is
+    // allocated only on a real transition into queued.
     if (expected === undefined) {
       rows = await db`
         with changed as (
-          update tasks set
+          update tasks as t set
             updated_at = ${now},
             status = case when ${hasStatus} then ${status} else status end,
             completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
@@ -1526,8 +1582,11 @@ export async function updateTask(input: {
             assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end,
             actor_type = case when ${hasActor} then ${actorType} else actor_type end,
             actor_id = case when ${hasActor} then ${actorId} else actor_id end
-          where id = ${input.id}
-          returning *
+          from (
+            select id, status from tasks where id = ${input.id} for update
+          ) as previous
+          where t.id = previous.id
+          returning t.*, previous.status as previous_status
         ),
         logged as (
           insert into events (agent_id, session_id, kind, title, detail)
@@ -1542,15 +1601,43 @@ export async function updateTask(input: {
               'status', changed.status,
               'actor_type', ${activityActorType}::text,
               'actor_id', ${activityActorId}::text
-            )
+            ) || case
+              when changed.status = 'queued' and changed.previous_status is distinct from 'queued'
+              then jsonb_build_object('_ak_task_queue_v1', jsonb_build_object('task_id', changed.id::text))
+              else '{}'::jsonb
+            end
           from changed
           returning id, kind, created_at
+        ),
+        notice as (
+          insert into gh_events (delivery_id, event, action, repo, number, head_sha, payload)
+          select
+            'task:ready:' || changed.id::text || ':' || logged.id::text,
+            'task-ready',
+            null,
+            'agent-kontrol/task-queue',
+            null,
+            null,
+            jsonb_build_object(
+              'v', 1,
+              'task_id', changed.id::text,
+              'queue_receipt_id', logged.id::text,
+              'platform', changed.platform,
+              'machine', changed.machine
+            )
+          from changed
+          join logged on true
+          where ${notify}::boolean
+            and changed.status = 'queued'
+            and changed.previous_status is distinct from 'queued'
+          returning id
         )
         select
           changed.*,
           logged.id as receipt_id,
           logged.kind as receipt_kind,
-          logged.created_at as receipt_at
+          logged.created_at as receipt_at,
+          (select count(*) from notice) as notice_rows
         from changed
         left join logged on true
       `;
@@ -1567,9 +1654,12 @@ export async function updateTask(input: {
             assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end,
             actor_type = case when ${hasActor} then ${actorType} else actor_type end,
             actor_id = case when ${hasActor} then ${actorId} else actor_id end
-          where t.id = ${input.id}
+          from (
+            select id, status from tasks where id = ${input.id} for update
+          ) as previous
+          where t.id = previous.id
             and md5(t::text) = ${expected}
-          returning *
+          returning t.*, previous.status as previous_status
         ),
         logged as (
           insert into events (agent_id, session_id, kind, title, detail)
@@ -1584,15 +1674,43 @@ export async function updateTask(input: {
               'status', changed.status,
               'actor_type', ${activityActorType}::text,
               'actor_id', ${activityActorId}::text
-            )
+            ) || case
+              when changed.status = 'queued' and changed.previous_status is distinct from 'queued'
+              then jsonb_build_object('_ak_task_queue_v1', jsonb_build_object('task_id', changed.id::text))
+              else '{}'::jsonb
+            end
           from changed
           returning id, kind, created_at
+        ),
+        notice as (
+          insert into gh_events (delivery_id, event, action, repo, number, head_sha, payload)
+          select
+            'task:ready:' || changed.id::text || ':' || logged.id::text,
+            'task-ready',
+            null,
+            'agent-kontrol/task-queue',
+            null,
+            null,
+            jsonb_build_object(
+              'v', 1,
+              'task_id', changed.id::text,
+              'queue_receipt_id', logged.id::text,
+              'platform', changed.platform,
+              'machine', changed.machine
+            )
+          from changed
+          join logged on true
+          where ${notify}::boolean
+            and changed.status = 'queued'
+            and changed.previous_status is distinct from 'queued'
+          returning id
         )
         select
           changed.*,
           logged.id as receipt_id,
           logged.kind as receipt_kind,
-          logged.created_at as receipt_at
+          logged.created_at as receipt_at,
+          (select count(*) from notice) as notice_rows
         from changed
         left join logged on true
       `;

@@ -8,6 +8,7 @@ import { demoTasks } from "@/lib/demo-data";
 import { ListParamError, TASK_REST, listBody, listParamError, parseSearchList } from "@/lib/list-params";
 import { loadTaskPage } from "@/lib/list-read";
 import { createTask } from "@/lib/store";
+import { containsReservedQueueMarker } from "@/lib/task-queue-notice";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -73,6 +74,12 @@ export async function POST(req: Request) {
   }
   if (!body.title) {
     return apiError("missing_field", { message: "title is required", fields: { title: "title is required" } });
+  }
+  if (containsReservedQueueMarker(body)) {
+    return apiError("validation_failed", {
+      message: "The reserved queue marker cannot be supplied by a caller.",
+      fields: { detail: "The reserved queue marker cannot be supplied by a caller." },
+    });
   }
   try {
     const task = await createTask({

@@ -39,6 +39,10 @@ Send a ping from the App settings to check the secret: a correct setup answers `
 
 `ping` is `200` and is not stored. Any other event is `202` and is not stored.
 
+## Internal task queue notices
+
+`task-ready` on `agent-kontrol/task-queue` with delivery id `task:ready:<task id>:<receipt id>` is reserved for the task writer. Webhook delivery syntax and `insertGhEvent` reject that event and delivery id. The receipt id is the audit row created when a task enters `queued`. The notice, when `AK_TASK_NOTICE_PRODUCER` is exactly `1`, is inserted in the same statement as that receipt. The variable is unset in this tree. A task still records the episode marker while the producer is off. History outside the recent audit window is unknown, not covered. This is not a coverage percentage.
+
 ## Table
 
 ```sql
