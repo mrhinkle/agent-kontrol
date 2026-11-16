@@ -57,7 +57,27 @@ export function sha(seed: string | number): string {
 }
 
 export interface IssueFixture { number: number; labels: string[]; labelTotal?: number }
-export interface CtxFixture { kind: "check" | "status"; name: string; status?: string; conclusion?: string | null; state?: string }
+export interface CtxFixture {
+  kind: "check" | "status";
+  name: string;
+  status?: string;
+  conclusion?: string | null;
+  state?: string;
+  /** Present only when a case sets them. Absent fields stay off the payload. */
+  checkId?: number;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  appId?: number;
+  appSlug?: string;
+  runId?: number;
+  runNumber?: number;
+  runCreatedAt?: string;
+  event?: string;
+  workflowId?: number;
+  workflowName?: string;
+  createdAt?: string;
+  creator?: string;
+}
 export interface PrFixture {
   number: number;
   title?: string;
@@ -140,9 +160,50 @@ export class Fixture {
         commits: { nodes: oid === null ? [] : [{ commit: { oid, statusCheckRollup: ctx === null ? null : {
           contexts: {
             pageInfo: { hasNextPage: pr.contextsTruncated === true },
-            nodes: ctx.map((c) => c.kind === "check"
-              ? { __typename: "CheckRun", name: c.name, status: c.status ?? "COMPLETED", conclusion: c.conclusion === undefined ? "SUCCESS" : c.conclusion }
-              : { __typename: "StatusContext", context: c.name, state: c.state ?? "SUCCESS" }),
+            nodes: ctx.map((c) => {
+              if (c.kind === "status") {
+                const status: Json = { __typename: "StatusContext", context: c.name, state: c.state ?? "SUCCESS" };
+                if (c.createdAt !== undefined) status.createdAt = c.createdAt;
+                if (c.creator !== undefined) status.creator = { login: c.creator };
+                return status;
+              }
+              const check: Json = {
+                __typename: "CheckRun",
+                name: c.name,
+                status: c.status ?? "COMPLETED",
+                conclusion: c.conclusion === undefined ? "SUCCESS" : c.conclusion,
+              };
+              if (c.checkId !== undefined) check.databaseId = c.checkId;
+              if (c.startedAt !== undefined) check.startedAt = c.startedAt;
+              if (c.completedAt !== undefined) check.completedAt = c.completedAt;
+              const suite: Json = {};
+              let hasSuite = false;
+              if (c.appId !== undefined || c.appSlug !== undefined) {
+                const app: Json = {};
+                if (c.appId !== undefined) app.databaseId = c.appId;
+                if (c.appSlug !== undefined) app.slug = c.appSlug;
+                suite.app = app;
+                hasSuite = true;
+              }
+              const hasRun = [c.runId, c.runNumber, c.runCreatedAt, c.event, c.workflowId, c.workflowName].some((v) => v !== undefined);
+              if (hasRun) {
+                const run: Json = {};
+                if (c.runId !== undefined) run.databaseId = c.runId;
+                if (c.runNumber !== undefined) run.runNumber = c.runNumber;
+                if (c.runCreatedAt !== undefined) run.createdAt = c.runCreatedAt;
+                if (c.event !== undefined) run.event = c.event;
+                if (c.workflowId !== undefined || c.workflowName !== undefined) {
+                  const workflow: Json = {};
+                  if (c.workflowId !== undefined) workflow.databaseId = c.workflowId;
+                  if (c.workflowName !== undefined) workflow.name = c.workflowName;
+                  run.workflow = workflow;
+                }
+                suite.workflowRun = run;
+                hasSuite = true;
+              } else if (hasSuite) suite.workflowRun = null;
+              if (hasSuite) check.checkSuite = suite;
+              return check;
+            }),
           },
         } } }] },
         reviews: { totalCount: (pr.reviews ?? []).length, nodes: (pr.reviews ?? []).map((r) => ({ state: r.state, commit: { oid: r.oid } })) },

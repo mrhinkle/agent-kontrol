@@ -75,6 +75,26 @@ describe("bounded SSE transport", () => {
     assert.equal((await reader.read()).done, true);
   });
 
+  it("emits the observation baseline before events and does not advance a cursor", async () => {
+    const abort = new AbortController();
+    const res = transportResponse({
+      consumer: "observe", position: "0", generation: "4", credential: "c", signal: abort.signal,
+      baseline: "15",
+      first: { expired: false, events: [{ id: "16", event: "task-ready", payload: { v: 1, task_id: "9" } }] },
+      read: async () => ({ expired: false, events: [] }),
+      pollMs: 1000, heartbeatMs: 60000, lifetimeMs: 2000,
+    });
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    const first = decoder.decode((await reader.read()).value);
+    const second = decoder.decode((await reader.read()).value);
+    assert.equal(first, 'event: observation\ndata: {"baseline":"15","generation":"4"}\n\n');
+    assert.doesNotMatch(first, /^id:/m);
+    assert.match(second, /^id: observe:16\nevent: github\n/);
+    assert.equal(JSON.parse(first.slice(first.indexOf("data: ") + 6)).baseline, "15");
+    abort.abort();
+  });
+
   it("closes at the configured lifetime even without events", async () => {
     const res = transportResponse({ consumer: "duration", position: "0", generation: "1", credential: "c", signal: new AbortController().signal,
       first: { expired: false, events: [] }, read: async () => ({ expired: false, events: [] }), pollMs: 1, heartbeatMs: 10000, lifetimeMs: 20 });

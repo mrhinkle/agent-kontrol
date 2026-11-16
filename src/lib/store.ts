@@ -5,6 +5,21 @@ import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } fr
 import { StaleWrite, absentRevision } from "./revision";
 import { writeSessionNote } from "./session-memory";
 import { sql, withTransaction, type SqlTag } from "./db";
+import { boundedTransaction } from "./events-stream";
+import {
+  QUEUE_EPISODE_SCAN_LIMIT,
+  QUEUE_EPISODE_WINDOW_DAYS,
+  TASK_NOTICE_VERSION,
+  TASK_QUEUE_REPO,
+  TASK_READY_EVENT,
+  containsReservedQueueMarker,
+  decideQueueEvidence,
+  ReservedQueueMarkerError,
+  taskNoticeProducerEnabled,
+  unknownCoverage,
+  type TaskCoverage,
+  type TaskNoticeObserverProof,
+} from "./task-queue-notice";
 import { insertToolReceipt, ToolReceiptError } from "./tool-receipt";
 import { stampSortAt } from "./list-params";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
@@ -88,6 +103,9 @@ function rethrowStore(e: unknown): never {
  * writes store null provenance, which consumer liveness does not count.
  */
 export async function report(input: ReportInput, opts?: { principal?: Principal | null }): Promise<Receipt | null> {
+  if (containsReservedQueueMarker(input.detail) || containsReservedQueueMarker(input)) {
+    throw new ReservedQueueMarkerError();
+  }
   const db = sql();
   const provenance = provenanceFromPrincipal(opts && "principal" in opts ? opts.principal : currentPrincipal());
   const principalKind = provenance?.principal_kind ?? null;
@@ -631,6 +649,15 @@ function asTask(row: Record<string, unknown>): Task {
   delete extra.receipt_id;
   delete extra.receipt_kind;
   delete extra.receipt_at;
+  delete extra.previous_status;
+  delete extra.notice_rows;
+  delete extra.notice_gate;
+  delete extra.scanned_rows;
+  delete extra.queue_episode;
+  delete extra.notice_id;
+  delete extra.notice_at;
+  delete extra.observer_generation;
+  delete extra.measured_at;
   if (receipt) attachReceipt(task, receipt);
   return task;
 }
@@ -1206,6 +1233,7 @@ async function insertTask(
 ): Promise<Task | null> {
   const db = sql();
   const actor = actorFields(input.actor);
+  const notify = taskNoticeProducerEnabled();
   try {
     const rows = claim
       ? await db`
@@ -1256,10 +1284,32 @@ async function insertTask(
                 'tool', 'create_task',
                 'actor_type', w.actor_type,
                 'actor_id', w.actor_id,
-                'task_id', w.id::text
+                'task_id', w.id::text,
+                '_ak_task_queue_v1', jsonb_build_object('task_id', w.id::text)
               )
             from w
             returning id, kind, created_at
+          ),
+          notice as (
+            insert into gh_events (delivery_id, event, action, repo, number, head_sha, payload)
+            select
+              'task:ready:' || w.id::text || ':' || e.id::text,
+              'task-ready',
+              null,
+              'agent-kontrol/task-queue',
+              null,
+              null,
+              jsonb_build_object(
+                'v', 1,
+                'task_id', w.id::text,
+                'queue_receipt_id', e.id::text,
+                'platform', w.platform,
+                'machine', w.machine
+              )
+            from w
+            join e on true
+            where ${notify}::boolean
+            returning id
           ),
           stored as (
             update idempotency_keys as k
@@ -1277,6 +1327,7 @@ async function insertTask(
               and k.claim_token = ${claim.token}
               and exists (select 1 from w)
               and exists (select 1 from e)
+              and (select count(*) from notice) >= 0
             returning k.response
           )
           select response from stored
@@ -1312,12 +1363,35 @@ async function insertTask(
                 'tool', 'create_task',
                 'actor_type', w.actor_type,
                 'actor_id', w.actor_id,
-                'task_id', w.id::text
+                'task_id', w.id::text,
+                '_ak_task_queue_v1', jsonb_build_object('task_id', w.id::text)
               )
             from w
             returning id, kind, created_at
+          ),
+          notice as (
+            insert into gh_events (delivery_id, event, action, repo, number, head_sha, payload)
+            select
+              'task:ready:' || w.id::text || ':' || e.id::text,
+              'task-ready',
+              null,
+              'agent-kontrol/task-queue',
+              null,
+              null,
+              jsonb_build_object(
+                'v', 1,
+                'task_id', w.id::text,
+                'queue_receipt_id', e.id::text,
+                'platform', w.platform,
+                'machine', w.machine
+              )
+            from w
+            join e on true
+            where ${notify}::boolean
+            returning id
           )
-          select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at
+          select w.*, e.id as receipt_id, e.kind as receipt_kind, e.created_at as receipt_at,
+            (select count(*) from notice) as notice_rows
           from w, e
         `;
     const row = claim ? responseRow(rows as Record<string, unknown>[]) : rows[0] as Record<string, unknown> | undefined;
@@ -1545,17 +1619,21 @@ export async function updateTask(input: {
   const activityTool = input.activityTool ?? "update_task";
   const activityActorType = activity?.actor_type ?? null;
   const activityActorId = activity?.actor_id ?? null;
+  const notify = taskNoticeProducerEnabled();
 
   let rows: Record<string, unknown>[] = [];
   try {
     // Activity binds are after the task predicate. A zero-row update inserts
     // no event, because the insert selects from the updated rows only.
+    // previous.status is locked in this statement so a queue episode is
+    // allocated only on a real transition into queued. The kept value is
+    // t.status: previous also exposes status, and a bare status is ambiguous.
     if (expected === undefined) {
       rows = await db`
         with changed as (
-          update tasks set
+          update tasks as t set
             updated_at = ${now},
-            status = case when ${hasStatus} then ${status} else status end,
+            status = case when ${hasStatus} then ${status} else t.status end,
             completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
             result = case when ${hasResult} then ${input.result ?? null} else result end,
             cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
@@ -1563,8 +1641,12 @@ export async function updateTask(input: {
             assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end,
             actor_type = case when ${hasActor} then ${actorType} else actor_type end,
             actor_id = case when ${hasActor} then ${actorId} else actor_id end
-          where id = ${input.id}
-          returning *
+          from (
+            select id, status, ${notify}::boolean as notify
+            from tasks where id = ${input.id} for update
+          ) as previous
+          where t.id = previous.id
+          returning t.*, previous.status as previous_status, previous.notify as notice_gate
         ),
         logged as (
           insert into events (agent_id, session_id, kind, title, detail)
@@ -1579,15 +1661,43 @@ export async function updateTask(input: {
               'status', changed.status,
               'actor_type', ${activityActorType}::text,
               'actor_id', ${activityActorId}::text
-            )
+            ) || case
+              when changed.status = 'queued' and changed.previous_status is distinct from 'queued'
+              then jsonb_build_object('_ak_task_queue_v1', jsonb_build_object('task_id', changed.id::text))
+              else '{}'::jsonb
+            end
           from changed
           returning id, kind, created_at
+        ),
+        notice as (
+          insert into gh_events (delivery_id, event, action, repo, number, head_sha, payload)
+          select
+            'task:ready:' || changed.id::text || ':' || logged.id::text,
+            'task-ready',
+            null,
+            'agent-kontrol/task-queue',
+            null,
+            null,
+            jsonb_build_object(
+              'v', 1,
+              'task_id', changed.id::text,
+              'queue_receipt_id', logged.id::text,
+              'platform', changed.platform,
+              'machine', changed.machine
+            )
+          from changed
+          join logged on true
+          where changed.notice_gate
+            and changed.status = 'queued'
+            and changed.previous_status is distinct from 'queued'
+          returning id
         )
         select
           changed.*,
           logged.id as receipt_id,
           logged.kind as receipt_kind,
-          logged.created_at as receipt_at
+          logged.created_at as receipt_at,
+          (select count(*) from notice) as notice_rows
         from changed
         left join logged on true
       `;
@@ -1596,7 +1706,7 @@ export async function updateTask(input: {
         with changed as (
           update tasks t set
             updated_at = ${now},
-            status = case when ${hasStatus} then ${status} else status end,
+            status = case when ${hasStatus} then ${status} else t.status end,
             completed_at = case when ${complete} then ${now}::timestamptz else completed_at end,
             result = case when ${hasResult} then ${input.result ?? null} else result end,
             cost_usd = case when ${hasCost} then ${input.cost_usd ?? null} else cost_usd end,
@@ -1604,9 +1714,13 @@ export async function updateTask(input: {
             assigned_agent = case when ${hasAgent} then ${input.assigned_agent ?? null} else assigned_agent end,
             actor_type = case when ${hasActor} then ${actorType} else actor_type end,
             actor_id = case when ${hasActor} then ${actorId} else actor_id end
-          where t.id = ${input.id}
+          from (
+            select id, status, ${notify}::boolean as notify
+            from tasks where id = ${input.id} for update
+          ) as previous
+          where t.id = previous.id
             and md5(t::text) = ${expected}
-          returning *
+          returning t.*, previous.status as previous_status, previous.notify as notice_gate
         ),
         logged as (
           insert into events (agent_id, session_id, kind, title, detail)
@@ -1621,15 +1735,43 @@ export async function updateTask(input: {
               'status', changed.status,
               'actor_type', ${activityActorType}::text,
               'actor_id', ${activityActorId}::text
-            )
+            ) || case
+              when changed.status = 'queued' and changed.previous_status is distinct from 'queued'
+              then jsonb_build_object('_ak_task_queue_v1', jsonb_build_object('task_id', changed.id::text))
+              else '{}'::jsonb
+            end
           from changed
           returning id, kind, created_at
+        ),
+        notice as (
+          insert into gh_events (delivery_id, event, action, repo, number, head_sha, payload)
+          select
+            'task:ready:' || changed.id::text || ':' || logged.id::text,
+            'task-ready',
+            null,
+            'agent-kontrol/task-queue',
+            null,
+            null,
+            jsonb_build_object(
+              'v', 1,
+              'task_id', changed.id::text,
+              'queue_receipt_id', logged.id::text,
+              'platform', changed.platform,
+              'machine', changed.machine
+            )
+          from changed
+          join logged on true
+          where changed.notice_gate
+            and changed.status = 'queued'
+            and changed.previous_status is distinct from 'queued'
+          returning id
         )
         select
           changed.*,
           logged.id as receipt_id,
           logged.kind as receipt_kind,
-          logged.created_at as receipt_at
+          logged.created_at as receipt_at,
+          (select count(*) from notice) as notice_rows
         from changed
         left join logged on true
       `;
@@ -1655,6 +1797,229 @@ async function taskRevisionOf(id: number): Promise<string | null> {
   `;
   const revision = rows[0]?.revision;
   return typeof revision === "string" ? revision : null;
+}
+
+function isoTime(value: unknown): string {
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "string" && value.length > 0) return value;
+  throw new Error("coverage clock returned no timestamp");
+}
+
+async function coverageMeasuredAt(): Promise<string> {
+  const rows = await sql()`select clock_timestamp() as measured_at`;
+  return isoTime(rows[0]?.measured_at);
+}
+
+function coverageFromClaimRow(row: Record<string, unknown>): TaskCoverage {
+  const measuredAt = isoTime(row.measured_at);
+  // A failed observer check must not reveal whether an episode or notice exists.
+  if (row.observer_generation == null || row.observer_generation === "") {
+    return unknownCoverage("ineligible_observer", measuredAt);
+  }
+  const scanned = Number(row.scanned_rows ?? 0);
+  const evidence = decideQueueEvidence({
+    scanned: Number.isFinite(scanned) ? scanned : QUEUE_EPISODE_SCAN_LIMIT,
+    scanLimit: QUEUE_EPISODE_SCAN_LIMIT,
+    episodeId: row.queue_episode == null || row.queue_episode === "" ? null : String(row.queue_episode),
+    noticeId: row.notice_id == null || row.notice_id === "" ? null : String(row.notice_id),
+    noticeAt: row.notice_at == null || row.notice_at === "" ? null : isoTime(row.notice_at),
+  });
+  return { ...evidence, measured_at: measuredAt };
+}
+
+/**
+ * Claim one task and, only for an events observer, attach bounded queue evidence.
+ * The lookup is the same statement as the status change. It reads at most
+ * QUEUE_EPISODE_SCAN_LIMIT newest audit rows in the 30-day window
+ * (events_created_idx) and does not fall back to an older episode.
+ * An ineligible observer still claims, with unknown evidence and no ids.
+ */
+export async function claimTaskWithCoverage(input: {
+  platform: string;
+  machine?: string;
+  agent_id: string;
+  observer: TaskNoticeObserverProof | null;
+}): Promise<{ task: Task | null; coverage: TaskCoverage }> {
+  if (!input.observer) {
+    const task = await claimNextTask(input);
+    return { task, coverage: unknownCoverage("ineligible_observer", await coverageMeasuredAt()) };
+  }
+  const observer = input.observer;
+  const db = sql();
+  let candidates: Task[];
+  try {
+    const rows = await db`
+      select * from tasks
+      where status = 'queued'
+        and platform = any(${[input.platform, "any"]}::text[])
+      order by priority asc, created_at asc
+      limit 10
+    `;
+    candidates = (rows as Record<string, unknown>[]).map(asTask);
+  } catch (e) {
+    throw new Error(errMsg(e));
+  }
+
+  const now = new Date().toISOString();
+  const actor = currentActor();
+  const activityActorType = actor?.actor_type ?? null;
+  const activityActorId = actor?.actor_id ?? null;
+  for (const t of candidates) {
+    if (t.machine && input.machine && t.machine !== input.machine) continue;
+    if (t.machine && !input.machine) continue;
+    try {
+      // The scan cutoff is statement_timestamp(), which is stable for this
+      // statement, so the created_at index can stop at the window. A volatile
+      // clock_timestamp() made the same LIMIT read every older row. The slice
+      // follows that index only. An id tie on the oldest timestamp is used
+      // only when the slice holds the whole tie; otherwise that edge is
+      // unknown and is not replaced by an older episode. The observer locks
+      // the consumer, then shares the credential, matching the stream binding.
+      const claimed = await boundedTransaction(async (tx) => {
+      const rows = await tx`
+        with changed as (
+          update tasks set
+            status = 'claimed',
+            assigned_agent = ${input.agent_id},
+            claimed_at = ${now},
+            updated_at = ${now}
+          where id = ${t.id} and status = 'queued'
+          returning *
+        ),
+        logged as (
+          insert into events (agent_id, session_id, kind, title, detail)
+          select
+            null,
+            null,
+            'task_claimed',
+            'Claimed task #' || changed.id::text || ': ' || coalesce(changed.title, ''),
+            jsonb_build_object(
+              'task_id', changed.id,
+              'tool', 'claim_task',
+              'status', changed.status,
+              'assigned_agent', changed.assigned_agent,
+              'actor_type', ${activityActorType}::text,
+              'actor_id', ${activityActorId}::text
+            )
+          from changed
+          returning id, kind, created_at
+        ),
+        cutoff as materialized (
+          select statement_timestamp() - (${QUEUE_EPISODE_WINDOW_DAYS}::int * interval '1 day') as ts
+        ),
+        slice as (
+          select e.id, e.created_at, e.detail
+          from events e
+          where e.created_at >= (select ts from cutoff)
+          order by e.created_at desc
+          limit ${QUEUE_EPISODE_SCAN_LIMIT}
+        ),
+        bounds as (
+          select count(*)::int as n, min(created_at) as edge from slice
+        ),
+        edge_open as (
+          select case
+            when b.n < ${QUEUE_EPISODE_SCAN_LIMIT} then false
+            else exists (
+              select 1
+              from events e
+              where e.created_at = b.edge
+                and e.id not in (select s.id from slice s where s.created_at = b.edge)
+            )
+          end as open
+          from bounds b
+        ),
+        usable as (
+          select s.id, s.created_at, s.detail
+          from slice s
+          cross join bounds b
+          cross join edge_open o
+          where b.n < ${QUEUE_EPISODE_SCAN_LIMIT}
+            or not o.open
+            or s.created_at > b.edge
+        ),
+        episode as (
+          select s.id::text as episode_id, s.created_at as episode_at
+          from usable s
+          where s.detail->'_ak_task_queue_v1'->>'task_id' = (select id::text from changed)
+          order by s.created_at desc, s.id desc
+          limit 1
+        ),
+        notice as (
+          select g.id::text as notice_id, g.received_at as notice_at
+          from episode ep
+          join gh_events g
+            on g.delivery_id = 'task:ready:' || (select id::text from changed) || ':' || ep.episode_id
+          where g.event = ${TASK_READY_EVENT}
+            and g.repo = ${TASK_QUEUE_REPO}
+            and g.payload->>'v' = ${String(TASK_NOTICE_VERSION)}
+            and g.payload->>'task_id' = (select id::text from changed)
+            and g.payload->>'queue_receipt_id' = ep.episode_id
+        ),
+        observer as (
+          select c.generation::text as generation
+          from event_stream_consumers c
+          join agent_credentials a on a.id = c.credential_id
+          where c.id = ${observer.consumer}
+            and c.credential_id = ${observer.credentialId}
+            and c.enabled
+            and a.revoked_at is null
+            and (a.expires_at is null or a.expires_at > clock_timestamp())
+            and 'events:read' = any(a.scopes)
+            and ${TASK_QUEUE_REPO} = any(c.repos)
+            and ${TASK_READY_EVENT} = any(c.event_types)
+            and c.generation::text = ${observer.generation}
+          for update of c for share of a
+        )
+        select
+          changed.*,
+          logged.id as receipt_id,
+          logged.kind as receipt_kind,
+          logged.created_at as receipt_at,
+          (select count(*) from slice) as scanned_rows,
+          (select episode_id from episode) as queue_episode,
+          (select notice_id from notice) as notice_id,
+          (select notice_at from notice) as notice_at,
+          (select generation from observer) as observer_generation,
+          clock_timestamp() as measured_at
+        from changed
+        left join logged on true
+      `;
+      const bound = rows[0] as Record<string, unknown> | undefined;
+      // A second statement takes a new snapshot. Skip it when the claim
+      // already withheld the binding, so a mismatched consumer is not locked
+      // again. When the claim held the locks, this rechecks the credential
+      // and consumer before commit and drops ids if either changed.
+      if (bound && bound.observer_generation != null && bound.observer_generation !== "") {
+        const still = await tx`
+          select c.generation::text as generation
+          from event_stream_consumers c
+          join agent_credentials a on a.id = c.credential_id
+          where c.id = ${observer.consumer}
+            and c.credential_id = ${observer.credentialId}
+            and c.enabled
+            and a.revoked_at is null
+            and (a.expires_at is null or a.expires_at > clock_timestamp())
+            and 'events:read' = any(a.scopes)
+            and ${TASK_QUEUE_REPO} = any(c.repos)
+            and ${TASK_READY_EVENT} = any(c.event_types)
+            and c.generation::text = ${observer.generation}
+          for update of c for share of a
+        `;
+        if (!still.length) bound.observer_generation = null;
+      }
+      return rows;
+      });
+      if (claimed.length > 0) {
+        const row = claimed[0] as Record<string, unknown>;
+        const coverage = coverageFromClaimRow(row);
+        return { task: asTask(row), coverage };
+      }
+    } catch (e) {
+      throw new Error(errMsg(e));
+    }
+  }
+  return { task: null, coverage: unknownCoverage("no_claim", await coverageMeasuredAt()) };
 }
 
 /** Read one task. Callers that confirm a preview use `readTaskForPreview` instead. */

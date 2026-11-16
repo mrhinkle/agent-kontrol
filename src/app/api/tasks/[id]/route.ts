@@ -8,6 +8,7 @@ import { previewTaskChange } from "@/lib/dry-run-actions";
 import { demoGetTask, demoUpdateTaskGuarded } from "@/lib/demo-store";
 import { taskRevision } from "@/lib/revision";
 import { updateTask, report } from "@/lib/store";
+import { containsReservedQueueMarker } from "@/lib/task-queue-notice";
 import type { TaskStatus } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -41,6 +42,12 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
     }
     // `null` is valid JSON. Reading `.dry_run` on it throws, which became a 500.
     if (peeked === null) return apiError("invalid_json");
+    if (containsReservedQueueMarker(peeked)) {
+      return apiError("validation_failed", {
+        message: "The reserved queue marker cannot be supplied by a caller.",
+        fields: { detail: "The reserved queue marker cannot be supplied by a caller." },
+      });
+    }
     const dry = readDryRun(peeked.dry_run);
     if (!dry.ok) {
       return apiError("validation_failed", {
@@ -118,6 +125,12 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
   }
   // Same null-body crash as the no-database branch above.
   if (body === null) return apiError("invalid_json");
+  if (containsReservedQueueMarker(body)) {
+    return apiError("validation_failed", {
+      message: "The reserved queue marker cannot be supplied by a caller.",
+      fields: { detail: "The reserved queue marker cannot be supplied by a caller." },
+    });
+  }
   const dry = readDryRun(body.dry_run);
   if (!dry.ok) {
     return apiError("validation_failed", {
