@@ -169,7 +169,7 @@ export function OwnerSettings() {
     <div data-owner-settings className="space-y-4">
       <div className="rounded-lg border border-[#2563eb]/40 bg-[#2563eb]/10 px-3 py-2 text-sm text-blue-100">
         {writable
-          ? "Name a GitHub user or organization. The collector adds repos that were pushed inside the activity window. Hide wins over pin."
+          ? "Name a GitHub user or organization. The collector keeps every repo allowed by the fork and archive settings, including inactive repos. Activity days filter the Progress board and brief only. Hide wins over pin."
           : "No database is connected (demo mode), so owners are read-only."}
       </div>
       <div className="rounded-xl border border-white/10 bg-[#101828] p-4 md:p-6">
@@ -192,7 +192,7 @@ export function OwnerSettings() {
                     />
                   </label>
                   <label className="block">
-                    <span className="mb-1 block text-xs text-gray-400">Activity days</span>
+                    <span className="mb-1 block text-xs text-gray-400">Active view days</span>
                     <input
                       className={input}
                       type="number"
@@ -200,7 +200,7 @@ export function OwnerSettings() {
                       max={3650}
                       value={row.activity_days}
                       disabled={disabled}
-                      aria-label={`Activity days for ${row.owner || `owner ${index + 1}`}`}
+                      aria-label={`Active view days for ${row.owner || `owner ${index + 1}`}`}
                       onChange={(ev) => edit(index, { activity_days: Number(ev.target.value) })}
                     />
                   </label>
@@ -254,7 +254,7 @@ export function OwnerSettings() {
             );
           })}
         </ul>
-        {rows.length === 0 && <p className="text-sm text-gray-400">No owners yet. Add one and the next collector tick fills in its active repos.</p>}
+        {rows.length === 0 && <p className="text-sm text-gray-400">No owners yet. Add one and the next collector tick fills in its repository inventory.</p>}
         {errors.some((item) => item.index < 0) && (
           <ul className="mt-3 space-y-1" role="alert">
             {errors

@@ -1826,6 +1826,27 @@ export function openApiDocument(): Json {
           },
         }),
       },
+      "/api/velocity": {
+        get: operation({
+          operationId: "getVelocityBenchmarks", tags: ["progress"], summary: "Private development-velocity captures, baseline and compatible trends.",
+          description: "Operator session or existing MC_TOKEN only; agents, OAuth and dev-open are denied. Returns up to 50 compatible series and 120 latest periods. Each interval selects the latest server-recorded revision. The first server-recorded capture stays the baseline even when older periods are imported later. Only the latest capture includes repository rows; history carries derived summaries. Responses are private, no-store. No database or missing approved history table returns 503, never synthetic data.",
+          security: operatorSessionOrMcToken,
+          parameters: [query("series", { type: "string", pattern: "^[0-9a-f]{64}$" }, "Compatible-series key from a previous response. Defaults to the newest period.")],
+          responses: { "200": jsonResponse("Series, latest snapshot, immutable baseline and bounded history.", { type: "object", required: ["series", "selectedKey", "latest", "baseline", "history", "historyLimited"] }), ...flatErrors, "503": jsonResponse("History storage unavailable.", ref("Error")) },
+        }),
+      },
+      "/api/velocity/ingest": {
+        post: operation({
+          operationId: "recordVelocityBenchmark", tags: ["progress"], summary: "Append an immutable, validated development-velocity capture.",
+          description: "Operator session with exact same-origin Origin, or existing MC_TOKEN collector bearer. Agents, OAuth and dev-open are denied. UTF-8 JSON body is limited to 2 MB and 1000 repositories. Contract is src/lib/velocity.ts; scripts/convert-velocity.py converts the versioned evidence artifact. Validates complete calendar days, cohort/sample/count identities, unique repository scope and finite nonnegative values. Canonical payload SHA-256 is the primary key. Exact repeat imports return the original receipt with duplicate=true; changed evidence appends a row. No update/delete path. Server actor and record time are authoritative. No schema is applied by this endpoint.",
+          security: operatorSessionOrMcToken,
+          requestBody: body({ type: "object", required: ["schemaVersion", "metricVersion", "capturedAt", "captureKind", "window", "scope", "inventoryComplete", "source", "repositories"], properties: {
+            schemaVersion: { type: "integer", const: 1 }, metricVersion: { type: "string", const: "observed-development-velocity-v1.0" }, capturedAt: { type: "string", format: "date-time" }, captureKind: { type: "string", enum: ["observed", "reconstructed"] },
+            window: { type: "object", description: "start/end RFC3339 instants at local midnight, days 1–366, timezone IANA name; end is exclusive." }, scope: { type: "object", description: "owners (1–20), includeForks, includeArchived, cohort=pr-created-in-window." }, inventoryComplete: { type: "boolean" }, source: { type: "object", description: "artifactSha256, evidenceSha256, collectorVersion." }, repositories: { type: "array", maxItems: 1000, items: { type: "object" }, description: "Per-repository inventory, explicit PR/CI/CD coverage, additive counts, raw numeric samples and dense daily buckets. See the shared validator and converter." },
+          }, additionalProperties: false }),
+          responses: { "200": jsonResponse("Recorded receipt, including safe duplicate replay.", { type: "object", required: ["ok", "id", "scopeKey", "duplicate", "recordedAt"], properties: { ok: { const: true }, id: { type: "string" }, scopeKey: { type: "string" }, duplicate: { type: "boolean" }, recordedAt: { type: "string", format: "date-time" } } }), ...flatErrors, "413": jsonResponse("Payload too large.", ref("Error")), "415": jsonResponse("JSON content type required.", ref("Error")), "503": jsonResponse("Capture was not confirmed saved. Retry the identical capture after storage is available.", ref("Error")) },
+        }),
+      },
       "/api/progress": {
         get: operation({
           operationId: "getProgress",

@@ -1,9 +1,10 @@
 /**
  * Pure planner for one owner's discovery tick.
  *
- * A failed, rate-limited, or empty `gh repo list` changes nothing. A repo
- * that goes quiet stays in the list and drops off the brief only once its
- * age is greater than `activity_days` (the boundary day is still shown).
+ * A failed, rate-limited, or empty `gh repo list` changes nothing. Eligible
+ * repos enter the inventory even when inactive or never pushed. Activity
+ * filters the brief only: age greater than `activity_days` is hidden (the
+ * boundary day is still shown), and never-pushed auto repos are hidden.
  * Hide wins over pin. A repo marked gone is not shown, including when it is pinned.
  * Forks and archived repos are not added unless that owner's flag says so.
  * A pin still shows a fork or archive that is already stored.
@@ -139,15 +140,6 @@ export function parseCollectorSweptAt(
     return { ok: false, error: "swept_at must not be more than 5 minutes in the future." };
   }
   return { ok: true, sweptAt: new Date(ms).toISOString() };
-}
-
-/**
- * New-repo activity uses the collector's `sweptAt` when it parses.
- * Callers that have not been given one still use `now`.
- */
-export function discoveryCutoff(sweep: { sweptAt?: string | null }, now: Date): Date {
-  const at = parseActivity(sweep.sweptAt ?? null);
-  return at === null ? now : new Date(at);
 }
 
 /**
@@ -308,7 +300,7 @@ export function planDiscovery(
   existing: TrackedRepo[],
   owner: OwnerRule,
   sweep: DiscoverySweep,
-  now: Date,
+  _now: Date,
 ): DiscoveryOutcome {
   const ownerKey = owner.owner.toLowerCase();
   if (sweep.repos === null) {
@@ -336,7 +328,6 @@ export function planDiscovery(
   const seen = new Set<string>();
   const added: string[] = [];
   const updated: string[] = [];
-  const cutoff = discoveryCutoff(sweep, now);
 
   for (const item of listed) {
     const repo = `${ownerKey}/${item.name}`;
@@ -346,8 +337,7 @@ export function planDiscovery(
     const activity = parseActivity(item.pushedAt);
     const current = byIdentity.get(id);
     if (!current) {
-      const inWindow = item.pushedAt != null && withinActivityWindow(item.pushedAt, owner.activityDays, cutoff);
-      if (!eligible(item, owner) || !inWindow) continue;
+      if (!eligible(item, owner)) continue;
       const created: TrackedRepo = {
         repo,
         label: labelFor(item.name),

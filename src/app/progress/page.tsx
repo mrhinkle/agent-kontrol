@@ -34,7 +34,8 @@ function Panel({
 }
 
 /** Signed number where positive is the bad direction. */
-function NetBacklog({ value, className = "" }: { value: number; className?: string }) {
+function NetBacklog({ value, className = "" }: { value: number | null; className?: string }) {
+  if (value === null) return <span className={`text-gray-500 ${className}`} title="Not measured">—</span>;
   const tone = value > 0 ? "text-[#ff7a40]" : value < 0 ? "text-emerald-400" : "text-gray-300";
   return (
     <span className={`tabular-nums ${tone} ${className}`}>
@@ -57,11 +58,12 @@ function Stat({ label, value, sub }: { label: string; value: React.ReactNode; su
 /* ------------------------------------------------------------ zone 1: cards */
 
 function repoTone(r: RepoProgress): { stripe: string; note: string | null } {
+  if (r.metrics_complete === false) return { stripe: "bg-gray-600", note: "partial metrics" };
   if (r.blocked_ratio !== null && r.blocked_ratio > THRESHOLDS.blockedRatio) {
     return { stripe: "bg-[#f44800]", note: "over blocked threshold" };
   }
-  if (r.net_backlog > 0) return { stripe: "bg-[#ff9a3c]", note: "backlog grew" };
-  if (r.merged_prs === 0 && r.open_prs > 0) return { stripe: "bg-[#2563eb]", note: "nothing merged" };
+  if (r.net_backlog !== null && r.net_backlog > 0) return { stripe: "bg-[#ff9a3c]", note: "backlog grew" };
+  if (r.merged_prs === 0 && r.open_prs !== null && r.open_prs > 0) return { stripe: "bg-[#2563eb]", note: "nothing merged" };
   return { stripe: "bg-emerald-500", note: null };
 }
 
@@ -79,12 +81,19 @@ function RepoCard({ r }: { r: RepoProgress }) {
             href={`https://github.com/${r.repo}`}
             target="_blank"
             rel="noreferrer"
-            className="font-semibold tracking-wide hover:text-white"
+            className="min-w-0 break-words font-semibold tracking-wide hover:text-white"
           >
             {r.label}
           </a>
           {tone.note && <span className="mono text-[10px] uppercase tracking-wider text-gray-500">{tone.note}</span>}
         </div>
+        <div className="mt-1 break-all text-[11px] text-gray-400">{r.repo}</div>
+        {r.activity && (
+          <div className="mt-1 text-[11px] text-gray-400">
+            {r.activity.reasons.map((reason) => reason === "open_prs" ? "Open PRs" : reason === "recent_activity" ? "Active in past 24h" : "Pinned").join(" · ")}
+            {r.activity.status !== "fresh" && <span className="text-amber-300"> · {r.activity.status === "legacy" ? "Awaiting activity scan" : `Activity ${r.activity.status}`}</span>}
+          </div>
+        )}
 
         <div className="mt-3 flex items-end gap-5">
           <div>
@@ -94,7 +103,7 @@ function RepoCard({ r }: { r: RepoProgress }) {
           <div className="pb-1">
             <div className="mono text-[10px] uppercase tracking-[0.12em] text-gray-500">shipped</div>
             <div className="text-lg font-semibold tabular-nums leading-none text-gray-200">
-              {r.merged_prs} <span className="text-xs font-normal text-gray-500">PRs</span>
+              {r.merged_prs ?? "—"} <span className="text-xs font-normal text-gray-500">PRs</span>
             </div>
           </div>
         </div>
@@ -103,13 +112,13 @@ function RepoCard({ r }: { r: RepoProgress }) {
           <div className="flex justify-between gap-2">
             <dt className="text-gray-500">closed / opened</dt>
             <dd className="mono tabular-nums text-gray-300">
-              {r.issues_closed} / {r.issues_opened}
+              {r.issues_closed ?? "—"} / {r.issues_opened ?? "—"}
             </dd>
           </div>
           <div className="flex justify-between gap-2">
             <dt className="text-gray-500">queue</dt>
             <dd className="mono tabular-nums text-gray-300">
-              {r.open_issues} issues · {r.open_prs} PR{r.open_prs === 1 ? "" : "s"}
+              {r.open_issues ?? "—"} issues · {r.open_prs ?? "—"} PR{r.open_prs === 1 ? "" : "s"}
             </dd>
           </div>
           <div className="flex justify-between gap-2">
@@ -118,13 +127,16 @@ function RepoCard({ r }: { r: RepoProgress }) {
               className={`mono tabular-nums ${
                 overBlocked ? "font-semibold text-[#ff7a40]" : blockedPct === null ? "text-gray-600" : "text-gray-300"
               }`}
-              title={blockedPct === null ? "This repo has no blocked label, so blocked work isn't measurable here" : undefined}
+              title={blockedPct === null ? "Blocked work has not been measured or has no configured label" : undefined}
             >
-              {blockedPct === null ? "not tracked" : `${blockedPct}%`}
+              {blockedPct === null ? (r.blocked_label ? "unavailable" : "not tracked") : `${blockedPct}%`}
               {overBlocked && " ⚠"}
             </dd>
           </div>
         </dl>
+        <div className="mt-2 text-[10px] text-gray-500">
+          Metrics {r.last_collected_at ? <TimeAgo iso={r.last_collected_at} /> : "not collected"}
+        </div>
       </div>
     </div>
   );
@@ -132,22 +144,22 @@ function RepoCard({ r }: { r: RepoProgress }) {
 
 /* ------------------------------------------------------- zone 3: breakdown */
 
-function Bar({ label, value, max, color }: { label: string; value: number; max: number; color: string }) {
-  const pct = max > 0 ? (value / max) * 100 : 0;
+function Bar({ label, value, max, color }: { label: string; value: number | null; max: number; color: string }) {
+  const pct = max > 0 && value !== null ? (value / max) * 100 : 0;
   return (
     <div className="flex items-center gap-3">
       <span className="mono w-14 shrink-0 text-[11px] text-gray-500">{label}</span>
       <span className="h-3 flex-1 overflow-hidden rounded-sm bg-white/5">
-        <span className="block h-full rounded-sm" style={{ width: `${Math.max(pct, value > 0 ? 2 : 0)}%`, background: color }} />
+        <span className="block h-full rounded-sm" style={{ width: `${Math.max(pct, value !== null && value > 0 ? 2 : 0)}%`, background: color }} />
       </span>
-      <span className="mono w-8 shrink-0 text-right text-[12px] tabular-nums text-gray-300">{value}</span>
+      <span className="mono w-8 shrink-0 text-right text-[12px] tabular-nums text-gray-300">{value ?? "—"}</span>
     </div>
   );
 }
 
 function Breakdown({ data }: { data: ProgressResponse }) {
   const t = data.totals;
-  const max = Math.max(t.merged_prs, t.issues_closed, t.issues_opened, 1);
+  const max = Math.max(t.merged_prs ?? 0, t.issues_closed ?? 0, t.issues_opened ?? 0, 1);
   const lanes = Object.entries(t.lane_mix).sort((a, b) => b[1] - a[1]);
   const rounds = data.repos.filter((r) => r.review_rounds !== null);
   const meanRounds = rounds.length
@@ -221,8 +233,8 @@ function NeedsYou({ alerts }: { alerts: Alert[] }) {
     return (
       <div className="flex h-full min-h-[120px] flex-col items-center justify-center gap-1 text-center">
         <span className="text-emerald-400">✓</span>
-        <p className="text-sm text-gray-400">Nothing needs you.</p>
-        <p className="text-[11px] text-gray-600">No threshold breaches, no stalled PRs.</p>
+        <p className="text-sm text-gray-400">No alerts from the available metrics.</p>
+        <p className="text-[11px] text-gray-600">Check coverage above for unmeasured repositories.</p>
       </div>
     );
   }
@@ -286,6 +298,7 @@ export default function ProgressPage() {
   const [win, setWin] = useState<TimeWindow>("24h");
   const [chartRepo, setChartRepo] = useState<string | null>(null);
   const { data, error, loading } = useProgress(win);
+  const visibleChartRepo = data?.repos.some((repo) => repo.repo === chartRepo) ? chartRepo : null;
 
   return (
     <div className="space-y-4">
@@ -294,7 +307,7 @@ export default function ProgressPage() {
         <div>
           <h1 className="text-xl font-semibold tracking-wide">Progress</h1>
           <p className="mt-0.5 text-[12px] text-gray-500">
-            Is the backlog shrinking? Merges alone won&apos;t tell you.
+            Open PRs or activity in the past 24 hours, across all watched repositories.
           </p>
         </div>
         <div className="flex items-center gap-4">
@@ -337,8 +350,24 @@ export default function ProgressPage() {
 
       {data && !data.demo && !data.window_complete && (
         <div className="rounded-lg border border-[#f0b429]/30 bg-[#f0b429]/10 px-4 py-2.5 text-[12.5px] text-[#f0d08a]">
-          History doesn&apos;t reach back a full {win} yet, so these totals cover less ground than the label claims.
-          They fill in as the collector runs.
+          Totals are partial: some metrics are missing, more than two hours old, or don&apos;t cover the full {win}.
+          Unmeasured values appear as —. Each card shows when its metrics were collected.
+        </div>
+      )}
+
+      {data?.coverage && (
+        <div className="rounded-lg border border-white/10 bg-[#101828] px-4 py-3 text-[12px] text-gray-400">
+          <p><span className="font-semibold text-gray-200">{data.coverage.shown_repos} repositories shown</span> · {data.coverage.checked_repos} of {data.coverage.eligible_repos} checked in the past 2 hours · {data.coverage.tracked_repos} retained</p>
+          <p className="mt-1">Activity includes pushes and PR or issue updates. The chart&apos;s time window changes metrics, not which repositories appear. Explicit pins stay visible.</p>
+          {data.coverage.discovery_errors.length > 0 && <p className="mt-2 text-amber-300">Repository discovery unavailable for {data.coverage.discovery_errors.join(", ")}; coverage may be incomplete.</p>}
+          {data.coverage.incomplete.length > 0 && (
+            <details className="mt-2 text-amber-300">
+              <summary className="cursor-pointer">{data.coverage.incomplete.length} repositories need a fresh activity scan; additional active repos may be missing</summary>
+              <ul className="mt-2 space-y-1">
+                {data.coverage.incomplete.map((repo) => <li key={repo.repo}>{repo.repo} — {repo.status === "legacy" ? "awaiting activity scan" : repo.status}</li>)}
+              </ul>
+            </details>
+          )}
         </div>
       )}
 
@@ -350,18 +379,19 @@ export default function ProgressPage() {
               <div key={r.repo} className="h-[196px] animate-pulse rounded-xl border border-white/10 bg-[#101828]" />
             ))}
       </div>
+      {data && data.repos.length === 0 && <p className="text-sm text-gray-400">No qualifying repositories in the available observations.</p>}
 
       {/* zone 2 */}
       <Panel
         title="backlog over time"
         right={
-          <div className="flex gap-1">
+          <div className="flex flex-wrap justify-end gap-1">
             {[{ repo: null, label: "all" }, ...(data?.repos ?? []).map((r) => ({ repo: r.repo, label: r.short }))].map((o) => (
               <button
                 key={o.label}
                 onClick={() => setChartRepo(o.repo)}
                 className={`mono rounded px-2 py-0.5 text-[10px] uppercase tracking-wider transition-colors ${
-                  chartRepo === o.repo ? "bg-white/10 text-white" : "text-gray-500 hover:text-gray-300"
+                  visibleChartRepo === o.repo ? "bg-white/10 text-white" : "text-gray-500 hover:text-gray-300"
                 }`}
               >
                 {o.label}
@@ -372,7 +402,7 @@ export default function ProgressPage() {
       >
         <BacklogChart
           history={data?.history ?? []}
-          repo={chartRepo}
+          repo={visibleChartRepo}
           emptyHint={
             data && !data.demo
               ? "The collector needs two daily snapshots before this can draw a line. Check back tomorrow."

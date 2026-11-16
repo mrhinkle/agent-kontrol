@@ -13,7 +13,9 @@ This document describes the adapters that connect coding agents to Agent Kontrol
 | cowork-cloud (MCP) | Only if the agent calls `report_status` | Yes, via `check_inbox` | Yes, via MCP tools | No | No |
 | grok | Dispatcher plus MCP | Via MCP | Via the dispatcher | No | No |
 | hermes | Via MCP | Via MCP | Via MCP (`claim_task`) | Any OpenTelemetry exporter | With the usage collector |
-| usage-collector | No | No | No | No | Yes |
+| usage-collector | No | No | No | No | Hermes usage |
+| claude-usage-collector | No | No | No | No | Local Claude Code usage |
+| collect-provider-usage.ts | No | No | No | No | OpenRouter, Claude API, recorded Claude fees |
 | progress-collector | No (feeds the Progress board) | No | No | No | No |
 
 "Via MCP" means the agent has to call the tool; it is not automatic. Every adapter that ends a session, or reports status `done` or `failed`, also gets an automatic note in shared memory (see [Memory (Notes)](MEMORY.md)). Any agent or SDK that can export OpenTelemetry can send traces to `/api/v1/traces` (see [Telemetry and traces](TELEMETRY.md)). A Cline and Roo Code adapter was proposed but is not included: its file locations have not been verified against a real install.
@@ -106,3 +108,7 @@ claim production event coverage from this counter or from synthetic tests.
 
 This source change does not activate any dispatcher, reviewer, scheduler or
 Carmack job. Follow the API consumer setup and existing owner deployment holds.
+
+## Provider and Claude usage collectors
+
+`npx tsx scripts/collect-provider-usage.ts` collects OpenRouter management and Anthropic Console admin reports. `agents/claude-usage-collector/collector.py` separately collects allowlisted local Claude Code usage metadata; it does not change the lifecycle hook. Both are dry-run by default and publish only with an explicit flag. Credential provisioning and recurring activation are separate operator actions. See [Usage and Costs](USAGE.md) and the [Claude collector README](../agents/claude-usage-collector/README.md).

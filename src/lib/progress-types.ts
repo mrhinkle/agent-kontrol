@@ -44,6 +44,8 @@ export interface StalledPr {
 }
 
 export interface SnapshotDetail {
+  /** Lightweight, paginated GitHub observation; never a detailed metric tick. */
+  activity?: RepoActivityObservation;
   /**
    * Commits on the default branch in the window, counted by bot identity.
    * A repo that commits everything under one vendor-neutral bot, so its work
@@ -69,6 +71,34 @@ export interface SnapshotDetail {
   merged?: BriefSnapshotMergedRaw[];
   /** anything the collector wants to say about a partial run */
   notes?: string[];
+}
+
+export interface RepoActivityObservation {
+  status: "complete" | "unavailable";
+  checked_at: string;
+  pushed_at: string | null;
+  pr_updated_at: string | null;
+  issue_updated_at: string | null;
+  open_issues: number | null;
+  error?: string;
+}
+
+export interface ProgressActivity {
+  status: "fresh" | "stale" | "unavailable" | "legacy";
+  checked_at: string | null;
+  last_activity_at: string | null;
+  reasons: ("open_prs" | "recent_activity" | "pinned")[];
+}
+
+export interface ProgressCoverage {
+  evaluated_at: string;
+  cutoff: string;
+  tracked_repos: number;
+  eligible_repos: number;
+  checked_repos: number;
+  shown_repos: number;
+  incomplete: { repo: string; status: ProgressActivity["status"] }[];
+  discovery_errors: string[];
 }
 
 /** Stuck PR as `scripts/morning-brief.sh` prints it. `repo` is the short name. */
@@ -111,8 +141,8 @@ export interface RepoProgress {
   color: string;
 
   /** queue depth right now */
-  open_issues: number;
-  open_prs: number;
+  open_issues: number | null;
+  open_prs: number | null;
   /** null when the repo has no blocked label — not tracked, not zero */
   blocked_issues: number | null;
   /** the GitHub label that marks blocked work in this repo; null when not tracked */
@@ -121,14 +151,14 @@ export interface RepoProgress {
   blocked_ratio: number | null;
 
   /** totals across the selected window */
-  merged_prs: number;
-  issues_closed: number;
-  issues_opened: number;
+  merged_prs: number | null;
+  issues_closed: number | null;
+  issues_opened: number | null;
   /**
    * issues_opened − issues_closed. Positive means the queue grew: the number
    * that makes a 28-merge day read honestly. Negative is good.
    */
-  net_backlog: number;
+  net_backlog: number | null;
 
   review_rounds: number | null;
   no_verdict_rate: number | null;
@@ -137,6 +167,8 @@ export interface RepoProgress {
 
   /** when this repo was last collected; null if it never has been */
   last_collected_at: string | null;
+  activity?: ProgressActivity;
+  metrics_complete?: boolean;
 }
 
 /** One point on the history graph, per repo. */
@@ -164,12 +196,12 @@ export interface Alert {
 }
 
 export interface FleetTotals {
-  merged_prs: number;
-  issues_closed: number;
-  issues_opened: number;
-  net_backlog: number;
-  open_issues: number;
-  open_prs: number;
+  merged_prs: number | null;
+  issues_closed: number | null;
+  issues_opened: number | null;
+  net_backlog: number | null;
+  open_issues: number | null;
+  open_prs: number | null;
   /** sum of tasks.cost_usd completed inside the window */
   spend_usd: number | null;
   lane_mix: Record<string, number>;
@@ -199,6 +231,7 @@ export interface ProgressResponse {
    */
   baseline_at: string | null;
   window_complete: boolean;
+  coverage?: ProgressCoverage;
   repos: RepoProgress[];
   totals: FleetTotals;
   history: HistoryPoint[];

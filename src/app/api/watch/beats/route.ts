@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { enforceApi } from "@/lib/auth";
+import { describeDbError } from "@/lib/db-error";
 import { readBeats } from "@/lib/watch";
 import { NO_STORE, databaseUnavailable, requireWatchAgent } from "../access";
 
@@ -24,7 +25,7 @@ export async function GET(req: Request) {
     const beats = await readBeats();
     return NextResponse.json({ beats }, { headers: NO_STORE });
   } catch (err) {
-    console.error("[watch] beat read failed", err instanceof Error ? err.name : "error");
+    console.error("[watch] beat read failed", describeDbError(err));
     return databaseUnavailable();
   }
 }
