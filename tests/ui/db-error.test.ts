@@ -429,6 +429,10 @@ describe("sanitizeErrorMessage", () => {
     );
     assert.equal(sanitizeErrorMessage("via npg\\u005fSECaRETb then"), "via [redacted] then");
     assert.equal(sanitizeErrorMessage("sent \\u0042earer SECaRETb upstream"), "sent Bearer [redacted] upstream");
+    assert.equal(sanitizeErrorMessage("via akc\\u005fSECaRETb then"), "via [redacted] then");
+    // The decode runs on the whole message, so an escaped letter in ordinary
+    // text is logged decoded.
+    assert.equal(sanitizeErrorMessage('relation "\\u0061gents" does not exist'), 'relation "agents" does not exist');
     // Only key characters are decoded. An escaped quote, backslash, space or
     // marker stays as written, so it cannot end a quoted value early.
     const others = "caf\\u00e9 \\u0022quoted\\u0022 \\uE000 \\u005c tab\\u0009";

@@ -82,9 +82,10 @@ const NEON_PASSWORD = /npg_\S*/g;
 const BEARER = new RegExp(String.raw`\bBearer\s+${TO_WHITESPACE}`, "gi");
 const AGENT_CREDENTIAL = /akc_\S*/g;
 const SAFE_CODE = /^[A-Za-z0-9_]{1,40}$/;
-// A JSON `\uXXXX` escape inside a key (`pass\u0077ord`, or `pass\\u0077ord` in
-// JSON inside JSON) is decoded first, so the message is redacted as if it had
-// been written without it. Only a character that can sit in a key or a token
+// A JSON `\uXXXX` escape is decoded first, anywhere in the message, so a key
+// spelled with one (`pass\u0077ord`, or `pass\\u0077ord` in JSON inside JSON)
+// is redacted as if it had been written without it. In other text the decode
+// only changes how the log line reads. Only a character that can sit in a key or a token
 // prefix (a letter, a digit, `_`, `.`, `-`) is decoded. Decoding a quote, a
 // backslash or a space would move where a value ends, valid JSON never escapes
 // its structural `:` `,` `}` `]`, and the marker U+E000 stays unforgeable. The
