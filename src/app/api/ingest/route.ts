@@ -4,6 +4,7 @@ import { provenanceFromPrincipal } from "@/lib/actor";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { report, type ReportInput } from "@/lib/store";
+import { parseRunTelemetry } from "@/lib/run-telemetry";
 import { SweepClockError } from "@/lib/sweep-clock";
 import { SweepEvidenceConflict, isReservedIngestKind, isSweepObservationKind, writeObservation } from "@/lib/sweep-evidence";
 
@@ -57,6 +58,13 @@ export async function POST(req: Request) {
     if (!body.agent_id) fields.agent_id = "agent_id is required";
     if (!body.kind) fields.kind = "kind is required";
     return apiError("missing_field", { message: "agent_id and kind are required", fields });
+  }
+  if (body.kind === "run_complete" && !parseRunTelemetry(body.detail)) {
+    return apiError("validation_failed", {
+      message: "invalid completed-run metadata",
+      fix: "Send a completed run with schema mc.run.v2 and the required run fields. The rejected detail was not stored.",
+      extra: { cause: "The completed-run detail did not match the run schema." },
+    });
   }
 
   if (isReservedIngestKind(body.kind)) {
