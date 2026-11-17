@@ -76,7 +76,7 @@ import urllib.request
 from pathlib import Path
 
 import ak_pointers
-from dispatch_ready_bridge import frame_untrusted_issue
+from dispatch_ready_bridge import bridge_frame_refusal, frame_untrusted_issue
 
 
 def load_env_file() -> None:
@@ -523,6 +523,12 @@ def run_task(task: dict, platform: str, sem: threading.Semaphore) -> None:
     tid = task["id"]
     lock: WorktreeLock | None = None
     try:
+        # Invalid v2 and legacy v1 are not worker instructions. Refuse before
+        # the lock, the running status, the work-event ingest, and the child.
+        refusal = bridge_frame_refusal(task)
+        if refusal is not None:
+            fail_task(tid, agent_id, refusal)
+            return
         project = task.get("project")
         runtime = RUNTIME_FOR_PLATFORM.get(platform)
         try:

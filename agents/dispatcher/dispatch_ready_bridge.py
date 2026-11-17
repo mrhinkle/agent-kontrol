@@ -17,6 +17,9 @@ allowlisted config. The framing does not claim to defeat prompt injection.
 
 Title limit is 256 Unicode code points. Body limit is 32,768 UTF-8 bytes.
 URL limit is 2,048 UTF-8 bytes. Over-limit text is rejected, not truncated.
+JSON escaping can make the v2 object larger than the body. The frame bound
+is the worst-case object for those limits, so a body within 32,768 bytes
+still round-trips. An object that does not decode is not posted.
 A null body is an empty body. A missing, non-string, or truncated body is
 an incomplete read. The URL must be exactly
 ``https://github.com/{configured-repo}/issues/{number}``. Markup, links,
@@ -75,6 +78,8 @@ ISSUE_CONTENT_MARK = "agent-kontrol.dispatch-ready-bridge/v2"
 TITLE_MAX_CHARS = 256
 BODY_MAX_UTF8_BYTES = 32768
 URL_MAX_UTF8_BYTES = 2048
+# json.dumps (ensure_ascii=False) writes U+0001 as \u0001: six bytes per source byte.
+_JSON_CONTROL_EXPANSION = 6
 _CONTENT_KEYS = (
     "authority",
     "body",
@@ -141,6 +146,41 @@ _AUTHORITY_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _NODE_RE = re.compile(r"^[A-Za-z0-9_]{1,200}$")
 _MACHINE_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 _ACTOR_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,200}$")
+# Same ceilings the parsers enforce: authority 64, node 200, repo 100/100.
+_AUTHORITY_MAX_CHARS = 64
+_NODE_MAX_CHARS = 200
+_REPO_PART_MAX_CHARS = 100
+
+
+def _content_json_max_bytes() -> int:
+    """Largest canonical v2 JSON object the accepted field limits can produce.
+
+    Body and title use the six-byte control escape. The other fields are the
+    longest unescaped values that still fit the URL and identifier limits.
+    A longer declared object is not a frame this bridge will post or read.
+    """
+    repository = ("a" * _REPO_PART_MAX_CHARS) + "/" + ("b" * _REPO_PART_MAX_CHARS)
+    prefix = f"https://github.com/{repository}/issues/"
+    digits = URL_MAX_UTF8_BYTES - len(prefix.encode("utf-8"))
+    if digits < 1:
+        raise RuntimeError("issue URL budget cannot hold the repository and a number")
+    number = int("9" * digits)
+    skeleton = {
+        "authority": "a" * _AUTHORITY_MAX_CHARS,
+        "body": "",
+        "issue_node_id": "N" * _NODE_MAX_CHARS,
+        "issue_number": number,
+        "repository": repository,
+        "title": "",
+        "url": prefix + str(number),
+        "v": 2,
+    }
+    blob = json.dumps(skeleton, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    expanded = (BODY_MAX_UTF8_BYTES * _JSON_CONTROL_EXPANSION) + (TITLE_MAX_CHARS * _JSON_CONTROL_EXPANSION)
+    return len(blob) + expanded
+
+
+CONTENT_JSON_MAX_BYTES = _content_json_max_bytes()
 
 
 class LostTaskReply(Exception):
@@ -335,6 +375,14 @@ def _handoff_new(parsed, journal, issues, tasks, current, check, clock) -> dict:
     except ValueError:
         return _result("halted", reason="invalid_clock")
     record = _new_record(parsed, winner, current)
+    if decode_issue_content(record["body"]["description"]) is None:
+        # The snapshot fit the body limit, but the frame would not decode.
+        # Do not journal a posting row and do not queue the task.
+        return _result(
+            "halted",
+            reason="issue_content_unframeable",
+            issue_node_id=record["issue_node_id"],
+        )
     journal["authority"] = parsed["authority"]
     journal["actor_id"] = parsed["actor_id"]
     journal["handoffs"][record["issue_node_id"]] = record
@@ -760,6 +808,7 @@ def encode_issue_content(
 
     The byte count covers the JSON only. Newlines and delimiter-looking text
     inside the strings stay inside that JSON. The result is data, not a command.
+    A new handoff posts it only when ``decode_issue_content`` accepts it.
     """
     payload = {
         "authority": authority,
@@ -863,6 +912,34 @@ def frame_untrusted_issue(task: Mapping) -> str | None:
     )
 
 
+def bridge_frame_refusal(task: Mapping) -> str | None:
+    """Return a non-success reason when this task must not launch a worker.
+
+    Ordinary tasks and a valid v2 issue frame return None. A v1 hash record
+    and a v2 frame that does not decode are refused. The caller must not
+    start a child or report a work event after a reason is returned.
+    ``build_prompt`` may still describe the refusal. That text is not a launch.
+    """
+    if not isinstance(task, Mapping):
+        return None
+    description = task.get("description")
+    if not isinstance(description, str) or description == "":
+        return None
+    if description.startswith(DESCRIPTION_MARK + "\n"):
+        return (
+            "blocked: legacy v1 bridge record is a title hash, not issue "
+            "instructions. No worker started."
+        )
+    if not description.startswith(ISSUE_CONTENT_MARK + "\n"):
+        return None
+    if decode_issue_content(description) is None:
+        return (
+            "blocked: v2 issue-content frame did not validate. "
+            "No worker started."
+        )
+    return None
+
+
 def _locate_frame(text: str):
     if not isinstance(text, str):
         return None
@@ -890,7 +967,7 @@ def _locate_frame(text: str):
                 return None
             size = int(count)
             break
-    if size is None or size < 2 or size > BODY_MAX_UTF8_BYTES + URL_MAX_UTF8_BYTES + 8192:
+    if size is None or size < 2 or size > CONTENT_JSON_MAX_BYTES:
         return None
     rest = text[pos:]
     try:
