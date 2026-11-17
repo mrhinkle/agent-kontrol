@@ -76,6 +76,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import ak_pointers
+from dispatch_ready_bridge import bridge_frame_refusal, frame_untrusted_issue
 from run_telemetry import ParsedRun, build_detail, parse_cli_output, resumes_session
 
 
@@ -173,12 +174,22 @@ def ingest(kind: str, title: str, agent_id: str, platform: str, detail: dict | N
 
 
 def build_prompt(task: dict, pointers: bool = False) -> str:
-    lines = [
-        f"You are running as an autonomous worker dispatched by Agent Kontrol (task #{task['id']}).",
-        f"Task: {task['title']}",
-    ]
-    if task.get("description"):
-        lines.append(f"Instructions:\n{task['description']}")
+    framed = frame_untrusted_issue(task)
+    if framed is not None:
+        # Issue content stays inside the length-delimited object. It is not
+        # labeled as dispatcher instructions. Lane and argv are chosen by the
+        # dispatcher from the task record's platform and project, not from this text.
+        lines = [
+            f"You are running as an autonomous worker dispatched by Agent Kontrol (task #{task['id']}).",
+            framed,
+        ]
+    else:
+        lines = [
+            f"You are running as an autonomous worker dispatched by Agent Kontrol (task #{task['id']}).",
+            f"Task: {task['title']}",
+        ]
+        if task.get("description"):
+            lines.append(f"Instructions:\n{task['description']}")
     if pointers:
         lines.append(
             f"AGENTS.md in this worktree holds a temporary skill-pointer block between "
@@ -193,10 +204,14 @@ def build_prompt(task: dict, pointers: bool = False) -> str:
 
 
 def build_review_prompt(task: dict, worker_output: str) -> str:
+    framed = frame_untrusted_issue(task)
+    if framed is not None:
+        task_block = framed
+    else:
+        task_block = f"Task: {task['title']}\n{task.get('description') or ''}"
     return (
         f"You are a skeptical senior reviewer. Another AI agent just completed this task:\n"
-        f"Task: {task['title']}\n"
-        f"{task.get('description') or ''}\n\n"
+        f"{task_block}\n\n"
         f"Worker's report:\n{worker_output[-3000:]}\n\n"
         "Review the actual state of the working tree / recent changes in this project. "
         "Do NOT make changes. Verify the work is correct and complete. "
@@ -569,6 +584,12 @@ def run_task(task: dict, platform: str, sem: threading.Semaphore) -> None:
     tid = task["id"]
     lock: WorktreeLock | None = None
     try:
+        # Invalid v2 and legacy v1 are not worker instructions. Refuse before
+        # the lock, the running status, the work-event ingest, and the child.
+        refusal = bridge_frame_refusal(task)
+        if refusal is not None:
+            fail_task(tid, agent_id, refusal)
+            return
         project = task.get("project")
         runtime = RUNTIME_FOR_PLATFORM.get(platform)
         try:
