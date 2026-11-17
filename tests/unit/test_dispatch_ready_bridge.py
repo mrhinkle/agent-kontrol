@@ -1544,6 +1544,91 @@ class IssueContentTests(BridgeTest):
             ),
         )
 
+    def test_control_expansion_stays_within_six_json_bytes(self):
+        for code in list(range(1, 32)) + [ord('"'), ord("\\")]:
+            char = chr(code)
+            inner = len(json.dumps(char, ensure_ascii=False).encode("utf-8")) - 2
+            self.assertLessEqual(inner, bridge._JSON_CONTROL_EXPANSION * len(char.encode("utf-8")))
+
+    def test_worst_case_frame_matches_the_bound_and_one_extra_byte_does_not(self):
+        repository = ("a" * bridge._REPO_PART_MAX_CHARS) + "/" + ("b" * bridge._REPO_PART_MAX_CHARS)
+        prefix = f"https://github.com/{repository}/issues/"
+        digits = bridge.URL_MAX_UTF8_BYTES - len(prefix.encode("utf-8"))
+        number = int("9" * digits)
+        body = "\u0001" * bridge.BODY_MAX_UTF8_BYTES
+        title = "\u0001" * bridge.TITLE_MAX_CHARS
+        text = bridge.encode_issue_content(
+            title=title,
+            body=body,
+            url=prefix + str(number),
+            node_id="N" * bridge._NODE_MAX_CHARS,
+            repository=repository,
+            number=number,
+            authority="a" * bridge._AUTHORITY_MAX_CHARS,
+        )
+        decoded = decode_issue_content(text)
+        self.assertEqual(decoded["body"].encode("utf-8"), body.encode("utf-8"))
+        self.assertEqual(decoded["title"].encode("utf-8"), title.encode("utf-8"))
+        located = bridge._locate_frame(text)
+        self.assertEqual(len(located[0].encode("utf-8")), bridge.CONTENT_JSON_MAX_BYTES)
+        marker = f"{bridge._BYTE_HEADER}{bridge.CONTENT_JSON_MAX_BYTES}\n"
+        bigger = text.replace(
+            marker,
+            f"{bridge._BYTE_HEADER}{bridge.CONTENT_JSON_MAX_BYTES + 1}\n",
+            1,
+        ) + " "
+        self.assertIsNone(bridge._locate_frame(bigger))
+        self.assertIsNone(decode_issue_content(bigger))
+
+    def test_max_control_bodies_round_trip_through_build_prompt(self):
+        old_cap = bridge.BODY_MAX_UTF8_BYTES + bridge.URL_MAX_UTF8_BYTES + 8192
+        cases = (
+            ("newlines", "\n" * 32768),
+            ("u0001-10000", "\u0001" * 10000),
+            ("u0001-max", "\u0001" * 32768),
+        )
+        for name, body in cases:
+            with self.subTest(name=name):
+                self.tasks.posts.clear()
+                self.tasks.stored.clear()
+                self.tasks.next_id = 1
+                self.issues.reads.clear()
+                journal = self.ledger / "handoff.json"
+                if journal.exists():
+                    journal.unlink()
+                self.issues.set("mrhinkle/agent-kontrol", [
+                    issue("I_ready", 1, ["dispatch-ready", "P0"], title="t", body=body),
+                ])
+                result = self.once()
+                self.assertEqual(result["outcome"], "handed_off", result)
+                self.assertEqual(len(self.tasks.posts), 1)
+                description = self.tasks.posts[0]["body"]["description"]
+                self.assertGreater(len(description.encode("utf-8")), old_cap)
+                self.assertEqual(decode_issue_content(description)["body"].encode("utf-8"), body.encode("utf-8"))
+                claimed = self.tasks.claim_one()
+                prompt = mc_dispatcher.build_prompt(claimed)
+                extracted = extract_issue_content(prompt)
+                self.assertEqual(extracted["body"].encode("utf-8"), body.encode("utf-8"))
+                self.assertIn("UNTRUSTED ISSUE CONTENT", prompt)
+                self.assertNotIn("\nInstructions:\n", prompt)
+                if "\u0001" in body:
+                    self.assertNotIn("\u0001", prompt)
+                else:
+                    self.assertNotIn("\n" * 100, prompt)
+
+    def test_unframeable_issue_is_not_queued(self):
+        self.issues.set("mrhinkle/agent-kontrol", [
+            issue("I_ready", 1, ["dispatch-ready", "P0"], title="t", body="\n" * 32),
+        ])
+        with mock.patch.object(bridge, "CONTENT_JSON_MAX_BYTES", 64):
+            result = self.once()
+        self.assertEqual(result["outcome"], "halted")
+        self.assertEqual(result["reason"], "issue_content_unframeable")
+        self.assertEqual(result["posted"], False)
+        self.assertIsNone(result["task_id"])
+        self.assertEqual(self.tasks.posts, [])
+        self.assertFalse((self.ledger / "handoff.json").exists())
+
     def assert_rejected(self, row):
         self.issues.set("mrhinkle/agent-kontrol", [row])
         result = self.once()
