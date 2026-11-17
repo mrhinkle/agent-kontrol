@@ -29,7 +29,7 @@ Config via environment (or ~/.claude/mission-control.env, read by main() only):
   MC_MAX_CONCURRENT      parallel tasks across all platforms (default 2)
   MC_TASK_TIMEOUT        seconds per run (default 3600)
   MC_CLAUDE_ARGS         extra args for claude (default: --permission-mode acceptEdits)
-  MC_CODEX_ARGS          extra args for codex exec (default: --full-auto)
+  MC_CODEX_ARGS          extra args for codex exec (default: --sandbox workspace-write)
   MC_GROK_ARGS           extra args for grok
   MC_EVENT_CONSUMER      optional, explicitly registered event consumer id
   MC_EVENT_TOKEN         optional events:read akc_ credential (never MC_TOKEN)
@@ -57,7 +57,6 @@ Or install the launchd plist — see agents/dispatcher/README.md. Stdlib only.
 # importable on Python 3.9, which is still the system python3 on macOS.
 from __future__ import annotations
 
-import datetime
 import fcntl
 import json
 import os
@@ -73,9 +72,11 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import ak_pointers
+from run_telemetry import ParsedRun, build_detail, parse_cli_output, resumes_session
 
 
 def load_env_file() -> None:
@@ -116,6 +117,7 @@ LANE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}")
 MAX_POINTER_RESPONSE = 256_000
 MAX_POINTER_BLOCK = 64_000
 LOCK_NAME = "ak-dispatch.lock"
+SKILL_RECOVERY_NAME = "ak-skill-recovery.json"  # written by ak_skill_launch; blocks every dispatch until recovered
 KILL_GRACE = 5.0  # seconds a CLI's process group gets after SIGTERM, then again after SIGKILL
 
 
@@ -151,7 +153,8 @@ def api(path: str, body: dict | None = None, method: str = "POST", max_bytes: in
         return json.loads(raw.decode("utf-8"))
 
 
-def ingest(kind: str, title: str, agent_id: str, platform: str, detail: dict | None = None) -> None:
+def ingest(kind: str, title: str, agent_id: str, platform: str, detail: dict | None = None,
+           quiet: bool = False) -> None:
     try:
         api(
             "/api/ingest",
@@ -165,7 +168,8 @@ def ingest(kind: str, title: str, agent_id: str, platform: str, detail: dict | N
             },
         )
     except Exception as e:
-        print(f"[mc] ingest failed: {e}", file=sys.stderr)
+        if not quiet:
+            print(f"[mc] ingest failed: {e}", file=sys.stderr)
 
 
 def build_prompt(task: dict, pointers: bool = False) -> str:
@@ -262,18 +266,24 @@ def stop_group(proc: subprocess.Popen, grace: float) -> bool:
     The group id is the CLI's pid (start_new_session), never this process's group.
     A process that moved itself to another group or session is outside it.
     """
-    pgid = proc.pid
+    return stop_group_id(proc.pid, proc.poll, grace)
+
+
+def stop_group_id(pgid: int, reap, grace: float) -> bool:
+    """stop_group for a process group known only by id. reap() collects the leader if it is our child."""
+    if pgid <= 1 or pgid == os.getpgrp():
+        raise ValueError(f"refusing to signal process group {pgid}")
     for sig in (signal.SIGTERM, signal.SIGKILL):
         deadline = time.monotonic() + grace
         try:
             os.killpg(pgid, sig)
         except ProcessLookupError:
-            proc.poll()
+            reap()
             return True
         except PermissionError:
             pass
         while time.monotonic() < deadline:
-            proc.poll()  # reap the leader so its zombie does not keep the group alive
+            reap()  # reap the leader so its zombie does not keep the group alive
             try:
                 os.killpg(pgid, 0)
             except ProcessLookupError:
@@ -281,7 +291,7 @@ def stop_group(proc: subprocess.Popen, grace: float) -> bool:
             except PermissionError:
                 pass
             time.sleep(0.05)
-    proc.poll()
+    reap()
     return False
 
 
@@ -317,7 +327,8 @@ def run_contained(cmd: list[str], cwd: Path, timeout: float) -> tuple[int, str, 
         )
 
 
-def run_cli(platform: str, prompt: str, cwd: Path, review: bool = False) -> tuple[bool, str, float | None]:
+def run_cli(platform: str, prompt: str, cwd: Path, review: bool = False,
+            task_id: int | None = None) -> tuple[bool, str, float | None]:
     """Run one headless agent turn. Returns (ok, output_text, cost_usd)."""
     extra = os.environ.get(f"MC_{platform.split('-')[0].upper()}_ARGS", "").split()
     if platform == "claude-code":
@@ -327,30 +338,70 @@ def run_cli(platform: str, prompt: str, cwd: Path, review: bool = False) -> tupl
         )
     elif platform == "codex":
         cmd = ["codex", "exec"]
-        cmd += ["-s", "read-only"] if review else (extra or ["--full-auto"])
-        cmd += [prompt]
+        cmd += ["-s", "read-only"] if review else (extra or ["--sandbox", "workspace-write"])
+        cmd += ["--json", prompt]
     elif platform == "grok":
-        cmd = ["grok", "-p", prompt] + ([] if review else extra)
+        cmd = ["grok", "-p", prompt] + ([] if review else extra) + ["--output-format", "json"]
     else:
-        return False, f"no CLI runner for platform {platform}", None
+        cmd = None
 
+    started_at = datetime.now(timezone.utc)
+    started = time.monotonic()
+    finished = None
+    parsed = ParsedRun()
+    outcome, error_class = "failed", "process_error"
     try:
-        returncode, stdout, stderr = run_contained(cmd, cwd, TASK_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        return False, f"timed out after {TASK_TIMEOUT}s", None
-    except FileNotFoundError:
-        return False, f"{cmd[0]} not found on PATH", None
-
-    out = stdout + ("\n" + stderr if returncode != 0 and stderr else "")
-    cost = None
-    if platform == "claude-code":
+        if cmd is None:
+            outcome, error_class = "unavailable", "unavailable"
+            return False, f"no CLI runner for platform {platform}", None
         try:
-            payload = json.loads(stdout)
-            cost = payload.get("total_cost_usd")
-            out = payload.get("result") or out
+            # Returns only once the CLI's whole process group is stopped.
+            returncode, stdout, stderr = run_contained(cmd, cwd, TASK_TIMEOUT)
+            finished = time.monotonic()
+        except subprocess.TimeoutExpired:
+            outcome, error_class = "timeout", "timeout"
+            return False, f"timed out after {TASK_TIMEOUT}s", None
+        except FileNotFoundError:
+            outcome, error_class = "unavailable", "unavailable"
+            return False, f"{cmd[0]} not found on PATH", None
+        except OSError:
+            return False, "CLI process could not start", None
+
+        out = stdout + ("\n" + stderr if returncode != 0 and stderr else "")
+        parsed = parse_cli_output(platform, stdout)
+        if parsed.output_text:
+            out = parsed.output_text
+            if platform != "claude-code" and returncode != 0 and stderr:
+                out += "\n" + stderr
+        cost = None
+        if platform == "claude-code":
+            try:
+                payload = json.loads(stdout)
+                cost = payload.get("total_cost_usd")
+            except (ValueError, AttributeError):
+                pass
+        ok = returncode == 0 and not parsed.reported_error and parsed.protocol_ok
+        outcome = "completed" if ok else "failed"
+        error_class = None if ok else ("process_error" if returncode != 0 or parsed.reported_error else "protocol_error")
+        return ok, out.strip(), cost
+    finally:
+        # Reporting failures must never affect the existing task/result path.
+        try:
+            if finished is None:
+                finished = time.monotonic()
+            duration_ms = max(0, round((finished - started) * 1000))
+            # Map monotonic elapsed time onto the start timestamp so clock adjustments
+            # cannot produce a negative or misleading run span.
+            ended_at = started_at + timedelta(milliseconds=duration_ms)
+            detail = build_detail(
+                review=review, started_at=started_at, ended_at=ended_at,
+                duration_ms=duration_ms,
+                outcome=outcome, error_class=error_class, parsed=parsed,
+                cumulative=resumes_session(extra if not review else [], platform), task_id=task_id,
+            )
+            ingest("run_complete", "Agent run complete", f"{platform}-{HOSTNAME}", platform, detail, quiet=True)
         except Exception:
             pass
-    return returncode == 0, out.strip(), cost
 
 
 def extract_result(output: str) -> str:
@@ -461,6 +512,16 @@ class WorktreeLock:
                 self.fd = None
 
 
+def refuse_unresolved_recovery(git_dir: Path) -> None:
+    """Call with the worktree lock held. An interrupted skills launch may still have a live worker here."""
+    path = git_dir / SKILL_RECOVERY_NAME
+    if os.path.lexists(path):
+        raise DispatchRefused(
+            f"{path} records an interrupted skills launch; confirm its worker group is gone, "
+            "then run `ak_skill_launch.py recover --cwd <worktree>`"
+        )
+
+
 def fetch_pointers(lane: str, runtime: str) -> str:
     """The lane's pointer block from GET /api/skills/pointers. Only lane and runtime are sent."""
     query = urllib.parse.urlencode({"lane": lane, "runtime": runtime})
@@ -519,9 +580,11 @@ def run_task(task: dict, platform: str, sem: threading.Semaphore) -> None:
                     f"digits, and . _ : / - starting with a letter or digit (got {project!r})"
                 )
             cwd = resolve_project(project, WORKDIR)
-            candidate = WorktreeLock(linked_worktree_git_dir(cwd))
+            git_dir = linked_worktree_git_dir(cwd)
+            candidate = WorktreeLock(git_dir)
             candidate.acquire(cwd)
             lock = candidate
+            refuse_unresolved_recovery(git_dir)
         except DispatchRefused as e:
             fail_task(tid, agent_id, str(e))
             return
@@ -547,7 +610,9 @@ def run_task(task: dict, platform: str, sem: threading.Semaphore) -> None:
         try:
             api(f"/api/tasks/{tid}", {"status": "running", "agent_id": agent_id}, "PATCH")
             ingest("status", f"Running task #{tid}: {task['title']}", agent_id, platform, {"task_id": tid})
-            ok, output, cost = run_cli(platform, build_prompt(task, injection.changed and block != ""), cwd)
+            ok, output, cost = run_cli(
+                platform, build_prompt(task, injection.changed and block != ""), cwd, task_id=tid
+            )
         finally:
             try:
                 ak_pointers.cleanup(injection)
@@ -583,7 +648,9 @@ def run_task(task: dict, platform: str, sem: threading.Semaphore) -> None:
             else:
                 api(f"/api/tasks/{tid}", {"status": "review", "agent_id": agent_id}, "PATCH")
                 ingest("status", f"Task #{tid} in review by {reviewer}", agent_id, platform, {"task_id": tid})
-                r_ok, r_out, r_cost = run_cli(reviewer, build_review_prompt(task, output), cwd, review=True)
+                r_ok, r_out, r_cost = run_cli(
+                    reviewer, build_review_prompt(task, output), cwd, review=True, task_id=tid
+                )
                 if r_cost:
                     cost = (cost or 0) + r_cost
                 ok, note = review_outcome(r_ok, r_out)
@@ -637,17 +704,17 @@ _REASON = re.compile(r"^[a-z0-9_]{1,64}$")
 NOTICE_CACHE_LIMIT = 256
 
 
-def _instant(value: object) -> datetime.datetime | None:
+def _instant(value: object) -> datetime | None:
     if not isinstance(value, str) or len(value) > 40:
         return None
     text = value[:-1] + "+00:00" if value.endswith("Z") else value
     try:
-        parsed = datetime.datetime.fromisoformat(text)
+        parsed = datetime.fromisoformat(text)
     except ValueError:
         return None
     if parsed.tzinfo is None:
         return None
-    return parsed.astimezone(datetime.timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _route_name(value: object) -> bool:
