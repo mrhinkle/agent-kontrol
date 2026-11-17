@@ -4,6 +4,7 @@ export const NAV_LINKS: { href: string; label: string; accent?: boolean }[] = [
   { href: "/progress", label: "Progress" },
   { href: "/velocity", label: "Velocity" },
   { href: "/usage", label: "Usage and Costs" },
+  { href: "/observability", label: "Langfuse" },
   { href: "/tasks", label: "Tasks" },
   { href: "/decisions", label: "Decisions" },
   { href: "/history", label: "History" },
