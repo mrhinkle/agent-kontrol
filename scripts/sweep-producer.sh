@@ -170,8 +170,11 @@ PRS_QUERY='query SweepPrs($owner: String!, $name: String!, $after: String) {
             pageInfo { hasNextPage }
             nodes {
               __typename
-              ... on CheckRun { name status conclusion }
-              ... on StatusContext { context state }
+              ... on CheckRun {
+                databaseId name status conclusion startedAt completedAt
+                checkSuite { app { databaseId slug } workflowRun { databaseId runNumber createdAt event workflow { databaseId name } } }
+              }
+              ... on StatusContext { context state createdAt creator { login } }
             }
           }
         } } } }
@@ -339,11 +342,20 @@ PR_HEADS_PAGE_OK='
 '
 
 # One PR node to one intake row. Checks are the configured required contexts
-# on the commit GitHub reports for the head: a context that is missing, a
-# truncated context list, or no configured list is "unknown", never green. A
-# published review counts only at the current head. started:false needs the
-# configured review-start status context and a complete context list at the
-# head; without that source, review is omitted (unknown).
+# on the commit GitHub reports for the head. Repeated attempts of one name
+# reduce to the current run for that producer before the names are combined.
+# A check run and a commit status stay separate, and both have to pass.
+# Different apps stay separate. A GitHub Actions result also stays tied to
+# its workflow and event, so a different workflow cannot hide a failure.
+# The current attempt is the newest run whose run number, run id, and run
+# creation time agree, including a queued run that has not started. A later
+# completion on an older run does not replace it. A missing context, a
+# truncated list, no configured list, the wrong head, or an attempt whose
+# producer or ordering is ambiguous is "unknown", never green. A published
+# review counts only at the current head. started:false needs the configured
+# review-start status context and a complete context list at the head;
+# without that source, review is omitted (unknown). A skipped check from
+# another app is not that signal.
 PR_ROW='
   def lc: ascii_downcase;
   def sha: type == "string" and test("^([0-9a-f]{40}|[0-9a-f]{64})$");
@@ -355,8 +367,120 @@ PR_ROW='
     elif .__typename == "StatusContext" then
       (if .state == "SUCCESS" then "success" elif (.state | IN("PENDING", "EXPECTED")) then "pending" else "failure" end)
     else "unknown" end;
-  def ctxname: (if .__typename == "CheckRun" then .name elif .__typename == "StatusContext" then .context else null end)
-    | if type == "string" then lc else null end;
+  def num($v): if $v | type == "number" then $v else null end;
+  def txt($v): if $v | type == "string" and $v != "" then $v else null end;
+  def ts($v):
+    if $v == null then null
+    else try ($v | fromdateiso8601) catch (
+      if ($v | test("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d+Z$")) then
+        (($v | sub("\\.\\d+Z$"; "Z") | fromdateiso8601)
+          + (($v | capture("\\.(?<f>\\d+)Z").f + "000" | .[0:3] | tonumber) / 1000))
+      else null end) end;
+  def attempt:
+    if type != "object" then null
+    elif .__typename == "CheckRun" then
+      (txt(.name) | if . == null then null else lc end) as $n
+      | if $n == null then null
+        else {
+          typ: "check", n: $n, s: ctxstate,
+          app: num(.checkSuite.app.databaseId),
+          slug: (txt(.checkSuite.app.slug) | if . == null then null else lc end),
+          run: num(.checkSuite.workflowRun.databaseId),
+          runn: num(.checkSuite.workflowRun.runNumber),
+          rcreated: ts(txt(.checkSuite.workflowRun.createdAt)),
+          event: (txt(.checkSuite.workflowRun.event) | if . == null then null else lc end),
+          wf: num(.checkSuite.workflowRun.workflow.databaseId),
+          wfname: (txt(.checkSuite.workflowRun.workflow.name) | if . == null then null else lc end),
+          id: num(.databaseId),
+          started: ts(txt(.startedAt))
+        } end
+    elif .__typename == "StatusContext" then
+      (txt(.context) | if . == null then null else lc end) as $n
+      | if $n == null then null
+        else {
+          typ: "status", n: $n, s: ctxstate,
+          creator: (txt(.creator.login) | if . == null then null else lc end),
+          created: ts(txt(.createdAt))
+        } end
+    else null end;
+  def producer:
+    if .typ == "status" then (if .creator == null then null else "status|\(.creator)" end)
+    else
+      (if .slug == "github-actions" or .run != null or .runn != null or .wf != null or .wfname != null or .event != null or .rcreated != null then true else false end) as $actions
+      | if (.app == null and .slug == null) then null
+        elif $actions then
+          if ((.wf == null and .wfname == null) or .event == null) then null
+          else "check|app:\(.app // .slug)|wf:\(.wf // .wfname)|ev:\(.event)" end
+        else "check|app:\(.app // .slug)" end
+    end;
+  def ord($a; $b):
+    if $a == null or $b == null then null
+    elif $a > $b then 1 elif $a < $b then -1 else 0 end;
+  # Run number, run id, and run creation time have to agree. A later completion is not an order.
+  def run_order($a; $b):
+    (ord($a.runn; $b.runn)) as $rn
+    | (ord($a.run; $b.run)) as $ri
+    | (ord($a.rcreated; $b.rcreated)) as $rc
+    | if $rn == null or $ri == null then null
+      elif ($rn != 0 and $ri != 0 and $rn != $ri) or ($rn == 0 and $ri != 0) or ($ri == 0 and $rn != 0) then "conflict"
+      elif $rc != null and $rc != 0 and (
+        ($rn != 0 and $rc != $rn) or ($ri != 0 and $rc != $ri) or ($rn == 0 and $ri == 0)
+      ) then "conflict"
+      elif $rn == 0 and $ri == 0 then 0
+      else (if $rn == 0 then $ri else $rn end) end;
+  def beats($a; $b):
+    if $a.typ == "status" then
+      (ord($a.created; $b.created)) as $c
+      | if $c == null or $c == 0 then null else $c == 1 end
+    elif ($a.event != null and ($a.wf != null or $a.wfname != null)) then
+      (run_order($a; $b)) as $runord
+      | if $runord == "conflict" or $runord == null then null
+        elif $runord == 1 then true
+        elif $runord == -1 then false
+        else
+          (ord($a.id; $b.id)) as $id
+          | (ord($a.started; $b.started)) as $st
+          | if $id == null or $id == 0 then null
+            elif $st != null and $st != 0 and $st != $id then null
+            else $id == 1 end
+        end
+    else
+      (ord($a.id; $b.id)) as $id
+      | (ord($a.started; $b.started)) as $st
+      | if $id == null or $id == 0 then null
+        elif $st != null and $st != 0 and $st != $id then null
+        else $id == 1 end
+    end;
+  def pick($g):
+    if ($g | length) == 1 then $g[0]
+    elif $g[0].typ == "status" then
+      if any($g[]; .created == null) or (($g | map(.created) | unique | length) != ($g | length)) then null
+      else
+        [range(0; $g | length) as $i
+          | select(all(range(0; $g | length); . as $j | $j == $i or beats($g[$i]; $g[$j]) == true))
+          | $i]
+        | if length == 1 then $g[.[0]] else null end
+      end
+    elif any($g[]; .id == null) or (if $g[0].event != null then any($g[]; .run == null or .runn == null) else false end) then null
+    else
+      [range(0; $g | length) as $i
+        | select(all(range(0; $g | length); . as $j | $j == $i or beats($g[$i]; $g[$j]) == true))
+        | $i]
+      | if length == 1 then $g[.[0]] else null end
+    end;
+  def bucket($items):
+    if ($items | length) <= 1 then [$items[] | {n, typ, s}]
+    elif any($items[]; producer == null) then [{n: $items[0].n, typ: $items[0].typ, s: "unknown"}]
+    else
+      [ $items | group_by(producer)[]
+        | pick(.) as $cur
+        | if $cur == null then {n: .[0].n, typ: .[0].typ, s: "unknown"} else {n: $cur.n, typ: $cur.typ, s: $cur.s} end ]
+    end;
+  def contributions($nodes):
+    [ $nodes[] | attempt | select(. != null) ]
+    | group_by([.typ, .n])
+    | [ .[] | bucket(.) ]
+    | add // [];
   (($cfg.required_checks // []) | map(lc)) as $req
   | (($cfg.review_start.status_context // null) | if . == null then null else lc end) as $rctx
   | .headRefOid as $head
@@ -366,7 +490,7 @@ PR_ROW='
      elif $c.statusCheckRollup == null then {complete: true, list: []}
      elif ($c.statusCheckRollup.contexts.nodes | type) != "array" then {complete: false, list: []}
      else {complete: ($c.statusCheckRollup.contexts.pageInfo.hasNextPage == false),
-           list: [$c.statusCheckRollup.contexts.nodes[] | {n: ctxname, s: ctxstate}]} end) as $x
+           list: contributions($c.statusCheckRollup.contexts.nodes)} end) as $x
   | (if ($req | length) == 0 or ($x.complete | not) or $coid != $head then "unknown"
      else [$req[] as $r | [$x.list[] | select(.n == $r) | .s]] as $per
        | if any($per[]; length == 0) or any($per[][]; . == "unknown") then "unknown"

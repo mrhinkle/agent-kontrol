@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { enforceBearer } from "@/lib/auth";
+import { deny, resolveBearerAccess } from "@/lib/auth";
+import { actorFromPrincipal, runWithActor } from "@/lib/actor";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
 import { ingestSnapshots, type IngestInput } from "@/lib/progress-store";
@@ -27,8 +28,8 @@ export const maxDuration = 30;
  * }
  */
 export async function POST(req: Request) {
-  const denied = await enforceBearer(req);
-  if (denied) return denied;
+  const access = await resolveBearerAccess(req);
+  if (!access.ok) return deny(access);
   if (!isConfigured()) {
     return NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; snapshot dropped" });
   }
@@ -50,7 +51,7 @@ export async function POST(req: Request) {
   }
 
   try {
-    const written = await ingestSnapshots(body);
+    const written = await runWithActor(actorFromPrincipal(access.principal), () => ingestSnapshots(body));
     return NextResponse.json({ ok: true, written });
   } catch (e) {
     return publicError("[progress] ingest failed", e);

@@ -1,9 +1,10 @@
 import { gunzipSync } from "node:zlib";
 import { NextResponse } from "next/server";
-import { enforceBearer } from "@/lib/auth";
+import { deny, resolveBearerAccess } from "@/lib/auth";
+import { actorFromPrincipal, runWithActor } from "@/lib/actor";
 import { apiError, publicError } from "@/lib/api-error";
 import { isConfigured } from "@/lib/db";
-import { pruneSpans, upsertSpans } from "@/lib/trace-store";
+import { pruneSpans, storeAcceptedSpans } from "@/lib/trace-store";
 import { captureContentEnabled, dedupeSpans, MAX_BODY_BYTES, parseOtlp } from "@/lib/traces";
 
 export const dynamic = "force-dynamic";
@@ -42,8 +43,8 @@ async function readCapped(req: Request, max: number): Promise<Buffer | null> {
  * unless MC_TRACE_CAPTURE_CONTENT is set (credentials are never kept).
  */
 export async function POST(req: Request) {
-  const denied = await enforceBearer(req);
-  if (denied) return denied;
+  const access = await resolveBearerAccess(req);
+  if (!access.ok) return deny(access);
   const type = req.headers.get("content-type") ?? "";
   if (!type.includes("json")) {
     return apiError("unsupported_media_type", {
@@ -84,7 +85,10 @@ export async function POST(req: Request) {
   if (!isConfigured()) return NextResponse.json({ partialSuccess, demo: true });
 
   try {
-    await upsertSpans(dedupeSpans(spans));
+    const accepted = dedupeSpans(spans);
+    if (accepted.length > 0) {
+      await runWithActor(actorFromPrincipal(access.principal), () => storeAcceptedSpans(accepted));
+    }
     // Housekeeping on roughly 1 in 50 writes, so no scheduler is needed.
     if (Math.random() < 0.02) pruneSpans().catch((e) => console.error("[traces] prune failed", e));
     return NextResponse.json({ partialSuccess });

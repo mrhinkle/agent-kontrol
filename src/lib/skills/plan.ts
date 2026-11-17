@@ -118,7 +118,7 @@ export function fingerprint(skill: {
   const refs = [...skill.references]
     .map((ref) => ({ path: ref.path, sha: skillSha(ref.content) }))
     .sort((a, b) => a.path.localeCompare(b.path));
-  return skillSha(JSON.stringify({
+  return skillSha(canonicalJson({
     source_id: skill.source_id,
     path: skill.path,
     name: skill.name,
@@ -132,4 +132,25 @@ export function fingerprint(skill: {
     tags: skill.tags ?? [],
     frontmatter: skill.frontmatter ?? {},
   }));
+}
+
+/**
+ * JSON with object keys sorted at every depth. Postgres jsonb does not keep
+ * key order, so a stored frontmatter map reads back reordered. Array order,
+ * scalar types and null are kept as JSON.stringify writes them.
+ */
+function canonicalJson(value: unknown): string {
+  const json = value != null && typeof (value as { toJSON?: unknown }).toJSON === "function"
+    ? (value as { toJSON: () => unknown }).toJSON()
+    : value;
+  if (Array.isArray(json)) return `[${json.map((item) => canonicalJson(item ?? null)).join(",")}]`;
+  if (json !== null && typeof json === "object") {
+    const record = json as Record<string, unknown>;
+    const fields = Object.keys(record)
+      .sort()
+      .filter((key) => record[key] !== undefined && typeof record[key] !== "function")
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`);
+    return `{${fields.join(",")}}`;
+  }
+  return JSON.stringify(json) ?? "null";
 }

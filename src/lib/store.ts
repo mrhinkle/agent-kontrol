@@ -4,7 +4,8 @@ import { activityRow, attachReceipt, receiptFromParts, type ActivityRow, type Re
 import { IDEMPOTENCY_ROUTE, payloadOf, runIdempotent, type IdempotencyClaim } from "./idempotency";
 import { StaleWrite, absentRevision } from "./revision";
 import { writeSessionNote } from "./session-memory";
-import { sql, type SqlTag } from "./db";
+import { sql, withTransaction, type SqlTag } from "./db";
+import { insertToolReceipt, ToolReceiptError } from "./tool-receipt";
 import { boundedTransaction } from "./events-stream";
 import {
   QUEUE_EPISODE_SCAN_LIMIT,
@@ -20,8 +21,10 @@ import {
   type TaskCoverage,
   type TaskNoticeObserverProof,
 } from "./task-queue-notice";
-import { insertToolReceipt } from "./tool-receipt";
+import { isTaskLane } from "./task-lane";
 import { stampSortAt } from "./list-params";
+import { queueLangfuseEvent } from "./langfuse-report";
+import { parseRunTelemetry } from "./run-telemetry";
 import type { Event, FleetAgent, Message, MemoryItem, Session, Task, TaskStatus } from "./types";
 import { asUnknownWriteOutcome } from "./write-outcome";
 
@@ -75,6 +78,17 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+function messageResourceId(value: unknown): string {
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "number" && Number.isInteger(value) && value > 0) return String(value);
+  if (typeof value === "string" && /^[1-9]\d*$/.test(value)) return value;
+  throw new Error("message id missing");
+}
+
+function sortMessageIds(ids: string[]): string[] {
+  return [...ids].sort((a, b) => a.length - b.length || (a < b ? -1 : a > b ? 1 : 0));
+}
+
 function isUniqueViolation(e: unknown): boolean {
   return typeof e === "object" && e !== null && (e as { code?: unknown }).code === "23505";
 }
@@ -95,6 +109,8 @@ export async function report(input: ReportInput, opts?: { principal?: Principal 
   if (containsReservedQueueMarker(input.detail) || containsReservedQueueMarker(input)) {
     throw new ReservedQueueMarkerError();
   }
+  const run = input.kind === "run_complete" ? parseRunTelemetry(input.detail) : null;
+  if (input.kind === "run_complete" && !run) throw new Error("invalid run telemetry");
   const db = sql();
   const provenance = provenanceFromPrincipal(opts && "principal" in opts ? opts.principal : currentPrincipal());
   const principalKind = provenance?.principal_kind ?? null;
@@ -106,6 +122,7 @@ export async function report(input: ReportInput, opts?: { principal?: Principal 
   // never clobbers platform/machine/display_name set by hooks (or vice versa).
   // COALESCE on conflict keeps existing values when the new side is null.
   const platform = input.platform ?? null;
+  let storedPlatform = platform;
   const machine = input.machine ?? null;
   const displayName = input.display_name ?? null;
   const sessionId = input.session_id ? input.session_id : null;
@@ -122,8 +139,11 @@ export async function report(input: ReportInput, opts?: { principal?: Principal 
   // One statement. The event insert depends on the agent and session
   // writes, so a rejecting events trigger rolls all of them back.
   let receipt: Receipt | null = null;
+  let persistedEvent: { id: number; created_at: string | Date } | undefined;
   try {
-    const rows = await db`
+    // A completed run is stored once per (agent, run_id): its sanitized detail
+    // replaces the raw one, and an advisory lock serializes concurrent deliveries.
+    const write = (q: SqlTag) => q`
       with agent_row as (
         insert into agents (id, platform, machine, display_name, last_seen_at)
         values (
@@ -138,7 +158,7 @@ export async function report(input: ReportInput, opts?: { principal?: Principal 
           platform = coalesce(${platform}::text, agents.platform),
           machine = coalesce(${machine}::text, agents.machine),
           display_name = coalesce(${displayName}::text, agents.display_name)
-        returning id
+        returning id, platform
       ),
       prior_session as (
         select id, status
@@ -190,19 +210,34 @@ export async function report(input: ReportInput, opts?: { principal?: Principal 
           agent_row.id,
           ${sessionId}::text,
           ${input.kind},
-          ${title}::text,
-          ${detail}::jsonb,
+          ${run ? "CLI run completed" : title}::text,
+          ${run ? JSON.stringify(run) : detail}::jsonb,
           ${principalKind}::text,
           ${principalId}::text
         from agent_row
         where (select count(*) from session_insert) >= 0
           and (select count(*) from session_update) >= 0
+          and (${run?.run_id ?? null}::text is null or not exists (
+            select 1 from events
+            where agent_id = agent_row.id and kind = 'run_complete' and detail->>'run_id' = ${run?.run_id ?? null}::text
+          ))
         returning id, kind, created_at
       )
-      select id, kind, created_at from event_row
+      select event_row.id, event_row.kind, event_row.created_at, agent_row.platform
+      from event_row cross join agent_row
     `;
+    const rows = run
+      ? await withTransaction(async (tx) => {
+          await tx`select pg_advisory_xact_lock(hashtextextended(${JSON.stringify([agentId, run.run_id])}, 0))`;
+          return write(tx);
+        })
+      : await write(db);
     const row = rows[0] as Record<string, unknown> | undefined;
-    receipt = row ? receiptFromParts(row.id, row.kind, row.created_at) : null;
+    if (row) {
+      receipt = receiptFromParts(row.id, row.kind, row.created_at);
+      persistedEvent = { id: Number(row.id), created_at: row.created_at as string | Date };
+      if (typeof row.platform === "string") storedPlatform = row.platform;
+    }
   } catch (e) {
     throw new Error(`report: ${errMsg(e)}`);
   }
@@ -216,6 +251,17 @@ export async function report(input: ReportInput, opts?: { principal?: Principal 
     await Promise.race([work, new Promise<void>((resolve) => (timer = setTimeout(resolve, 2500)))]);
     clearTimeout(timer);
   }
+  // Only a newly stored event is exported; a duplicate run delivery is not.
+  if (persistedEvent) queueLangfuseEvent({
+    id: persistedEvent.id,
+    created_at: persistedEvent.created_at,
+    agent_id: agentId,
+    session_id: input.session_id,
+    platform: storedPlatform,
+    kind: input.kind,
+    status: input.status,
+    ...(run ? { run } : {}),
+  });
   return receipt;
 }
 
@@ -1090,16 +1136,29 @@ export async function fetchMessages(input: {
     const now = new Date().toISOString();
     const ids = msgs.map((m) => m.id);
     try {
-      await db`
-        update messages
-        set delivered_at = coalesce(delivered_at, ${now}), acked_at = ${now}
-        where id = any(${ids}::bigint[])
-      `;
-      msgs = msgs.map((m) => ({
-        ...m,
-        delivered_at: m.delivered_at ?? now,
-        acked_at: now,
-      }));
+      const written = await withTransaction(async (tx) => {
+        const rows = await tx`
+          update messages
+          set delivered_at = coalesce(delivered_at, ${now}), acked_at = ${now}
+          where id = any(${ids}::bigint[])
+            and acked_at is null
+          returning id
+        `;
+        const updated = sortMessageIds(rows.map((row) => messageResourceId(row.id)));
+        if (updated.length === 0) return updated;
+        await insertToolReceipt(tx, {
+          kind: "messages.ack",
+          title: "Messages acknowledged",
+          extra: { operation: "ack", message_ids: updated },
+        });
+        return updated;
+      });
+      const stamped = new Set(written);
+      msgs = msgs.map((m) => (
+        stamped.has(String(m.id))
+          ? { ...m, delivered_at: m.delivered_at ?? now, acked_at: now }
+          : m
+      ));
     } catch (e) {
       throw new Error(errMsg(e));
     }
@@ -1128,23 +1187,36 @@ export async function listConversation(input: {
   }
 }
 
-/** Operator opens the drawer — clear unread on outbound replies. */
+/**
+ * Operator opens the drawer — clear unread on outbound replies.
+ * The timestamp update and its actor receipt commit together. Zero matches
+ * store no receipt. agent_id selects the conversation; it is not the actor.
+ */
 export async function markConversationRead(input: {
   agent_id: string;
 }): Promise<number> {
-  const db = sql();
   const agentId = slugify(input.agent_id);
   const now = new Date().toISOString();
   try {
-    const rows = await db`
-      update messages
-      set read_by_dashboard_at = ${now}
-      where agent_id = ${agentId}
-        and direction = 'outbound'
-        and read_by_dashboard_at is null
-      returning id
-    `;
-    return rows.length;
+    const written = await withTransaction(async (tx) => {
+      const rows = await tx`
+        update messages
+        set read_by_dashboard_at = ${now}
+        where agent_id = ${agentId}
+          and direction = 'outbound'
+          and read_by_dashboard_at is null
+        returning id
+      `;
+      const updated = sortMessageIds(rows.map((row) => messageResourceId(row.id)));
+      if (updated.length === 0) return updated;
+      await insertToolReceipt(tx, {
+        kind: "messages.read",
+        title: "Messages marked read",
+        extra: { operation: "read", message_ids: updated },
+      });
+      return updated;
+    });
+    return written.length;
   } catch (e) {
     throw new Error(errMsg(e));
   }
@@ -1459,27 +1531,71 @@ export async function listTasks(input?: {
   }
 }
 
-/**
- * Atomically claim the next queued task for a platform (and optionally a
- * machine). Guarded update (`status = 'queued'`) means two dispatchers racing
- * for the same row can't both win — the loser just tries the next candidate.
- */
-export async function claimNextTask(input: {
+type ClaimFilterInput = {
   platform: string;
   machine?: string;
   agent_id: string;
-}): Promise<Task | null> {
+  /** Omitted keeps every project. Null, blank, or a non-lane is rejected before SQL. */
+  project?: string | null;
+};
+
+type ClaimScope = {
+  machine: string | null;
+  hasMachine: boolean;
+  project: string | null;
+  hasProject: boolean;
+};
+
+/**
+ * A supplied project is an exact lane or an error. Omitting the property
+ * is the historical unfiltered claim. A present null is not an omission.
+ */
+function claimScope(input: { machine?: string; project?: string | null }): ClaimScope {
+  const supplied = Object.prototype.hasOwnProperty.call(input, "project");
+  if (supplied && !isTaskLane(input.project)) throw new Error("invalid task project filter");
+  const machine = input.machine ? input.machine : null;
+  return {
+    machine,
+    hasMachine: machine !== null,
+    project: supplied ? input.project ?? null : null,
+    hasProject: supplied,
+  };
+}
+
+/** Eligible rows only, before the candidate limit, so a wrong lane or machine cannot hide a later match. */
+async function queuedClaimCandidates(platform: string, scope: ClaimScope): Promise<Task[]> {
+  const db = sql();
+  const rows = await db`
+    select * from tasks
+    where status = 'queued'
+      and platform = any(${[platform, "any"]}::text[])
+      and (
+        machine is null
+        or (${scope.hasMachine}::boolean and machine = ${scope.machine}::text)
+      )
+      and (
+        ${scope.hasProject}::boolean = false
+        or project = ${scope.project}::text
+      )
+    order by priority asc, created_at asc
+    limit 10
+  `;
+  return (rows as Record<string, unknown>[]).map(asTask);
+}
+
+/**
+ * Atomically claim the next queued task for a platform (and optionally a
+ * machine and an exact project). Guarded update (`status = 'queued'`, plus
+ * the same platform, machine, and project predicate) means two dispatchers
+ * racing for the same row can't both win, and a row whose lane changed after
+ * it was selected is not claimed and writes no receipt.
+ */
+export async function claimNextTask(input: ClaimFilterInput): Promise<Task | null> {
+  const scope = claimScope(input);
   const db = sql();
   let candidates: Task[];
   try {
-    const rows = await db`
-      select * from tasks
-      where status = 'queued'
-        and platform = any(${[input.platform, "any"]}::text[])
-      order by priority asc, created_at asc
-      limit 10
-    `;
-    candidates = (rows as Record<string, unknown>[]).map(asTask);
+    candidates = await queuedClaimCandidates(input.platform, scope);
   } catch (e) {
     throw new Error(errMsg(e));
   }
@@ -1489,12 +1605,13 @@ export async function claimNextTask(input: {
   const activityActorType = actor?.actor_type ?? null;
   const activityActorId = actor?.actor_id ?? null;
   for (const t of candidates) {
-    if (t.machine && input.machine && t.machine !== input.machine) continue;
-    if (t.machine && !input.machine) continue;
+    if (t.machine && scope.hasMachine && t.machine !== scope.machine) continue;
+    if (t.machine && !scope.hasMachine) continue;
+    if (scope.hasProject && t.project !== scope.project) continue;
     try {
       // One statement. The event insert reads only the updated row, so a lost
-      // race (zero rows) writes no event. Actor parameters follow `where id`
-      // so the claim's existing binds stay $1..$4.
+      // race (zero rows) writes no event. Platform, machine, and project are
+      // checked again here. Actor parameters stay after that predicate.
       const claimed = await db`
         with changed as (
           update tasks set
@@ -1502,7 +1619,17 @@ export async function claimNextTask(input: {
             assigned_agent = ${input.agent_id},
             claimed_at = ${now},
             updated_at = ${now}
-          where id = ${t.id} and status = 'queued'
+          where id = ${t.id}
+            and status = 'queued'
+            and platform = any(${[input.platform, "any"]}::text[])
+            and (
+              machine is null
+              or (${scope.hasMachine}::boolean and machine = ${scope.machine}::text)
+            )
+            and (
+              ${scope.hasProject}::boolean = false
+              or project = ${scope.project}::text
+            )
           returning *
         ),
         logged as (
@@ -1797,28 +1924,18 @@ function coverageFromClaimRow(row: Record<string, unknown>): TaskCoverage {
  * (events_created_idx) and does not fall back to an older episode.
  * An ineligible observer still claims, with unknown evidence and no ids.
  */
-export async function claimTaskWithCoverage(input: {
-  platform: string;
-  machine?: string;
-  agent_id: string;
+export async function claimTaskWithCoverage(input: ClaimFilterInput & {
   observer: TaskNoticeObserverProof | null;
 }): Promise<{ task: Task | null; coverage: TaskCoverage }> {
+  const scope = claimScope(input);
   if (!input.observer) {
     const task = await claimNextTask(input);
     return { task, coverage: unknownCoverage("ineligible_observer", await coverageMeasuredAt()) };
   }
   const observer = input.observer;
-  const db = sql();
   let candidates: Task[];
   try {
-    const rows = await db`
-      select * from tasks
-      where status = 'queued'
-        and platform = any(${[input.platform, "any"]}::text[])
-      order by priority asc, created_at asc
-      limit 10
-    `;
-    candidates = (rows as Record<string, unknown>[]).map(asTask);
+    candidates = await queuedClaimCandidates(input.platform, scope);
   } catch (e) {
     throw new Error(errMsg(e));
   }
@@ -1828,8 +1945,9 @@ export async function claimTaskWithCoverage(input: {
   const activityActorType = actor?.actor_type ?? null;
   const activityActorId = actor?.actor_id ?? null;
   for (const t of candidates) {
-    if (t.machine && input.machine && t.machine !== input.machine) continue;
-    if (t.machine && !input.machine) continue;
+    if (t.machine && scope.hasMachine && t.machine !== scope.machine) continue;
+    if (t.machine && !scope.hasMachine) continue;
+    if (scope.hasProject && t.project !== scope.project) continue;
     try {
       // The scan cutoff is statement_timestamp(), which is stable for this
       // statement, so the created_at index can stop at the window. A volatile
@@ -1846,7 +1964,17 @@ export async function claimTaskWithCoverage(input: {
             assigned_agent = ${input.agent_id},
             claimed_at = ${now},
             updated_at = ${now}
-          where id = ${t.id} and status = 'queued'
+          where id = ${t.id}
+            and status = 'queued'
+            and platform = any(${[input.platform, "any"]}::text[])
+            and (
+              machine is null
+              or (${scope.hasMachine}::boolean and machine = ${scope.machine}::text)
+            )
+            and (
+              ${scope.hasProject}::boolean = false
+              or project = ${scope.project}::text
+            )
           returning *
         ),
         logged as (
@@ -2058,7 +2186,9 @@ export async function readMemoryForPreview(key: string): Promise<{ item: MemoryI
 /**
  * One events row for a write that already committed in its own statement.
  * Decision tools use this after the row is stored. The kind is the tool name.
- * A write that must roll back with its receipt calls `insertToolReceipt` on its own transaction instead.
+ * A suppressed insert returns null so that already-committed write still
+ * resolves. Any other database error throws. A write that must roll back
+ * with its receipt calls `insertToolReceipt` on its own transaction instead.
  */
 export async function recordToolReceipt(input: {
   kind: string;
@@ -2068,6 +2198,7 @@ export async function recordToolReceipt(input: {
   try {
     return await insertToolReceipt(sql(), input);
   } catch (e) {
+    if (e instanceof ToolReceiptError) return null;
     throw new Error(`recordToolReceipt: ${errMsg(e)}`);
   }
 }

@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { apiError } from "@/lib/api-error";
+import { DASHBOARD_ACTOR_ID, runWithActor, type Actor } from "@/lib/actor";
 import { requireDashboardSession } from "@/lib/auth";
 import { describeDbError } from "@/lib/db-error";
 import {
@@ -52,6 +53,18 @@ function failure(what: string, e: unknown) {
   return apiError("internal_error", { message: `Could not ${what}.` });
 }
 
+/**
+ * Call only after requireDashboardSession has allowed the request.
+ * A configured password means that gate already matched the session cookie,
+ * so the actor is the dashboard operator. No password is the open local
+ * dashboard: store a null actor, not a person. This does not read the
+ * Authorization header or accept a bearer.
+ */
+function actorAfterDashboardGate(): Actor | null {
+  if (!process.env.MC_DASHBOARD_PASSWORD) return null;
+  return { actor_type: "human", actor_id: DASHBOARD_ACTOR_ID };
+}
+
 export async function GET(req: Request) {
   const denied = await requireDashboardSession(req);
   if (denied) return denied;
@@ -79,13 +92,13 @@ export async function POST(req: Request) {
     rate_limit_per_day?: unknown;
   };
   try {
-    const created = await createCredential({
+    const created = await runWithActor(actorAfterDashboardGate(), () => createCredential({
       label: record.label,
       scopes: record.scopes,
       expires_at: record.expires_at,
       rate_limit_per_minute: record.rate_limit_per_minute,
       rate_limit_per_day: record.rate_limit_per_day,
-    });
+    }));
     if (!created.ok) return rejected(created.error);
     return NextResponse.json({ credential: { ...created.credential, token: created.token } });
   } catch (e) {
@@ -105,7 +118,7 @@ export async function PATCH(req: Request) {
   const checked = validateLimitsInput(body);
   if (!checked.ok) return rejected(checked.error);
   try {
-    const credential = await updateCredentialLimits(checked);
+    const credential = await runWithActor(actorAfterDashboardGate(), () => updateCredentialLimits(checked));
     if (!credential) return apiError("not_found", { message: "credential not found" });
     return NextResponse.json({ credential });
   } catch (e) {
@@ -127,7 +140,7 @@ export async function DELETE(req: Request) {
     return rejected("id is required");
   }
   try {
-    const credential = await revokeCredential(id);
+    const credential = await runWithActor(actorAfterDashboardGate(), () => revokeCredential(id));
     if (!credential) return apiError("not_found", { message: "credential not found" });
     return NextResponse.json({ credential });
   } catch (e) {

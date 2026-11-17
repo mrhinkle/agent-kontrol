@@ -12,7 +12,7 @@ import { Client } from "pg";
 import { runEventStreamTests } from "./pg-events-stream-tests";
 import { evaluateAlerts, setBeforeClaimForTests, setBriefSettingsForTests } from "../src/lib/brief-alerts";
 import type { BriefSettings } from "../src/lib/progress-config";
-import { sql, withTransaction } from "../src/lib/db";
+import { sql, sqlTransaction, withTransaction } from "../src/lib/db";
 import { insertGhEvent, signBody } from "../src/lib/gh-events";
 import { testSweeper } from "./pg-sweeper-tests";
 import { testProviderCosts } from "./pg-provider-costs-tests";
@@ -24,6 +24,7 @@ import { StaleWrite } from "../src/lib/revision";
 import { readReceipt } from "../src/lib/activity";
 import { report, remember, recall, createTask, claimNextTask, listTasks, updateTask, readMemoryForPreview, readTaskForPreview, findAgent, deleteMemory, slugify } from "../src/lib/store";
 import { testTaskQueueNotices } from "./pg-task-notice-tests";
+import { testTaskLaneClaims } from "./pg-task-lane-tests";
 import { updateTaskForTool } from "../src/lib/dry-run-actions";
 import { runWithActor } from "../src/lib/actor";
 import { GET as getRepoSettings, PUT as putRepoSettings } from "../src/app/api/settings/repos/route";
@@ -49,7 +50,9 @@ import {
   WRITEBACK_LOCK_LEASE_SECONDS,
   type UpsertInput,
 } from "../src/lib/decisions";
-import { finishSyncRun, markSkillRemoved, SyncLeaseLost, upsertSettings, upsertSkill } from "../src/lib/skills/store";
+import { finishSyncRun, getSkillRow, markSkillRemoved, SyncLeaseLost, upsertSettings, upsertSkill } from "../src/lib/skills/store";
+import { planSync } from "../src/lib/skills/plan";
+import type { AssembledSkill } from "../src/lib/skills/assemble";
 import { runScheduleTick, type TickResult } from "../src/lib/skills/schedule";
 import { listLastScheduledTasks, listOpenScheduledTasks } from "../src/lib/skills/schedule-store";
 import type { SkillRecord } from "../src/lib/skills/types";
@@ -78,6 +81,19 @@ async function main() {
 
   const tag = `pgtest-${Date.now()}`;
   await report({ agent_id: `${tag}-agent`, platform: "codex", machine: "m1", kind: "session_start", title: "hello", project: "p" } as never);
+
+  const run = { schema: "mc.run.v2", run_id: "11111111-1111-4111-8111-111111111111", role: "worker", started_at: new Date().toISOString(), ended_at: new Date().toISOString(), duration_ms: 0, outcome: "completed", error_class: null, usage_scope: "unavailable", usage_complete: false, model_usage: [] };
+  const input = { agent_id: `${tag}-agent`, platform: "codex", kind: "run_complete", detail: run };
+  await Promise.all([report(input), report(input)]);
+  await report(input);
+  const saved = await sql()`select count(*)::int as n from events where agent_id = ${input.agent_id} and kind = 'run_complete'`;
+  assert.equal(saved[0].n, 1, "concurrent and retried run delivery stores one event");
+  await assert.rejects(sqlTransaction([
+    { text: "insert into events (agent_id, kind, title) values ($1, 'rollback_probe', 'test')", params: [input.agent_id] },
+    { text: "select 1/0", params: [] },
+  ]));
+  const rolledBack = await sql()`select count(*)::int as n from events where agent_id = ${input.agent_id} and kind = 'rollback_probe'`;
+  assert.equal(rolledBack[0].n, 0, "a failed transaction leaves no partial run writes");
 
   const first = await remember({ content: `alpha ${tag}`, key: `${tag}/k1`, tags: [tag, "b"], agent_id: `${tag}-agent` });
   const second = await remember({ content: `alpha ${tag} v2`, key: `${tag}/k1`, tags: [tag], agent_id: `${tag}-agent` });
@@ -139,6 +155,7 @@ async function main() {
   assert.equal(untouched.actor_id, `${tag}-actor`);
   assert.equal(untouched.result, "still mine");
   await testTaskQueueNotices();
+  await testTaskLaneClaims();
 
   const absentKey = `${tag}/absent`;
   const raced = await Promise.allSettled([
@@ -375,6 +392,7 @@ async function main() {
   await testReportStatusAtomic(tag);
   await testDecisions(tag);
   await testSkillLeaseFence(tag);
+  await testSkillJsonbRoundTripPlan(tag);
   await testSkillSchedule(tag);
   await testWatchBeats(tag);
   await testWatchBeatRoute(tag);
@@ -1126,6 +1144,69 @@ async function testSkillLeaseFence(tag: string): Promise<void> {
     await holder.end();
     await sql()`delete from skills where id = ${skillId}`;
     await sql()`delete from skill_sync_runs where id = ${runId}::uuid`;
+  }
+}
+
+/**
+ * jsonb does not keep object key order. A row written from upstream
+ * frontmatter and read back must still plan as unchanged, and a real change
+ * must still plan an upsert.
+ */
+async function testSkillJsonbRoundTripPlan(tag: string): Promise<void> {
+  const skillId = `roundtrip-${tag}`.replace(/[^a-z0-9-]/gi, "").slice(0, 48);
+  const frontmatter = {
+    name: skillId,
+    description: "jsonb roundtrip",
+    version: "1.0.0",
+    metadata: { author: "vercel", version: "1.0.0", internal: false, nested: { zeta: 1, alpha: null } },
+    runtimes: ["claude", "codex"],
+    list: [{ beta: "2", a: true }, { zz: 0, y: "0" }],
+  };
+  const next: AssembledSkill = {
+    ...skillRecord(skillId, "body"),
+    description: "jsonb roundtrip",
+    runtimes: { claude: true, codex: true, grok: false, hermes: false, mini: false, nemoclaw: false },
+    category: "build",
+    tags: ["x", "y"],
+    frontmatter,
+    position: 0,
+    problems: [],
+  };
+  await sql()`delete from skills where id = ${skillId}`;
+  try {
+    await sql()`
+      insert into skills (
+        id, source_id, path, name, description, version, sha, commit_sha, body,
+        "references", runtimes, frontmatter, category, tags, removed_at, synced_at
+      ) values (
+        ${skillId}, ${next.source_id}, ${next.path}, ${next.name}, ${next.description}, ${next.version},
+        ${next.sha}, ${"b".repeat(40)}, ${next.body},
+        ${JSON.stringify(next.references)}::jsonb, ${JSON.stringify(next.runtimes)}::jsonb,
+        ${JSON.stringify(next.frontmatter)}::jsonb, ${next.category}, ${JSON.stringify(next.tags)}::jsonb, null, now()
+      )
+    `;
+    const row = await getSkillRow(skillId);
+    assert.ok(row);
+    assert.deepEqual(row.frontmatter, frontmatter);
+    assert.notEqual(JSON.stringify(row.frontmatter), JSON.stringify(frontmatter), "jsonb hands keys back in another order");
+    const planFor = (candidate: AssembledSkill) => planSync({
+      failedSourceIds: [],
+      successfulSourceIds: [next.source_id],
+      existing: [row],
+      candidates: [candidate],
+      preserved: [],
+    });
+    const same = planFor(next);
+    assert.deepEqual(same.upserts, [], "an unchanged row read back from jsonb plans no upsert");
+    assert.deepEqual(same.unchanged, [skillId]);
+    const changed = planFor({ ...next, frontmatter: { ...frontmatter, metadata: { ...frontmatter.metadata, internal: "false" } } });
+    assert.deepEqual(changed.upserts.map((skill) => skill.id), [skillId], "a changed frontmatter value still plans an upsert");
+    const reordered = planFor({ ...next, frontmatter: { ...frontmatter, runtimes: ["codex", "claude"] } });
+    assert.deepEqual(reordered.upserts.map((skill) => skill.id), [skillId], "array order still counts");
+    const body = planFor({ ...next, body: "body 2" });
+    assert.deepEqual(body.upserts.map((skill) => skill.id), [skillId], "a changed body still plans an upsert");
+  } finally {
+    await sql()`delete from skills where id = ${skillId}`;
   }
 }
 
@@ -2107,6 +2188,7 @@ async function testRepoCaseIdentity(tag: string): Promise<void> {
     assert.equal(toWatchedRepo(pinnedRepo, [rule], new Date("2026-10-29T00:00:00.000Z")).shown, true,
       "a case-insensitive pin still shows an inactive repository");
   } finally {
+    await sql()`delete from events where kind = 'owners.discover' and detail->>'owner' = ${owner}`;
     await sql()`delete from watched_repos where lower(repo) like ${`${owner.toLowerCase()}/%`}`;
     await sql()`delete from watched_owners where owner = ${owner}`;
   }

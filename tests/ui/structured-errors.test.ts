@@ -196,6 +196,19 @@ describe("structured errors for the remaining API families", { concurrency: fals
     setSqlForTests(async (strings) => {
       const text = strings.join("?");
       if (text.includes("select id from agent_credentials")) return [{ id: "cred123" }];
+      if (text.includes("insert into event_stream_consumers")) {
+        return [{
+          id: "inbox",
+          credential_id: "cred123",
+          generation: "0",
+          enabled: true,
+          repos: ["Example/alpha"],
+          event_types: ["push"],
+        }];
+      }
+      if (text.includes("insert into events")) {
+        return [{ id: "1", kind: "event_consumer.register", created_at: "2026-11-16T00:00:00.000Z" }];
+      }
       return [];
     });
     const savedConsumer = await post(JSON.stringify(registration));

@@ -211,7 +211,7 @@ describe("demo store", () => {
     const route = fs.readFileSync("src/app/api/[transport]/route.ts", "utf8");
     const store = fs.readFileSync("src/lib/store.ts", "utf8");
     assert.match(route, /No queued tasks for your platform\./);
-    assert.match(store, /where id = \$\{t\.id\} and status = 'queued'/);
+    assert.match(store, /where id = \$\{t\.id\}\s{1,40}and status = 'queued'/);
     assert.equal(DEMO_EMPTY_CLAIM, "No queued tasks for your platform.");
 
     const task = await demoCreateTask({ title: "only one", platform: "grok" });

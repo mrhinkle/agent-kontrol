@@ -8,8 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Protocol errors now include `code`, `cause`, `fix`, and `retryable` on MCP JSON-RPC and tool errors, the initial credential-store outage (`503`, no invalid-token challenge), event-stream control frames, OAuth JSON errors, and failed owner-discovery items. RFC OAuth fields, HTTP status, challenges, SSE event names, and successful bodies stay. HTML authorization pages stay HTML. `POST /oauth/register` with JSON `null` or another non-object is `400` `invalid_client_metadata`. A failed discovery item's `error`, `cause`, and stored `last_error` are a fixed summary for the failure code. Collector diagnostic text is not copied into those fields. Middleware HTML, non-JSON documents, primitive JSON-RPC `error.data`, and frames over 1 MiB stay outside that teaching. A tools/call whose combined array elements and object members exceed 4096 is rejected before schema expansion, so that isError stays short enough to carry tool teaching. A token request whose client lookup cannot read OAuth storage is `503` `server_error` with `retryable` true. A missing client or a wrong secret stays `401` `invalid_client`. This does not close scorecard Q6.
 - Gibson: load tasks in valid 200-row pages, preserving the 400-task view instead of failing with `tasks API 400`.
-- Database errors are diagnosable from the logs. The credentials routes, the watch beat routes, the credential lookup and rate-limit paths, and the idle-pool handlers used to log only the error name (for example `[settings/credentials] list credentials NeonDbError`). They now log the name, the Postgres SQLSTATE or driver `code`, and the message with connection URLs, `user:password@` pairs, values under secret-looking keys (`password`, `token`, `secret`, `api_key`, `credential`, `private_key`) and `Authorization:`/`Cookie:` header values (quoted, escaped or bare), Neon `npg_` passwords, bearer tokens and `akc_` credentials replaced. Each message is capped at 300 characters, and `cause` and the Neon `sourceError` are followed for up to three errors. `detail`, `hint`, the query, its parameters, the request body and `DATABASE_URL` are never logged.
+- Database errors are diagnosable from the logs. The credentials routes, the watch beat routes, the credential lookup and rate-limit paths, and the idle-pool handlers used to log only the error name (for example `[settings/credentials] list credentials NeonDbError`). They now log the name, the Postgres SQLSTATE or driver `code`, and the message with connection URLs, `user:password@` pairs, values under secret-looking keys (`password`, `token`, `secret`, `api_key`, `credential`, `private_key`) and `Authorization:`/`Cookie:` header values (quoted, escaped or bare), Neon `npg_` passwords, bearer tokens and `akc_` credentials replaced. A key spelled with JSON `\uXXXX` escapes is redacted like its plain spelling. Each message is capped at 300 characters, and `cause` and the Neon `sourceError` are followed for up to three errors. `detail`, `hint`, the query, its parameters, the request body and `DATABASE_URL` are never logged.
 
 ### Documentation
 
@@ -65,6 +66,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Documentation
 
 - What "blocked" means (a label you choose, not something detected), the release-branch workflow on Vercel, an adapter capability table, a Status section in the README, and release and dependency policy in CONTRIBUTING.
+
+## [1.0.0-beta.2] - 2026-11-03
+
+### Added
+
+- Private development-velocity dashboard at `/velocity`, with per-repository CI revisions to observed green, first-pass rate, merge time, dated PR throughput, and separate production and preview deployment measurements. Fleet statistics pool individual observations and keep incomplete coverage visible.
+- Immutable benchmark captures through authenticated read and ingest routes. Compatible reporting periods share a baseline and trend history; changed evidence creates a new revision and identical imports return the original receipt.
+- Local evidence conversion and collector delivery tools that reconcile source counts, preserve source hashes, bind existing authentication to its configured origin, and return bounded import receipts.
+- Additive `velocity_benchmarks` storage with row-level security and a dated migration. The existing schema applicator includes the table; preview builds continue to use the documented migration-skip setting.
+
+### Fixed
+
+- Owner discovery retains eligible inactive and never-pushed repositories in its inventory, while existing activity rules continue to govern active views.
 
 ## [1.0.0-beta.1] - 2026-10-09
 
