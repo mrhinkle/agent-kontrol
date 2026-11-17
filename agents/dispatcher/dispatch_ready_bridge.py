@@ -397,10 +397,16 @@ def _matching_ids(tasks, body: Mapping) -> tuple[str, tuple[int, ...]]:
     kind, rows = _list_all(tasks)
     if kind != "ok":
         return kind, ()
+    # Every row id is part of the listing. A repeat or an unreadable id on any
+    # page means the pages are not one complete set, even when that row is not
+    # a candidate for this issue.
+    seen: set[int] = set()
     found = []
     for row in rows:
-        if not isinstance(row, Mapping):
+        task_id = _canonical_task_id(row)
+        if task_id is None or task_id in seen:
             return "list_incomplete", ()
+        seen.add(task_id)
         for field in (
             "id",
             "title",
@@ -415,7 +421,7 @@ def _matching_ids(tasks, body: Mapping) -> tuple[str, tuple[int, ...]]:
             if field not in row:
                 return "list_incomplete", ()
         if _identity_matches(row, body):
-            found.append(row["id"])
+            found.append(task_id)
     unique = tuple(sorted(set(found)))
     if len(unique) != len(found):
         return "list_incomplete", ()
@@ -657,11 +663,18 @@ def _replay_allowed(record: Mapping, current: datetime, actor_id: str) -> bool:
     return timedelta(0) <= delta <= REPLAY_WITHIN
 
 
-def _identity_matches(task, body: Mapping) -> bool:
-    if not isinstance(task, Mapping):
-        return False
-    task_id = task.get("id")
+def _canonical_task_id(row):
+    if not isinstance(row, Mapping):
+        return None
+    task_id = row.get("id")
+    # bool subclasses int and compares equal to 1, so it is not a task id.
     if type(task_id) is not int or isinstance(task_id, bool) or task_id < 1:
+        return None
+    return task_id
+
+
+def _identity_matches(task, body: Mapping) -> bool:
+    if _canonical_task_id(task) is None:
         return False
     expected_reviewer = body.get("reviewer_platform") if "reviewer_platform" in body else None
     if task.get("reviewer_platform") != expected_reviewer:

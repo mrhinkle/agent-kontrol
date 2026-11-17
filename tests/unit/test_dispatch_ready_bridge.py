@@ -139,6 +139,22 @@ class FakeTasks:
             if query.get("cursor") is None:
                 return {"demo": False, "tasks": [task], "next_cursor": "page-2"}
             return {"demo": False, "tasks": [dict(task)], "next_cursor": None}
+        if self.list_mode == "unrelated_duplicate_pages":
+            task = self.stored[0]["task"]
+            stray = dict(task)
+            stray["id"] = 2
+            stray["description"] = "unrelated"
+            if query.get("cursor") is None:
+                return {"demo": False, "tasks": [task, stray], "next_cursor": "page-2"}
+            return {"demo": False, "tasks": [dict(stray)], "next_cursor": None}
+        if self.list_mode == "invalid_id_pages":
+            task = self.stored[0]["task"]
+            bad = dict(task)
+            bad["id"] = True
+            bad["description"] = "unrelated"
+            if query.get("cursor") is None:
+                return {"demo": False, "tasks": [task], "next_cursor": "page-2"}
+            return {"demo": False, "tasks": [bad], "next_cursor": None}
         return {"demo": False, "tasks": [row["task"] for row in self.stored], "next_cursor": None}
 
     def _remember(self, body, key):
@@ -648,6 +664,27 @@ class RecoveryTests(BridgeTest):
         ])
         self.assertEqual(bridge._matching_ids(distinct, body), ("ok", (7, 8)))
 
+        match = dict(task)
+        match["id"] = 1
+        stray = dict(task)
+        stray["id"] = 2
+        stray["description"] = "unrelated"
+        unrelated_pages = listed([
+            {"demo": False, "tasks": [match, stray], "next_cursor": "page-2"},
+            {"demo": False, "tasks": [dict(stray)], "next_cursor": None},
+        ])
+        self.assertEqual(bridge._matching_ids(unrelated_pages, body), ("list_incomplete", ()))
+        invalid = listed([
+            {"demo": False, "tasks": [task], "next_cursor": "page-2"},
+            {"demo": False, "tasks": [{**task, "id": True, "description": "unrelated"}], "next_cursor": None},
+        ])
+        self.assertEqual(bridge._matching_ids(invalid, body), ("list_incomplete", ()))
+        complete = listed([
+            {"demo": False, "tasks": [stray], "next_cursor": "page-2"},
+            {"demo": False, "tasks": [task], "next_cursor": None},
+        ])
+        self.assertEqual(bridge._matching_ids(complete, body), ("ok", (7,)))
+
         self.arm()
         self.tasks.mode = "lose"
         self.once()
@@ -664,6 +701,18 @@ class RecoveryTests(BridgeTest):
         paged = self.once()
         self.assertEqual(paged["reason"], "list_incomplete")
         self.assertFalse(paged["posted"])
+        self.assertEqual(len(self.tasks.posts), 1)
+        self.assertEqual(self.journal()["handoffs"]["I_ready"]["state"], "posting")
+        self.tasks.list_mode = "unrelated_duplicate_pages"
+        unrelated = self.once()
+        self.assertEqual(unrelated["reason"], "list_incomplete")
+        self.assertFalse(unrelated["posted"])
+        self.assertEqual(len(self.tasks.posts), 1)
+        self.assertEqual(self.journal()["handoffs"]["I_ready"]["state"], "posting")
+        self.tasks.list_mode = "invalid_id_pages"
+        invalid_pages = self.once()
+        self.assertEqual(invalid_pages["reason"], "list_incomplete")
+        self.assertFalse(invalid_pages["posted"])
         self.assertEqual(len(self.tasks.posts), 1)
         self.assertEqual(self.journal()["handoffs"]["I_ready"]["state"], "posting")
 
