@@ -873,6 +873,13 @@ export function openApiDocument(): Json {
               description:
                 "Optional exact case-sensitive task lane. Omit it to claim any project. Null, blank, a trailing newline, or any other non-lane is validation_failed and writes nothing.",
             },
+            task_id: {
+              type: "integer",
+              minimum: 1,
+              maximum: 9007199254740991,
+              description:
+                "Optional exact task id. Omit it to claim the next queued task. Null, a string, a fraction, zero, a negative, or an integer above 9007199254740991 is validation_failed and writes nothing. A present id claims that queued row only when it matches platform, machine, and project. A miss is task null and does not claim another row.",
+            },
           },
         },
         PatchTask: {
@@ -1593,11 +1600,13 @@ export function openApiDocument(): Json {
         post: operation({
           operationId: "claimTask",
           tags: ["tasks"],
-          summary: "Atomically claim the next queued task for a platform.",
+          summary: "Atomically claim one queued task for a platform.",
+          description:
+            "Omit task_id to claim the next queued task for the platform, in the existing priority order. Send task_id to claim that exact queued row only when it also matches platform, machine, and project. A miss returns task null and does not claim a different row or write a receipt. Null, a string, a fraction, zero, a negative, or an integer above 9007199254740991 is validation_failed and writes nothing. The rejected value is not echoed. With no database, an otherwise eligible body is still task null and demo true.",
           security: cookieOrBearer,
           requestBody: body(ref("ClaimTask")),
           responses: {
-            "200": jsonResponse("The claimed task, or task null when none is queued.", {
+            "200": jsonResponse("The claimed task, or task null when none is queued or the exact task_id is not an eligible queued row.", {
               type: "object",
               properties: {
                 task: { oneOf: [ref("Task"), { type: "null" }] },

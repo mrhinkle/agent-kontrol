@@ -4,7 +4,7 @@ import { deny, resolveApiAccess } from "@/lib/auth";
 import { apiError, publicError } from "@/lib/api-error";
 import { resolveAgentCredential } from "@/lib/credentials";
 import { isConfigured } from "@/lib/db";
-import { claimNextTask, claimTaskWithCoverage, report } from "@/lib/store";
+import { claimNextTask, claimTaskWithCoverage, isExactTaskId, report } from "@/lib/store";
 import { isTaskLane } from "@/lib/task-lane";
 import { readTaskNoticeObserverHeaders, unknownCoverage, type TaskNoticeObserverProof } from "@/lib/task-queue-notice";
 import type { Task } from "@/lib/types";
@@ -13,12 +13,16 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 30;
 
 /**
- * POST /api/tasks/claim { platform, machine?, agent_id, project? }
+ * POST /api/tasks/claim { platform, machine?, agent_id, project?, task_id? }
  * A dispatcher (or any agent) asks for its next queued task. Atomic: the
  * same task is never handed to two callers. Returns { task: null } when the
  * queue is empty for that platform. `project`, when sent, is an exact
  * case-sensitive lane. A null, blank, malformed, or overlong project is
  * rejected and writes nothing. Omitting it keeps the unfiltered claim.
+ * `task_id`, when sent, is a positive safe integer and claims that queued
+ * row only. A miss is { task: null } and does not claim another row.
+ * Omitting it keeps priority order. A null, string, fraction, zero,
+ * negative, or unsafe integer is rejected before any claim, including demo.
  */
 export async function POST(req: Request) {
   const access = await resolveApiAccess(req);
@@ -32,6 +36,8 @@ export async function POST(req: Request) {
     }
     const project = exactProject(peeked);
     if (!project.ok) return project.response;
+    const taskId = exactTaskId(peeked);
+    if (!taskId.ok) return taskId.response;
     const coverage = isRecord(peeked) && peeked.coverage === true;
     if (!coverage) return NextResponse.json({ task: null, demo: true });
     return NextResponse.json({
@@ -54,6 +60,8 @@ export async function POST(req: Request) {
   }
   const project = exactProject(body);
   if (!project.ok) return project.response;
+  const taskId = exactTaskId(body);
+  if (!taskId.ok) return taskId.response;
   const platform = body.platform;
   const agentId = body.agent_id;
   const coverageRequested = body.coverage === true;
@@ -63,6 +71,7 @@ export async function POST(req: Request) {
       machine: body.machine,
       agent_id: agentId,
       ...(project.project !== undefined ? { project: project.project } : {}),
+      ...(taskId.taskId !== undefined ? { task_id: taskId.taskId } : {}),
     };
     // The events credential is resolved outside the task principal. The claim
     // itself runs once, inside that principal, so the receipt records the caller.
@@ -103,6 +112,23 @@ function exactProject(body: unknown): { ok: true; project?: string } | { ok: fal
     };
   }
   return { ok: true, project: body.project };
+}
+
+const TASK_ID_FIELD = "must be a positive integer from 1 to 9007199254740991.";
+
+/** Omitted task_id keeps queue order. A present value that is not a positive safe integer is a 400 and writes nothing. */
+function exactTaskId(body: unknown): { ok: true; taskId?: number } | { ok: false; response: NextResponse } {
+  if (!isRecord(body) || !Object.prototype.hasOwnProperty.call(body, "task_id")) return { ok: true };
+  if (!isExactTaskId(body.task_id)) {
+    return {
+      ok: false,
+      response: apiError("validation_failed", {
+        message: "task_id must be a positive safe integer",
+        fields: { task_id: TASK_ID_FIELD },
+      }),
+    };
+  }
+  return { ok: true, taskId: body.task_id };
 }
 
 function reportClaim(agentId: string, platform: string, machine: string | undefined, task: Task): Promise<unknown> {
