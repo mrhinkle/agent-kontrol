@@ -1537,29 +1537,61 @@ type ClaimFilterInput = {
   agent_id: string;
   /** Omitted keeps every project. Null, blank, or a non-lane is rejected before SQL. */
   project?: string | null;
+  /**
+   * Omitted keeps priority order and the candidate limit.
+   * A present value must be a positive safe integer and selects that id only.
+   */
+  task_id?: number | null;
 };
+
+/** Public task ids are positive JavaScript safe integers. Anything else is rejected before SQL. */
+export function isExactTaskId(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
 
 type ClaimScope = {
   machine: string | null;
   hasMachine: boolean;
   project: string | null;
   hasProject: boolean;
+  taskId: number | null;
+  hasTaskId: boolean;
 };
 
 /**
  * A supplied project is an exact lane or an error. Omitting the property
  * is the historical unfiltered claim. A present null is not an omission.
  */
-function claimScope(input: { machine?: string; project?: string | null }): ClaimScope {
+function claimScope(input: { machine?: string; project?: string | null; task_id?: number | null }): ClaimScope {
   const supplied = Object.prototype.hasOwnProperty.call(input, "project");
   if (supplied && !isTaskLane(input.project)) throw new Error("invalid task project filter");
+  const hasTaskId = Object.prototype.hasOwnProperty.call(input, "task_id");
+  if (hasTaskId && !isExactTaskId(input.task_id)) throw new Error("invalid task id filter");
   const machine = input.machine ? input.machine : null;
   return {
     machine,
     hasMachine: machine !== null,
     project: supplied ? input.project ?? null : null,
     hasProject: supplied,
+    taskId: hasTaskId && isExactTaskId(input.task_id) ? input.task_id : null,
+    hasTaskId,
   };
+}
+
+function sameTaskId(rowId: unknown, taskId: number): boolean {
+  if (typeof rowId === "bigint") return rowId === BigInt(taskId);
+  if (typeof rowId === "number") return Number.isSafeInteger(rowId) && rowId === taskId;
+  if (typeof rowId === "string") return rowId === String(taskId);
+  return false;
+}
+
+/** Platform is applied in SQL. Machine, project, and an exact id are checked again here. */
+function claimCandidateMatches(task: Task, scope: ClaimScope): boolean {
+  if (scope.hasTaskId && (scope.taskId === null || !sameTaskId(task.id, scope.taskId))) return false;
+  if (task.machine && scope.hasMachine && task.machine !== scope.machine) return false;
+  if (task.machine && !scope.hasMachine) return false;
+  if (scope.hasProject && task.project !== scope.project) return false;
+  return true;
 }
 
 /** Eligible rows only, before the candidate limit, so a wrong lane or machine cannot hide a later match. */
@@ -1577,6 +1609,10 @@ async function queuedClaimCandidates(platform: string, scope: ClaimScope): Promi
         ${scope.hasProject}::boolean = false
         or project = ${scope.project}::text
       )
+      and (
+        ${scope.hasTaskId}::boolean = false
+        or id = ${scope.taskId}::bigint
+      )
     order by priority asc, created_at asc
     limit 10
   `;
@@ -1585,10 +1621,11 @@ async function queuedClaimCandidates(platform: string, scope: ClaimScope): Promi
 
 /**
  * Atomically claim the next queued task for a platform (and optionally a
- * machine and an exact project). Guarded update (`status = 'queued'`, plus
- * the same platform, machine, and project predicate) means two dispatchers
- * racing for the same row can't both win, and a row whose lane changed after
- * it was selected is not claimed and writes no receipt.
+ * machine, an exact project, and an exact id). Guarded update (`status =
+ * 'queued'`, plus the same platform, machine, project, and id predicate)
+ * means two dispatchers racing for the same row can't both win, and a row
+ * whose lane or id changed after it was selected is not claimed and writes
+ * no receipt. A supplied id never falls through to another row.
  */
 export async function claimNextTask(input: ClaimFilterInput): Promise<Task | null> {
   const scope = claimScope(input);
@@ -1604,14 +1641,20 @@ export async function claimNextTask(input: ClaimFilterInput): Promise<Task | nul
   const actor = currentActor();
   const activityActorType = actor?.actor_type ?? null;
   const activityActorId = actor?.actor_id ?? null;
+  let attemptedExact = false;
   for (const t of candidates) {
-    if (t.machine && scope.hasMachine && t.machine !== scope.machine) continue;
-    if (t.machine && !scope.hasMachine) continue;
-    if (scope.hasProject && t.project !== scope.project) continue;
+    if (!claimCandidateMatches(t, scope)) continue;
+    if (scope.hasTaskId) attemptedExact = true;
     try {
       // One statement. The event insert reads only the updated row, so a lost
-      // race (zero rows) writes no event. Platform, machine, and project are
-      // checked again here. Actor parameters stay after that predicate.
+      // race (zero rows) writes no event. Platform, machine, project, and the
+      // exact id are checked again here. Actor parameters stay after that
+      // predicate. A BEFORE INSERT trigger that returns NULL would otherwise
+      // commit the claim through the left join. The cast runs on the CASE
+      // result when the statement executes, so a missing receipt aborts this
+      // statement and the update rolls back with it. The error text is a CASE
+      // branch, not a constant cast: PostgreSQL plans a constant invalid cast
+      // even when its condition is false.
       const claimed = await db`
         with changed as (
           update tasks set
@@ -1620,6 +1663,7 @@ export async function claimNextTask(input: ClaimFilterInput): Promise<Task | nul
             claimed_at = ${now},
             updated_at = ${now}
           where id = ${t.id}
+            and (${scope.hasTaskId}::boolean = false or id = ${scope.taskId}::bigint)
             and status = 'queued'
             and platform = any(${[input.platform, "any"]}::text[])
             and (
@@ -1657,8 +1701,19 @@ export async function claimNextTask(input: ClaimFilterInput): Promise<Task | nul
           logged.created_at as receipt_at
         from changed
         left join logged on true
+        where (
+          select cast(
+            case
+              when (select count(*) from changed) > (select count(*) from logged)
+              then 'claim receipt was not stored'
+              else '1'
+            end
+            as integer
+          )
+        ) = 1
       `;
       if (claimed.length > 0) return asTask(claimed[0] as Record<string, unknown>);
+      if (attemptedExact) return null;
     } catch (e) {
       throw new Error(errMsg(e));
     }
@@ -1944,10 +1999,10 @@ export async function claimTaskWithCoverage(input: ClaimFilterInput & {
   const actor = currentActor();
   const activityActorType = actor?.actor_type ?? null;
   const activityActorId = actor?.actor_id ?? null;
+  let attemptedExact = false;
   for (const t of candidates) {
-    if (t.machine && scope.hasMachine && t.machine !== scope.machine) continue;
-    if (t.machine && !scope.hasMachine) continue;
-    if (scope.hasProject && t.project !== scope.project) continue;
+    if (!claimCandidateMatches(t, scope)) continue;
+    if (scope.hasTaskId) attemptedExact = true;
     try {
       // The scan cutoff is statement_timestamp(), which is stable for this
       // statement, so the created_at index can stop at the window. A volatile
@@ -1956,6 +2011,11 @@ export async function claimTaskWithCoverage(input: ClaimFilterInput & {
       // only when the slice holds the whole tie; otherwise that edge is
       // unknown and is not replaced by an older episode. The observer locks
       // the consumer, then shares the credential, matching the stream binding.
+      // The exact id is part of the update, not only the earlier read. A
+      // suppressed receipt makes the CASE result fail its integer cast while
+      // this statement is executing, so the transaction rolls the claim back.
+      // The error text stays a CASE branch. A constant invalid cast is planned
+      // even when the condition is false and would reject a real claim.
       const claimed = await boundedTransaction(async (tx) => {
       const rows = await tx`
         with changed as (
@@ -1965,6 +2025,7 @@ export async function claimTaskWithCoverage(input: ClaimFilterInput & {
             claimed_at = ${now},
             updated_at = ${now}
           where id = ${t.id}
+            and (${scope.hasTaskId}::boolean = false or id = ${scope.taskId}::bigint)
             and status = 'queued'
             and platform = any(${[input.platform, "any"]}::text[])
             and (
@@ -2075,6 +2136,16 @@ export async function claimTaskWithCoverage(input: ClaimFilterInput & {
           clock_timestamp() as measured_at
         from changed
         left join logged on true
+        where (
+          select cast(
+            case
+              when (select count(*) from changed) > (select count(*) from logged)
+              then 'claim receipt was not stored'
+              else '1'
+            end
+            as integer
+          )
+        ) = 1
       `;
       const bound = rows[0] as Record<string, unknown> | undefined;
       // A second statement takes a new snapshot. Skip it when the claim
@@ -2106,6 +2177,7 @@ export async function claimTaskWithCoverage(input: ClaimFilterInput & {
         const coverage = coverageFromClaimRow(row);
         return { task: asTask(row), coverage };
       }
+      if (attemptedExact) break;
     } catch (e) {
       throw new Error(errMsg(e));
     }
