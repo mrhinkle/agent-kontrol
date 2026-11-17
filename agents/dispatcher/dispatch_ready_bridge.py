@@ -5,6 +5,42 @@ Disabled unless ``config["enabled"] is True``. One call binds at most one
 issue. Transports are injected. This module does not read credentials, write
 GitHub labels, claim a task, start a lane, or import ``mc_dispatcher``.
 
+``actor_id`` is a label the caller stored. The task transport does not
+authenticate it, and this module never treats that label as a credential
+principal. The same label, a different label, a clock change, and the age of
+the row do not authorize another POST.
+
+A fresh invocation may POST once, and only after it has durably saved the
+new ``posting`` row under this host's ledger lock. Any later invocation that
+finds that row does not POST. A lost reply, transport exception, malformed
+create body, HTTP error, failed acknowledgment save, or failed halt save
+leaves a fail-closed recovery row. The idempotency key and the frozen body
+stay on the row for identity. The key is not evidence that the server applied
+the create once.
+
+Recovery uses the existing bounded ``status=all`` task pages. Two complete
+scans with the same single exact field match can acknowledge that task. The
+match shows that a task with those fields exists. It does not show which
+credential created it. Zero matches, several matches, a demo page, and a
+malformed, incomplete, or changing listing cannot authorize a POST. Zero or
+several exact matches halt for an operator. Absence does not prove the
+request never reached the server, and that issue is not selected again. An
+unusable listing stays deferred and can be scanned later, still without a
+POST.
+
+A crash after the durable ``posting`` row and before the POST is an uncertain
+handoff. It is not retried. That is the availability tradeoff: a create that
+the server accepted but that is not visible in two exact scans stays stuck
+until an operator reconciles it, because posting again could duplicate the
+task when no authenticated scope can be proved. This is one ledger on one
+host. A different host with a different journal is not coordinated and can
+still create another task.
+
+A demo create response means the server kept no task. The row is halted only
+when that halt is durably saved. If the save fails, this call does not POST
+again. A later call that still sees ``posting`` does not POST either. Do not
+treat a failed journal save as proof the file changed or proof it did not.
+
 The next unit's dispatcher seam, not implemented here:
 
 - Before ``POST /api/tasks/claim``, a stop file means do not claim and do
@@ -16,10 +52,6 @@ The next unit's dispatcher seam, not implemented here:
   ``run_contained`` already owns. No process-name or session selection.
 - The work event is the existing status ingest at a real running or review
   phase. No merge call and no merge credential.
-
-Idempotency-Key on ``POST /api/tasks`` expires 24 hours and is scoped to the
-authenticated actor and the route. The journal below is the durable binding.
-A key alone is not.
 """
 
 from __future__ import annotations
@@ -32,11 +64,10 @@ import re
 import stat
 import subprocess
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
-REPLAY_WITHIN = timedelta(hours=23)
 LIST_LIMIT = 200
 LIST_FIELDS = (
     "id,title,description,project,platform,machine,priority,"
@@ -239,10 +270,10 @@ def _locked(parsed, issues, tasks, current, check, clock) -> dict:
     posting = [row for row in journal["handoffs"].values() if row["state"] == "posting"]
     if len(posting) > 1:
         return _result("halted", reason="ledger_unreadable")
+    # An existing posting row is an uncertain handoff. The caller label is not
+    # an authenticated principal, so this invocation never POSTs it again.
     if posting:
-        if existed and journal["actor_id"] != parsed["actor_id"]:
-            return _reconcile(parsed, journal, posting[0], tasks, current, allow_replay=False)
-        return _reconcile(parsed, journal, posting[0], tasks, current, allow_replay=True)
+        return _reconcile(parsed, journal, posting[0], tasks)
     if existed and journal["actor_id"] != parsed["actor_id"]:
         return _result("halted", reason="actor_mismatch")
     return _handoff_new(parsed, journal, issues, tasks, current, check, clock)
@@ -293,20 +324,23 @@ def _handoff_new(parsed, journal, issues, tasks, current, check, clock) -> dict:
             issue_node_id=record["issue_node_id"],
             idempotency_key=record["idempotency_key"],
         )
-    return _post(parsed, journal, record, tasks, initial=True)
+    return _post(parsed, journal, record, tasks)
 
 
-def _reconcile(parsed, journal, record, tasks, current, allow_replay: bool) -> dict:
+def _reconcile(parsed, journal, record, tasks) -> dict:
+    """Bind an existing posting row from two listings, or leave it unreposted.
+
+    The only POST is the fresh invocation that just saved this row. Recovery
+    never calls ``create_task``.
+    """
     node = record["issue_node_id"]
     key = record["idempotency_key"]
     if parsed["stop_file"] is not None and parsed["stop_file"].exists():
         return _result("stopped", issue_node_id=node, idempotency_key=key)
-    if allow_replay and _replay_allowed(record, current, parsed["actor_id"]):
-        return _post(parsed, journal, record, tasks, initial=False)
     return _reconcile_list(parsed, journal, record, tasks)
 
 
-def _post(parsed, journal, record, tasks, initial: bool) -> dict:
+def _post(parsed, journal, record, tasks) -> dict:
     node = record["issue_node_id"]
     key = record["idempotency_key"]
     try:
@@ -321,7 +355,16 @@ def _post(parsed, journal, record, tasks, initial: bool) -> dict:
     if kind == "demo":
         record["state"] = "halted"
         record["halt_reason"] = "demo_not_delivered"
-        _save_journal(parsed["ledger_dir"], journal)
+        # A failed save may or may not have replaced the file. Either way the
+        # next invocation must see a posting row or a halt, and must not POST.
+        if not _save_journal(parsed["ledger_dir"], journal):
+            return _result(
+                "halted",
+                posted=True,
+                reason="ledger_unavailable",
+                issue_node_id=node,
+                idempotency_key=key,
+            )
         return _result("halted", posted=True, reason="demo_not_delivered", issue_node_id=node, idempotency_key=key)
     if kind != "task" or not _identity_matches(task, record["body"]):
         return _result(
@@ -333,12 +376,12 @@ def _post(parsed, journal, record, tasks, initial: bool) -> dict:
         )
     record["state"] = "acknowledged"
     record["task_id"] = task["id"]
-    record["bound_by"] = "post" if initial else "replay"
+    record["bound_by"] = "post"
     record["halt_reason"] = None
     if not _save_journal(parsed["ledger_dir"], journal):
         return _result("halted", posted=True, reason="ledger_unavailable", issue_node_id=node, idempotency_key=key, task_id=task["id"])
     return _result(
-        "handed_off" if initial else "replayed",
+        "handed_off",
         posted=True,
         task_id=task["id"],
         issue_node_id=node,
@@ -354,7 +397,14 @@ def _http_result(parsed, journal, record, err: TaskHttpError) -> dict:
     if err.status == 409 and payload.get("code") == "idempotency_conflict" and not retryable:
         record["state"] = "halted"
         record["halt_reason"] = "idempotency_conflict"
-        _save_journal(parsed["ledger_dir"], journal)
+        if not _save_journal(parsed["ledger_dir"], journal):
+            return _result(
+                "halted",
+                posted=True,
+                reason="ledger_unavailable",
+                issue_node_id=node,
+                idempotency_key=key,
+            )
         return _result("halted", posted=True, reason="idempotency_conflict", issue_node_id=node, idempotency_key=key)
     reason = "retryable_conflict" if retryable else "task_api_error"
     return _result("deferred", posted=True, reason=reason, issue_node_id=node, idempotency_key=key)
@@ -378,10 +428,20 @@ def _reconcile_list(parsed, journal, record, tasks) -> dict:
         record["halt_reason"] = None
         if not _save_journal(parsed["ledger_dir"], journal):
             return _result("halted", reason="ledger_unavailable", issue_node_id=node, idempotency_key=key, task_id=found[0])
-        return _result("reconciled", task_id=found[0], issue_node_id=node, idempotency_key=key)
+        # The two scans agreed on one task identity. They do not prove which
+        # credential created it, and the caller-supplied actor label is not that proof.
+        return _result(
+            "reconciled",
+            task_id=found[0],
+            issue_node_id=node,
+            idempotency_key=key,
+            match_evidence="exact_task_fields",
+            creator_proven=False,
+        )
     record["state"] = "halted"
     record["halt_reason"] = "ambiguous_task" if found else "unreconciled"
-    _save_journal(parsed["ledger_dir"], journal)
+    if not _save_journal(parsed["ledger_dir"], journal):
+        return _result("halted", reason="ledger_unavailable", issue_node_id=node, idempotency_key=key)
     return _result("halted", reason=record["halt_reason"], issue_node_id=node, idempotency_key=key)
 
 
@@ -636,16 +696,6 @@ def _idempotency_key(authority: str, node: str) -> str:
     return f"drb1-{digest}"
 
 
-def _replay_allowed(record: Mapping, current: datetime, actor_id: str) -> bool:
-    if record.get("actor_id") != actor_id:
-        return False
-    attempt = _parse_time(record.get("attempt_at")) if isinstance(record.get("attempt_at"), str) else None
-    if attempt is None:
-        return False
-    delta = current - attempt
-    return timedelta(0) <= delta <= REPLAY_WITHIN
-
-
 def _identity_matches(task, body: Mapping) -> bool:
     if not isinstance(task, Mapping):
         return False
@@ -742,6 +792,8 @@ def _validate_handoff(authority: str, row):
     task_id = row["task_id"]
     if task_id is not None and (type(task_id) is not int or isinstance(task_id, bool) or task_id < 1):
         return "ledger_unreadable"
+    # "replay" remains readable so a row written by the old client still loads.
+    # This module no longer writes that binding and does not POST it again.
     if row["state"] == "acknowledged" and (task_id is None or row["bound_by"] not in ("post", "replay", "reconcile")):
         return "ledger_unreadable"
     if row["state"] == "halted" and not isinstance(row["halt_reason"], str):

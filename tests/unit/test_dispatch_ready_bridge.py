@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 DISPATCHER = Path(__file__).resolve().parents[2] / "agents" / "dispatcher"
 sys.path.insert(0, str(DISPATCHER))
@@ -95,6 +96,10 @@ class FakeTasks:
             raise TaskHttpError(409, {"code": "idempotency_conflict", "retryable": False, "error": "different body"})
         if self.mode == "http":
             raise TaskHttpError(500, {"code": "internal_error", "retryable": False})
+        if self.mode == "explode":
+            raise RuntimeError("dropped")
+        if self.mode == "malformed":
+            return {"ok": False}
         prior = self._find(idempotency_key)
         if prior is not None and not self.mint_new_on_repeat:
             if prior["body"] != dict(body):
@@ -111,6 +116,8 @@ class FakeTasks:
             return {"broken": True}
         if self.list_mode == "demo":
             return {"demo": True, "tasks": [], "next_cursor": None}
+        if self.list_mode == "malformed":
+            return {"demo": False, "tasks": None, "next_cursor": None}
         if self.list_mode == "omit_cursor":
             return {"demo": False, "tasks": [row["task"] for row in self.stored]}
         if self.list_mode == "empty":
@@ -346,7 +353,7 @@ class RecoveryTests(BridgeTest):
         self.assertEqual(self.journal()["handoffs"]["I_ready"]["state"], "acknowledged")
         self.assertEqual(self.journal()["handoffs"]["I_ready"]["bound_by"], "post")
 
-    def test_lost_reply_then_restart_replays_one_task(self):
+    def test_lost_reply_then_restart_binds_without_another_post(self):
         self.arm()
         self.tasks.mode = "lose"
         first = self.once()
@@ -354,15 +361,19 @@ class RecoveryTests(BridgeTest):
         self.assertEqual(first["reason"], "lost_reply")
         self.assertEqual(self.journal()["handoffs"]["I_ready"]["state"], "posting")
         self.tasks.mode = "ok"
+        self.tasks.mint_new_on_repeat = True
         second = self.once()
-        self.assertEqual(second["outcome"], "replayed")
+        self.assertEqual(second["outcome"], "reconciled")
         self.assertEqual(second["task_id"], 1)
+        self.assertFalse(second["posted"])
+        self.assertIs(second["creator_proven"], False)
+        self.assertEqual(second["match_evidence"], "exact_task_fields")
         self.assertEqual(len(self.tasks.stored), 1)
-        self.assertEqual(self.tasks.posts[0]["key"], self.tasks.posts[1]["key"])
-        self.assertEqual(self.tasks.posts[0]["body"], self.tasks.posts[1]["body"])
+        self.assertEqual(len(self.tasks.posts), 1)
+        self.assertEqual(self.journal()["handoffs"]["I_ready"]["bound_by"], "reconcile")
         third = self.once()
         self.assertEqual(third["outcome"], "no_eligible_issue")
-        self.assertEqual(len(self.tasks.posts), 2)
+        self.assertEqual(len(self.tasks.posts), 1)
 
     def test_second_issue_waits_until_the_open_handoff_binds(self):
         self.issues.set("mrhinkle/agent-kontrol", [
@@ -372,12 +383,16 @@ class RecoveryTests(BridgeTest):
         self.tasks.mode = "lose"
         self.once()
         self.tasks.mode = "ok"
-        replayed = self.once()
-        self.assertEqual(replayed["issue_node_id"], "I_first")
-        self.assertEqual(len(self.tasks.posts), 2)
+        self.tasks.mint_new_on_repeat = True
+        bound = self.once()
+        self.assertEqual(bound["outcome"], "reconciled")
+        self.assertEqual(bound["issue_node_id"], "I_first")
+        self.assertFalse(bound["posted"])
+        self.assertEqual(len(self.tasks.posts), 1)
         nxt = self.once()
         self.assertEqual(nxt["outcome"], "handed_off")
         self.assertEqual(nxt["issue_node_id"], "I_second")
+        self.assertEqual(len(self.tasks.posts), 2)
         self.assertEqual(len(self.tasks.stored), 2)
 
     def test_contender_does_not_post(self):
@@ -436,10 +451,16 @@ class RecoveryTests(BridgeTest):
         self.assertEqual(first["reason"], "retryable_conflict")
         key = first["idempotency_key"]
         self.tasks.mode = "ok"
+        self.tasks.mint_new_on_repeat = True
         second = self.once()
-        self.assertEqual(second["outcome"], "replayed")
+        self.assertEqual(second["outcome"], "halted")
+        self.assertEqual(second["reason"], "unreconciled")
+        self.assertFalse(second["posted"])
         self.assertEqual(second["idempotency_key"], key)
-        self.assertEqual(len(self.tasks.stored), 1)
+        self.assertEqual(len(self.tasks.posts), 1)
+        self.assertEqual(self.tasks.stored, [])
+        self.assertEqual(self.journal()["handoffs"]["I_ready"]["idempotency_key"], key)
+        self.assertEqual(self.journal()["handoffs"]["I_ready"]["state"], "halted")
 
     def test_demo_response_is_not_delivery_and_is_not_retried(self):
         self.arm()
@@ -463,8 +484,12 @@ class RecoveryTests(BridgeTest):
         changed = self.once(self.config(actor_id="agent:other"))
         self.assertEqual(changed["outcome"], "reconciled")
         self.assertEqual(changed["task_id"], 1)
+        self.assertFalse(changed["posted"])
+        self.assertIs(changed["creator_proven"], False)
         self.assertEqual(len(self.tasks.posts), 1)
         self.assertEqual(self.tasks.list_calls, 2)
+        self.assertEqual(self.journal()["actor_id"], "agent:bridge")
+        self.assertEqual(self.journal()["handoffs"]["I_ready"]["actor_id"], "agent:bridge")
 
     def test_actor_change_with_no_match_does_not_enqueue(self):
         self.arm()
@@ -538,14 +563,18 @@ class RecoveryTests(BridgeTest):
         self.assertEqual(omitted["reason"], "list_incomplete")
         self.assertEqual(len(self.tasks.posts), 1)
 
-    def test_exact_window_still_replays_and_a_backward_clock_does_not(self):
+    def test_inside_23_hours_and_a_backward_clock_do_not_post(self):
         self.arm()
         self.tasks.mode = "lose"
         self.once()
         self.tasks.mode = "ok"
+        self.tasks.mint_new_on_repeat = True
         self.when = START + timedelta(hours=23)
-        replayed = self.once()
-        self.assertEqual(replayed["outcome"], "replayed")
+        bound = self.once()
+        self.assertEqual(bound["outcome"], "reconciled")
+        self.assertEqual(bound["task_id"], 1)
+        self.assertFalse(bound["posted"])
+        self.assertEqual(len(self.tasks.posts), 1)
         self.assertEqual(len(self.tasks.stored), 1)
         self.ledger.joinpath("handoff.json").unlink()
         self.tasks.posts.clear()
@@ -560,6 +589,7 @@ class RecoveryTests(BridgeTest):
         self.when = START - timedelta(seconds=1)
         backed = self.once()
         self.assertEqual(backed["reason"], "unreconciled")
+        self.assertFalse(backed["posted"])
         self.assertEqual(len(self.tasks.posts), 1)
 
     def test_authority_mismatch_and_corrupt_journal_do_not_post(self):
@@ -576,6 +606,273 @@ class RecoveryTests(BridgeTest):
         corrupt = self.once()
         self.assertEqual(corrupt["reason"], "ledger_unreadable")
         self.assertEqual(self.tasks.posts, [])
+
+    def test_lost_reply_restart_and_principal_rotation_do_not_post(self):
+        self.arm()
+        self.tasks.mode = "lose"
+        lost = self.once()
+        self.assertEqual(lost["reason"], "lost_reply")
+        frozen = dict(self.journal()["handoffs"]["I_ready"]["body"])
+        key = self.journal()["handoffs"]["I_ready"]["idempotency_key"]
+        self.tasks.mode = "ok"
+        self.tasks.mint_new_on_repeat = True
+        self.tasks.list_calls = 0
+        same = self.once()
+        self.assertEqual(same["outcome"], "reconciled")
+        self.assertEqual(same["task_id"], 1)
+        self.assertFalse(same["posted"])
+        self.assertIs(same["creator_proven"], False)
+        self.assertEqual(same["match_evidence"], "exact_task_fields")
+        self.assertEqual(len(self.tasks.posts), 1)
+        self.assertEqual(self.tasks.posts[0]["key"], key)
+        self.assertEqual(self.tasks.posts[0]["body"], frozen)
+        self.assertEqual(self.tasks.list_calls, 2)
+        self.assertEqual(self.journal()["handoffs"]["I_ready"]["actor_id"], "agent:bridge")
+
+        self.ledger.joinpath("handoff.json").unlink()
+        self.tasks.posts.clear()
+        self.tasks.stored.clear()
+        self.tasks.next_id = 1
+        self.tasks.list_calls = 0
+        self.tasks.mint_new_on_repeat = False
+        self.tasks.mode = "lose"
+        self.once()
+        self.tasks.mode = "ok"
+        self.tasks.mint_new_on_repeat = True
+        rotated = self.once(self.config(actor_id="agent:rotated"))
+        self.assertEqual(rotated["outcome"], "reconciled")
+        self.assertEqual(rotated["task_id"], 1)
+        self.assertFalse(rotated["posted"])
+        self.assertIs(rotated["creator_proven"], False)
+        self.assertEqual(len(self.tasks.posts), 1)
+        self.assertEqual(len(self.tasks.stored), 1)
+        self.assertEqual(self.tasks.list_calls, 2)
+        self.assertEqual(self.journal()["actor_id"], "agent:bridge")
+        self.assertEqual(self.journal()["handoffs"]["I_ready"]["actor_id"], "agent:bridge")
+        self.assertEqual(self.journal()["handoffs"]["I_ready"]["bound_by"], "reconcile")
+        self.assertEqual(self.journal()["handoffs"]["I_ready"]["body"], frozen)
+
+    def test_crash_before_post_never_posts(self):
+        snapshot = self._durable_posting_without_request()
+        attempts = (
+            (START + timedelta(hours=23), None),
+            (START + timedelta(hours=24), None),
+            (START - timedelta(seconds=1), None),
+            (START + timedelta(hours=1), "agent:rotated"),
+        )
+        for when, actor in attempts:
+            (self.ledger / "handoff.json").write_text(snapshot, encoding="utf-8")
+            self.tasks.posts.clear()
+            self.tasks.stored.clear()
+            self.tasks.next_id = 1
+            self.tasks.mode = "ok"
+            self.tasks.list_mode = "empty"
+            self.tasks.mint_new_on_repeat = True
+            self.when = when
+            config = self.config() if actor is None else self.config(actor_id=actor)
+            result = self.once(config)
+            self.assertEqual(result["outcome"], "halted")
+            self.assertEqual(result["reason"], "unreconciled")
+            self.assertFalse(result["posted"])
+            self.assertIsNone(result["task_id"])
+            self.assertEqual(self.tasks.posts, [])
+            self.assertEqual(self.tasks.stored, [])
+            row = self.journal()["handoffs"]["I_ready"]
+            self.assertEqual(row["state"], "halted")
+            self.assertEqual(row["halt_reason"], "unreconciled")
+            self.assertEqual(row["actor_id"], "agent:bridge")
+            self.assertIsNone(row["task_id"])
+            self.assertEqual(self.journal()["actor_id"], "agent:bridge")
+
+    def test_demo_halt_save_failure_never_posts(self):
+        self.arm()
+        self.tasks.mode = "demo"
+
+        def freeze(_body, _key):
+            os.chmod(self.ledger, 0o500)
+
+        self.tasks.on_create = freeze
+        try:
+            failed = self.once()
+        finally:
+            if self.ledger.exists():
+                os.chmod(self.ledger, 0o700)
+        self.assertEqual(failed["outcome"], "halted")
+        self.assertEqual(failed["reason"], "ledger_unavailable")
+        self.assertTrue(failed["posted"])
+        self.assertIsNone(failed["task_id"])
+        self.assertEqual(len(self.tasks.posts), 1)
+        self.assertEqual(self.tasks.stored, [])
+        self.assertEqual(self.journal()["handoffs"]["I_ready"]["state"], "posting")
+        self.tasks.mode = "ok"
+        self.tasks.mint_new_on_repeat = True
+        self.tasks.on_create = None
+        later = self.once()
+        self.assertEqual(later["reason"], "unreconciled")
+        self.assertFalse(later["posted"])
+        self.assertEqual(len(self.tasks.posts), 1)
+        self.assertEqual(self.tasks.stored, [])
+        self.assertEqual(self.journal()["handoffs"]["I_ready"]["state"], "halted")
+
+    def test_ack_save_failure_binds_without_repost(self):
+        self.arm()
+
+        def freeze(_body, _key):
+            os.chmod(self.ledger, 0o500)
+
+        self.tasks.on_create = freeze
+        try:
+            failed = self.once()
+        finally:
+            if self.ledger.exists():
+                os.chmod(self.ledger, 0o700)
+        self.assertEqual(failed["outcome"], "halted")
+        self.assertEqual(failed["reason"], "ledger_unavailable")
+        self.assertTrue(failed["posted"])
+        self.assertEqual(failed["task_id"], 1)
+        self.assertEqual(len(self.tasks.posts), 1)
+        self.assertEqual(self.journal()["handoffs"]["I_ready"]["state"], "posting")
+        self.assertIsNone(self.journal()["handoffs"]["I_ready"]["task_id"])
+        self.tasks.on_create = None
+        self.tasks.mint_new_on_repeat = True
+        self.tasks.list_calls = 0
+        bound = self.once()
+        self.assertEqual(bound["outcome"], "reconciled")
+        self.assertEqual(bound["task_id"], 1)
+        self.assertFalse(bound["posted"])
+        self.assertIs(bound["creator_proven"], False)
+        self.assertEqual(bound["match_evidence"], "exact_task_fields")
+        self.assertEqual(len(self.tasks.posts), 1)
+        self.assertEqual(len(self.tasks.stored), 1)
+        self.assertEqual(self.tasks.list_calls, 2)
+        self.assertEqual(self.journal()["handoffs"]["I_ready"]["bound_by"], "reconcile")
+
+    def test_listing_exact_match_zero_and_ambiguous_fail_closed(self):
+        self.arm()
+        self.tasks.mode = "lose"
+        self.once()
+        self.tasks.mode = "ok"
+        self.tasks.mint_new_on_repeat = True
+        self.tasks.list_mode = "pages"
+        self.tasks.list_calls = 0
+        self.when = START + timedelta(hours=1)
+        matched = self.once()
+        self.assertEqual(matched["outcome"], "reconciled")
+        self.assertEqual(matched["task_id"], 1)
+        self.assertFalse(matched["posted"])
+        self.assertIs(matched["creator_proven"], False)
+        self.assertEqual(len(self.tasks.posts), 1)
+        self.assertEqual(self.tasks.list_calls, 4)
+        self.assertEqual(self.tasks.last_query["status"], "all")
+        self.assertEqual(self.tasks.last_query["limit"], 200)
+        self.assertEqual(self.tasks.last_query["cursor"], "page-2")
+
+        shapes = (
+            ("empty", "halted", "unreconciled", "halted"),
+            ("two", "halted", "ambiguous_task", "halted"),
+            ("change", "deferred", "listing_changed", "posting"),
+            ("demo", "deferred", "list_demo", "posting"),
+            ("omit_cursor", "deferred", "list_incomplete", "posting"),
+            ("malformed", "deferred", "list_incomplete", "posting"),
+        )
+        for list_mode, outcome, reason, state in shapes:
+            self.ledger.joinpath("handoff.json").unlink()
+            self.tasks.posts.clear()
+            self.tasks.stored.clear()
+            self.tasks.next_id = 1
+            self.tasks.list_calls = 0
+            self.tasks.mode = "lose"
+            self.tasks.list_mode = "mirror"
+            self.tasks.mint_new_on_repeat = False
+            self.when = START
+            self.once()
+            self.tasks.mode = "ok"
+            self.tasks.mint_new_on_repeat = True
+            self.tasks.list_mode = list_mode
+            self.when = START + timedelta(minutes=5)
+            result = self.once()
+            self.assertEqual(result["outcome"], outcome, list_mode)
+            self.assertEqual(result["reason"], reason, list_mode)
+            self.assertFalse(result["posted"], list_mode)
+            self.assertEqual(len(self.tasks.posts), 1, list_mode)
+            self.assertEqual(self.journal()["handoffs"]["I_ready"]["state"], state, list_mode)
+
+    def test_undurable_posting_record_does_not_post(self):
+        self.arm()
+        self.tasks.mint_new_on_repeat = True
+        with mock.patch.object(bridge, "_save_journal", return_value=False):
+            result = self.once()
+        self.assertEqual(result["outcome"], "halted")
+        self.assertEqual(result["reason"], "ledger_unavailable")
+        self.assertFalse(result["posted"])
+        self.assertEqual(self.tasks.posts, [])
+        self.assertEqual(self.tasks.stored, [])
+        self.assertFalse((self.ledger / "handoff.json").exists())
+
+    def test_transport_http_and_malformed_creates_are_not_replayed(self):
+        cases = (
+            ("explode", "transport_error"),
+            ("http", "task_api_error"),
+            ("malformed", "malformed_response"),
+        )
+        for mode, reason in cases:
+            journal = self.ledger / "handoff.json"
+            if journal.exists():
+                journal.unlink()
+            self.tasks.posts.clear()
+            self.tasks.stored.clear()
+            self.tasks.next_id = 1
+            self.tasks.list_mode = "empty"
+            self.tasks.mint_new_on_repeat = True
+            self.tasks.mode = mode
+            self.arm()
+            first = self.once()
+            self.assertEqual(first["reason"], reason, mode)
+            self.assertTrue(first["posted"], mode)
+            self.assertEqual(self.journal()["handoffs"]["I_ready"]["state"], "posting", mode)
+            self.tasks.mode = "ok"
+            second = self.once()
+            self.assertEqual(second["outcome"], "halted", mode)
+            self.assertEqual(second["reason"], "unreconciled", mode)
+            self.assertFalse(second["posted"], mode)
+            self.assertEqual(len(self.tasks.posts), 1, mode)
+            self.assertEqual(self.tasks.stored, [], mode)
+
+    def test_historical_replay_binding_is_not_posted_again(self):
+        self.arm()
+        done = self.once()
+        self.assertEqual(done["outcome"], "handed_off")
+        self.assertEqual(self.journal()["handoffs"]["I_ready"]["bound_by"], "post")
+        data = self.journal()
+        data["handoffs"]["I_ready"]["bound_by"] = "replay"
+        (self.ledger / "handoff.json").write_text(json.dumps(data), encoding="utf-8")
+        self.tasks.mint_new_on_repeat = True
+        again = self.once()
+        self.assertEqual(again["outcome"], "no_eligible_issue")
+        self.assertEqual(len(self.tasks.posts), 1)
+        self.assertEqual(self.journal()["handoffs"]["I_ready"]["bound_by"], "replay")
+        self.assertEqual(self.journal()["handoffs"]["I_ready"]["state"], "acknowledged")
+
+    def _durable_posting_without_request(self) -> str:
+        self.arm()
+        stop = self.root / "STOP"
+        real_save = bridge._save_journal
+
+        def save(ledger, journal):
+            saved = real_save(ledger, journal)
+            stop.write_text("halt", encoding="utf-8")
+            return saved
+
+        with mock.patch.object(bridge, "_save_journal", side_effect=save):
+            result = self.once(self.config(stop_file=str(stop)))
+        self.assertEqual(result["outcome"], "stopped")
+        self.assertEqual(result["issue_node_id"], "I_ready")
+        self.assertFalse(result["posted"])
+        self.assertEqual(self.tasks.posts, [])
+        self.assertEqual(self.journal()["handoffs"]["I_ready"]["state"], "posting")
+        self.assertIsNone(self.journal()["handoffs"]["I_ready"]["task_id"])
+        stop.unlink()
+        return (self.ledger / "handoff.json").read_text(encoding="utf-8")
 
 
 class WorktreeTests(BridgeTest):

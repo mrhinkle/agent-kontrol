@@ -171,20 +171,39 @@ the plist. Importing `mc_dispatcher` reads no file; only `main()` does.
 `dispatch_ready_bridge.py` is the inert issue-to-task handoff. It does nothing
 unless the caller passes `enabled: true`. One call selects one ready issue from
 an injected snapshot, checks the mapped project is an existing linked worktree,
-and POSTs one `/api/tasks` create. The idempotency key is stable per authority
-and issue, and a private journal is fsynced before that POST. A lost reply
-replays the same key only inside a 23 hour client window. After that, or after
-the caller’s actor id changes, the bridge lists `GET /api/tasks?status=all`
-with an explicit page size and binds a task only when both complete reads show
-the same single matching row. Zero matches, many matches, a demo response, and
-an incomplete page do not create another task. The module reads no credentials
-and writes no GitHub labels.
+and may POST one `/api/tasks` create. The idempotency key is stable per
+authority and issue. A private journal is fsynced before that POST. The
+configured `actor_id` is only a label in that journal. The transport does not
+authenticate it, and the bridge never treats the label as a credential
+principal.
+
+The invocation that durably saved a new `posting` row may POST that body once.
+No later invocation POSTs an existing `posting` row. A restart, a lost reply,
+a transport or HTTP failure, a malformed body, a failed acknowledgment save, a
+failed halt save, a different actor label, a backward clock, and any age
+inside or past 23 hours all take the same path: do not POST. The old 23-hour
+automatic replay is gone. A create that reached the server and then lost its
+reply is not retried, so that issue stays stuck until an operator reconciles
+it. That is the availability cost of refusing a duplicate when no
+authenticated scope can be proved.
+
+Recovery lists `GET /api/tasks?status=all` with an explicit page size. Two
+complete reads that show the same single matching row can bind that task. The
+bind is evidence of a matching task, not evidence of who created it. Zero
+matches halt as `unreconciled`. Several matches halt as `ambiguous_task`.
+Absence does not prove the request never arrived, and the halted issue is not
+selected again. A demo page, a malformed or incomplete page, and two scans
+that disagree stay deferred and are not posted. A demo create response halts
+the row only when that halt is saved. If the halt save fails, a later call
+that still sees `posting` does not POST. The module reads no credentials and
+writes no GitHub labels.
 
 This does not start the lane. `mc_dispatcher.py` is unchanged, so it still
 claims whatever the existing loop claims and it has no bridge stop check.
-Cross-host processes with separate journals are not coordinated. An issue with
-no P0, P1, or P2 label sorts last and is not enqueued: create priority is 1
-through 3, and 3 is already P2.
+One ledger on one host is the whole scope. Cross-host processes with separate
+journals are not coordinated and can still create a second task. An issue
+with no P0, P1, or P2 label sorts last and is not enqueued: create priority
+is 1 through 3, and 3 is already P2.
 
 ```bash
 python3 -m unittest tests.unit.test_dispatch_ready_bridge -v
