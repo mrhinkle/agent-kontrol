@@ -46,6 +46,14 @@ CREATED_BY = "dispatch-ready-bridge"
 DESCRIPTION_MARK = "agent-kontrol.dispatch-ready-bridge/v1"
 PRIORITY_FOR_LABEL = {"p0": 1, "p1": 2, "p2": 3}
 RANK_FOR_LABEL = {"p0": 0, "p1": 1, "p2": 2}
+_PRIORITY_LABEL_NAMES = {
+    "p0": "p0",
+    "p1": "p1",
+    "p2": "p2",
+    "priority:p0": "p0",
+    "priority:p1": "p1",
+    "priority:p2": "p2",
+}
 PLATFORMS = {"claude-code", "codex", "grok", "hermes", "cowork-cloud", "any"}
 REVIEWERS = {"claude-code", "codex", "grok"}
 FORBIDDEN_KEYS = {
@@ -409,7 +417,7 @@ def _matching_ids(tasks, body: Mapping) -> tuple[str, tuple[int, ...]]:
         if _identity_matches(row, body):
             found.append(row["id"])
     unique = tuple(sorted(set(found)))
-    if len(unique) != len(set(found)):
+    if len(unique) != len(found):
         return "list_incomplete", ()
     return "ok", unique
 
@@ -578,14 +586,17 @@ def _priority(issue: Mapping):
 
     Sort rank 3 is an issue with no P0, P1, or P2 label. Task priority stays
     None for that issue: OpenAPI create priority is 1 through 3, and 3 is P2.
+    ``priority:P0``, ``priority:P1``, and ``priority:P2`` are the same ranks
+    as bare P0, P1, and P2. The match is case-insensitive. Two different
+    ranks on one issue are ambiguous.
     """
     labels = {_ascii_lower(label) for label in issue["labels"]}
-    found = [name for name in ("p0", "p1", "p2") if name in labels]
+    found = {_PRIORITY_LABEL_NAMES[label] for label in labels if label in _PRIORITY_LABEL_NAMES}
     if len(found) > 1:
         return "ambiguous"
     if not found:
         return (3, None)
-    name = found[0]
+    name = next(iter(found))
     return (RANK_FOR_LABEL[name], PRIORITY_FOR_LABEL[name])
 
 
@@ -773,6 +784,16 @@ def _validate_body(body):
     return dict(body)
 
 
+def _write_all(fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    offset = 0
+    while offset < len(view):
+        written = os.write(fd, view[offset:])
+        if type(written) is not int or written <= 0 or written > len(view) - offset:
+            raise OSError("incomplete journal write")
+        offset += written
+
+
 def _save_journal(ledger: Path, journal: Mapping) -> bool:
     path = ledger / "handoff.json"
     if path.is_symlink():
@@ -789,7 +810,7 @@ def _save_journal(ledger: Path, journal: Mapping) -> bool:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
             os.fchmod(fd, 0o600)
-            os.write(fd, raw)
+            _write_all(fd, raw)
             os.fsync(fd)
         finally:
             os.close(fd)
