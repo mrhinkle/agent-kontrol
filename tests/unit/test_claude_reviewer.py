@@ -1501,5 +1501,116 @@ class SandboxReadBoundaryTests(unittest.TestCase):
 
 
 
+# ---------------------------------------------------------------------------------------------
+# Retirement report (AC 76, 92, 93, 103, 104)
+# ---------------------------------------------------------------------------------------------
+from agents.reviewer import retirement_report  # noqa: E402
+
+
+class RetirementReportTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ak-reviewer-report-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.state = os.path.join(self.tmp, "state")
+        os.makedirs(self.state)
+        self.slots = ["2026-11-24T10:00:00Z", "2026-11-24T10:15:00Z", "2026-11-24T10:30:00Z"]
+
+    def write(self, name, text):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w") as h:
+            h.write(text)
+        return path
+
+    def jsonl(self, path, rows):
+        with open(path, "w") as h:
+            h.write("".join(json.dumps(r) + "\n" for r in rows))
+
+    def receipt(self, slot, status=200, mode="live", spend=1500000, breaches=0):
+        return {"scheduled_at": slot, "observed_at": slot, "receipt_http_status": status,
+                "app_login": BOT, "mode": mode, "detail": {"scheduled_at": slot, "spend_microusd_today": spend,
+                                                          "sla_breaches": breaches, "posted": 1}}
+
+    def ledger_row(self, slot, phase="live", number=5):
+        return {"repo": REPO, "number": number, "head_sha": "a" * 40, "tier": "B", "green_since": None,
+                "posted_at": slot, "waited_minutes": 0, "app_login": BOT, "provenance": ["codex"], "phase": phase,
+                "scheduled_at": slot}
+
+    def run_report(self, phase, receipts, schedule=None):
+        schedule_path = self.write("schedule.txt", "\n".join(schedule or self.slots) + "\n")
+        receipts_path = os.path.join(self.tmp, "receipts.jsonl")
+        self.jsonl(receipts_path, receipts)
+        out = os.path.join(self.tmp, "out.jsonl")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = retirement_report.main(["--schedule", schedule_path, "--state-dir", self.state, "--receipts",
+                                           receipts_path, "--phase", phase, "--out", out])
+        rows = ledger.read_jsonl(out) if os.path.exists(out) else None
+        return code, rows
+
+    def test_live_complete(self):
+        self.jsonl(os.path.join(self.state, "reviews.jsonl"), [self.ledger_row(self.slots[1]), self.ledger_row("2026-11-01T00:00:00Z")])
+        code, rows = self.run_report("live", [self.receipt(s) for s in self.slots])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(set(rows[0]), {"scheduled_at", "observed_at", "receipt_http_status", "app_login", "posted",
+                                        "budget_total_microusd", "sla_breaches", "missing_run"})
+        self.assertEqual(rows[1]["posted"], [{"repo": REPO, "number": 5, "head_sha": "a" * 40, "app_login": BOT,
+                                              "provenance": ["codex"], "phase": "live"}])
+        self.assertEqual((rows[0]["posted"], rows[0]["budget_total_microusd"], rows[0]["missing_run"]), ([], 1500000, False))
+
+    def test_missing_run_exit_1(self):
+        code, rows = self.run_report("live", [self.receipt(self.slots[0]), self.receipt(self.slots[2], status=500)])
+        self.assertEqual(code, 1)
+        self.assertEqual([r["missing_run"] for r in rows], [False, True, True])
+        self.assertEqual(rows[1], {"scheduled_at": self.slots[1], "observed_at": None, "receipt_http_status": None,
+                                   "app_login": None, "posted": [], "budget_total_microusd": 0, "sla_breaches": 0,
+                                   "missing_run": True})
+
+    def test_dry_run_would_be(self):
+        self.jsonl(os.path.join(self.state, "would-be.jsonl"), [self.ledger_row(self.slots[0], phase="dry-run")])
+        code, rows = self.run_report("dry-run", [self.receipt(s, mode="dry-run") for s in self.slots])
+        self.assertEqual(code, 0)
+        self.assertEqual(rows[0]["posted"], [])
+        self.assertEqual(rows[0]["would_be"][0]["phase"], "dry-run")
+        self.assertEqual(rows[1]["would_be"], [])
+
+    def test_malformed_inputs_exit_2(self):
+        cases = {
+            "bad schedule": (["2026-11-24 10:00"], [], "live"),
+            "duplicate schedule": ([self.slots[0], self.slots[0]], [], "live"),
+            "duplicate receipt": (None, [self.receipt(self.slots[0]), self.receipt(self.slots[0])], "live"),
+            "unmatched receipt": (None, [self.receipt("2026-11-24T11:00:00Z")], "live"),
+            "malformed receipt time": (None, [dict(self.receipt(self.slots[0]), scheduled_at="2026-11-24T10:00:00.000Z")], "live"),
+            "bad status": (None, [dict(self.receipt(self.slots[0]), receipt_http_status="200")], "live"),
+            "mode mismatch": (None, [self.receipt(self.slots[0], mode="live")], "dry-run"),
+            "negative spend": (None, [self.receipt(self.slots[0], spend=-1)], "live"),
+        }
+        for name, (schedule, receipts, phase) in cases.items():
+            with self.subTest(name=name):
+                code, _ = self.run_report(phase, receipts, schedule)
+                self.assertEqual(code, 2)
+        self.jsonl(os.path.join(self.state, "reviews.jsonl"), [self.ledger_row(self.slots[0])])
+        code, _ = self.run_report("dry-run", [self.receipt(s, mode="dry-run") for s in self.slots])
+        self.assertEqual(code, 2, "a live post inside a dry-run window is refused")
+
+    def test_built_from_a_real_dry_run(self):
+        h = Harness(self)
+        h.ready_pull()
+        fixed = dt.datetime(2026, 11, 24, 10, 7, 30, tzinfo=dt.timezone.utc)
+        self.assertEqual(h.run(clock=lambda: fixed), 0)
+        state = os.path.join(h.tmp, "state")
+        schedule = self.write("schedule.txt", "2026-11-24T10:00:00Z\n2026-11-24T10:15:00Z\n")
+        out = os.path.join(self.tmp, "real.jsonl")
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = retirement_report.main(["--schedule", schedule, "--state-dir", state, "--receipts",
+                                           os.path.join(state, "receipts.jsonl"), "--phase", "dry-run", "--out", out])
+        self.assertEqual(code, 1)
+        rows = ledger.read_jsonl(out)
+        self.assertEqual(rows[0]["app_login"], BOT)
+        self.assertEqual(rows[0]["receipt_http_status"], 200)
+        self.assertEqual(len(rows[0]["would_be"]), 1)
+        self.assertEqual(rows[0]["budget_total_microusd"], 250000)
+        self.assertTrue(rows[1]["missing_run"])
+
+
 if __name__ == "__main__":
     unittest.main()
