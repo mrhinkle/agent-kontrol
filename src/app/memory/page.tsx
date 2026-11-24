@@ -125,7 +125,7 @@ export default function MemoryPage() {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Search notes…"
-          className="bg-[#101828] border border-white/10 rounded-lg px-3 py-1.5 text-sm outline-none focus:border-[#2563eb] w-64"
+          className="bg-panel border border-white/10 rounded-lg px-3 py-1.5 text-sm outline-none focus:border-accent w-64"
         />
       </div>
 
@@ -133,11 +133,11 @@ export default function MemoryPage() {
 
       <div className="grid gap-3">
         {items.map((m) => (
-          <div key={m.id} className="rounded-xl border border-white/10 bg-[#101828] p-4">
+          <div key={m.id} className="rounded-xl border border-white/10 bg-panel p-4">
             <div className="flex items-center gap-3 text-xs text-gray-500 mb-1.5 flex-wrap">
-              {m.key && <span className="mono text-[#7aa5ff]">{m.key}</span>}
+              {m.key && <span className="mono text-accent">{m.key}</span>}
               {m.tags.map((t) => (
-                <span key={t} className="rounded-full bg-white/5 px-2 py-0.5 mono">
+                <span key={t} className="rounded-sm bg-white/5 px-2 py-0.5 mono">
                   #{t}
                 </span>
               ))}
@@ -163,13 +163,13 @@ export default function MemoryPage() {
                 <textarea
                   value={draft.content}
                   onChange={(e) => setDraft({ ...draft, content: e.target.value })}
-                  className="min-h-24 w-full rounded-lg border border-white/10 bg-[#0a0f1c] px-3 py-2 text-sm text-gray-200 outline-none focus:border-[#2563eb]"
+                  className="min-h-24 w-full rounded-lg border border-white/10 bg-bg px-3 py-2 text-sm text-gray-200 outline-none focus:border-accent"
                   aria-label={`Replacement for ${m.key}`}
                 />
                 <div className="mt-2 flex gap-2">
                   <button
                     type="button"
-                    className="rounded-lg bg-[#2563eb] px-3 py-1.5 text-sm text-white disabled:opacity-50"
+                    className="rounded-lg bg-accent px-3 py-1.5 text-sm text-accent-ink disabled:opacity-50"
                     disabled={busy}
                     onClick={() => void requestPreview()}
                   >

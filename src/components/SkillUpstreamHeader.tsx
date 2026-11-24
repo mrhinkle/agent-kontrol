@@ -7,7 +7,7 @@ import { shortSha } from "./SkillHelpers";
 import type { SkillSyncView, SkillUpstream } from "./skills-types";
 
 const control =
-  "rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-gray-200 hover:bg-white/10 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#19d2ff]/70";
+  "rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-gray-200 hover:bg-white/10 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70";
 
 export function SkillUpstreamHeader({ upstream, onSynced }: { upstream: SkillUpstream; onSynced: () => void }) {
   const [pending, setPending] = useState(false);
@@ -47,7 +47,7 @@ export function SkillUpstreamHeader({ upstream, onSynced }: { upstream: SkillUps
         {pending ? "Syncing…" : "Sync now"}
       </button>
       <SkillSyncFeedback view={view} />
-      <span className={driftHot ? "font-medium text-[#ffb020]" : "text-gray-600"}>Drift: {upstream.driftCount}</span>
+      <span className={driftHot ? "font-medium text-warn" : "text-gray-600"}>Drift: {upstream.driftCount}</span>
     </div>
   );
 }

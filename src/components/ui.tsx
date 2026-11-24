@@ -10,34 +10,35 @@ import type { AgentStatus } from "@/lib/types";
  * Class strings stay literal so Tailwind can see them.
  */
 export const STATUS_STYLES: Record<AgentStatus | string, { label: string; dot: string; text: string; ring: string }> = {
-  active: { label: "ACTIVE", dot: "bg-[#2ee6a6]", text: "text-[#2ee6a6]", ring: "ring-[#2ee6a6]/40" },
-  waiting: { label: "NEEDS YOU", dot: "bg-[#ffb020]", text: "text-[#ffb020]", ring: "ring-[#ffb020]/45" },
-  failed: { label: "FAILED", dot: "bg-[#ff3b5c]", text: "text-[#ff5c77]", ring: "ring-[#ff3b5c]/45" },
-  done: { label: "DONE", dot: "bg-[#5c6f96]", text: "text-[#8b9bc0]", ring: "ring-[#5c6f96]/35" },
-  offline: { label: "OFFLINE", dot: "bg-[#3b4559]", text: "text-[#8f98ab]", ring: "ring-[#3b4559]/50" },
+  active: { label: "ACTIVE", dot: "bg-success", text: "text-success", ring: "ring-success/40" },
+  waiting: { label: "NEEDS YOU", dot: "bg-warn", text: "text-warn", ring: "ring-warn/45" },
+  failed: { label: "FAILED", dot: "bg-error", text: "text-error", ring: "ring-error/45" },
+  done: { label: "DONE", dot: "bg-muted", text: "text-muted", ring: "ring-muted/35" },
+  offline: { label: "OFFLINE", dot: "bg-muted-dim", text: "text-muted", ring: "ring-muted-dim/50" },
 };
 
 /**
  * Task status styles, in the same palette: green running, amber review (needs
- * you), red failed, dim done. Queued and claimed use Gibson's floor blues;
- * cancelled is neutral gray. Text colors keep at least 4.5:1 contrast on cards.
+ * you), red failed, dim done. Queued is dim gray; claimed is Ion violet (an
+ * agent has picked it up); cancelled is faded and struck through, so no two
+ * statuses share a look. Text colors keep at least 4.5:1 contrast on cards.
  */
 export const TASK_STATUS_STYLES: Record<string, { label: string; dot: string; text: string; ring: string }> = {
-  queued: { label: "QUEUED", dot: "bg-[#4a5f9e]", text: "text-[#aab6d6]", ring: "ring-[#4a5f9e]/50" },
-  claimed: { label: "CLAIMED", dot: "bg-[#7f9cff]", text: "text-[#a3b8ff]", ring: "ring-[#7f9cff]/45" },
-  running: { label: "RUNNING", dot: "bg-[#2ee6a6]", text: "text-[#2ee6a6]", ring: "ring-[#2ee6a6]/40" },
-  review: { label: "IN REVIEW", dot: "bg-[#ffb020]", text: "text-[#ffb020]", ring: "ring-[#ffb020]/45" },
-  done: { label: "DONE", dot: "bg-[#5c6f96]", text: "text-[#8b9bc0]", ring: "ring-[#5c6f96]/35" },
-  failed: { label: "FAILED", dot: "bg-[#ff3b5c]", text: "text-[#ff5c77]", ring: "ring-[#ff3b5c]/45" },
-  cancelled: { label: "CANCELLED", dot: "bg-[#4b5263]", text: "text-[#8f98ab]", ring: "ring-[#4b5263]/40" },
+  queued: { label: "QUEUED", dot: "bg-muted-dim", text: "text-muted", ring: "ring-muted-dim/50" },
+  claimed: { label: "CLAIMED", dot: "bg-violet", text: "text-violet-text", ring: "ring-violet/45" },
+  running: { label: "RUNNING", dot: "bg-success", text: "text-success", ring: "ring-success/40" },
+  review: { label: "IN REVIEW", dot: "bg-warn", text: "text-warn", ring: "ring-warn/45" },
+  done: { label: "DONE", dot: "bg-muted", text: "text-muted", ring: "ring-muted/35" },
+  failed: { label: "FAILED", dot: "bg-error", text: "text-error", ring: "ring-error/45" },
+  cancelled: { label: "CANCELLED", dot: "bg-muted-dim/40", text: "text-muted", ring: "ring-muted-dim/40" },
 };
 
 export function TaskStatusChip({ status }: { status: string }) {
   const s = TASK_STATUS_STYLES[status] ?? TASK_STATUS_STYLES.queued;
   return (
-    <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[11px] font-semibold ring-1 ${s.ring} ${s.text} bg-white/5 mono`}>
+    <span className={`inline-flex items-center gap-1.5 rounded-sm px-2.5 py-0.5 text-[11px] font-semibold ring-1 ${s.ring} ${s.text} bg-white/5 mono`}>
       <span aria-hidden className={`h-1.5 w-1.5 rounded-full ${s.dot} ${status === "running" ? "pulse-dot" : ""}`} />
-      {s.label}
+      <span className={status === "cancelled" ? "line-through" : undefined}>{s.label}</span>
     </span>
   );
 }
@@ -45,7 +46,7 @@ export function TaskStatusChip({ status }: { status: string }) {
 export function StatusChip({ status }: { status: string }) {
   const s = STATUS_STYLES[status] ?? STATUS_STYLES.offline;
   return (
-    <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[11px] font-semibold ring-1 ${s.ring} ${s.text} bg-white/5 mono`}>
+    <span className={`inline-flex items-center gap-1.5 rounded-sm px-2.5 py-0.5 text-[11px] font-semibold ring-1 ${s.ring} ${s.text} bg-white/5 mono`}>
       <span className={`h-1.5 w-1.5 rounded-full ${s.dot} ${status === "active" ? "pulse-dot" : ""}`} />
       {s.label}
     </span>
@@ -119,7 +120,7 @@ export function TimeAgo({ iso }: { iso: string | null }) {
 export function DemoPill() {
   return (
     <span
-      className="mono whitespace-nowrap rounded-full bg-[#2563eb]/15 px-2.5 py-1 text-[10.5px] font-semibold uppercase tracking-wider text-[#9db9ff] ring-1 ring-inset ring-[#2563eb]/50"
+      className="mono whitespace-nowrap rounded-sm bg-accent/15 px-2.5 py-1 text-[10.5px] font-semibold uppercase tracking-wider text-accent ring-1 ring-inset ring-accent/50"
       title="Demo mode: simulated data, no database connected. Set DATABASE_URL and MC_TOKEN to go live."
     >
       demo · simulated

@@ -20,14 +20,14 @@ export function UsageCostPanels({ data }: { data: UsageSummary }) {
         </div>
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
           {(data.providers ?? []).map((provider) => (
-            <article key={provider.account_id} className="rounded-xl border border-white/10 bg-[#101828] p-4">
+            <article key={provider.account_id} className="rounded-xl border border-white/10 bg-panel p-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <h3 className="font-medium">{provider.label}</h3>
-                <span className={`rounded-full px-2 py-0.5 text-xs ${provider.coverage === "complete" ? "bg-emerald-500/10 text-emerald-300" : "bg-amber-500/10 text-amber-200"}`}>
+                <span className={`rounded-sm px-2 py-0.5 text-xs ${provider.coverage === "complete" ? "bg-emerald-500/10 text-emerald-300" : "bg-amber-500/10 text-amber-200"}`}>
                   {provider.coverage === "complete" ? "Complete report" : provider.coverage === "partial" ? "Partial period" : provider.coverage === "unverified" ? "Unverified coverage" : "Not connected"}
                 </span>
               </div>
-              <div className="mt-3 text-3xl font-semibold tabular-nums text-[#ff9a3c]">{dollars(provider.cost_usd)}</div>
+              <div className="mt-3 text-3xl font-semibold tabular-nums text-warn">{dollars(provider.cost_usd)}</div>
               <p className="mt-1 text-xs text-gray-400">{provider.coverage === "complete" ? "Reported cost for this period" : "Observed cost only; period total is not verified"}</p>
               <p className="mt-3 text-xs leading-relaxed text-gray-400">{provider.note}</p>
               {provider.account_id === "openrouter-shared" && (
@@ -39,7 +39,7 @@ export function UsageCostPanels({ data }: { data: UsageSummary }) {
           ))}
         </div>
         {data.providers?.some((p) => p.cost_usd !== null) && (
-          <details className="rounded-xl border border-white/10 bg-[#101828] p-4">
+          <details className="rounded-xl border border-white/10 bg-panel p-4">
             <summary className="cursor-pointer text-sm font-medium text-gray-200">Daily provider costs</summary>
             <div className="mt-3 overflow-x-auto">
               <table className="w-full text-sm tabular-nums">
@@ -53,7 +53,7 @@ export function UsageCostPanels({ data }: { data: UsageSummary }) {
         )}
       </section>
       {data.grok && (
-        <section aria-labelledby="grok-cost-heading" className="rounded-xl border border-white/10 bg-[#101828] p-4">
+        <section aria-labelledby="grok-cost-heading" className="rounded-xl border border-white/10 bg-panel p-4">
           <h2 id="grok-cost-heading" className="text-base font-semibold">Grok subscription and routed usage</h2>
           <div className="mt-4 grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
             <div><p className="text-xs text-gray-400">Recorded subscription fees</p><p className="mt-1 text-2xl font-semibold tabular-nums">{dollars(data.grok.subscription_fees_usd)}</p><p className="mt-1 text-xs text-gray-400">{data.grok.fee_records ? `${data.grok.fee_records} verified payment record(s) in the selected rolling window` : "No verified fee records in this window"}</p></div>
@@ -64,7 +64,7 @@ export function UsageCostPanels({ data }: { data: UsageSummary }) {
         </section>
       )}
       {local && (
-        <section aria-labelledby="claude-usage-heading" className="rounded-xl border border-white/10 bg-[#101828] p-4">
+        <section aria-labelledby="claude-usage-heading" className="rounded-xl border border-white/10 bg-panel p-4">
           <h2 id="claude-usage-heading" className="text-base font-semibold">Claude subscription and local usage</h2>
           <p className="mt-1 text-xs text-gray-400">Recorded fees and Claude Code observations in the selected rolling window. Local usage covers scanned machines; claude.ai and other devices are not included.</p>
           <div className="mt-4 grid gap-5 sm:grid-cols-2 lg:grid-cols-4">

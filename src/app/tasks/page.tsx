@@ -49,10 +49,10 @@ function NewTaskForm({ onCreated, onCancel }: { onCreated: () => void; onCancel?
   }
 
   const input =
-    "bg-[#0a0f1c] border border-white/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-[#2563eb] w-full";
+    "bg-bg border border-white/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-accent w-full";
 
   return (
-    <div className="rounded-xl border border-white/10 bg-[#101828] p-4 mb-6">
+    <div className="rounded-xl border border-white/10 bg-panel p-4 mb-6">
       <div className="text-sm font-semibold mb-3">Queue a task</div>
       <div className="grid gap-3">
         <input className={input} placeholder="Title — e.g. Fix the broken subscribe form on example.com"
@@ -80,7 +80,7 @@ function NewTaskForm({ onCreated, onCancel }: { onCreated: () => void; onCancel?
         </div>
         <div className="flex items-center gap-3">
           <button onClick={submit} disabled={state === "sending" || !title.trim()}
-            className="text-sm px-4 py-2 rounded-lg bg-[#f44800] hover:bg-[#ff5a10] disabled:opacity-40 text-white font-semibold transition-colors">
+            className="text-sm px-4 py-2 rounded-lg bg-accent hover:bg-accent-hover disabled:opacity-40 text-accent-ink font-semibold transition-colors">
             {state === "sending" ? "Queuing…" : "Queue task"}
           </button>
           {onCancel && (
@@ -108,17 +108,17 @@ function TaskRow({ t, onAction, onCancelTask }: { t: Task; onAction: () => void;
   }
 
   return (
-    <div className="rounded-xl border border-white/10 bg-[#101828] p-4">
+    <div className="rounded-xl border border-white/10 bg-panel p-4">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="font-medium flex items-center gap-2 flex-wrap">
             <span className="text-gray-500 mono text-xs">#{t.id}</span>
             {t.title}
-            {t.priority === 1 && <span className="text-[11px] mono text-[#ff7a40]">HIGH</span>}
+            {t.priority === 1 && <span className="text-[11px] mono text-error">HIGH</span>}
           </div>
           <div className="flex items-center gap-3 mt-1 text-xs text-gray-500 flex-wrap">
             <PlatformBadge platform={t.platform} />
-            {t.project && <span className="mono text-[#7aa5ff]">{t.project}</span>}
+            {t.project && <span className="mono text-accent">{t.project}</span>}
             {t.reviewer_platform && <span>review: {t.reviewer_platform}</span>}
             {t.assigned_agent && <span className="mono">{t.assigned_agent}</span>}
             {t.cost_usd != null && <span className="mono">${Number(t.cost_usd).toFixed(2)}</span>}
@@ -274,7 +274,7 @@ export default function TasksPage() {
           <button
             type="button"
             onClick={() => setComposing(true)}
-            className="ml-auto rounded-lg bg-[#2563eb] px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-[#1d4ed8] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#19d2ff]/70"
+            className="ml-auto rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-accent-ink transition-colors hover:bg-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70"
           >
             + Queue a task
           </button>

@@ -21,9 +21,9 @@ interface Loaded {
 }
 
 const input =
-  "w-full bg-[#0a0f1c] border border-white/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-[#2563eb] disabled:opacity-60";
+  "w-full bg-bg border border-white/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-accent disabled:opacity-60";
 const primary =
-  "bg-[#2563eb] hover:bg-[#1d4ed8] text-white rounded-lg px-4 py-2 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed";
+  "bg-accent hover:bg-accent-hover text-accent-ink rounded-lg px-4 py-2 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed";
 const secondary = "border border-white/15 rounded-lg px-4 py-2 text-sm text-gray-200 hover:bg-white/5 disabled:opacity-50";
 const iconBtn = "rounded-md border border-white/10 px-2 py-1 text-xs text-gray-300 hover:bg-white/5 disabled:opacity-30";
 const GRID = "md:grid md:grid-cols-[72px_minmax(0,2fr)_minmax(0,1.4fr)_minmax(0,0.8fr)_130px_minmax(0,1.2fr)_52px] md:items-start md:gap-3";
@@ -228,7 +228,7 @@ export function RepoSettings() {
 
   if (loadError) {
     return (
-      <div className="rounded-xl border border-white/10 bg-[#101828] p-6">
+      <div className="rounded-xl border border-white/10 bg-panel p-6">
         <p className="text-red-400 text-sm">{loadError}</p>
         <button className={`${secondary} mt-3`} onClick={() => void load()}>
           Retry
@@ -246,10 +246,10 @@ export function RepoSettings() {
 
   return (
     <div className="space-y-4">
-      <div className="rounded-lg border border-[#2563eb]/40 bg-[#2563eb]/10 px-3 py-2 text-sm text-blue-100">{banner}</div>
+      <div className="rounded-lg border border-accent/40 bg-accent/10 px-3 py-2 text-sm text-blue-100">{banner}</div>
 
       {autoRepos.length > 0 && (
-        <div className="rounded-xl border border-white/10 bg-[#101828] p-4 md:p-6">
+        <div className="rounded-xl border border-white/10 bg-panel p-4 md:p-6">
           <h3 className="text-sm font-medium text-gray-200">Discovered</h3>
           <p className="mt-1 text-xs text-gray-500">
             These stay collected. Pin keeps a quiet repo on the brief. Hide wins over pin. A repo marked gone is not shown, including when it is pinned.
@@ -293,7 +293,7 @@ export function RepoSettings() {
         </div>
       )}
 
-      <div data-repo-settings className="rounded-xl border border-white/10 bg-[#101828] p-4 md:p-6">
+      <div data-repo-settings className="rounded-xl border border-white/10 bg-panel p-4 md:p-6">
         <div className={`hidden ${GRID} mb-2 text-[11px] uppercase tracking-wider text-gray-500`}>
           <span>Order</span>
           <span>Repo (owner/name)</span>
@@ -343,7 +343,7 @@ export function RepoSettings() {
                   <span className="flex items-center gap-2">
                     <input
                       type="color"
-                      value={/^#[0-9a-fA-F]{6}$/.test(r.color) ? r.color : "#2563eb"}
+                      value={/^#[0-9a-fA-F]{6}$/.test(r.color) ? r.color : "#00d8ff"}
                       disabled={disabled}
                       onChange={(ev) => edit(r.id, { color: ev.target.value })}
                       className="h-9 w-10 cursor-pointer rounded-md border border-white/10 bg-transparent p-0.5 disabled:opacity-60"

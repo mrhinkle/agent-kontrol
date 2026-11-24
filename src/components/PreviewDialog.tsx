@@ -32,7 +32,7 @@ export function PreviewDialog({
         role="dialog"
         aria-modal="true"
         aria-labelledby="dry-run-title"
-        className="max-h-[80vh] w-full max-w-lg overflow-auto rounded-xl border border-white/10 bg-[#101828] p-5 shadow-xl"
+        className="max-h-[80vh] w-full max-w-lg overflow-auto rounded-xl border border-white/10 bg-panel p-5 shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
         <h2 id="dry-run-title" className="text-base font-semibold">
@@ -64,7 +64,7 @@ export function PreviewDialog({
           </button>
           <button
             type="button"
-            className="rounded-lg bg-[#2563eb] px-4 py-2 text-sm font-medium text-white hover:bg-[#1d4ed8] disabled:cursor-not-allowed disabled:opacity-50"
+            className="rounded-lg bg-accent px-4 py-2 text-sm font-medium text-accent-ink hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
             onClick={onConfirm}
             disabled={!canApply}
           >

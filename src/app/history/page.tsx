@@ -47,7 +47,7 @@ function History() {
           <select
             value={agentId ?? ""}
             onChange={(e) => setAgent(e.target.value || null)}
-            className="rounded-md border border-white/10 bg-[#101828] px-2 py-1 text-sm text-gray-200 focus:border-white/30 focus:outline-none"
+            className="rounded-md border border-white/10 bg-panel px-2 py-1 text-sm text-gray-200 focus:border-white/30 focus:outline-none"
           >
             <option value="">All agents ({agents.length})</option>
             {agentId && !selected && <option value={agentId}>{agentId} (not reporting)</option>}
@@ -67,7 +67,7 @@ function History() {
       </div>
 
       {agentId && !selected ? (
-        <div className="rounded-lg border border-white/10 bg-[#101828] px-4 py-6 text-sm text-gray-400">
+        <div className="rounded-lg border border-white/10 bg-panel px-4 py-6 text-sm text-gray-400">
           No agent with id <span className="mono text-gray-200">{agentId}</span> is in the fleet right now. It may have been renamed or
           stopped reporting.{" "}
           <Link href="/history" className="text-gray-200 underline underline-offset-2">
@@ -138,7 +138,7 @@ function HistoryLists({
               setHideBackground(e.target.checked);
               setEventPage(1);
             }}
-            className="accent-[#2ee6a6]"
+            className="accent-success"
           />
           Hide heartbeats & telemetry{backgroundCount > 0 && hideBackground ? ` (${backgroundCount} hidden)` : ""}
         </label>
@@ -146,7 +146,7 @@ function HistoryLists({
       <ol className="relative pl-5 before:absolute before:bottom-0 before:left-1.5 before:top-0 before:w-px before:bg-white/10">
         {ePage.items.map((e) => (
           <li key={e.id} className="relative pb-4">
-            <span className={`absolute -left-5 top-1.5 h-2.5 w-2.5 rounded-full ring-4 ring-[#0a0f1c] ${eventDot(e)}`} />
+            <span className={`absolute -left-5 top-1.5 h-2.5 w-2.5 rounded-full ring-4 ring-bg ${eventDot(e)}`} />
             <div className="mono text-xs text-gray-600">
               <TimeAgo iso={e.created_at} /> · {names[e.agent_id] ?? e.agent_id} · {e.kind}
             </div>
@@ -165,7 +165,7 @@ function HistoryLists({
 function SessionRow({ h, now, showAgent, onAgent }: { h: HistorySession; now: number; showAgent: boolean; onAgent: (id: string) => void }) {
   const { session: s, title } = h;
   return (
-    <div className="flex items-start gap-4 rounded-lg border border-white/10 bg-[#101828] px-4 py-3 text-sm">
+    <div className="flex items-start gap-4 rounded-lg border border-white/10 bg-panel px-4 py-3 text-sm">
       <div className="pt-0.5">
         <StatusChip status={s.status} />
       </div>
@@ -182,7 +182,7 @@ function SessionRow({ h, now, showAgent, onAgent }: { h: HistorySession; now: nu
               {h.agentName}
             </button>
           )}
-          {s.project && <span className="mono whitespace-nowrap rounded bg-[#7aa5ff]/10 px-1.5 text-[#9dbcff]">{s.project}</span>}
+          {s.project && <span className="mono whitespace-nowrap rounded bg-accent/10 px-1.5 text-accent">{s.project}</span>}
           <span>
             <time dateTime={s.started_at} title={s.started_at}>
               {startedLabel(s.started_at, now)}
@@ -212,8 +212,8 @@ function startedLabel(iso: string, now: number): string {
 }
 
 function eventDot(e: Event): string {
-  if (e.kind === "error" || e.kind === "failed") return "bg-[#ff3b5c]";
-  if (e.kind === "milestone" || e.kind === "session_start") return "bg-[#2ee6a6]/80";
+  if (e.kind === "error" || e.kind === "failed") return "bg-error";
+  if (e.kind === "milestone" || e.kind === "session_start") return "bg-success/80";
   if (isBackground(e)) return "bg-gray-700";
-  return "bg-[#7f9cff]/70";
+  return "bg-muted/70";
 }

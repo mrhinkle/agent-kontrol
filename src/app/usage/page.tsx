@@ -21,7 +21,7 @@ function Panel({
   className?: string;
 }) {
   return (
-    <section className={`rounded-xl border border-white/10 bg-[#101828] ${className}`}>
+    <section className={`rounded-xl border border-white/10 bg-panel ${className}`}>
       <header className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-2.5">
         <h2 className="mono text-[11px] font-semibold uppercase tracking-[0.14em] text-gray-500">
           {title}
@@ -129,7 +129,7 @@ export default function UsagePage() {
                 type="button"
                 onClick={() => setWin(w)}
                 className={`mono px-2.5 py-1 text-[11px] transition-colors ${
-                  w === win ? "bg-[#f44800] font-semibold text-white" : "text-gray-400 hover:bg-white/5"
+                  w === win ? "bg-accent/15 font-semibold text-accent" : "text-gray-400 hover:bg-white/5"
                 }`}
               >
                 {w}
@@ -171,7 +171,7 @@ export default function UsagePage() {
       {data && !setupRequired && <UsageCostPanels data={data} />}
 
       {empty && (
-        <div className="rounded-xl border border-white/10 bg-[#101828] px-5 py-8 text-center text-sm text-gray-400">
+        <div className="rounded-xl border border-white/10 bg-panel px-5 py-8 text-center text-sm text-gray-400">
           <p className="text-base font-medium text-gray-200">No Hermes usage in this window</p>
           <p className="mt-2 max-w-lg mx-auto">
             Provider and Claude observations appear above. Hermes attribution will appear here when observations are collected.
@@ -182,17 +182,17 @@ export default function UsagePage() {
       {data && !setupRequired && !empty && (
         <>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            <div className="relative overflow-hidden rounded-xl border border-white/10 bg-[#101828] p-4">
-              <span className="absolute inset-y-0 left-0 w-[3px] bg-[#f44800]" aria-hidden />
+            <div className="relative overflow-hidden rounded-xl border border-white/10 bg-panel p-4">
+              <span className="absolute inset-y-0 left-0 w-[3px] bg-error" aria-hidden />
               <Stat
                 label="Agent-attributed paid"
                 value={usd(data.fleet.paid_cost_usd)}
                 sub="Hermes attribution only; may overlap provider billing"
-                tone="text-[#ff9a3c]"
+                tone="text-warn"
               />
             </div>
-            <div className="relative overflow-hidden rounded-xl border border-white/10 bg-[#101828] p-4">
-              <span className="absolute inset-y-0 left-0 w-[3px] bg-[#2563eb]" aria-hidden />
+            <div className="relative overflow-hidden rounded-xl border border-white/10 bg-panel p-4">
+              <span className="absolute inset-y-0 left-0 w-[3px] bg-accent" aria-hidden />
               <Stat
                 label="Codex shadow (not charged)"
                 value={usd(data.fleet.shadow_cost_usd)}
@@ -200,7 +200,7 @@ export default function UsagePage() {
                 tone="text-sky-300"
               />
             </div>
-            <div className="relative overflow-hidden rounded-xl border border-white/10 bg-[#101828] p-4">
+            <div className="relative overflow-hidden rounded-xl border border-white/10 bg-panel p-4">
               <span className="absolute inset-y-0 left-0 w-[3px] bg-emerald-500" aria-hidden />
               <Stat
                 label="Cache hit rate"
@@ -208,7 +208,7 @@ export default function UsagePage() {
                 sub={`${data.fleet.cache_read_tokens.toLocaleString()} cache-read / ${(data.fleet.input_tokens + data.fleet.cache_read_tokens).toLocaleString()} total in`}
               />
             </div>
-            <div className="relative overflow-hidden rounded-xl border border-white/10 bg-[#101828] p-4">
+            <div className="relative overflow-hidden rounded-xl border border-white/10 bg-panel p-4">
               <span className="absolute inset-y-0 left-0 w-[3px] bg-violet-500" aria-hidden />
               <Stat
                 label="Subscription fees"
@@ -233,7 +233,7 @@ export default function UsagePage() {
                   {data.by_profile.slice(0, 12).map((b) => (
                     <tr key={b.key} className="border-t border-white/5">
                       <td className="py-1.5 font-medium">{b.label}</td>
-                      <td className="py-1.5 text-right tabular-nums text-[#ff9a3c]">{usd(b.paid_cost_usd)}</td>
+                      <td className="py-1.5 text-right tabular-nums text-warn">{usd(b.paid_cost_usd)}</td>
                       <td className="py-1.5 text-right tabular-nums text-sky-300">{usd(b.shadow_cost_usd)}</td>
                       <td className="py-1.5 text-right tabular-nums text-gray-500">{b.rows}</td>
                     </tr>
@@ -255,7 +255,7 @@ export default function UsagePage() {
                   {data.by_model.slice(0, 12).map((b) => (
                     <tr key={b.key} className="border-t border-white/5">
                       <td className="py-1.5 mono text-[12px]">{b.label}</td>
-                      <td className="py-1.5 text-right tabular-nums text-[#ff9a3c]">{usd(b.paid_cost_usd)}</td>
+                      <td className="py-1.5 text-right tabular-nums text-warn">{usd(b.paid_cost_usd)}</td>
                       <td className="py-1.5 text-right tabular-nums text-sky-300">{usd(b.shadow_cost_usd)}</td>
                     </tr>
                   ))}
@@ -320,7 +320,7 @@ export default function UsagePage() {
                       ) : null}
                     </td>
                     <td className="py-1.5 mono text-[11px]">{s.model}</td>
-                    <td className="py-1.5 text-right tabular-nums text-[#ff9a3c]">{usd(s.paid_cost_usd)}</td>
+                    <td className="py-1.5 text-right tabular-nums text-warn">{usd(s.paid_cost_usd)}</td>
                     <td className="py-1.5 text-right tabular-nums text-sky-300">{usd(s.shadow_cost_usd)}</td>
                   </tr>
                 ))}

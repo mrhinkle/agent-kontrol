@@ -32,8 +32,8 @@ import {
   stackHeight,
 } from "./layout";
 
-/** Darkened steel blue-gray derived from STATUS_COLORS.done (#3d5078). */
-const DONE_BODY_COLOR = "#1a2438";
+/** Ion panel-elevated: the body of a finished floor. */
+const DONE_BODY_COLOR = "#181c22";
 const FLOOR_SELECT_COLOR = NEUTRAL.select;
 const FILTER_DIM = 0.12;
 const DIM_FACE_OPACITY = 0.25;
@@ -42,7 +42,7 @@ const DONE_DIM_OPACITY = 0.3;
 const TOWER_LABEL_FADE = 0.3;
 /** Warm data-face when work is running — the running status hue. */
 const FACE_AMBER = STATUS_COLORS.running;
-const FACE_CYAN = "#19d2ff";
+const FACE_CYAN = "#00d8ff";
 const FACE_SCROLL = 0.006;
 const FACE_DIM_OPACITY = 0.15;
 const HISTORY_MERGE_MIN = 3;

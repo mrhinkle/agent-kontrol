@@ -21,7 +21,7 @@ function MailboxBadges({ agent }: { agent: FleetAgent }) {
     <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
       {pending > 0 && (
         <span
-          className="rounded-full bg-[#ffb020]/10 px-2 py-0.5 text-[#ffcf70] ring-1 ring-[#ffb020]/30"
+          className="rounded-sm bg-warn/10 px-2 py-0.5 text-warn ring-1 ring-warn/30"
           title={`${pending} message${pending === 1 ? "" : "s"} you sent that the agent hasn't picked up yet. Agents read messages at their next check-in.`}
         >
           📬 {pending} waiting for agent
@@ -29,7 +29,7 @@ function MailboxBadges({ agent }: { agent: FleetAgent }) {
       )}
       {unread > 0 && (
         <span
-          className="rounded-full bg-[#2ee6a6]/10 px-2 py-0.5 text-[#7ff3c8] ring-1 ring-[#2ee6a6]/30"
+          className="rounded-sm bg-success/10 px-2 py-0.5 text-success ring-1 ring-success/30"
           title={`${unread} repl${unread === 1 ? "y" : "ies"} from the agent you haven't opened. Open the conversation to read ${unread === 1 ? "it" : "them"}.`}
         >
           💬 {unread} new repl{unread === 1 ? "y" : "ies"}
@@ -49,12 +49,12 @@ function AgentCard({ agent, events }: { agent: FleetAgent; events: Event[] }) {
   // The card edge carries the status too, so a NEEDS YOU or FAILED card reads from across the room.
   const edge =
     agent.derived_status === "waiting"
-      ? "border-[#ffb020]/40 hover:border-[#ffb020]/70"
+      ? "border-warn/40 hover:border-warn/70"
       : agent.derived_status === "failed"
-        ? "border-[#ff3b5c]/40 hover:border-[#ff3b5c]/70"
+        ? "border-error/40 hover:border-error/70"
         : "border-white/10 hover:border-white/20";
   return (
-    <div className={`flex flex-col gap-3 rounded-xl border bg-[#101828] p-4 transition-colors ${edge}`}>
+    <div className={`flex flex-col gap-3 rounded-xl border bg-panel p-4 transition-colors ${edge}`}>
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0">
           {/* Full name, wrapped — never truncated. */}
@@ -93,7 +93,7 @@ function AgentCard({ agent, events }: { agent: FleetAgent; events: Event[] }) {
             </div>
           )}
           <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-500">
-            {s.project && <span className="mono whitespace-nowrap rounded bg-[#7aa5ff]/10 px-1.5 text-[#9dbcff]">{s.project}</span>}
+            {s.project && <span className="mono whitespace-nowrap rounded bg-accent/10 px-1.5 text-accent">{s.project}</span>}
             <span>
               started <TimeAgo iso={s.started_at} />
             </span>
@@ -107,7 +107,7 @@ function AgentCard({ agent, events }: { agent: FleetAgent; events: Event[] }) {
             <TimeAgo iso={last.ended_at ?? last.updated_at} />
           </div>
           <div
-            className={`mt-0.5 line-clamp-2 ${last.status === "failed" ? "text-[#ff8da0]" : lastHeadline.source === "fallback" ? "text-gray-600" : "text-gray-400"}`}
+            className={`mt-0.5 line-clamp-2 ${last.status === "failed" ? "text-error" : lastHeadline.source === "fallback" ? "text-gray-600" : "text-gray-400"}`}
             title={lastHeadline.title}
           >
             {lastHeadline.title}
@@ -183,12 +183,12 @@ export default function FleetPage() {
       <div className="mb-5 flex flex-wrap items-center gap-x-6 gap-y-1">
         <h1 className="text-lg font-semibold">Fleet</h1>
         <div className="text-sm text-gray-500">
-          <span className="font-semibold text-[#2ee6a6]">{working}</span> working ·{" "}
-          <span className="font-semibold text-[#ffb020]">{needsYou}</span> need{needsYou === 1 ? "s" : ""} you
+          <span className="font-semibold text-success">{working}</span> working ·{" "}
+          <span className="font-semibold text-warn">{needsYou}</span> need{needsYou === 1 ? "s" : ""} you
           {failed > 0 && (
             <>
               {" "}
-              · <span className="font-semibold text-[#ff5c77]">{failed}</span> failed
+              · <span className="font-semibold text-error">{failed}</span> failed
             </>
           )}{" "}
           · {data.agents.length} agents
@@ -209,11 +209,11 @@ export default function FleetPage() {
 
       <PanelHeader title="Live activity" count={feed.items.length} href="/history" hrefLabel="Full history" className="mt-10">
         <label className="flex cursor-pointer items-center gap-1.5 text-xs text-gray-500">
-          <input type="checkbox" checked={showBackground} onChange={(e) => setShowBackground(e.target.checked)} className="accent-[#2ee6a6]" />
+          <input type="checkbox" checked={showBackground} onChange={(e) => setShowBackground(e.target.checked)} className="accent-success" />
           Show heartbeats &amp; telemetry{!showBackground && feed.hidden > 0 ? ` (${feed.hidden} hidden)` : ""}
         </label>
       </PanelHeader>
-      <div className="rounded-xl border border-white/10 bg-[#101828] px-4 py-2">
+      <div className="rounded-xl border border-white/10 bg-panel px-4 py-2">
         {feed.items.map((it) => (
           <EventRow key={it.event.id} e={it.event} count={it.count} agent={byId.get(it.event.agent_id)} />
         ))}

@@ -230,13 +230,13 @@ export function platformMatchesFilters(
   return filters.platforms.length === 0 || filters.platforms.includes(platform);
 }
 
-/** Agent status colors. Active pulses, waiting is amber, failed red, done dim. */
+/** Agent status colors, in Chatterbuilt Ion tokens (success, warn, error, muted-dim). Active pulses, waiting is amber, failed red, done dim. */
 export const AGENT_STATUS_COLORS: Record<AgentStatus, string> = {
-  active: "#2ee6a6",
+  active: "#3ecf8e",
   waiting: "#ffb020",
-  failed: "#ff3b5c",
-  done: "#5c6f96",
-  offline: "#3b4559",
+  failed: "#f07178",
+  done: "#8fa3b8",
+  offline: "#6b7c8f",
 };
 
 export const AGENT_STATUS_LABELS: Record<AgentStatus, string> = {
@@ -249,12 +249,13 @@ export const AGENT_STATUS_LABELS: Record<AgentStatus, string> = {
 
 /** Task-status colors for tower floors — same hue family as agent status. */
 export const STATUS_COLORS: Record<GibsonFloorStatus, string> = {
-  queued: "#4a5f9e",
-  claimed: "#7f9cff",
-  running: "#2ee6a6",
-  review: "#19d2ff",
-  failed: "#ff3b5c",
-  done: "#3d5078",
+  queued: "#6b7c8f",
+  claimed: "#8fa3b8",
+  running: "#3ecf8e",
+  review: "#00d8ff",
+  failed: "#f07178",
+  // Ion muted-dim at half strength on the page background, so finished floors recede.
+  done: "#3a4450",
 };
 
 export const STATUS_LABELS: Record<GibsonFloorStatus, string> = {
@@ -268,9 +269,9 @@ export const STATUS_LABELS: Record<GibsonFloorStatus, string> = {
 
 /** Neutral (non-status) colors for chrome: labels, selection, platform glyphs. */
 export const NEUTRAL = {
-  label: "#e8efff",
-  labelMuted: "#93a4c8",
-  glyph: "#c9d4ee",
+  label: "#e8eaed",
+  labelMuted: "#8fa3b8",
+  glyph: "#e8eaed",
   select: "#ffffff",
 } as const;
 
@@ -308,4 +309,4 @@ export const PLATFORM_KEY: Array<{ shape: GibsonPlatformShape; label: string; pl
   { shape: "hex", label: "Other", platforms: [] },
 ];
 
-export const GIBSON_BG = "#05070f";
+export const GIBSON_BG = "#0b0d10";

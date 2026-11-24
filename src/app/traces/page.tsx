@@ -72,13 +72,13 @@ export default function TracesPage() {
                     </td>
                     <td className="px-3 py-2">{t.agent_id}</td>
                     <td className="px-3 py-2">
-                      <Link href={`/traces/${t.trace_id}`} className="text-[#9dbcff] hover:underline">
+                      <Link href={`/traces/${t.trace_id}`} className="text-accent hover:underline">
                         {t.root_name}
                       </Link>
                       <span className="mono ml-2 text-[11px] text-gray-600">{t.trace_id.slice(0, 8)}</span>
                     </td>
                     <td className="px-3 py-2 text-right tabular-nums">{t.span_count}</td>
-                    <td className={`px-3 py-2 text-right tabular-nums ${t.error_count ? "text-[#ff5c77]" : "text-gray-500"}`}>{t.error_count}</td>
+                    <td className={`px-3 py-2 text-right tabular-nums ${t.error_count ? "text-error" : "text-gray-500"}`}>{t.error_count}</td>
                     <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums text-gray-400">
                       {formatDuration(dur)}
                     </td>

@@ -46,20 +46,18 @@ export function SiteNav() {
       <div ref={ref} className="no-scrollbar flex items-center gap-1 overflow-x-auto px-3 text-sm md:overflow-visible md:px-0">
         {NAV_LINKS.map((l) => {
           const active = isActive(pathname, l.href);
-          const tone = l.accent
-            ? active
-              ? "text-[#19d2ff]"
-              : "text-[#19d2ff]/80 hover:text-[#19d2ff]"
-            : active
-              ? "text-white"
+          const tone = active
+            ? "bg-accent/15 text-accent"
+            : l.accent
+              ? "text-accent/80 hover:text-accent"
               : "text-gray-400 hover:text-white";
           return (
             <Link
               key={l.href}
               href={l.href}
               aria-current={active ? "page" : undefined}
-              className={`shrink-0 whitespace-nowrap rounded-md px-2 py-2 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#19d2ff]/70 md:py-0.5 ${l.accent ? "mono" : ""} ${tone} ${
-                active ? "bg-white/[0.06]" : ""
+              className={`shrink-0 whitespace-nowrap rounded-md px-2 py-2 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 md:py-0.5 ${l.accent ? "mono" : ""} ${tone} ${
+                ""
               }`}
             >
               {l.label}
@@ -67,8 +65,8 @@ export function SiteNav() {
           );
         })}
       </div>
-      {edges.left && <span aria-hidden className="pointer-events-none absolute inset-y-0 left-0 w-6 bg-gradient-to-r from-[#0a0f1c] to-transparent md:hidden" />}
-      {edges.right && <span aria-hidden className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-[#0a0f1c] to-transparent md:hidden" />}
+      {edges.left && <span aria-hidden className="pointer-events-none absolute inset-y-0 left-0 w-6 bg-gradient-to-r from-bg to-transparent md:hidden" />}
+      {edges.right && <span aria-hidden className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-bg to-transparent md:hidden" />}
     </nav>
   );
 }

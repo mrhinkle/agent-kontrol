@@ -5,7 +5,7 @@ import type { ScopeAction } from "./SkillHelpers";
 import type { SkillScope } from "./skills-types";
 
 const field =
-  "min-w-0 flex-1 rounded-lg border border-white/10 bg-[#0a0f1c] px-3 py-2 text-sm text-gray-200 outline-none focus-visible:ring-2 focus-visible:ring-[#19d2ff]/70 disabled:opacity-40 sm:max-w-xs";
+  "min-w-0 flex-1 rounded-lg border border-white/10 bg-bg px-3 py-2 text-sm text-gray-200 outline-none focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-40 sm:max-w-xs";
 
 /**
  * `scope` is what to show, which may be an unsaved empty Selected draft. Every edit goes to
@@ -60,7 +60,7 @@ export function SkillScopeControl({
                 value={value}
                 checked={scope.mode === value}
                 onChange={() => onAction({ type: "mode", mode: value })}
-                className="h-4 w-4 accent-[#2563eb] focus-visible:ring-2 focus-visible:ring-[#19d2ff]/70"
+                className="h-4 w-4 accent-accent focus-visible:ring-2 focus-visible:ring-accent/70"
               />
               {label}
             </label>
@@ -73,13 +73,13 @@ export function SkillScopeControl({
             {options.map((lane) => (
               <label
                 key={lane}
-                className="inline-flex min-h-11 items-center gap-2 rounded-full bg-white/5 px-3 text-xs text-gray-200 ring-1 ring-white/10 md:min-h-8"
+                className="inline-flex min-h-11 items-center gap-2 rounded-sm bg-white/5 px-3 text-xs text-gray-200 ring-1 ring-white/10 md:min-h-8"
               >
                 <input
                   type="checkbox"
                   checked={scope.lanes.includes(lane)}
                   onChange={() => onAction({ type: "toggle", lane })}
-                  className="h-4 w-4 accent-[#2563eb] focus-visible:ring-2 focus-visible:ring-[#19d2ff]/70"
+                  className="h-4 w-4 accent-accent focus-visible:ring-2 focus-visible:ring-accent/70"
                 />
                 <span className="mono">{lane}</span>
               </label>
@@ -105,7 +105,7 @@ export function SkillScopeControl({
               type="button"
               onClick={addLane}
               disabled={!draft.trim()}
-              className="min-h-11 rounded-lg border border-white/10 bg-white/5 px-3 text-sm text-gray-200 hover:bg-white/10 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#19d2ff]/70 md:min-h-8"
+              className="min-h-11 rounded-lg border border-white/10 bg-white/5 px-3 text-sm text-gray-200 hover:bg-white/10 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 md:min-h-8"
             >
               Add
             </button>
@@ -114,7 +114,7 @@ export function SkillScopeControl({
             <p className="mt-2 text-xs text-gray-400">Not saved yet. Pick or add a lane to limit this skill to it.</p>
           )}
           {lastLaneNotice && (
-            <p role="status" className="mt-2 text-xs text-[#ffb020]">
+            <p role="status" className="mt-2 text-xs text-warn">
               Selected lanes needs at least one lane. Keep this lane, or choose All lanes to run this skill everywhere.
             </p>
           )}

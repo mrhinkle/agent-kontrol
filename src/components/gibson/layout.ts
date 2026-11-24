@@ -15,7 +15,7 @@ export const DOCK_SHAPE_Y = 1.5;
 export const DOCK_SHAPE_SIZE = 0.6;
 export const STREAM_ARC = 6;
 export const STREAM_SEGMENTS = 40;
-export const LABEL_COLOR = "#e8efff";
+export const LABEL_COLOR = "#e8eaed";
 
 export interface TowerPose {
   id: string;

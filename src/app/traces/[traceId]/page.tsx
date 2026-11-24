@@ -5,11 +5,11 @@ import Link from "next/link";
 import { buildWaterfall, formatDuration, type SpanRow } from "@/lib/traces";
 
 const KIND_COLOR: Record<string, string> = {
-  session: "bg-[#5c6f96]",
-  turn: "bg-[#7f9cff]",
-  tool: "bg-[#2ee6a6]",
-  model: "bg-[#c78bff]",
-  other: "bg-[#8f98ab]",
+  session: "bg-muted-dim",
+  turn: "bg-muted",
+  tool: "bg-success",
+  model: "bg-violet-text",
+  other: "bg-muted",
 };
 
 export default function TraceDetail({ params }: { params: Promise<{ traceId: string }> }) {
@@ -74,11 +74,11 @@ export default function TraceDetail({ params }: { params: Promise<{ traceId: str
                   }`}
                 >
                   <span className="truncate" style={{ paddingLeft: `${Math.min(r.depth, 8) * 14}px` }}>
-                    <span className={r.span.status === "error" ? "text-[#ff5c77]" : ""}>{r.span.name}</span>
+                    <span className={r.span.status === "error" ? "text-error" : ""}>{r.span.name}</span>
                   </span>
                   <span className="relative h-3 rounded bg-white/5">
                     <span
-                      className={`absolute top-0 h-3 rounded ${r.span.status === "error" ? "bg-[#ff3b5c]" : KIND_COLOR[r.span.kind] ?? KIND_COLOR.other} ${r.open ? "animate-pulse" : ""}`}
+                      className={`absolute top-0 h-3 rounded ${r.span.status === "error" ? "bg-error" : KIND_COLOR[r.span.kind] ?? KIND_COLOR.other} ${r.open ? "animate-pulse" : ""}`}
                       style={{ left: `${r.offsetPct}%`, width: `${Math.min(r.widthPct, 100 - r.offsetPct)}%` }}
                     />
                   </span>

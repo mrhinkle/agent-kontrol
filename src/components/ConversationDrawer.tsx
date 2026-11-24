@@ -20,7 +20,7 @@ function stateLabel(s: DeliveryState): string {
 
 function stateClass(s: DeliveryState): string {
   if (s === "queued") return "text-amber-300";
-  if (s === "delivered") return "text-[#7aa5ff]";
+  if (s === "delivered") return "text-accent";
   return "text-emerald-300";
 }
 
@@ -121,14 +121,14 @@ export function ConversationDrawer({ agent }: { agent: FleetAgent }) {
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center justify-between gap-2 rounded-lg border border-white/10 bg-[#0a0f1c] px-2.5 py-1.5 text-xs text-gray-300 hover:border-white/20 transition-colors"
+        className="w-full flex items-center justify-between gap-2 rounded-lg border border-white/10 bg-bg px-2.5 py-1.5 text-xs text-gray-300 hover:border-white/20 transition-colors"
       >
         <span className="font-medium">
           {open ? "Hide conversation" : "Conversation"}
         </span>
         <span className="flex items-center gap-2 mono text-[11px]">
           {pending > 0 && (
-            <span className="text-[#ff7a40]" title="waiting for agent">
+            <span className="text-error" title="waiting for agent">
               📬 {pending}
             </span>
           )}
@@ -142,7 +142,7 @@ export function ConversationDrawer({ agent }: { agent: FleetAgent }) {
       </button>
 
       {open && (
-        <div className="mt-2 rounded-lg border border-white/10 bg-[#0a0f1c] p-2.5 flex flex-col gap-2">
+        <div className="mt-2 rounded-lg border border-white/10 bg-bg p-2.5 flex flex-col gap-2">
           {setupRequired ? (
             <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-2 text-[11px] text-amber-50">
               <div className="font-semibold text-amber-100">Two-way messaging isn&apos;t set up yet</div>
@@ -197,13 +197,13 @@ export function ConversationDrawer({ agent }: { agent: FleetAgent }) {
                     if (e.key === "Enter") void send();
                   }}
                   placeholder={`Message ${agent.display_name ?? agent.id}…`}
-                  className="flex-1 bg-[#101828] border border-white/10 rounded-lg px-2.5 py-1.5 text-xs outline-none focus:border-[#2563eb]"
+                  className="flex-1 bg-panel border border-white/10 rounded-lg px-2.5 py-1.5 text-xs outline-none focus:border-accent"
                 />
                 <button
                   type="button"
                   onClick={() => void send()}
                   disabled={sendState === "sending" || !text.trim()}
-                  className="text-xs px-2.5 py-1.5 rounded-lg bg-[#f44800] hover:bg-[#ff5a10] disabled:opacity-40 text-white font-semibold transition-colors"
+                  className="text-xs px-2.5 py-1.5 rounded-lg bg-accent hover:bg-accent-hover disabled:opacity-40 text-accent-ink font-semibold transition-colors"
                 >
                   {sendState === "sending" ? "…" : sendState === "sent" ? "Sent ✓" : "Send"}
                 </button>

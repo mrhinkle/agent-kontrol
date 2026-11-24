@@ -7,10 +7,10 @@ import { distribution, localDate, parseVelocity, summarizeVelocity, VELOCITY_MAX
 const number = (v: number | null | undefined, digits = 0) => v == null ? "—" : v.toLocaleString("en-US", { maximumFractionDigits: digits, minimumFractionDigits: digits });
 const percent = (v: number | null | undefined) => v == null ? "—" : `${number(v * 100, 1)}%`;
 const dateLabel = (d: string) => new Date(`${d.slice(0, 10)}T12:00:00Z`).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
-const control = "rounded-lg border border-white/15 bg-[#101828] px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-cyan-400 disabled:cursor-not-allowed disabled:opacity-40";
+const control = "rounded-lg border border-white/15 bg-panel px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-2 focus:ring-cyan-400 disabled:cursor-not-allowed disabled:opacity-40";
 
 function Panel({ title, note, children, className = "" }: { title: string; note?: string; children: React.ReactNode; className?: string }) {
-  return <section className={`min-w-0 rounded-xl border border-white/10 bg-[#101828] ${className}`}>
+  return <section className={`min-w-0 rounded-xl border border-white/10 bg-panel ${className}`}>
     <header className="flex flex-wrap items-baseline justify-between gap-2 border-b border-white/10 px-5 py-3">
       <h2 className="mono text-xs font-semibold uppercase tracking-[0.12em] text-gray-300">{title}</h2>
       {note && <span className="text-xs text-gray-400">{note}</span>}
@@ -31,9 +31,9 @@ function Throughput({ summary }: { summary: VelocitySummary }) {
     <svg viewBox={`0 0 ${width} ${height + 30}`} className="w-full" role="img" aria-label="Daily opened and merged pull requests. Exact values are in the daily counts table.">
       {[0, 0.5, 1].map((n) => <line key={n} x1="0" x2={width} y1={height * n} y2={height * n} stroke="white" strokeOpacity="0.08" />)}
       {days.map((d, i) => <g key={d.date}><title>{d.date}: {d.merged} merged, {d.opened} opened</title>
-        <rect x={i * step + step * .14} y={height - d.merged / max * (height - 8)} width={Math.max(1, step * .32)} height={d.merged / max * (height - 8)} rx="2" fill="#22d3ee" />
-        <rect x={i * step + step * .51} y={height - d.opened / max * (height - 8)} width={Math.max(1, step * .32)} height={d.opened / max * (height - 8)} rx="2" fill="#fdba74" opacity="0.8" />
-        {(i === 0 || i === days.length - 1 || (i % Math.max(1, Math.floor(days.length / 5)) === 0 && i < days.length - 2)) && <text x={i * step + step / 2} y={height + 23} fill="#9ca3af" fontSize="11" textAnchor={i === 0 ? "start" : i === days.length - 1 ? "end" : "middle"}>{dateLabel(d.date)}</text>}
+        <rect x={i * step + step * .14} y={height - d.merged / max * (height - 8)} width={Math.max(1, step * .32)} height={d.merged / max * (height - 8)} rx="2" fill="#00d8ff" />
+        <rect x={i * step + step * .51} y={height - d.opened / max * (height - 8)} width={Math.max(1, step * .32)} height={d.opened / max * (height - 8)} rx="2" fill="#ffb020" opacity="0.8" />
+        {(i === 0 || i === days.length - 1 || (i % Math.max(1, Math.floor(days.length / 5)) === 0 && i < days.length - 2)) && <text x={i * step + step / 2} y={height + 23} fill="#8fa3b8" fontSize="11" textAnchor={i === 0 ? "start" : i === days.length - 1 ? "end" : "middle"}>{dateLabel(d.date)}</text>}
       </g>)}
     </svg>
     <details className="mt-3 text-xs text-gray-400"><summary className="cursor-pointer hover:text-white">View exact daily counts</summary><div className="mt-3">
@@ -66,12 +66,12 @@ function BenchmarkTrend({ points, baseline, latest, preview }: { points: Velocit
         {points.map((p, i) => {
           const v = value(p), prev = points[i - 1], pv = prev && value(prev);
           return v == null ? null : <g key={p.id}><title>{dateLabel(p.windowEnd)}: {format(v)} · {p.summary.repositories} repositories · {p.captureKind}</title>
-            {prev && pv != null && prev.inventoryKey === p.inventoryKey && <line x1={x(i - 1)} y1={y(pv)} x2={x(i)} y2={y(v)} stroke="#22d3ee" strokeWidth="2.5" />}
-            <circle cx={x(i)} cy={y(v)} r="4" fill={p.captureKind === "reconstructed" ? "#fdba74" : "#22d3ee"} />
-            {(i === 0 || i === points.length - 1) && <text x={x(i)} y="180" textAnchor={i === 0 ? "start" : "end"} fill="#9ca3af" fontSize="11">{dateLabel(p.windowEnd)}</text>}
+            {prev && pv != null && prev.inventoryKey === p.inventoryKey && <line x1={x(i - 1)} y1={y(pv)} x2={x(i)} y2={y(v)} stroke="#00d8ff" strokeWidth="2.5" />}
+            <circle cx={x(i)} cy={y(v)} r="4" fill={p.captureKind === "reconstructed" ? "#ffb020" : "#00d8ff"} />
+            {(i === 0 || i === points.length - 1) && <text x={x(i)} y="180" textAnchor={i === 0 ? "start" : "end"} fill="#8fa3b8" fontSize="11">{dateLabel(p.windowEnd)}</text>}
           </g>;
         })}
-        <text x="32" y="12" fill="#9ca3af" fontSize="11">{format(max)}</text>
+        <text x="32" y="12" fill="#8fa3b8" fontSize="11">{format(max)}</text>
       </svg>}
     {!preview && baseline && latest && <div className="mt-3 flex flex-wrap gap-x-6 gap-y-2 text-xs text-gray-400"><span>Baseline {format(value(baseline))}</span><span>Latest {format(value(latest))}</span><span>{baseline.id === latest.id ? "First capture" : !sameCoverage ? "Coverage changed · delta withheld" : delta == null ? "Delta unavailable" : `Change ${delta > 0 ? "+" : ""}${metric === "firstPass" ? `${number(delta * 100, 1)} percentage points` : number(delta, 2)}`}</span></div>}
     {points.length > 1 && <details className="mt-4 text-xs text-gray-400"><summary className="cursor-pointer">Capture history and sample sizes</summary><div className="mt-3">

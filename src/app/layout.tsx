@@ -1,9 +1,12 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { Inter } from "next/font/google";
 import { AgentKontrolMark } from "@/components/AgentKontrolMark";
 import { SiteNav } from "@/components/SiteNav";
 import { AttentionStrip } from "@/components/AttentionStrip";
 import "./globals.css";
+
+const inter = Inter({ subsets: ["latin"], variable: "--font-inter", display: "swap" });
 
 export const metadata: Metadata = {
   title: "Agent Kontrol",
@@ -15,9 +18,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   // The byline and trademark notice belong to the default product name only.
   const branded = process.env.NEXT_PUBLIC_MC_NAME === undefined;
   return (
-    <html lang="en">
+    <html lang="en" className={inter.variable}>
       <body className="min-h-screen">
-        <header className="border-b border-white/10 sticky top-0 z-10 backdrop-blur bg-[#0a0f1c]/80">
+        <header className="border-b border-white/10 sticky top-0 z-10 bg-bg">
           <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-x-6 gap-y-1 px-4 py-2">
             <Link href="/" className="group flex shrink-0 items-center gap-2 py-1 md:py-0">
               <AgentKontrolMark className="h-6 w-6 text-gray-200 transition-colors group-hover:text-white" />

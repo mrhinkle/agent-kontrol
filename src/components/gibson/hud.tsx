@@ -82,8 +82,8 @@ export function StatusPill({ status }: { status: AgentStatus }) {
   const c = AGENT_STATUS_COLORS[status];
   return (
     <span
-      className="mono inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider"
-      style={{ color: status === "done" || status === "offline" ? "#c3cde4" : c, backgroundColor: `${c}22`, boxShadow: `inset 0 0 0 1px ${c}66` }}
+      className="mono inline-flex items-center gap-1.5 rounded-sm px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider"
+      style={{ color: status === "done" || status === "offline" ? "#e8eaed" : c, backgroundColor: `${c}22`, boxShadow: `inset 0 0 0 1px ${c}66` }}
     >
       {AGENT_STATUS_LABELS[status]}
     </span>
@@ -91,11 +91,11 @@ export function StatusPill({ status }: { status: AgentStatus }) {
 }
 
 const TONE: Record<string, { fg: string; bg: string; ring: string }> = {
-  red: { fg: "#ff9aac", bg: "#ff3b5c22", ring: "#ff3b5c88" },
-  amber: { fg: "#ffd27a", bg: "#ffb02022", ring: "#ffb02088" },
-  cyan: { fg: "#8be6ff", bg: "#19d2ff1a", ring: "#19d2ff66" },
-  gray: { fg: "#aab4cc", bg: "#ffffff0d", ring: "#ffffff26" },
-  green: { fg: "#8ff5cf", bg: "#2ee6a61a", ring: "#2ee6a666" },
+  red: { fg: "#f07178", bg: "#f0717822", ring: "#f0717888" },
+  amber: { fg: "#ffb020", bg: "#ffb02022", ring: "#ffb02088" },
+  cyan: { fg: "#6fe9ff", bg: "#00d8ff1a", ring: "#00d8ff66" },
+  gray: { fg: "#8fa3b8", bg: "#ffffff0d", ring: "#ffffff26" },
+  green: { fg: "#3ecf8e", bg: "#3ecf8e1a", ring: "#3ecf8e66" },
 };
 
 const LEVEL_TONE: Record<GibsonBanner["level"], keyof typeof TONE> = {
@@ -116,7 +116,7 @@ export function StatusBanner({
   return (
     <div className="flex min-w-0 flex-wrap items-center justify-center gap-1.5" role="status" aria-live="polite">
       <span
-        className="mono rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em]"
+        className="mono rounded-sm px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em]"
         style={{ color: tone.fg, backgroundColor: tone.bg, boxShadow: `inset 0 0 0 1px ${tone.ring}` }}
       >
         {banner.level === "critical" ? "● " : banner.level === "attention" ? "▲ " : ""}
@@ -126,7 +126,7 @@ export function StatusBanner({
         const t = TONE[item.tone];
         const inner = <>{item.label}</>;
         const cls =
-          "mono rounded-full px-2 py-1 text-[10.5px] transition-colors hover:brightness-125 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#19d2ff]";
+          "mono rounded-sm px-2 py-1 text-[10.5px] transition-colors hover:brightness-125 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent";
         const style = { color: t.fg, backgroundColor: t.bg, boxShadow: `inset 0 0 0 1px ${t.ring}` };
         return item.key === "needs-you" ? (
           <Link key={item.key} href="/progress" className={cls} style={style} title="Open the Progress board">
@@ -170,7 +170,7 @@ export function Roster({
             .map((s, i) => (
               <span key={s}>
                 {i > 0 && " · "}
-                <span style={{ color: s === "done" || s === "offline" ? "#aab4cc" : AGENT_STATUS_COLORS[s] }}>{c[s]}</span>{" "}
+                <span style={{ color: s === "done" || s === "offline" ? "#8fa3b8" : AGENT_STATUS_COLORS[s] }}>{c[s]}</span>{" "}
                 {AGENT_STATUS_LABELS[s].toLowerCase()}
               </span>
             ))}
@@ -208,7 +208,7 @@ export function Roster({
                     <span className="min-w-0 flex-1">
                       <span className="block break-words text-[13px] leading-snug text-gray-100">{o.label}</span>
                       <span className="mono mt-0.5 block truncate text-[10.5px] text-gray-400">
-                        <span style={{ color: o.status === "done" || o.status === "offline" ? "#9aa6c2" : AGENT_STATUS_COLORS[o.status] }}>
+                        <span style={{ color: o.status === "done" || o.status === "offline" ? "#8fa3b8" : AGENT_STATUS_COLORS[o.status] }}>
                           {AGENT_STATUS_LABELS[o.status].toUpperCase()}
                         </span>
                         {" · "}
@@ -430,7 +430,7 @@ export function TowerPanel({
       {agents.length > 0 && (
         <div className="mt-3 flex flex-wrap gap-1.5">
           {agents.map((a) => (
-            <button key={a.id} type="button" onClick={() => onSelectAgent(a.id)} className="inline-flex items-center gap-1.5 rounded-full border border-white/10 px-2 py-0.5 text-[11px] text-gray-200 hover:border-white/30">
+            <button key={a.id} type="button" onClick={() => onSelectAgent(a.id)} className="inline-flex items-center gap-1.5 rounded-sm border border-white/10 px-2 py-0.5 text-[11px] text-gray-200 hover:border-white/30">
               <StatusDot status={a.status} reducedMotion /> {a.label}
             </button>
           ))}
@@ -536,7 +536,7 @@ export function LegendPanel({
       </section>
 
       {(statusFilter.length > 0 || platformFilter.length > 0) && (
-        <button type="button" onClick={onClear} className="rounded-full border border-white/20 px-3 py-1 text-[11px] text-gray-200 hover:bg-white/10">
+        <button type="button" onClick={onClear} className="rounded-sm border border-white/20 px-3 py-1 text-[11px] text-gray-200 hover:bg-white/10">
           × Clear filters
         </button>
       )}
@@ -562,12 +562,12 @@ export function GibsonTooltip({ info }: { info: GibsonHoverInfo }) {
   const flipLeft = typeof window !== "undefined" && info.clientX > window.innerWidth - 320;
   return (
     <div
-      className="pointer-events-none fixed z-50 max-w-[19rem] rounded-lg border border-white/15 bg-[#0a0f1c]/95 px-3 py-2 shadow-xl backdrop-blur"
+      className="pointer-events-none fixed z-50 max-w-[19rem] rounded-lg border border-white/15 bg-bg/95 px-3 py-2 shadow-xl backdrop-blur"
       style={{
         left: flipLeft ? info.clientX - 14 : info.clientX + 16,
         top: info.clientY + 16,
         transform: flipLeft ? "translateX(-100%)" : undefined,
-        borderLeft: `3px solid ${info.accent ?? "#5c6f96"}`,
+        borderLeft: `3px solid ${info.accent ?? "#6b7c8f"}`,
       }}
       role="tooltip"
     >

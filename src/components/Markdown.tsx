@@ -47,7 +47,7 @@ export function CollapsibleMarkdown({ source, className = "" }: { source: string
         <div ref={content}>
           <Markdown source={source} className={className} />
         </div>
-        {tall && !open && <div className="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-t from-[#101828] to-transparent" />}
+        {tall && !open && <div className="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-t from-panel to-transparent" />}
       </div>
       {tall && (
         <button
@@ -129,7 +129,7 @@ function renderBlock(b: Block, key: number): ReactNode {
       const items = b.items.map((it, i) => (
         <li key={i} className={it.checked === null ? undefined : "flex list-none items-start gap-2 -ml-5"}>
           {it.checked !== null && (
-            <input type="checkbox" checked={it.checked} readOnly disabled aria-label={it.checked ? "done" : "not done"} className="mt-1 accent-[#2ee6a6]" />
+            <input type="checkbox" checked={it.checked} readOnly disabled aria-label={it.checked ? "done" : "not done"} className="mt-1 accent-success" />
           )}
           <span className="min-w-0">
             {renderInlines(it.c)}
@@ -175,7 +175,7 @@ function renderInlines(nodes: Inline[]): ReactNode[] {
           <a
             key={i}
             href={n.href}
-            className="text-[#8be6ff] underline decoration-[#8be6ff]/40 underline-offset-2 hover:decoration-[#8be6ff]"
+            className="text-accent-core underline decoration-accent-core/40 underline-offset-2 hover:decoration-accent-core"
             {...(external ? { target: "_blank", rel: "noopener noreferrer nofollow" } : {})}
           >
             {renderInlines(n.c)}

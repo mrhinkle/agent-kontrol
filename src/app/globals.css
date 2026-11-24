@@ -1,10 +1,56 @@
 @import "tailwindcss";
 
+/* Chatterbuilt Ion, dark mode. Token names and values come from the
+   Chatterbuilt DESIGN.md (the source of truth); change them there first. */
 @theme {
-  --color-bg: #0a0f1c;
-  --color-panel: #101828;
-  --color-flame: #f44800;
-  --color-electric: #2563eb;
+  --color-bg: #0b0d10;
+  --color-panel: #12151a;
+  --color-panel-elevated: #181c22;
+  --color-fg: #e8eaed;
+  --color-muted: #8fa3b8;
+  --color-muted-dim: #6b7c8f;
+  --color-accent: #00d8ff;
+  --color-accent-core: #6fe9ff;
+  --color-accent-hover: #5ce6ff;
+  --color-accent-ink: #0b0d10;
+  --color-violet: #6c4cf1;
+  --color-violet-text: #b3a6ff;
+  --color-success: #3ecf8e;
+  --color-error: #f07178;
+  /* Ion has no warning token yet; amber is the one local addition. */
+  --color-warn: #ffb020;
+
+  /* Ion's three text steps replace Tailwind's gray scale. */
+  --color-gray-50: #e8eaed;
+  --color-gray-100: #e8eaed;
+  --color-gray-200: #e8eaed;
+  --color-gray-300: #e8eaed;
+  --color-gray-400: #8fa3b8;
+  --color-gray-500: #8fa3b8;
+  --color-gray-600: #6b7c8f;
+  --color-gray-700: #6b7c8f;
+
+  /* Status hues used through Tailwind's palette names. */
+  --color-red-300: #f07178;
+  --color-red-400: #f07178;
+  --color-red-500: #f07178;
+  --color-emerald-300: #3ecf8e;
+  --color-emerald-400: #3ecf8e;
+  --color-emerald-500: #3ecf8e;
+  --color-cyan-300: #00d8ff;
+  --color-cyan-400: #00d8ff;
+  --color-sky-300: #00d8ff;
+  --color-violet-300: #b3a6ff;
+  --color-violet-500: #6c4cf1;
+
+  /* Ion shapes: 0.25rem everywhere, 0.375rem for code blocks. */
+  --radius-sm: 0.25rem;
+  --radius-md: 0.25rem;
+  --radius-lg: 0.25rem;
+  --radius-xl: 0.25rem;
+  --radius-2xl: 0.375rem;
+
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
 }
 
 :root {
@@ -12,9 +58,15 @@
 }
 
 body {
-  background: #0a0f1c;
-  color: #e5e7eb;
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+}
+
+/* Ion: every interactive element shows a 2px accent outline on keyboard focus. */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
 }
 
 .mono {
