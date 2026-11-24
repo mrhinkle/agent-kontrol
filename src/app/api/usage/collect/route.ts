@@ -8,7 +8,9 @@ import type { Principal } from "@/lib/scopes";
 import { ingestUsageBatch } from "@/lib/usage-store";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 60;
+// A provider report can take dozens of paginated requests. Providers run concurrently,
+// and this is the ceiling for the slowest one.
+export const maxDuration = 300;
 
 /**
  * GET or POST /api/usage/collect

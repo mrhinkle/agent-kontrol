@@ -51,7 +51,8 @@ export interface ScheduledOptions {
 
 /**
  * Collect the last `days` complete UTC days for each configured provider.
- * Providers are independent: one failing does not stop the next. `ok` is
+ * Providers are independent and run concurrently: one failing or running long
+ * does not stop or delay another. `ok` is
  * false when any configured provider failed; an unconfigured one is skipped.
  */
 export async function runScheduledCollection(opts: ScheduledOptions): Promise<{ ok: boolean; results: ScheduledResult[] }> {
@@ -62,25 +63,23 @@ export async function runScheduledCollection(opts: ScheduledOptions): Promise<{ 
   const log = opts.log ?? ((message: string) => console.error(message));
   const until = utcMidnight(now);
   const since = new Date(until.getTime() - days * DAY_MS);
-  const results: ScheduledResult[] = [];
-  for (const provider of opts.providers ?? SCHEDULED_PROVIDERS) {
-    if (!provider.configured(env)) {
-      results.push({ provider: provider.id, status: "skipped" });
-      continue;
-    }
+  // Providers run at the same time, so a slow or heavily paginated one cannot use up
+  // the function's time limit before the others have started. Results keep the list order.
+  const results = await Promise.all((opts.providers ?? SCHEDULED_PROVIDERS).map(async (provider): Promise<ScheduledResult> => {
+    if (!provider.configured(env)) return { provider: provider.id, status: "skipped" };
     try {
       // Tests inject accounts that are not in the registry; the adapters under test ignore the record.
       const account = getAccount(provider.accountId) ?? { id: provider.accountId };
       const batch = await provider.adapter.fetchUsage(account as NonNullable<ReturnType<typeof getAccount>>, since, until);
       const written = await opts.ingest({ kind: "cost-collection-v1", collected_at: batch.snapshot?.collected_at ?? now.toISOString(), ...batch });
       if (written !== batch.facts.length) throw new Error("Incomplete usage batch");
-      results.push({ provider: provider.id, status: "published", facts: written });
+      return { provider: provider.id, status: "published", facts: written };
     } catch (err) {
       // Adapter and transport messages are fixed strings: no secret or provider response.
       log(`[usage] scheduled collection failed for ${provider.id}: ${err instanceof Error ? err.message : "unknown error"}`);
-      results.push({ provider: provider.id, status: "failed" });
+      return { provider: provider.id, status: "failed" };
     }
-  }
+  }));
   return { ok: results.every((r) => r.status !== "failed"), results };
 }
 

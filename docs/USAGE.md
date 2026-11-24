@@ -45,7 +45,7 @@ Set these on the deployment (Production only), not in a file on a machine:
 - `MC_XAI_MANAGEMENT_KEY` and `MC_XAI_TEAM_ID` for xAI.
 - `MC_ANTHROPIC_ADMIN_KEY` for the Claude API.
 
-A provider with no credentials is skipped. Providers are independent: one failing does not stop the others, and the response is 502 with that provider marked `failed`. The cause goes to the server log as a fixed message with no secret and no provider response. The response body names each provider and a fact count only.
+A provider with no credentials is skipped. Providers run at the same time and are independent: one failing or running long does not stop the others, and the response is 502 with that provider marked `failed`. The cause goes to the server log as a fixed message with no secret and no provider response. The response body names each provider and a fact count only.
 
 Run it once by hand after setting the variables:
 

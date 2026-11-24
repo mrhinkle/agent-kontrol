@@ -50,6 +50,22 @@ async function main() {
   assert.deepEqual(written, ["good-0"]);
   console.log("scheduled_isolates_failures_ok");
 
+  // A slow provider does not hold up the next: "slow" only finishes after "fast" has been written.
+  let fastWritten!: () => void;
+  const fastDone = new Promise<void>((resolve) => { fastWritten = resolve; });
+  const slow: ScheduledProvider = { id: "slow", accountId: "slow-account", configured: () => true,
+    adapter: { id: "slow", async fetchUsage() { await fastDone; return { facts: [fact("slow-0")] }; } } };
+  const order: string[] = [];
+  const concurrent = await Promise.race([
+    runScheduledCollection({ env: { K2: "y" }, now: NOW, providers: [slow, provider("fast", "K2", 1)],
+      ingest: async (body) => { order.push(body.facts[0].session_id!); if (body.facts[0].session_id === "fast-0") fastWritten(); return body.facts.length; } }),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 2000)),
+  ]);
+  assert.ok(concurrent, "a slow provider blocked the next one");
+  assert.deepEqual(concurrent.results, [{ provider: "slow", status: "published", facts: 1 }, { provider: "fast", status: "published", facts: 1 }]);
+  assert.deepEqual(order, ["fast-0", "slow-0"]);
+  console.log("scheduled_runs_concurrently_ok");
+
   // A short write is a failure, never a silent success.
   const short = await runScheduledCollection({ env: { K1: "x" }, now: NOW, providers: [provider("one", "K1", 3)], ingest: async () => 2, log: () => {} });
   assert.deepEqual(short, { ok: false, results: [{ provider: "one", status: "failed" }] });
