@@ -1024,7 +1024,12 @@ async function main() {
         fx.raw(REPO, "SweepPrReviews-1", "first", JSON.stringify({ data: { repository: { pullRequest: { number: 2, headRefOid: sha("f1"), reviews: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } } }));
       }, /malformed/],
       ["head moved before the review read", (fx) => fx.prs(REPO, [{ number: 1, head: sha("f1"), contexts: green(), reviewHead: sha("pushed") }]), /head moved/],
-      ["more than 3000 reviews", (fx) => fx.prs(REPO, [{ number: 1, head: sha("f1"), contexts: green(), reviews: many(3001) }]), /more than 3000 reviews/],
+      ["review cursor repeats", (fx) => {
+        fx.prs(REPO, two());
+        const pg = (c: string) => JSON.stringify({ data: { repository: { pullRequest: { number: 1, headRefOid: sha("f1"), reviews: { pageInfo: { hasNextPage: true, endCursor: c }, nodes: [] } } } } });
+        fx.raw(REPO, "SweepPrReviews-1", "first", pg("loop"));
+        fx.raw(REPO, "SweepPrReviews-1", "loop", pg("loop"));
+      }, /repeated cursor/],
     ];
     for (const [label, setup, error] of cases) {
       const fx = new Fixture(root);
@@ -1036,6 +1041,19 @@ async function main() {
       assert.ok(!("ready" in q) && !("raw" in q), `${label}: never a zero`);
       assert.deepEqual(q.ready_items, []);
     }
+  });
+
+  await check("pr_review: reviews paginate until hasNextPage is false, with no count cap", async () => {
+    const fx = new Fixture(root);
+    fx.issues(REPO, []);
+    const filler = (n: number) => Array.from({ length: n }, () => ({ state: "COMMENTED", oid: sha("o"), login: "x" }));
+    fx.prs(REPO, [
+      { number: 1, head: sha("big1"), contexts: green(), reviews: [...filler(3100), { state: "APPROVED", oid: sha("big1"), login: BOT }] },
+      { number: 2, head: sha("big2"), contexts: green(), reviews: filler(3101) },
+    ]);
+    const q = await reviewQueue(fx, withReview());
+    assert.equal(q.complete, true, q.error);
+    assert.deepEqual(q.ready_items, [{ number: 2, head_sha: sha("big2") }], "the suppressing review on page 32 is found");
   });
 
   await check("pr_review: refs and ready_items are the lowest 50; counts stay exact", async () => {

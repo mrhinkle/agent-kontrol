@@ -39,7 +39,6 @@ LOCK_WAIT="${MC_SWEEP_LOCK_WAIT:-300}"
 ISSUE_CAP=1000   # open issues measured per repo; more is an incomplete observation
 PR_CAP=200       # the intake's PRS_MAX
 REFS_CAP=50      # the intake's REFS_MAX; counts stay exact
-REVIEW_PAGE_CAP=30  # review pages of 100 read per PR; more is an incomplete pr_review observation
 
 log() { printf '[%s] sweep-producer: %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 
@@ -656,11 +655,12 @@ REVIEW_SUPPRESSES='
 # else REVIEW_ERR. Any failed, malformed, truncated, or moved page fails the whole read.
 REVIEW_ERR=""
 page_reviews() {
-  local number="$1" head="$2" nodes="$3" cursor="" page=0 out
+  local number="$1" head="$2" nodes="$3" cursor="" page=0 out seen=$'\n'
   : >"$nodes"
+  # Pages are read until hasNextPage is false (AC 26/81), with no count cap. A
+  # cursor GitHub already returned would loop forever, so it counts as truncation.
   while :; do
     page=$((page + 1))
-    if (( page > REVIEW_PAGE_CAP )); then REVIEW_ERR="PR #$number has more than $((REVIEW_PAGE_CAP * 100)) reviews"; return 1; fi
     out="$TMP_DIR/reviews-$number-$page.json"
     if ! gh_reviews_page "$number" "$cursor" "$out"; then REVIEW_ERR="$GH_ERR"; return 1; fi
     if ! jq -e --argjson n "$number" "$REVIEWS_PAGE_OK" "$out" >/dev/null 2>&1; then
@@ -677,6 +677,10 @@ page_reviews() {
     jq -c '.data.repository.pullRequest.reviews.nodes[]' "$out" >>"$nodes"
     [[ "$(jq -r '.data.repository.pullRequest.reviews.pageInfo.hasNextPage' "$out")" == "true" ]] || return 0
     cursor="$(jq -r '.data.repository.pullRequest.reviews.pageInfo.endCursor' "$out")"
+    case "$seen" in *$'\n'"$cursor"$'\n'*)
+      REVIEW_ERR="a review page for PR #$number is truncated (repeated cursor)"; return 1;;
+    esac
+    seen+="$cursor"$'\n'
   done
 }
 
