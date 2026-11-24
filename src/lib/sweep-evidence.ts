@@ -1057,7 +1057,7 @@ export async function readPrReviewQueues(): Promise<PrReviewQueueRow[]> {
            ) end as ready_items
     from sweep_queues q
     where q.classification = 'pr_review'
-    order by q.queue
+    order by q.queue collate "C"
   `;
   return rows.map((row): PrReviewQueueRow => {
     const base = {
