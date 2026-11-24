@@ -1612,5 +1612,33 @@ class RetirementReportTests(unittest.TestCase):
         self.assertTrue(rows[1]["missing_run"])
 
 
+class TestPartOneRouteContract(unittest.TestCase):
+    """AC 74: the runner's queue parser against Part 1's recorded route response
+    (tests/ui/fixtures/sweep-queues-pr_review.json, written by the real route test)."""
+
+    FIXTURE = os.path.join(ROOT, "tests", "ui", "fixtures", "sweep-queues-pr_review.json")
+
+    def test_recorded_route_rows(self):
+        import collections
+        import types
+        from agents.reviewer.claude_reviewer import Runner
+        with open(self.FIXTURE, encoding="utf-8") as f:
+            rows = json.load(f)["queues"]
+        refs = [types.SimpleNamespace(queue="reviews:acme/" + n, repo="acme/" + n)
+                for n in ("widgets", "gadgets", "legacy", "stale")]
+        fake = types.SimpleNamespace(counters=collections.Counter(),
+                                     config=types.SimpleNamespace(queues=refs))
+        fake._usable_row = lambda row, repo: Runner._usable_row(fake, row, repo)
+        out = Runner._candidates(fake, rows)
+        # Only the complete, fresh row yields work; its repo is case-folded ("Acme/Widgets").
+        self.assertEqual([(c.repo, c.number) for c in out], [("acme/widgets", 7), ("acme/widgets", 12)])
+        self.assertEqual(len(out[1].head_sha), 64, "SHA-256 heads are accepted")
+        self.assertEqual(out[0].green_since, dt.datetime(2026, 11, 23, 10, 0, tzinfo=dt.timezone.utc))
+        self.assertIsNone(out[1].green_since)
+        # Incomplete, legacy (missing ready_items) and stale rows are unknown, never empty.
+        self.assertEqual(fake.counters["queue_unknown"], 3)
+        self.assertEqual(fake.counters["ready"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()
