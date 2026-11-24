@@ -763,6 +763,12 @@ create table if not exists sweep_queues (
   version bigint not null default 1
 );
 
+-- pr_review ready queue (#176): the ready PRs' heads, [{number, head_sha}] in
+-- numeric order, one per ready ref. Nullable: issue_dispatch rows never carry
+-- it, and a pr_review row written before this column is read back as
+-- incomplete ("missing ready_items") until a newer observation arrives.
+alter table sweep_queues add column if not exists ready_items jsonb;
+
 -- The newest PR snapshot per repository (lowercased owner/name).
 create table if not exists sweep_pr_sources (
   repo_key text primary key,

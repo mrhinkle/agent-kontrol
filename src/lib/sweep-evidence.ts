@@ -340,9 +340,17 @@ export interface QueueObservation {
   ready_refs: string[];
   raw_refs: string[];
   stale_after_minutes: number;
+  /** pr_review only: the ready PRs' heads, one per ready ref, in numeric order. Null on issue_dispatch. */
+  ready_items: ReadyItem[] | null;
 }
 
-const QUEUE_FIELDS = ["source", "queue", "classification", "repo", "seq", "observed_at", "complete", "error", "ready", "raw", "stale_after_minutes"];
+export interface ReadyItem {
+  number: number;
+  head_sha: string;
+}
+
+const QUEUE_FIELDS = ["source", "queue", "classification", "repo", "seq", "observed_at", "complete", "error", "ready", "raw", "stale_after_minutes", "ready_items"];
+const PR_REF = /^#([1-9][0-9]{0,8})$/;
 
 /**
  * issue_dispatch: ready is open issues labelled dispatch-ready and not
@@ -350,6 +358,11 @@ const QUEUE_FIELDS = ["source", "queue", "classification", "repo", "seq", "obser
  * label (unspecced). pr_review: ready is open non-draft PRs at their current
  * head waiting on a reviewer; raw is every open PR. A complete observation
  * must carry both counts. An incomplete one is stored as unknown, never zero.
+ *
+ * Every pr_review observation carries ready_items: [{number, head_sha}] for
+ * exactly the PRs in ready.refs (`#<number>`, numeric order), so a reader
+ * never derives a head from a PR number. An incomplete one sends []. An
+ * issue_dispatch observation may not carry it.
  */
 export function checkQueueObservation(body: unknown): Checked<QueueObservation> {
   const r = rootReader(body, QUEUE_FIELDS);
@@ -381,9 +394,57 @@ export function checkQueueObservation(body: unknown): Checked<QueueObservation> 
     ready_refs: complete ? ready.refs : [],
     raw_refs: complete ? raw.refs : [],
     stale_after_minutes: r.staleAfter("stale_after_minutes"),
+    ready_items: null,
   };
   if (!QUEUE_ID.test(value.queue)) r.fail("queue", `must match ${QUEUE_ID.source} (case-insensitive).`);
+  if (value.classification === "pr_review") {
+    value.ready_items = readyItems(r, value.ready_refs);
+  } else if (r.has("ready_items")) {
+    r.fail("ready_items", "is only valid on a pr_review observation.");
+  }
   return r.done(value);
+}
+
+/** ready_items must name exactly the PRs in ready.refs, in that order, each with its head. */
+function readyItems(r: Reader, readyRefs: string[]): ReadyItem[] {
+  const raw = r.raw("ready_items");
+  if (raw === undefined || raw === null) {
+    r.fail("ready_items", "is required on a pr_review observation ([] when it is incomplete).");
+    return [];
+  }
+  if (!Array.isArray(raw) || raw.length > REFS_MAX) {
+    r.fail("ready_items", `must be an array of at most ${REFS_MAX} {number, head_sha} items.`);
+    return [];
+  }
+  const items: ReadyItem[] = [];
+  raw.forEach((item, index) => {
+    if (!isObject(item)) {
+      r.fail(`ready_items[${index}]`, "must be an object.");
+      return;
+    }
+    const c = r.child(`ready_items[${index}]`, item, ["number", "head_sha"]);
+    const number = c.positiveInt("number");
+    const head = c.sha("head_sha");
+    if (head === null) c.fail("head_sha", "is required.");
+    r.merge(c);
+    items.push({ number, head_sha: head ?? "" });
+  });
+  const refNumbers = readyRefs.map((ref) => PR_REF.exec(ref)?.[1] ?? null);
+  if (refNumbers.some((n) => n === null)) {
+    r.fail("ready.refs", "must be #<number> PR refs on a pr_review observation.");
+    return items;
+  }
+  const want = refNumbers.map(Number);
+  for (let i = 1; i < want.length; i += 1) {
+    if (want[i] <= want[i - 1]) {
+      r.fail("ready.refs", "must be in increasing numeric order with no duplicates.");
+      return items;
+    }
+  }
+  if (items.length !== want.length || items.some((item, i) => item.number !== want[i])) {
+    r.fail("ready_items", "must list exactly the PRs in ready.refs, in the same order.");
+  }
+  return items;
 }
 
 // -------------------------------------------------------------- PR snapshot
@@ -780,11 +841,12 @@ export async function writeQueueObservation(obs: QueueObservation, provenance: P
     }
     await tx`
       insert into sweep_queues (
-        queue, source, classification, repo, complete, error, ready_count, raw_count, ready_refs, raw_refs,
+        queue, source, classification, repo, complete, error, ready_count, raw_count, ready_refs, raw_refs, ready_items,
         seq, observed_at, stale_after_minutes, received_at, empty_since, last_observation_id, version
       ) values (
         ${obs.queue}, ${obs.source}, ${obs.classification}, ${obs.repo}, ${obs.complete}, ${obs.error},
         ${obs.ready_count}, ${obs.raw_count}, ${JSON.stringify(obs.ready_refs)}::jsonb, ${JSON.stringify(obs.raw_refs)}::jsonb,
+        ${obs.ready_items === null ? null : JSON.stringify(obs.ready_items)}::jsonb,
         ${obs.seq}, ${obs.observed_at}::timestamptz, ${obs.stale_after_minutes}, ${now}::timestamptz,
         ${emptySince}::timestamptz, ${id}::bigint, 1
       )
@@ -798,6 +860,7 @@ export async function writeQueueObservation(obs: QueueObservation, provenance: P
         raw_count = excluded.raw_count,
         ready_refs = excluded.ready_refs,
         raw_refs = excluded.raw_refs,
+        ready_items = excluded.ready_items,
         seq = excluded.seq,
         observed_at = excluded.observed_at,
         stale_after_minutes = excluded.stale_after_minutes,
