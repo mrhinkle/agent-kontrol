@@ -22,6 +22,7 @@ import { entityDigest, formatPausedLines, type SweepCondition } from "../src/lib
 import { loadBrief, formatBriefText } from "../src/lib/brief";
 
 const MIGRATION = "supabase/migrations/20261030013738_absence_sweeper.sql";
+const READY_ITEMS_MIGRATION = "supabase/migrations/20261123_sweep_queue_ready_items.sql";
 const MIN = 60_000;
 const HOUR = 60 * MIN;
 
@@ -46,6 +47,7 @@ export async function testSweeper(tag: string, applyCanonicalSchema: () => Promi
   const dbNow = async () => new Date((await sql()`select (clock_timestamp() + ${clock}::double precision * interval '1 millisecond') as now`)[0].now).toISOString();
   const isoAgo = async (ms: number) => new Date(new Date(await dbNow()).getTime() - ms).toISOString();
   const isoAhead = async (ms: number) => new Date(new Date(await dbNow()).getTime() + ms).toISOString();
+  const isoOf = (v: unknown) => new Date(v as string).toISOString();
 
   const req = (url: string, body: unknown, auth: string | null) => new Request(`http://localhost${url}`, {
     method: "POST",
@@ -121,6 +123,27 @@ export async function testSweeper(tag: string, applyCanonicalSchema: () => Promi
         and table_name in ('sweep_consumers', 'sweep_observations', 'scheduler_jobs', 'sweep_queues', 'sweep_pr_sources', 'sweep_prs', 'sweep_latches')
     `;
     assert.equal(tables.length, 7);
+    // #176: the nullable ready_items column, from schema.sql and its dated changelog migration.
+    {
+      const readyItems = async () => sql()`
+        select data_type, is_nullable from information_schema.columns
+        where table_schema = 'public' and table_name = 'sweep_queues' and column_name = 'ready_items'
+      `;
+      assert.deepEqual((await readyItems()).map((c) => [c.data_type, c.is_nullable]), [["jsonb", "YES"]], "schema.sql adds nullable jsonb ready_items");
+      const statement = "alter table sweep_queues add column if not exists ready_items jsonb;";
+      const migration = fs.readFileSync(READY_ITEMS_MIGRATION, "utf8");
+      assert.ok(fs.readFileSync("supabase/schema.sql", "utf8").includes(statement), "schema.sql carries the statement");
+      assert.deepEqual(migration.split("\n").filter((l) => l.trim() && !l.startsWith("--")), [statement], "the migration is exactly that statement");
+      const mclient = new Client({ connectionString: process.env.DATABASE_URL });
+      await mclient.connect();
+      try {
+        await mclient.query(migration);
+        await mclient.query(migration);
+      } finally {
+        await mclient.end();
+      }
+      assert.deepEqual((await readyItems()).map((c) => [c.data_type, c.is_nullable]), [["jsonb", "YES"]]);
+    }
     await wipe();
 
     // ------------------------------------------------- empty registry
@@ -928,6 +951,252 @@ export async function testSweeper(tag: string, applyCanonicalSchema: () => Promi
       }
     }
 
+    // ---------------------------------- pr_review ready queue route (#176)
+    // GET /api/sweep/queues reads only the sweep_queues projection row per
+    // pr_review queue id; every age and staleness number is database time.
+    {
+      const { GET: queuesGet } = await import("../src/app/api/sweep/queues/route");
+      const qUrl = "http://localhost/api/sweep/queues?classification=pr_review";
+      const getQueues = async (auth: string = token) => {
+        const res = await queuesGet(new Request(qUrl, { headers: { authorization: `Bearer ${auth}` } }));
+        return { status: res.status, body: await res.json() as { queues: Record<string, any>[] } & Record<string, any> };
+      };
+      const readQueues = async () => {
+        const res = await getQueues();
+        assert.equal(res.status, 200, JSON.stringify(res.body));
+        return res.body.queues;
+      };
+      const rowOf = async (queue: string): Promise<Record<string, any>> => {
+        const found = (await readQueues()).find((r) => r.queue === queue);
+        assert.ok(found, `${queue} is listed`);
+        return found;
+      };
+      const suffix = tag.slice(-6).toLowerCase();
+      const repoA = `PrRev-${suffix}/Alpha`;
+      const repoB = `PrRev-${suffix}/Beta`;
+      const qA = `reviews:prrev-${suffix}/alpha`;
+      const qA2 = `reviews-two:prrev-${suffix}/alpha`;
+      const qB = `reviews:prrev-${suffix}/beta`;
+      const qLegacy = `reviews-legacy:prrev-${suffix}/alpha`;
+      const mine = (rows: Record<string, any>[]) => rows.filter((r) => String(r.queue).includes(`prrev-${suffix}/`));
+      const H = (c: string) => c.repeat(40);
+      const prObs = (queue: string, repo: string, seq: number, over: Json = {}) => ({
+        source: "collector", queue, classification: "pr_review", repo, seq, observed_at: new Date().toISOString(), complete: true,
+        ready: { count: 2, refs: ["#1", "#2"] }, raw: { count: 3, refs: ["#1", "#2", "#3"] },
+        ready_items: [{ number: 1, head_sha: H("1") }, { number: 2, head_sha: H("2") }], ...over,
+      });
+      const projection = async (queue: string) => (await sql()`
+        select seq::int as seq, received_at, ready_items, last_observation_id::text as obs_id from sweep_queues where queue = ${queue}
+      `)[0];
+      const lastApplied = async (queue: string) => (await sql()`
+        select id::text as id, seq::int as seq, received_at from sweep_observations
+        where kind = 'queue' and subject = ${queue} and outcome = 'applied' order by seq desc limit 1
+      `)[0];
+      const newestAudit = async (queue: string) => (await sql()`
+        select seq::int as seq, received_at, outcome from sweep_observations where kind = 'queue' and subject = ${queue} order by id desc limit 1
+      `)[0];
+
+      assert.deepEqual(mine(await readQueues()), [], "a queue id with no projection row is not listed");
+      assert.equal((await readQueues()).find((r) => r.queue === qA), undefined);
+
+      // Projection consistency: the row is the last applied observation, not the newest audit row.
+      await observe("sweep.queue", prObs(qA, repoA, 1));
+      await observe("sweep.queue", { source: "collector", queue: `issues:prrev-${suffix}/alpha`, classification: "issue_dispatch", repo: repoA, seq: 1, observed_at: new Date().toISOString(), complete: true, ready: { count: 1 }, raw: { count: 1 } });
+      let row = await rowOf(qA);
+      assert.equal((await readQueues()).some((r) => r.queue === `issues:prrev-${suffix}/alpha`), false, "issue_dispatch rows are never listed");
+      assert.deepEqual([row.complete, row.error, row.stale, row.ready, row.raw], [true, null, false, { count: 2, refs: ["#1", "#2"] }, { count: 3 }]);
+      assert.deepEqual(row.ready_items, [{ number: 1, head_sha: H("1"), green_since: null }, { number: 2, head_sha: H("2"), green_since: null }],
+        "heads come from the observation; no sweep_prs row means null green_since");
+      advance(1000);
+      const three = await observe("sweep.queue", prObs(qA, repoA, 3, { ready: { count: 1, refs: ["#2"] }, ready_items: [{ number: 2, head_sha: H("2") }] }));
+      assert.equal(three.outcome, "applied");
+      advance(1000);
+      assert.equal((await observe("sweep.queue", prObs(qA, repoA, 2, { ready: { count: 0, refs: [] }, ready_items: [] }))).outcome, "older");
+      advance(1000);
+      assert.equal((await observe("sweep.queue", prObs(qA, repoA, 3, { ready: { count: 0, refs: [] }, ready_items: [] }))).outcome, "replay");
+      const proj = await projection(qA);
+      const applied = await lastApplied(qA);
+      const audit = await newestAudit(qA);
+      assert.deepEqual([proj.seq, applied.seq, proj.obs_id], [3, 3, applied.id], "projection seq is the last applied observation");
+      assert.equal(isoOf(proj.received_at), isoOf(applied.received_at), "projection received_at is the last applied observation's");
+      assert.equal(audit.outcome, "replay");
+      assert.ok(new Date(audit.received_at).getTime() > new Date(applied.received_at).getTime(), "a newer audit row exists and is not selected");
+      row = await rowOf(qA);
+      assert.equal(row.received_at, isoOf(proj.received_at), "the route returns the projection's received_at");
+      assert.deepEqual(row.ready, { count: 1, refs: ["#2"] }, "seq 3's ready set, not the older or replayed bodies");
+      assert.deepEqual(row.ready_items.map((i: Json) => [i.number, i.head_sha]), [[2, H("2")]]);
+      assert.deepEqual(proj.ready_items, [{ number: 2, head_sha: H("2") }], "the projection stores the heads");
+
+      // green_since: joined only from the open sweep_prs row at the ready head.
+      await observe("sweep.queue", prObs(qA, repoA, 4));
+      const green = { state: "success", head_sha: "" };
+      await observe("sweep.pr_snapshot", {
+        source: "collector", repo: repoA.toUpperCase(), seq: 1, observed_at: new Date().toISOString(), complete: true,
+        prs: [
+          { number: 1, draft: false, opened_at: await isoAgo(HOUR), mergeable: "mergeable", head_sha: H("1"), required_checks: { ...green, head_sha: H("1") } },
+          { number: 2, draft: false, opened_at: await isoAgo(HOUR), mergeable: "mergeable", head_sha: H("9"), required_checks: { ...green, head_sha: H("9") } },
+          { number: 3, draft: false, opened_at: await isoAgo(HOUR), mergeable: "mergeable", head_sha: H("3"), required_checks: { state: "failure", head_sha: H("3") } },
+        ],
+      });
+      const stored = await sql()`select number, green_since from sweep_prs where repo_key = ${repoA.toLowerCase()} order by number`;
+      assert.ok(stored[0].green_since && stored[1].green_since, "both PRs are green in sweep_prs");
+      row = await rowOf(qA);
+      assert.equal(row.complete, true);
+      assert.deepEqual(row.ready_items, [
+        { number: 1, head_sha: H("1"), green_since: isoOf(stored[0].green_since) },
+        { number: 2, head_sha: H("2"), green_since: null },
+      ], "a head mismatch gives null and does not make the item incomplete");
+      advance(1000);
+      await observe("sweep.pr_snapshot", { source: "collector", repo: repoA, seq: 2, observed_at: new Date().toISOString(), complete: true, prs: [] });
+      row = await rowOf(qA);
+      assert.equal(row.ready_items[0].green_since, null, "a closed PR row gives null");
+      assert.equal(row.complete, true);
+
+      // Incomplete versus a measured empty queue, and per-repo isolation.
+      await observe("sweep.queue", prObs(qB, repoB, 1, { ready: { count: 0, refs: [] }, raw: { count: 3, refs: ["#5", "#6", "#7"] }, ready_items: [] }));
+      let b = await rowOf(qB);
+      assert.deepEqual([b.complete, b.ready, b.raw, b.ready_items], [true, { count: 0, refs: [] }, { count: 3 }, []], "measured empty is a real zero");
+      advance(1000);
+      await observe("sweep.queue", { source: "collector", queue: qB, classification: "pr_review", repo: repoB, seq: 2, observed_at: new Date().toISOString(), complete: false, error: "GitHub rate limited", ready_items: [] });
+      b = await rowOf(qB);
+      assert.deepEqual([b.complete, b.error, b.ready, b.raw, b.ready_items], [false, "GitHub rate limited", null, null, null], "incomplete is null, never ready.count 0");
+      row = await rowOf(qA);
+      assert.deepEqual([row.complete, row.ready.count], [true, 2], "another repo's failure leaves this queue alone");
+      const bad = await ingest("sweep.queue", prObs(qB, repoB, 3, { ready_items: undefined }));
+      assert.equal(bad.status, 400, "a new pr_review observation without ready_items is rejected");
+      assert.equal((await projection(qB)).seq, 2);
+
+      // Two queue ids for one repo are two rows; age and staleness by database time.
+      await observe("sweep.queue", prObs(qA2, repoA, 1, { stale_after_minutes: 5 }));
+      let rows = mine(await readQueues());
+      assert.deepEqual(rows.map((r) => r.queue), [qA2, qA, qB].sort(), "one row per projection row, sorted by queue");
+      assert.equal(rows.filter((r) => r.repo === repoA).length, 2);
+      let two = rows.find((r) => r.queue === qA2)!;
+      assert.deepEqual([two.age_minutes, two.stale, two.stale_after_minutes], [0, false, 5]);
+      advance(4 * MIN + 30_000);
+      two = (await rowOf(qA2))!;
+      assert.deepEqual([two.age_minutes, two.stale, two.complete, two.error], [4, false, true, null]);
+      assert.equal(two.ready.count, 2);
+      advance(60_000);
+      two = (await rowOf(qA2))!;
+      assert.deepEqual([two.age_minutes, two.stale, two.complete, two.error, two.ready, two.raw, two.ready_items], [5, true, true, "stale observation", null, null, null],
+        "5.5 minutes is past a 5-minute window although age_minutes rounds down to 5");
+      const ageSql = Number((await sql()`
+        select floor(extract(epoch from ((clock_timestamp() + ${clock}::double precision * interval '1 millisecond') - received_at)) / 60)::int as m
+        from sweep_queues where queue = ${qA2}
+      `)[0].m);
+      assert.equal(two.age_minutes, ageSql, "age_minutes is database time");
+      row = await rowOf(qA);
+      assert.equal(row.stale, false, "a 30-minute window is still fresh");
+      advance(31 * MIN);
+      row = await rowOf(qA);
+      assert.deepEqual([row.stale, row.error, row.ready], [true, "stale observation", null]);
+      assert.ok(row.age_minutes >= 31);
+      await observe("sweep.queue", prObs(qA, repoA, 5));
+      row = await rowOf(qA);
+      assert.deepEqual([row.stale, row.age_minutes, row.error, row.ready.count], [false, 0, null, 2], "a fresh observation renews it");
+
+      // A projection row written before ready_items existed is incomplete until refreshed.
+      await sql()`
+        insert into sweep_queues (queue, source, classification, repo, complete, error, ready_count, raw_count, ready_refs, raw_refs, seq, observed_at, stale_after_minutes, received_at)
+        values (${qLegacy}, 'collector', 'pr_review', ${repoA}, true, null, 1, 1, '["#1"]'::jsonb, '["#1"]'::jsonb, 7, now(),
+                30, (clock_timestamp() + ${clock}::double precision * interval '1 millisecond'))
+      `;
+      let legacy = (await rowOf(qLegacy))!;
+      assert.deepEqual([legacy.complete, legacy.error, legacy.ready, legacy.raw, legacy.ready_items], [false, "missing ready_items", null, null, null]);
+      await observe("sweep.queue", prObs(qLegacy, repoA, 8));
+      legacy = (await rowOf(qLegacy))!;
+      assert.deepEqual([legacy.complete, legacy.error, legacy.ready.count], [true, null, 2], "a refreshed observation replaces it");
+      await sql()`update sweep_queues set ready_items = null where queue = ${qLegacy}`;
+
+      // The recorded fixture (tests/ui) has the real route's keys and null pattern for each kind of row.
+      const fixture = JSON.parse(fs.readFileSync("tests/ui/fixtures/sweep-queues-pr_review.json", "utf8")) as { queues: Record<string, any>[] };
+      const shape = (r: Record<string, any>) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, v === null ? "null" : Array.isArray(v) ? "array" : typeof v]));
+      advance(1000);
+      await observe("sweep.queue", prObs(qA2, repoA, 2));
+      rows = mine(await readQueues());
+      const real = {
+        complete: rows.find((r) => r.queue === qA2)!,
+        incomplete: rows.find((r) => r.queue === qB)!,
+        legacy: rows.find((r) => r.queue === qLegacy)!,
+      };
+      const recorded = {
+        complete: fixture.queues.find((r) => r.complete === true && r.stale === false)!,
+        incomplete: fixture.queues.find((r) => r.complete === false && r.error !== "missing ready_items")!,
+        stale: fixture.queues.find((r) => r.stale === true)!,
+        legacy: fixture.queues.find((r) => r.error === "missing ready_items")!,
+      };
+      for (const kind of ["complete", "incomplete", "legacy"] as const) {
+        assert.deepEqual(Object.keys(real[kind]), Object.keys(recorded[kind]), `${kind}: same keys in the same order`);
+        const want = shape(recorded[kind]);
+        // observed_at and repo may be null in general; here they are set on both sides.
+        assert.deepEqual(shape(real[kind]), want, `${kind}: same value types and null pattern`);
+      }
+      assert.deepEqual(Object.keys(real.complete.ready_items[0]), Object.keys(recorded.complete.ready_items[0]));
+      advance(31 * MIN);
+      const staleReal = (await rowOf(qA2))!;
+      assert.deepEqual(shape(staleReal), shape(recorded.stale), "stale: same value types and null pattern");
+
+      // Access: progress:read and MC_TOKEN read; status:write alone is 403. GET writes nothing.
+      const writes = async () => (await sql()`
+        select (select count(*) from sweep_observations) as o, (select count(*) from sweep_queues) as q,
+               (select coalesce(sum(version), 0) from sweep_queues) as v, (select count(*) from sweep_prs) as p
+      `)[0];
+      const before = await writes();
+      assert.equal((await getQueues(generic.token)).status, 200, "an agent credential with progress:read");
+      const denied = await getQueues(other.token);
+      assert.equal(denied.status, 403);
+      assert.equal(denied.body.code, "insufficient_scope");
+      assert.deepEqual(await writes(), before, "GET never writes");
+    }
+
+    // ----------------- pr_review producer end to end (stub gh, real ingest and route)
+    {
+      const { GET: queuesGet } = await import("../src/app/api/sweep/queues/route");
+      const capture = await new IngestServer().start();
+      const fx = new Fixture(os.tmpdir());
+      const prodRepo = `RevProd-${tag.slice(-6)}/Gizmos`;
+      const prodKey = prodRepo.toLowerCase();
+      const rq = `reviews:${prodKey}`;
+      const h = (c: string) => c.repeat(40);
+      const green = [{ kind: "check" as const, name: "ci" }, { kind: "status" as const, name: "postgres" }];
+      fx.config(baseConfig({ [prodRepo]: repoConfig(prodRepo, { pr_review: { enabled: true, queue: rq, reviewer_logins: ["claude-reviewer[bot]"] } }) }, { source: "collector-pg" }));
+      try {
+        fx.issues(prodRepo, []);
+        fx.prs(prodRepo, [
+          { number: 1, head: h("a"), contexts: green },
+          { number: 2, head: h("b"), contexts: green, reviews: [{ state: "COMMENTED", oid: h("b"), login: "claude-reviewer[bot]" }] },
+          { number: 3, head: h("c"), contexts: green, draft: true },
+          { number: 4, head: h("d"), contexts: [{ kind: "check", name: "ci", conclusion: "FAILURE" }, { kind: "status", name: "postgres" }] },
+        ]);
+        const r = await runProducer(fx, ["--repo", prodRepo], { MC_URL: capture.url, MC_TOKEN: FAKE_TOKEN });
+        assert.equal(r.code, 0, r.stderr);
+        assert.deepEqual(capture.got.map((g) => [g.body.kind, g.body.observation.classification ?? null]),
+          [["sweep.queue", "issue_dispatch"], ["sweep.pr_snapshot", null], ["sweep.queue", "pr_review"]]);
+        for (const g of capture.got) {
+          const res = await ingestPost(new Request("http://localhost/api/ingest", {
+            method: "POST",
+            headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+            body: g.raw,
+          }));
+          const body = await res.json() as Json;
+          assert.equal(res.status, 200, JSON.stringify(body));
+          assert.equal(body.outcome, "applied");
+        }
+        const res = await queuesGet(new Request("http://localhost/api/sweep/queues?classification=pr_review", { headers: { authorization: `Bearer ${token}` } }));
+        assert.equal(res.status, 200);
+        const row = ((await res.json()) as { queues: Json[] }).queues.find((q) => q.queue === rq)!;
+        const greenSince = (await sql()`select green_since from sweep_prs where repo_key = ${prodKey} and number = 1`)[0].green_since;
+        assert.deepEqual([row.complete, row.repo, row.ready, row.raw], [true, prodRepo, { count: 1, refs: ["#1"] }, { count: 4 }]);
+        assert.deepEqual(row.ready_items, [{ number: 1, head_sha: h("a"), green_since: isoOf(greenSince) }],
+          "the producer's head, joined to the snapshot it posted first");
+      } finally {
+        await capture.stop();
+        fs.rmSync(fx.dir, { recursive: true, force: true });
+      }
+    }
+    console.log("test:pg pr_review queue ok (ready_items column and migration, projection seq/received_at, stale and age_minutes, incomplete versus empty, green_since join, per-repo isolation, legacy row, access, producer end to end)");
+
     // ------------------------------------------------ races and replays
     {
       const raceJob = `${tag}-race`.toLowerCase();
@@ -1106,6 +1375,7 @@ export async function testSweeper(tag: string, applyCanonicalSchema: () => Promi
             "supabase/migrations/20261030012111_gh_events.sql",
             "supabase/migrations/20261030012556_agent_credential_rate_limits.sql",
             MIGRATION,
+            READY_ITEMS_MIGRATION,
           ]) {
             await client.query(fs.readFileSync(file, "utf8"));
           }

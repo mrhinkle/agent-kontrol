@@ -9,7 +9,12 @@
       "blocked_labels": ["blocked"],
       "raw_exclude_labels": ["decision"],
       "required_checks": ["ci", "postgres", "docker"],
-      "review_start": { "status_context": "review/started" }
+      "review_start": { "status_context": "review/started" },
+      "pr_review": {
+        "enabled": false,
+        "queue": "reviews:example-owner/example-repo",
+        "reviewer_logins": ["example-reviewer[bot]"]
+      }
     }
   }
 }

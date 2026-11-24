@@ -94,6 +94,8 @@ const ROUTE_SCOPES: { method: string; path: RegExp; scope: Scope }[] = [
   // /api/sweep/consumers stay off this table: only MC_TOKEN or the signed-in
   // dashboard may run the sweeper or register a consumer.
   { method: "GET", path: /^\/api\/sweep$/, scope: "progress:read" },
+  // Read-only pr_review ready queue (#176): the current projection rows.
+  { method: "GET", path: /^\/api\/sweep\/queues$/, scope: "progress:read" },
   // POST /api/brief/alerts/evaluate stays off this table. The cron uses
   // MC_TOKEN, the same way POST /api/progress/ingest does. An agent
   // credential cannot send alerts.

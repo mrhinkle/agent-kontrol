@@ -811,6 +811,299 @@ async function main() {
     assert.deepEqual(server.got.map((g) => g.body.observation.seq), [2, 2], "the next run moves on to a new seq");
   });
 
+  // ------------------------------------------------ pr_review queue (#176)
+  const RQ = "reviews:acme/widgets";
+  const BOT = "claude-reviewer[bot]";
+  const prReview = (over: Json = {}) => ({ enabled: true, queue: "Reviews:Acme/Widgets", reviewer_logins: ["Claude-Reviewer[bot]"], ...over });
+  const withReview = (over: Json = {}, repo = REPO) => baseConfig({ [repo]: repoConfig(repo, { pr_review: prReview(over) }) });
+  const FIXED_DATE = '#!/usr/bin/env bash\ncase "$*" in *%Y*) echo 2026-11-23T12:00:00Z ;; *) echo 12:00:00 ;; esac\n';
+  /** Run with pr_review and return the pr_review envelope (the third), after validating all three. */
+  async function reviewQueue(fx: Fixture, cfg: Json, env: Record<string, string | undefined> = {}): Promise<Json> {
+    fx.config(cfg);
+    const r = await runProducer(fx, ["--repo", REPO, "--dry-run"], env);
+    assert.equal(r.code, 0, r.stderr);
+    const out = envelopes(r.stdout);
+    assert.deepEqual(out.map((e) => e.kind), ["sweep.queue", "sweep.pr_snapshot", "sweep.queue"]);
+    for (const e of out) valid(e.kind, e.observation);
+    const q = out[2].observation;
+    assert.equal(q.classification, "pr_review");
+    assert.equal(q.queue, RQ);
+    noSecret(r.stdout, r.stderr);
+    return q;
+  }
+
+  await check("pr_review: omitted or disabled is byte-identical to the producer without it", async () => {
+    const fx = new Fixture(root);
+    standard(fx);
+    fs.writeFileSync(path.join(fx.bin, "date"), FIXED_DATE, { mode: 0o755 });
+    const run = async (cfg: Json, script?: string) => {
+      fx.config(cfg);
+      const r = await runProducer(fx, ["--repo", REPO, "--dry-run"], {}, script);
+      assert.equal(r.code, 0, r.stderr);
+      return r;
+    };
+    const omitted = await run(baseConfig({ [REPO]: repoConfig(REPO) }));
+    const disabled = await run(withReview({ enabled: false }));
+    assert.equal(disabled.stdout, omitted.stdout, "stdout is byte-identical");
+    assert.equal(disabled.stderr, omitted.stderr);
+    assert.deepEqual(envelopes(omitted.stdout).map((e) => e.kind), ["sweep.queue", "sweep.pr_snapshot"]);
+    assert.ok(!fx.calls().some((c) => c.includes("SweepPrReviews")), "no review query when pr_review is off");
+    // The producer as it was before #176, when this checkout has that commit.
+    const base = spawnSync("git", ["show", "252fe31:scripts/sweep-producer.sh"], { encoding: "utf8" });
+    if (base.status === 0) {
+      const old = path.join(fx.dir, "sweep-producer.before-176.sh");
+      fs.writeFileSync(old, base.stdout);
+      const before = await run(baseConfig({ [REPO]: repoConfig(REPO) }), old);
+      assert.equal(omitted.stdout, before.stdout, "omitted pr_review: byte-identical to the pre-#176 producer");
+      assert.equal(disabled.stdout, before.stdout, "disabled pr_review: byte-identical to the pre-#176 producer");
+    } else {
+      console.log("  (pre-#176 producer not in this checkout; compared omitted with disabled only)");
+    }
+  });
+
+  await check("pr_review: invalid config is rejected before any GitHub call, nothing posted", async () => {
+    reset();
+    const fx = new Fixture(root);
+    standard(fx);
+    const bad: [string, Json][] = [
+      ["missing reviewer_logins", baseConfig({ [REPO]: repoConfig(REPO, { pr_review: { enabled: true, queue: RQ } }) })],
+      ["missing queue", baseConfig({ [REPO]: repoConfig(REPO, { pr_review: { enabled: true, reviewer_logins: [] } }) })],
+      ["missing enabled", baseConfig({ [REPO]: repoConfig(REPO, { pr_review: { queue: RQ, reviewer_logins: [] } }) })],
+      ["unknown field", withReview({ lenses: ["tests"] })],
+      ["enabled is a string", withReview({ enabled: "true" })],
+      ["null pr_review", baseConfig({ [REPO]: repoConfig(REPO, { pr_review: null }) })],
+      ["array pr_review", baseConfig({ [REPO]: repoConfig(REPO, { pr_review: [] }) })],
+      ["queue invalid", withReview({ queue: "-bad" })],
+      ["queue empty while disabled", withReview({ enabled: false, queue: "" })],
+      ["queue equals the issue queue, case-folded", withReview({ queue: "ISSUES:acme/widgets" })],
+      ["queue equals another repo's queue", baseConfig({ [REPO]: repoConfig(REPO, { pr_review: prReview({ queue: `issues:${OTHER}` }) }), [OTHER]: repoConfig(OTHER) })],
+      ["two repos share a pr_review queue", baseConfig({ [REPO]: repoConfig(REPO, { pr_review: prReview() }), [OTHER]: repoConfig(OTHER, { pr_review: prReview() }) })],
+      ["two repos share an issue queue, no pr_review anywhere", baseConfig({ [REPO]: repoConfig(REPO, { queue: "issues:shared" }), [OTHER]: repoConfig(OTHER, { queue: "issues:shared" }) })],
+      ["two repos share an issue queue case-folded, no pr_review anywhere", baseConfig({ [REPO]: repoConfig(REPO, { queue: "Issues:Shared" }), [OTHER]: repoConfig(OTHER, { queue: "issues:shared" }) })],
+      ["logins not an array", withReview({ reviewer_logins: BOT })],
+      ["logins not an array while disabled", withReview({ enabled: false, reviewer_logins: null })],
+      ["login with a space", withReview({ reviewer_logins: ["claude bot"] })],
+      ["login with a bad suffix", withReview({ reviewer_logins: ["claude[app]"] })],
+      ["empty login", withReview({ reviewer_logins: [""] })],
+      ["duplicate login after lower-casing", withReview({ reviewer_logins: ["Claude-Reviewer[bot]", "claude-reviewer[BOT]"] })],
+      ["login not a string", withReview({ reviewer_logins: [7] })],
+    ];
+    for (const [label, cfg] of bad) {
+      fx.config(cfg);
+      for (const args of [["--repo", REPO], ["--repo", REPO, "--dry-run"]]) {
+        const r = await runProducer(fx, args, live);
+        assert.equal(r.code, 3, `${label} ${args.join(" ")}: ${r.stderr}`);
+        assert.match(r.stderr, /invalid; nothing emitted/, label);
+        assert.equal(r.stdout, "", label);
+      }
+    }
+    assert.deepEqual(fx.calls(), [], "no GitHub collection");
+    assert.equal(server.got.length, 0, "nothing posted");
+    for (const ok of [withReview({ enabled: false }), withReview({ reviewer_logins: [] }), withReview({ reviewer_logins: ["a", "B-2", "x[bot]"] })]) {
+      fx.config(ok);
+      const r = await runProducer(fx, ["--repo", REPO, "--dry-run"], live);
+      assert.equal(r.code, 0, `${JSON.stringify(ok)}: ${r.stderr}`);
+    }
+  });
+
+  await check("pr_review: green at head, not draft, no suppressing review; red or pending excluded and still complete", async () => {
+    const fx = new Fixture(root);
+    fx.issues(REPO, []);
+    const h = (n: number) => sha(`rv${n}`);
+    fx.prs(REPO, [
+      { number: 100, head: h(100), contexts: green() },
+      { number: 9, head: h(9), contexts: green() },
+      { number: 20, head: h(20), contexts: [{ kind: "check", name: "ci", conclusion: "FAILURE" }, { kind: "status", name: "postgres" }] },
+      { number: 21, head: h(21), contexts: [{ kind: "check", name: "ci", status: "IN_PROGRESS", conclusion: null }, { kind: "status", name: "postgres" }] },
+      { number: 22, head: h(22), contexts: green(), draft: true },
+      { number: 23, head: h(23), contexts: ok("ci"), draft: true },
+      { number: 10, head: h(10), contexts: green() },
+    ]);
+    const q = await reviewQueue(fx, withReview());
+    assert.equal(q.complete, true);
+    assert.deepEqual(q.ready, { count: 3, refs: ["#9", "#10", "#100"] }, "numeric order, not lexical");
+    assert.deepEqual(q.ready_items, [{ number: 9, head_sha: h(9) }, { number: 10, head_sha: h(10) }, { number: 100, head_sha: h(100) }]);
+    assert.deepEqual(q.raw, { count: 7, refs: ["#9", "#10", "#20", "#21", "#22", "#23", "#100"] }, "raw is every open PR");
+    assert.equal(q.repo, REPO);
+    assert.equal(q.stale_after_minutes, 30);
+    const reviewed = fx.calls().filter((c) => c.includes("SweepPrReviews")).map((c) => c.split(" ")[1]).sort();
+    assert.deepEqual(reviewed, ["SweepPrReviews-10", "SweepPrReviews-100", "SweepPrReviews-9"], "reviews are read only for green non-draft candidates");
+  });
+
+  await check("pr_review: an unknown required check makes it incomplete, never zero", async () => {
+    const cases: [string, PrFixture[], Json | undefined][] = [
+      ["missing context", [{ number: 1, head: sha("u1"), contexts: green() }, { number: 2, head: sha("u2"), contexts: ok("ci") }], undefined],
+      ["truncated contexts", [{ number: 1, head: sha("u1"), contexts: green(), contextsTruncated: true }], undefined],
+      ["rollup not at head", [{ number: 1, head: sha("u1"), commitOid: sha("old"), contexts: green() }], undefined],
+      ["no required checks configured", [{ number: 1, head: sha("u1"), contexts: green() }], { required_checks: [] }],
+      ["required checks omitted", [{ number: 1, head: sha("u1"), contexts: green() }], { required_checks: undefined }],
+    ];
+    for (const [label, list, over] of cases) {
+      const fx = new Fixture(root);
+      fx.issues(REPO, []);
+      fx.prs(REPO, list);
+      const q = await reviewQueue(fx, baseConfig({ [REPO]: repoConfig(REPO, { ...(over ?? {}), pr_review: prReview() }) }));
+      assert.equal(q.complete, false, label);
+      assert.match(q.error, /required checks are unknown for PR #\d+/, label);
+      assert.ok(!("ready" in q) && !("raw" in q), `${label}: no counts`);
+      assert.deepEqual(q.ready_items, [], label);
+    }
+    // A draft with unknown checks cannot be ready, so it does not make the queue unmeasured.
+    const fx = new Fixture(root);
+    fx.issues(REPO, []);
+    fx.prs(REPO, [{ number: 1, head: sha("d1"), contexts: green() }, { number: 2, head: sha("d2"), contexts: ok("ci"), draft: true }]);
+    const q = await reviewQueue(fx, withReview());
+    assert.equal(q.complete, true);
+    assert.deepEqual(q.ready.refs, ["#1"]);
+  });
+
+  await check("pr_review: only a submitted review at the current head by a listed login suppresses", async () => {
+    const fx = new Fixture(root);
+    fx.issues(REPO, []);
+    const h = (n: number) => sha(`sp${n}`);
+    const at = (n: number, state: string, login: string | null) => ({ number: n, head: h(n), contexts: green(), reviews: [{ state, oid: h(n), login }] });
+    fx.prs(REPO, [
+      { number: 1, head: h(1), contexts: green(), reviews: [{ state: "COMMENTED", oid: sha("older"), login: BOT }] },
+      at(2, "PENDING", BOT),
+      at(3, "APPROVED", "someone-else"),
+      at(4, "COMMENTED", null),
+      { number: 5, head: h(5), contexts: green(), reviews: [{ state: "COMMENTED", oid: null, login: BOT }] },
+      at(6, "COMMENTED", BOT),
+      at(7, "CHANGES_REQUESTED", "CLAUDE-REVIEWER[bot]"),
+      at(8, "DISMISSED", BOT),
+      { number: 9, head: h(9), contexts: green(), reviews: [{ state: "PENDING", oid: h(9), login: BOT }, { state: "APPROVED", oid: h(9), login: "human" }, { state: "COMMENTED", oid: sha("x"), login: BOT }] },
+    ]);
+    const q = await reviewQueue(fx, withReview());
+    assert.equal(q.complete, true);
+    assert.deepEqual(q.ready.refs, ["#1", "#2", "#3", "#4", "#5", "#9"],
+      "older head, PENDING, unlisted login, null author, and no commit do not suppress");
+    assert.equal(q.raw.count, 9);
+    const none = await reviewQueue(fx, withReview({ reviewer_logins: [] }));
+    assert.equal(none.ready.count, 9, "an empty login list suppresses nothing");
+  });
+
+  await check("pr_review: reviews are paged in full with reviews(first: 100, after: $cursor)", async () => {
+    const fx = new Fixture(root);
+    fx.issues(REPO, []);
+    const head = sha("paged");
+    const noise = Array.from({ length: 230 }, (_, i) => ({ state: "COMMENTED", oid: sha(`old${i}`), login: i % 2 ? BOT : "human" }));
+    fx.prs(REPO, [
+      { number: 5, head, contexts: green(), reviews: [...noise, { state: "COMMENTED", oid: head, login: BOT }] },
+      { number: 6, head: sha("six"), contexts: green(), reviews: noise.slice(0, 150) },
+    ]);
+    const q = await reviewQueue(fx, withReview());
+    assert.equal(q.complete, true);
+    assert.deepEqual(q.ready.refs, ["#6"], "the matching review is on page 3, past any last-100 window");
+    const seq = fx.calls().filter((c) => c.includes("SweepPrReviews")).map((c) => c.split(" ").slice(1).join(" "));
+    assert.deepEqual(seq, ["SweepPrReviews-5 first", "SweepPrReviews-5 r1", "SweepPrReviews-5 r2", "SweepPrReviews-6 first", "SweepPrReviews-6 r1"]);
+    const query = fx.query("SweepPrReviews");
+    assert.match(query, /reviews\(first: 100, after: \$cursor\)/);
+    assert.match(query, /pageInfo \{ hasNextPage endCursor \}/);
+    assert.match(query, /author \{ login \}/);
+    assert.doesNotMatch(query, /last:/);
+  });
+
+  await check("pr_review: snapshot and review-page failures make it incomplete", async () => {
+    const two = () => [{ number: 1, head: sha("f1"), contexts: green() }, { number: 2, head: sha("f2"), contexts: green() }];
+    const many = (n: number) => Array.from({ length: n }, () => ({ state: "COMMENTED", oid: sha("o"), login: "x" }));
+    const cases: [string, (fx: Fixture) => void, RegExp][] = [
+      ["snapshot head moved", (fx) => fx.prs(REPO, two(), { heads: [[1, sha("f1")], [2, sha("moved")]] }), /head or the open PR set moved/],
+      ["snapshot over 200", (fx) => fx.prs(REPO, two(), { total: 201 }), /more than 200 open PRs/],
+      ["snapshot GitHub failure", (fx) => { fx.prs(REPO, two()); fx.raw(REPO, "SweepPrs", "first", "", { exit: 1 }); }, /GitHub API request failed/],
+      ["snapshot truncated page", (fx) => { fx.prs(REPO, two()); fx.raw(REPO, "SweepPrs", "first", JSON.stringify({ data: { repository: { pullRequests: { totalCount: 60, pageInfo: { hasNextPage: true, endCursor: null }, nodes: [] } } } })); }, /malformed/],
+      ["review page fails", (fx) => { fx.prs(REPO, two()); fx.raw(REPO, "SweepPrReviews-2", "first", "", { exit: 1 }); }, /GitHub API request failed/],
+      ["review second page fails", (fx) => { fx.prs(REPO, [{ number: 1, head: sha("f1"), contexts: green(), reviews: many(150) }]); fx.raw(REPO, "SweepPrReviews-1", "r1", null, { exit: 1 }); }, /GitHub API request failed/],
+      ["review page rate limited", (fx) => { fx.prs(REPO, two()); fx.raw(REPO, "SweepPrReviews-1", "first", "", { exit: 1, stderr: "API rate limit exceeded" }); }, /rate limited/],
+      ["review page truncated (no cursor)", (fx) => {
+        fx.prs(REPO, two());
+        fx.raw(REPO, "SweepPrReviews-1", "first", JSON.stringify({ data: { repository: { pullRequest: { number: 1, headRefOid: sha("f1"), reviews: { pageInfo: { hasNextPage: true, endCursor: null }, nodes: [] } } } } }));
+      }, /truncated/],
+      ["review page malformed", (fx) => { fx.prs(REPO, two()); fx.raw(REPO, "SweepPrReviews-1", "first", JSON.stringify({ data: { repository: { pullRequest: null } } })); }, /malformed/],
+      ["review page for another PR", (fx) => {
+        fx.prs(REPO, two());
+        fx.raw(REPO, "SweepPrReviews-1", "first", JSON.stringify({ data: { repository: { pullRequest: { number: 2, headRefOid: sha("f1"), reviews: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } } }));
+      }, /malformed/],
+      ["head moved before the review read", (fx) => fx.prs(REPO, [{ number: 1, head: sha("f1"), contexts: green(), reviewHead: sha("pushed") }]), /head moved/],
+      ["review cursor repeats", (fx) => {
+        fx.prs(REPO, two());
+        const pg = (c: string) => JSON.stringify({ data: { repository: { pullRequest: { number: 1, headRefOid: sha("f1"), reviews: { pageInfo: { hasNextPage: true, endCursor: c }, nodes: [] } } } } });
+        fx.raw(REPO, "SweepPrReviews-1", "first", pg("loop"));
+        fx.raw(REPO, "SweepPrReviews-1", "loop", pg("loop"));
+      }, /repeated cursor/],
+    ];
+    for (const [label, setup, error] of cases) {
+      const fx = new Fixture(root);
+      fx.issues(REPO, []);
+      setup(fx);
+      const q = await reviewQueue(fx, withReview(), { MC_SWEEP_GH_TIMEOUT: "5" });
+      assert.equal(q.complete, false, label);
+      assert.match(q.error, error, label);
+      assert.ok(!("ready" in q) && !("raw" in q), `${label}: never a zero`);
+      assert.deepEqual(q.ready_items, []);
+    }
+  });
+
+  await check("pr_review: reviews paginate until hasNextPage is false, with no count cap", async () => {
+    const fx = new Fixture(root);
+    fx.issues(REPO, []);
+    const filler = (n: number) => Array.from({ length: n }, () => ({ state: "COMMENTED", oid: sha("o"), login: "x" }));
+    fx.prs(REPO, [
+      { number: 1, head: sha("big1"), contexts: green(), reviews: [...filler(3100), { state: "APPROVED", oid: sha("big1"), login: BOT }] },
+      { number: 2, head: sha("big2"), contexts: green(), reviews: filler(3101) },
+    ]);
+    const q = await reviewQueue(fx, withReview());
+    assert.equal(q.complete, true, q.error);
+    assert.deepEqual(q.ready_items, [{ number: 2, head_sha: sha("big2") }], "the suppressing review on page 32 is found");
+  });
+
+  await check("pr_review: refs and ready_items are the lowest 50; counts stay exact", async () => {
+    const fx = new Fixture(root);
+    fx.issues(REPO, []);
+    fx.prs(REPO, Array.from({ length: 120 }, (_, i) => ({ number: 120 - i, head: sha(`c${120 - i}`), contexts: green(), draft: (120 - i) % 10 === 0 })));
+    const q = await reviewQueue(fx, withReview());
+    assert.equal(q.complete, true);
+    assert.equal(q.ready.count, 108);
+    assert.equal(q.raw.count, 120);
+    assert.equal(q.ready.refs.length, 50);
+    assert.equal(q.ready_items.length, 50);
+    assert.deepEqual(q.ready_items.map((i: Json) => `#${i.number}`), q.ready.refs);
+    assert.equal(q.ready.refs[0], "#1");
+    assert.equal(q.ready.refs[49], "#55", "drafts 10..50 skipped");
+    assert.equal(q.ready_items[49].head_sha, sha("c55"));
+  });
+
+  await check("pr_review: posted live as its own subject and seq; a held snapshot lock is incomplete", async () => {
+    reset();
+    const fx = new Fixture(root);
+    standard(fx);
+    fx.config(withReview());
+    let r = await runProducer(fx, ["--repo", REPO], live);
+    assert.equal(r.code, 0, r.stderr);
+    r = await runProducer(fx, ["--repo", REPO], live);
+    assert.equal(r.code, 0, r.stderr);
+    const queues = server.of("sweep.queue");
+    assert.deepEqual(queues.map((o) => [o.classification, o.queue, o.seq]),
+      [["issue_dispatch", "issues:acme/widgets", 1], ["pr_review", RQ, 1], ["issue_dispatch", "issues:acme/widgets", 2], ["pr_review", RQ, 2]]);
+    for (const o of queues) valid("sweep.queue", o);
+    assert.deepEqual(queues[1].ready_items, [{ number: 7, head_sha: sha("h7") }]);
+    assert.equal(server.got[2].body.kind, "sweep.queue", "the pr_review envelope is third");
+    assert.equal(server.got[2].auth, `Bearer ${FAKE_TOKEN}`);
+    noSecret(stateText(fx), r.stdout, r.stderr);
+
+    next();
+    fs.mkdirSync(fx.state, { recursive: true, mode: 0o700 });
+    const holder = await holdLock(lockFile(fx, "sweep.pr_snapshot|pr:acme/widgets"));
+    try {
+      r = await runProducer(fx, ["--repo", REPO], { ...live, MC_SWEEP_LOCK_WAIT: "0" });
+    } finally {
+      await kill9(holder);
+    }
+    assert.equal(r.code, 1);
+    const [held] = server.of("sweep.queue").filter((o) => o.classification === "pr_review");
+    valid("sweep.queue", held);
+    assert.deepEqual([held.complete, held.error, held.seq], [false, "the PR snapshot was not collected", 3]);
+  });
+
   await check("collect-progress: a tick runs the producer per repo; backfill never does; a producer failure keeps the tick", async () => {
     const fx = new Fixture(root);
     standard(fx);

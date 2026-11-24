@@ -1,0 +1,79 @@
+{
+  "queues": [
+    {
+      "queue": "reviews:acme/gadgets",
+      "repo": "acme/gadgets",
+      "observed_at": "2026-11-23T11:50:00.000Z",
+      "received_at": "2026-11-23T11:50:02.123Z",
+      "stale": false,
+      "age_minutes": 9,
+      "stale_after_minutes": 30,
+      "complete": false,
+      "error": "GitHub rate limited",
+      "ready": null,
+      "raw": null,
+      "ready_items": null
+    },
+    {
+      "queue": "reviews:acme/legacy",
+      "repo": "acme/legacy",
+      "observed_at": "2026-11-23T11:55:00.000Z",
+      "received_at": "2026-11-23T11:55:01.000Z",
+      "stale": false,
+      "age_minutes": 4,
+      "stale_after_minutes": 30,
+      "complete": false,
+      "error": "missing ready_items",
+      "ready": null,
+      "raw": null,
+      "ready_items": null
+    },
+    {
+      "queue": "reviews:acme/stale",
+      "repo": "acme/stale",
+      "observed_at": "2026-11-23T11:00:00.000Z",
+      "received_at": "2026-11-23T11:00:05.000Z",
+      "stale": true,
+      "age_minutes": 59,
+      "stale_after_minutes": 30,
+      "complete": true,
+      "error": "stale observation",
+      "ready": null,
+      "raw": null,
+      "ready_items": null
+    },
+    {
+      "queue": "reviews:acme/widgets",
+      "repo": "Acme/Widgets",
+      "observed_at": "2026-11-23T11:58:00.000Z",
+      "received_at": "2026-11-23T11:58:01.500Z",
+      "stale": false,
+      "age_minutes": 1,
+      "stale_after_minutes": 30,
+      "complete": true,
+      "error": null,
+      "ready": {
+        "count": 2,
+        "refs": [
+          "#7",
+          "#12"
+        ]
+      },
+      "raw": {
+        "count": 5
+      },
+      "ready_items": [
+        {
+          "number": 7,
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "green_since": "2026-11-23T10:00:00.000Z"
+        },
+        {
+          "number": 12,
+          "head_sha": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "green_since": null
+        }
+      ]
+    }
+  ]
+}
