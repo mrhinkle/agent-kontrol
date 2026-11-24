@@ -50,8 +50,8 @@ function useHeaderHeight(): number {
 
 function LoadingState() {
   return (
-    <div className="absolute inset-0 flex items-center justify-center bg-[#05070f]">
-      <span className="mono animate-pulse text-sm tracking-[0.3em] text-[#19d2ff]">JACKING IN…</span>
+    <div className="absolute inset-0 flex items-center justify-center bg-bg">
+      <span className="mono animate-pulse text-sm tracking-[0.3em] text-accent">JACKING IN…</span>
     </div>
   );
 }
@@ -62,7 +62,7 @@ const GibsonScene = dynamic(() => import("@/components/gibson/GibsonScene"), {
 });
 
 const toolBtn =
-  "mono min-h-[30px] min-w-[30px] rounded-md border border-white/15 bg-[#0d1424]/90 px-2.5 text-[11px] text-gray-200 backdrop-blur transition-colors hover:border-white/35 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#19d2ff] disabled:opacity-40";
+  "mono min-h-[30px] min-w-[30px] rounded-md border border-white/15 bg-panel-elevated/90 px-2.5 text-[11px] text-gray-200 backdrop-blur transition-colors hover:border-white/35 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-40";
 
 export default function GibsonPage() {
   const { model, error } = useGibson();
@@ -169,22 +169,22 @@ export default function GibsonPage() {
 
   return (
     <div
-      className="fixed inset-x-0 bottom-0 z-[5] flex flex-col overflow-hidden bg-[#05070f] text-[#d9fbff]"
+      className="fixed inset-x-0 bottom-0 z-[5] flex flex-col overflow-hidden bg-bg text-accent-core"
       style={{ top: headerH }}
     >
       {/* Top bar: title · status banner · drawn counts */}
-      <div className="flex flex-wrap items-center gap-x-6 gap-y-2 border-b border-white/10 bg-[#070b16] px-4 py-2.5">
+      <div className="flex flex-wrap items-center gap-x-6 gap-y-2 border-b border-white/10 bg-panel px-4 py-2.5">
         <div className="shrink-0">
           <h1 className="text-sm font-bold tracking-[0.24em] text-white">THE GIBSON</h1>
           {c ? (
             <p className="mono text-[10.5px] text-gray-400" title="Every count is derived from what is drawn">
               <strong className="text-gray-200">{c.agents}</strong> agents · <strong className="text-gray-200">{c.machines}</strong> machines ·{" "}
               <strong className="text-gray-200">{c.towers}</strong> towers · <strong className="text-gray-200">{c.openFloors}</strong> open tasks
-              {c.reviewTasks > 0 && <> · <span className="text-[#8be6ff]">{c.reviewTasks} in review</span></>}
+              {c.reviewTasks > 0 && <> · <span className="text-accent-core">{c.reviewTasks} in review</span></>}
               {c.byStatus.offline > 0 && <> · {c.byStatus.offline} offline</>}
             </p>
           ) : (
-            <p className="mono text-[10px] tracking-[0.18em] text-[#63dff4]/80">FLEET · PROJECTS · TASKS</p>
+            <p className="mono text-[10px] tracking-[0.18em] text-accent/80">FLEET · PROJECTS · TASKS</p>
           )}
         </div>
         <div className="flex min-w-0 flex-1 justify-center">
@@ -193,7 +193,7 @@ export default function GibsonPage() {
       </div>
 
       <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[16.5rem_minmax(0,1fr)_21rem]">
-        <aside className="hidden min-h-0 border-r border-white/10 bg-[#080d19] lg:flex lg:flex-col">
+        <aside className="hidden min-h-0 border-r border-white/10 bg-bg lg:flex lg:flex-col">
           {model && (
             <Roster
               model={model}
@@ -230,7 +230,7 @@ export default function GibsonPage() {
 
           {!model && error && (
             <div role="alert" className="absolute inset-0 flex items-center justify-center p-6">
-              <div className="max-w-sm rounded-lg border border-red-500/40 bg-[#1a0b10]/90 p-4 text-sm text-red-200">
+              <div className="max-w-sm rounded-lg border border-red-500/40 bg-panel/90 p-4 text-sm text-red-200">
                 <p className="font-semibold">Could not load the fleet.</p>
                 <p className="mono mt-1 text-[12px] text-red-300/80">{error}</p>
                 <p className="mt-2 text-[12px] text-gray-400">Retrying every few seconds.</p>
@@ -241,7 +241,7 @@ export default function GibsonPage() {
           {model && (
             <>
               <div className="pointer-events-none absolute inset-x-3 bottom-3 flex flex-wrap items-end justify-between gap-2">
-                <div className="mono pointer-events-auto rounded bg-[#05070f]/70 px-1.5 text-[10px] leading-5 text-gray-500">
+                <div className="mono pointer-events-auto rounded bg-bg/70 px-1.5 text-[10px] leading-5 text-gray-500">
                   <time dateTime={model.generatedAt} title={model.generatedAt}>
                     updated {new Date(model.generatedAt).toLocaleTimeString()}
                   </time>
@@ -267,7 +267,7 @@ export default function GibsonPage() {
                   </button>
                 </div>
               </div>
-              <p className="mono pointer-events-none absolute left-3 top-3 rounded-md bg-[#05070f]/70 px-2 py-1 text-[10.5px] text-gray-400">
+              <p className="mono pointer-events-none absolute left-3 top-3 rounded-md bg-bg/70 px-2 py-1 text-[10.5px] text-gray-400">
                 drag to orbit · scroll to zoom · click an agent · <Kbd>↑</Kbd><Kbd>↓</Kbd> cycle · <Kbd>Esc</Kbd> close
               </p>
             </>
@@ -275,7 +275,7 @@ export default function GibsonPage() {
         </div>
 
         <aside
-          className={`min-h-0 flex-col border-l border-white/10 bg-[#080d19] ${panelOpen ? "absolute inset-y-0 right-0 z-20 flex w-[min(21rem,100vw)] lg:static lg:w-auto" : "hidden lg:flex"}`}
+          className={`min-h-0 flex-col border-l border-white/10 bg-bg ${panelOpen ? "absolute inset-y-0 right-0 z-20 flex w-[min(21rem,100vw)] lg:static lg:w-auto" : "hidden lg:flex"}`}
         >
           <div className="flex border-b border-white/10 text-[12px]" role="tablist">
             {(["details", "key"] as const).map((t) => (

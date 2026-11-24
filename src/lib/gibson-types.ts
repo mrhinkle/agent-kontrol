@@ -249,12 +249,13 @@ export const AGENT_STATUS_LABELS: Record<AgentStatus, string> = {
 
 /** Task-status colors for tower floors — same hue family as agent status. */
 export const STATUS_COLORS: Record<GibsonFloorStatus, string> = {
-  queued: "#4a5f9e",
-  claimed: "#7f9cff",
+  queued: "#6b7c8f",
+  claimed: "#8fa3b8",
   running: "#3ecf8e",
-  review: "#19d2ff",
+  review: "#00d8ff",
   failed: "#f07178",
-  done: "#3d5078",
+  // Ion muted-dim at half strength on the page background, so finished floors recede.
+  done: "#3a4450",
 };
 
 export const STATUS_LABELS: Record<GibsonFloorStatus, string> = {
@@ -268,9 +269,9 @@ export const STATUS_LABELS: Record<GibsonFloorStatus, string> = {
 
 /** Neutral (non-status) colors for chrome: labels, selection, platform glyphs. */
 export const NEUTRAL = {
-  label: "#e8efff",
-  labelMuted: "#93a4c8",
-  glyph: "#c9d4ee",
+  label: "#e8eaed",
+  labelMuted: "#8fa3b8",
+  glyph: "#e8eaed",
   select: "#ffffff",
 } as const;
 
@@ -308,4 +309,4 @@ export const PLATFORM_KEY: Array<{ shape: GibsonPlatformShape; label: string; pl
   { shape: "hex", label: "Other", platforms: [] },
 ];
 
-export const GIBSON_BG = "#05070f";
+export const GIBSON_BG = "#0b0d10";
