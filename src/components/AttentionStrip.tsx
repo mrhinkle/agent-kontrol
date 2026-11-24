@@ -13,9 +13,9 @@ const PROGRESS_POLL_MS = 60_000;
 const PROGRESS_TIMEOUT_MS = 5_000;
 
 const TONE: Record<AttentionTone, { fg: string; bg: string; ring: string }> = {
-  red: { fg: "#ff9db0", bg: "#ff3b5c22", ring: "#ff3b5c88" },
-  amber: { fg: "#ffd27a", bg: "#ffb02022", ring: "#ffb02088" },
-  cyan: { fg: "#8be6ff", bg: "#19d2ff1a", ring: "#19d2ff66" },
+  red: { fg: "#f07178", bg: "#ff3b5c22", ring: "#ff3b5c88" },
+  amber: { fg: "#ffb020", bg: "#ffb02022", ring: "#ffb02088" },
+  cyan: { fg: "#6fe9ff", bg: "#19d2ff1a", ring: "#19d2ff66" },
 };
 
 interface Snapshot {
@@ -115,7 +115,7 @@ export function AttentionStrip() {
             key={item.key}
             href={item.href}
             title={item.title}
-            className="mono whitespace-nowrap rounded-full px-2.5 py-1 text-[10.5px] font-semibold uppercase tracking-wider transition-[filter] hover:brightness-125 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[#19d2ff]"
+            className="mono whitespace-nowrap rounded-sm px-2.5 py-1 text-[10.5px] font-semibold uppercase tracking-wider transition-[filter] hover:brightness-125 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
             style={{ color: t.fg, backgroundColor: t.bg, boxShadow: `inset 0 0 0 1px ${t.ring}` }}
           >
             {item.tone === "red" ? "● " : item.tone === "amber" ? "▲ " : ""}
@@ -125,7 +125,7 @@ export function AttentionStrip() {
       })}
       {snap.items.length === 0 && (
         <span className="mono flex items-center gap-1.5 text-[10.5px] uppercase tracking-wider text-gray-500" title="No failures, nobody waiting on you">
-          <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-[#2ee6a6]" />
+          <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-success" />
           clear
         </span>
       )}

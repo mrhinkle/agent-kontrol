@@ -19,12 +19,12 @@ export default async function ObservabilityPage() {
           <p className="mt-2 max-w-2xl text-sm text-gray-400">Run traces, reported model usage, runtime, and errors.</p>
         </div>
         {status.projectUrl && (
-          <a href={status.projectUrl} target="_blank" rel="noopener noreferrer" className="rounded-md border border-white/20 px-4 py-2 text-sm text-white hover:bg-white/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#19d2ff]">
+          <a href={status.projectUrl} target="_blank" rel="noopener noreferrer" className="rounded-md border border-white/20 px-4 py-2 text-sm text-white hover:bg-white/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent">
             Open Langfuse project ↗
           </a>
         )}
       </div>
-      <section className="rounded-xl border border-white/10 bg-[#101828] p-5" aria-labelledby="export-status">
+      <section className="rounded-xl border border-white/10 bg-panel p-5" aria-labelledby="export-status">
         <h2 id="export-status" className="font-medium text-gray-200">
           {ready ? "Event export configured" : status.state === "incomplete" ? "Setup incomplete" : "Event export disabled"}
         </h2>
@@ -37,15 +37,15 @@ export default async function ObservabilityPage() {
       </section>
       <RunDashboard metrics={await metricsPromise} />
       <div className="grid gap-4 md:grid-cols-2">
-        <section className="rounded-xl border border-white/10 bg-[#101828] p-5">
+        <section className="rounded-xl border border-white/10 bg-panel p-5">
           <h2 className="font-medium text-gray-200">Activity traces</h2>
           <p className="mt-2 text-sm leading-relaxed text-gray-400">New session starts, turns, milestones, waiting states, completions, and errors become timestamped events in Langfuse. Events share a hashed session reference. Routine heartbeats are excluded.</p>
-          <Link href="/history" className="mt-4 inline-block text-sm text-[#19d2ff] hover:underline">View fleet history →</Link>
+          <Link href="/history" className="mt-4 inline-block text-sm text-accent hover:underline">View fleet history →</Link>
         </section>
-        <section className="rounded-xl border border-white/10 bg-[#101828] p-5">
+        <section className="rounded-xl border border-white/10 bg-panel p-5">
           <h2 className="font-medium text-gray-200">Model usage</h2>
           <p className="mt-2 text-sm leading-relaxed text-gray-400">Completed dispatcher runs carry measured runtime, outcomes, and available per-model token totals. Langfuse receives a run span and model-total metadata. Individual model calls and request latency need native agent instrumentation.</p>
-          <Link href="/usage" className="mt-4 inline-block text-sm text-[#19d2ff] hover:underline">View usage and costs →</Link>
+          <Link href="/usage" className="mt-4 inline-block text-sm text-accent hover:underline">View usage and costs →</Link>
         </section>
       </div>
       <p className="max-w-3xl text-xs leading-relaxed text-gray-400">Export includes event kind, platform, timestamp, event ID, and hashed agent and session references. Prompts, replies, task text, raw errors, project names, and machine names stay out of Langfuse. Export is best effort; historical events are not backfilled.</p>

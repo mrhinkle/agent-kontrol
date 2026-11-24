@@ -1,4 +1,5 @@
 import { describe, it } from "node:test";
+import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { STATUS_STYLES, TASK_STATUS_STYLES } from "../../src/components/ui";
 import { AGENT_STATUS_COLORS } from "../../src/lib/gibson-types";
@@ -13,13 +14,16 @@ const contrast = (a: string, b: string) => {
   const [hi, lo] = [lum(a), lum(b)].sort((x, y) => y - x);
   return (hi + 0.05) / (lo + 0.05);
 };
+// Classes name Ion tokens (bg-success, text-muted); globals.css holds their values.
+const THEME = readFileSync(new URL("../../src/app/globals.css", import.meta.url), "utf8");
 const hexOf = (cls: string) => {
-  const m = /#[0-9a-f]{6}/i.exec(cls);
-  assert.ok(m, `no hex in ${cls}`);
-  return m[0];
+  const token = /^(?:bg|text|ring)-([a-z-]+?)(?:\/\d+)?$/.exec(cls)?.[1];
+  const m = token ? new RegExp(`--color-${token}:\\s*(#[0-9a-f]{6})`, "i").exec(THEME) : null;
+  assert.ok(m, `no Ion token for ${cls}`);
+  return m[1];
 };
-// Chips sit on a #101828 card with a white/5 fill: 0.95*card + 0.05*white.
-const CHIP_BG = "#1c2433";
+// Chips sit on an Ion panel (#12151a) with a white/5 fill: 0.95*panel + 0.05*white.
+const CHIP_BG = "#1e2125";
 
 describe("task status chips use the Fleet/Gibson palette", () => {
   it("green running, amber review, red failed, dim done", () => {

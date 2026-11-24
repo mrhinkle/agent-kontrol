@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { buildFeed } from "../../src/lib/feed";
@@ -55,10 +56,15 @@ describe("live activity feed", () => {
   });
 });
 
+const THEME = readFileSync(new URL("../../src/app/globals.css", import.meta.url), "utf8");
+
 describe("status colors match the Gibson", () => {
   it("uses the Gibson hex for every agent status dot", () => {
     for (const [status, hex] of Object.entries(AGENT_STATUS_COLORS)) {
-      assert.ok(STATUS_STYLES[status].dot.includes(hex), `${status}: ${STATUS_STYLES[status].dot} should use ${hex}`);
+      // Dots name Ion tokens (bg-success); globals.css holds the value the Gibson uses.
+      const token = STATUS_STYLES[status].dot.replace(/^bg-/, "");
+      const value = new RegExp(`--color-${token}:\\s*(#[0-9a-f]{6})`, "i").exec(THEME)?.[1];
+      assert.equal(value, hex, `${status}: ${STATUS_STYLES[status].dot} should resolve to ${hex}`);
     }
     assert.equal(STATUS_STYLES.waiting.label, "NEEDS YOU");
   });

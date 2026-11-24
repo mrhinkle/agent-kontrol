@@ -151,7 +151,7 @@ export function BacklogChart({
               textAnchor="end"
               className="mono"
               fontSize={10}
-              fill="#6b7280"
+              fill="#6b7c8f"
             >
               {t >= 1000 ? `${(t / 1000).toFixed(1)}k` : Math.round(t)}
             </text>
@@ -159,9 +159,9 @@ export function BacklogChart({
         ))}
 
         {/* the gap is the backlog */}
-        <path d={geom.area} fill="#f44800" fillOpacity={0.12} />
-        <path d={geom.line("created")} fill="none" stroke="#f44800" strokeWidth={1.75} />
-        <path d={geom.line("closed")} fill="none" stroke="#34d399" strokeWidth={1.75} />
+        <path d={geom.area} fill="#f07178" fillOpacity={0.12} />
+        <path d={geom.line("created")} fill="none" stroke="#f07178" strokeWidth={1.75} />
+        <path d={geom.line("closed")} fill="none" stroke="#3ecf8e" strokeWidth={1.75} />
 
         <line
           x1={geom.x(idx)}
@@ -172,8 +172,8 @@ export function BacklogChart({
           strokeWidth={1}
           strokeDasharray="3 3"
         />
-        <circle cx={geom.x(idx)} cy={geom.y(point.created)} r={3} fill="#f44800" />
-        <circle cx={geom.x(idx)} cy={geom.y(point.closed)} r={3} fill="#34d399" />
+        <circle cx={geom.x(idx)} cy={geom.y(point.created)} r={3} fill="#f07178" />
+        <circle cx={geom.x(idx)} cy={geom.y(point.closed)} r={3} fill="#3ecf8e" />
 
         {labelIdx.map((i, n) => (
           <text
@@ -183,7 +183,7 @@ export function BacklogChart({
             textAnchor={n === 0 ? "start" : n === labelIdx.length - 1 ? "end" : "middle"}
             className="mono"
             fontSize={10}
-            fill="#6b7280"
+            fill="#6b7c8f"
           >
             {series[i].date.slice(5)}
           </text>
@@ -192,10 +192,10 @@ export function BacklogChart({
 
       <div className="mt-1 flex flex-wrap gap-x-5 gap-y-1 text-[11px] text-gray-500 mono">
         <span className="inline-flex items-center gap-1.5">
-          <i className="h-0.5 w-3 rounded-full bg-[#f44800]" /> created (cumulative)
+          <i className="h-0.5 w-3 rounded-full bg-error" /> created (cumulative)
         </span>
         <span className="inline-flex items-center gap-1.5">
-          <i className="h-0.5 w-3 rounded-full bg-[#34d399]" /> closed (cumulative)
+          <i className="h-0.5 w-3 rounded-full bg-success" /> closed (cumulative)
         </span>
         <span className="text-gray-600">the gap is the backlog — converging is progress</span>
       </div>

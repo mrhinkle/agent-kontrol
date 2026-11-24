@@ -45,7 +45,7 @@ export default function SkillDetailPage() {
             href={source}
             target="_blank"
             rel="noreferrer noopener"
-            className="text-sm text-[#7aa5ff] underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#19d2ff]/70"
+            className="text-sm text-accent underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70"
           >
             Open upstream source
           </a>
@@ -53,7 +53,7 @@ export default function SkillDetailPage() {
       </div>
 
       <div className="grid items-start gap-4 md:grid-cols-2">
-        <section className="min-w-0 rounded-xl border border-white/10 bg-[#101828] p-4">
+        <section className="min-w-0 rounded-xl border border-white/10 bg-panel p-4">
           <h2 className="mb-2 text-sm font-semibold uppercase tracking-wider text-gray-400">SKILL.md</h2>
           <CollapsibleMarkdown source={data.body ?? ""} className="text-sm leading-relaxed text-gray-300" />
           <h3 className="mt-4 text-xs font-semibold uppercase tracking-wider text-gray-500">References:</h3>

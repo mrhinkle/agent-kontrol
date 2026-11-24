@@ -28,9 +28,9 @@ interface Loaded {
 }
 
 const input =
-  "w-full bg-[#0a0f1c] border border-white/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-[#2563eb] disabled:opacity-60";
+  "w-full bg-bg border border-white/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-accent disabled:opacity-60";
 const primary =
-  "bg-[#2563eb] hover:bg-[#1d4ed8] text-white rounded-lg px-4 py-2 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed";
+  "bg-accent hover:bg-accent-hover text-accent-ink rounded-lg px-4 py-2 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed";
 const secondary = "border border-white/15 rounded-lg px-4 py-2 text-sm text-gray-200 hover:bg-white/5 disabled:opacity-50";
 
 function blank(): OwnerRow {
@@ -155,7 +155,7 @@ export function OwnerSettings() {
 
   if (loadError) {
     return (
-      <div className="rounded-xl border border-white/10 bg-[#101828] p-6">
+      <div className="rounded-xl border border-white/10 bg-panel p-6">
         <p className="text-sm text-red-400">{loadError}</p>
         <button className={`${secondary} mt-3`} onClick={() => void load()}>
           Retry
@@ -167,12 +167,12 @@ export function OwnerSettings() {
 
   return (
     <div data-owner-settings className="space-y-4">
-      <div className="rounded-lg border border-[#2563eb]/40 bg-[#2563eb]/10 px-3 py-2 text-sm text-blue-100">
+      <div className="rounded-lg border border-accent/40 bg-accent/10 px-3 py-2 text-sm text-blue-100">
         {writable
           ? "Name a GitHub user or organization. The collector keeps every repo allowed by the fork and archive settings, including inactive repos. Activity days filter the Progress board and brief only. Hide wins over pin."
           : "No database is connected (demo mode), so owners are read-only."}
       </div>
-      <div className="rounded-xl border border-white/10 bg-[#101828] p-4 md:p-6">
+      <div className="rounded-xl border border-white/10 bg-panel p-4 md:p-6">
         <ul className="space-y-4">
           {rows.map((row, index) => {
             const rowErrors = errors.filter((item) => item.index === index);

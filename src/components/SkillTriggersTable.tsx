@@ -3,7 +3,7 @@ import type { SkillTriggerEvent, TriggerRunStatus } from "./skills-types";
 
 export function SkillTriggersTable({ triggers }: { triggers: readonly SkillTriggerEvent[] }) {
   return (
-    <section className="mt-4 rounded-xl border border-white/10 bg-[#101828]">
+    <section className="mt-4 rounded-xl border border-white/10 bg-panel">
       <h2 className="px-4 pt-4 text-sm font-semibold uppercase tracking-wider text-gray-400">Recent triggers</h2>
       {triggers.length === 0 ? (
         <p className="px-4 py-6 text-sm text-gray-500">No triggers yet.</p>
@@ -46,21 +46,21 @@ export function SkillTriggersTable({ triggers }: { triggers: readonly SkillTrigg
 function TriggerStatus({ status }: { status: TriggerRunStatus }) {
   if (status === "stalled") {
     return (
-      <span className="mono inline-flex items-center rounded-full bg-[#ff3b5c]/15 px-2 py-0.5 text-[11px] font-semibold text-[#ff5c77] ring-1 ring-[#ff3b5c]/45">
+      <span className="mono inline-flex items-center rounded-sm bg-error/15 px-2 py-0.5 text-[11px] font-semibold text-error ring-1 ring-error/45">
         STALLED
       </span>
     );
   }
   if (status === "running") {
     return (
-      <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-[#2ee6a6]">
-        <span aria-hidden className="pulse-dot h-1.5 w-1.5 rounded-full bg-[#19d2ff]" />
+      <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-success">
+        <span aria-hidden className="pulse-dot h-1.5 w-1.5 rounded-full bg-accent" />
         running
       </span>
     );
   }
   return (
-    <span className="mono text-[11px] font-semibold uppercase tracking-wider text-[#8b9bc0]" title="done">
+    <span className="mono text-[11px] font-semibold uppercase tracking-wider text-muted" title="done">
       ✓ done
     </span>
   );

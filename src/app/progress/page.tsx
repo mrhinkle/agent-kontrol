@@ -23,7 +23,7 @@ function Panel({
   className?: string;
 }) {
   return (
-    <section className={`rounded-xl border border-white/10 bg-[#101828] ${className}`}>
+    <section className={`rounded-xl border border-white/10 bg-panel ${className}`}>
       <header className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-2.5">
         <h2 className="mono text-[11px] font-semibold uppercase tracking-[0.14em] text-gray-500">{title}</h2>
         {right}
@@ -36,7 +36,7 @@ function Panel({
 /** Signed number where positive is the bad direction. */
 function NetBacklog({ value, className = "" }: { value: number | null; className?: string }) {
   if (value === null) return <span className={`text-gray-500 ${className}`} title="Not measured">—</span>;
-  const tone = value > 0 ? "text-[#ff7a40]" : value < 0 ? "text-emerald-400" : "text-gray-300";
+  const tone = value > 0 ? "text-error" : value < 0 ? "text-emerald-400" : "text-gray-300";
   return (
     <span className={`tabular-nums ${tone} ${className}`}>
       {value > 0 ? "+" : ""}
@@ -60,10 +60,10 @@ function Stat({ label, value, sub }: { label: string; value: React.ReactNode; su
 function repoTone(r: RepoProgress): { stripe: string; note: string | null } {
   if (r.metrics_complete === false) return { stripe: "bg-gray-600", note: "partial metrics" };
   if (r.blocked_ratio !== null && r.blocked_ratio > THRESHOLDS.blockedRatio) {
-    return { stripe: "bg-[#f44800]", note: "over blocked threshold" };
+    return { stripe: "bg-error", note: "over blocked threshold" };
   }
-  if (r.net_backlog !== null && r.net_backlog > 0) return { stripe: "bg-[#ff9a3c]", note: "backlog grew" };
-  if (r.merged_prs === 0 && r.open_prs !== null && r.open_prs > 0) return { stripe: "bg-[#2563eb]", note: "nothing merged" };
+  if (r.net_backlog !== null && r.net_backlog > 0) return { stripe: "bg-warn", note: "backlog grew" };
+  if (r.merged_prs === 0 && r.open_prs !== null && r.open_prs > 0) return { stripe: "bg-accent", note: "nothing merged" };
   return { stripe: "bg-emerald-500", note: null };
 }
 
@@ -73,7 +73,7 @@ function RepoCard({ r }: { r: RepoProgress }) {
   const overBlocked = r.blocked_ratio !== null && r.blocked_ratio > THRESHOLDS.blockedRatio;
 
   return (
-    <div className="relative overflow-hidden rounded-xl border border-white/10 bg-[#101828] transition-colors hover:border-white/20">
+    <div className="relative overflow-hidden rounded-xl border border-white/10 bg-panel transition-colors hover:border-white/20">
       <span className={`absolute inset-y-0 left-0 w-[3px] ${tone.stripe}`} aria-hidden />
       <div className="p-4 pl-5">
         <div className="flex items-baseline justify-between gap-2">
@@ -125,7 +125,7 @@ function RepoCard({ r }: { r: RepoProgress }) {
             <dt className="text-gray-500">blocked</dt>
             <dd
               className={`mono tabular-nums ${
-                overBlocked ? "font-semibold text-[#ff7a40]" : blockedPct === null ? "text-gray-600" : "text-gray-300"
+                overBlocked ? "font-semibold text-error" : blockedPct === null ? "text-gray-600" : "text-gray-300"
               }`}
               title={blockedPct === null ? "Blocked work has not been measured or has no configured label" : undefined}
             >
@@ -171,9 +171,9 @@ function Breakdown({ data }: { data: ProgressResponse }) {
 
   return (
     <div className="space-y-2.5">
-      <Bar label="merged" value={t.merged_prs} max={max} color="#2563eb" />
-      <Bar label="closed" value={t.issues_closed} max={max} color="#34d399" />
-      <Bar label="opened" value={t.issues_opened} max={max} color="#f44800" />
+      <Bar label="merged" value={t.merged_prs} max={max} color="#00d8ff" />
+      <Bar label="closed" value={t.issues_closed} max={max} color="#3ecf8e" />
+      <Bar label="opened" value={t.issues_opened} max={max} color="#f07178" />
 
       <div className="flex items-baseline justify-between gap-2 border-t border-white/10 pt-3 text-[12px]">
         <span className="text-gray-500">net backlog</span>
@@ -212,7 +212,7 @@ function Breakdown({ data }: { data: ProgressResponse }) {
 /* ------------------------------------------------------- zone 4: needs you */
 
 function AlertRow({ a }: { a: Alert }) {
-  const color = a.level === "bad" ? "text-[#ff7a40]" : "text-[#f0b429]";
+  const color = a.level === "bad" ? "text-error" : "text-warn";
   const body = (
     <>
       <span className={`shrink-0 ${color}`}>⚠</span>
@@ -256,7 +256,7 @@ function FleetStrip({ spend }: { spend: number | null }) {
   const vitals = process.env.NEXT_PUBLIC_HERMES_VITALS_URL;
 
   return (
-    <div className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-xl border border-white/10 bg-[#101828] px-4 py-3 text-[12px]">
+    <div className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-xl border border-white/10 bg-panel px-4 py-3 text-[12px]">
       <span className="mono text-[10px] uppercase tracking-[0.14em] text-gray-500">fleet</span>
 
       {data?.agents.length ? (
@@ -284,7 +284,7 @@ function FleetStrip({ spend }: { spend: number | null }) {
             hermes vitals ↗
           </a>
         )}
-        <Link href="/gibson" className="mono text-[#19d2ff]/80 hover:text-[#19d2ff]">
+        <Link href="/gibson" className="mono text-accent/80 hover:text-accent">
           the gibson ↗
         </Link>
       </span>
@@ -330,7 +330,7 @@ export default function ProgressPage() {
                 key={w}
                 onClick={() => setWin(w)}
                 className={`mono px-2.5 py-1 text-[11px] transition-colors ${
-                  w === win ? "bg-[#f44800] font-semibold text-white" : "text-gray-400 hover:bg-white/5"
+                  w === win ? "bg-accent/15 font-semibold text-accent" : "text-gray-400 hover:bg-white/5"
                 }`}
               >
                 {w}
@@ -341,7 +341,7 @@ export default function ProgressPage() {
       </div>
 
       {data?.demo && (
-        <div className="rounded-lg border border-[#2563eb]/30 bg-[#2563eb]/10 px-4 py-2.5 text-sm text-[#9db9ff]">
+        <div className="rounded-lg border border-accent/30 bg-accent/10 px-4 py-2.5 text-sm text-accent">
           Demo mode — no database connected. These are synthetic numbers, held still. Set{" "}
           <span className="mono">DATABASE_URL</span> and run <span className="mono">scripts/collect-progress.sh</span> to
           go live.
@@ -349,14 +349,14 @@ export default function ProgressPage() {
       )}
 
       {data && !data.demo && !data.window_complete && (
-        <div className="rounded-lg border border-[#f0b429]/30 bg-[#f0b429]/10 px-4 py-2.5 text-[12.5px] text-[#f0d08a]">
+        <div className="rounded-lg border border-warn/30 bg-warn/10 px-4 py-2.5 text-[12.5px] text-warn">
           Totals are partial: some metrics are missing, more than two hours old, or don&apos;t cover the full {win}.
           Unmeasured values appear as —. Each card shows when its metrics were collected.
         </div>
       )}
 
       {data?.coverage && (
-        <div className="rounded-lg border border-white/10 bg-[#101828] px-4 py-3 text-[12px] text-gray-400">
+        <div className="rounded-lg border border-white/10 bg-panel px-4 py-3 text-[12px] text-gray-400">
           <p><span className="font-semibold text-gray-200">{data.coverage.shown_repos} repositories shown</span> · {data.coverage.checked_repos} of {data.coverage.eligible_repos} checked in the past 2 hours · {data.coverage.tracked_repos} retained</p>
           <p className="mt-1">Activity includes pushes and PR or issue updates. The chart&apos;s time window changes metrics, not which repositories appear. Explicit pins stay visible.</p>
           {data.coverage.discovery_errors.length > 0 && <p className="mt-2 text-amber-300">Repository discovery unavailable for {data.coverage.discovery_errors.join(", ")}; coverage may be incomplete.</p>}
@@ -376,7 +376,7 @@ export default function ProgressPage() {
         {data
           ? data.repos.map((r) => <RepoCard key={r.repo} r={r} />)
           : REPOS.map((r) => (
-              <div key={r.repo} className="h-[196px] animate-pulse rounded-xl border border-white/10 bg-[#101828]" />
+              <div key={r.repo} className="h-[196px] animate-pulse rounded-xl border border-white/10 bg-panel" />
             ))}
       </div>
       {data && data.repos.length === 0 && <p className="text-sm text-gray-400">No qualifying repositories in the available observations.</p>}
@@ -424,7 +424,7 @@ export default function ProgressPage() {
           title="needs you"
           right={
             data && data.alerts.length > 0 ? (
-              <span className="mono text-[11px] text-[#ff7a40]">{data.alerts.length}</span>
+              <span className="mono text-[11px] text-error">{data.alerts.length}</span>
             ) : null
           }
         >

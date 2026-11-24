@@ -230,13 +230,13 @@ export function platformMatchesFilters(
   return filters.platforms.length === 0 || filters.platforms.includes(platform);
 }
 
-/** Agent status colors. Active pulses, waiting is amber, failed red, done dim. */
+/** Agent status colors, in Chatterbuilt Ion tokens (success, warn, error, muted-dim). Active pulses, waiting is amber, failed red, done dim. */
 export const AGENT_STATUS_COLORS: Record<AgentStatus, string> = {
-  active: "#2ee6a6",
+  active: "#3ecf8e",
   waiting: "#ffb020",
-  failed: "#ff3b5c",
-  done: "#5c6f96",
-  offline: "#3b4559",
+  failed: "#f07178",
+  done: "#8fa3b8",
+  offline: "#6b7c8f",
 };
 
 export const AGENT_STATUS_LABELS: Record<AgentStatus, string> = {
@@ -251,9 +251,9 @@ export const AGENT_STATUS_LABELS: Record<AgentStatus, string> = {
 export const STATUS_COLORS: Record<GibsonFloorStatus, string> = {
   queued: "#4a5f9e",
   claimed: "#7f9cff",
-  running: "#2ee6a6",
+  running: "#3ecf8e",
   review: "#19d2ff",
-  failed: "#ff3b5c",
+  failed: "#f07178",
   done: "#3d5078",
 };
 

@@ -23,9 +23,9 @@ type Credential = {
 };
 
 const input =
-  "w-full bg-[#0a0f1c] border border-white/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-[#2563eb]";
+  "w-full bg-bg border border-white/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-accent";
 const primary =
-  "bg-[#2563eb] hover:bg-[#1d4ed8] text-white rounded-lg px-4 py-2 text-sm font-medium disabled:opacity-50";
+  "bg-accent hover:bg-accent-hover text-accent-ink rounded-lg px-4 py-2 text-sm font-medium disabled:opacity-50";
 const secondary = "border border-white/15 rounded-lg px-3 py-1.5 text-sm text-gray-200 hover:bg-white/5 disabled:opacity-50";
 
 const LIMIT_RANGE = `${RATE_LIMIT_MIN} to ${RATE_LIMIT_MAX.toLocaleString("en-US")}`;
@@ -317,7 +317,7 @@ export function CredentialSettings() {
       )}
 
       <form
-        className="space-y-3 rounded-xl border border-white/10 bg-[#101828] p-4"
+        className="space-y-3 rounded-xl border border-white/10 bg-panel p-4"
         onSubmit={(e) => {
           e.preventDefault();
           void create();
@@ -367,7 +367,7 @@ export function CredentialSettings() {
       {credentials && credentials.length > 0 && (
         <ul className="space-y-2">
           {credentials.map((credential) => (
-            <li key={credential.id} className="rounded-xl border border-white/10 bg-[#101828] p-4 text-sm">
+            <li key={credential.id} className="rounded-xl border border-white/10 bg-panel p-4 text-sm">
               <div className="flex flex-wrap items-baseline justify-between gap-2">
                 <span className="font-medium">{credential.label}</span>
                 <span className="font-mono text-xs text-gray-400">{credential.token_prefix}…</span>

@@ -4,7 +4,7 @@ import type { RuntimeCompatibility } from "./skills-types";
 export function SkillCompatibility({ runtimes, sha }: { runtimes: RuntimeCompatibility; sha: string }) {
   const note = showHermesClaudeOnlyNote(runtimes);
   return (
-    <section className="min-w-0 rounded-xl border border-white/10 bg-[#101828] p-4">
+    <section className="min-w-0 rounded-xl border border-white/10 bg-panel p-4">
       <h2 className="text-sm font-semibold uppercase tracking-wider text-gray-400">Compatibility</h2>
       <ul className="mt-3 grid grid-cols-1 gap-1 sm:grid-cols-2">
         {RUNTIME_KEYS.map((key) => (
@@ -17,11 +17,11 @@ export function SkillCompatibility({ runtimes, sha }: { runtimes: RuntimeCompati
                 readOnly
                 aria-readonly="true"
                 onChange={() => {}}
-                className="h-4 w-4 accent-[#2563eb]"
+                className="h-4 w-4 accent-accent"
               />
               <span className="mono">{key}</span>
               {key === "hermes" && !runtimes.hermes && note && (
-                <span className="text-xs text-[#ffb020]">(Claude-only tools)</span>
+                <span className="text-xs text-warn">(Claude-only tools)</span>
               )}
             </label>
           </li>

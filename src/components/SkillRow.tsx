@@ -181,7 +181,7 @@ export function SkillRow({
   }
 
   return (
-    <article className={`rounded-xl border border-white/10 bg-[#101828] p-4 ${dimmed ? "opacity-60" : ""}`}>
+    <article className={`rounded-xl border border-white/10 bg-panel p-4 ${dimmed ? "opacity-60" : ""}`}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
@@ -189,11 +189,11 @@ export function SkillRow({
               {skill.name}
             </Link>
             <SkillRuntimeChips runtimes={skill.runtimes} />
-            <span className="rounded-full bg-white/5 px-2 py-0.5 text-[11px] text-gray-400 ring-1 ring-white/10" title="Category">
+            <span className="rounded-sm bg-white/5 px-2 py-0.5 text-[11px] text-gray-400 ring-1 ring-white/10" title="Category">
               {categoryLabel(skill.category)}
             </span>
             {flagged && (
-              <span className="inline-flex items-center rounded-full bg-[#ffb020]/15 px-2 py-0.5 text-[11px] font-medium text-[#ffb020] ring-1 ring-[#ffb020]/40">
+              <span className="inline-flex items-center rounded-sm bg-warn/15 px-2 py-0.5 text-[11px] font-medium text-warn ring-1 ring-warn/40">
                 claude only — hidden from codex/grok
               </span>
             )}
@@ -266,7 +266,7 @@ function SkillRuntimeChips({ runtimes }: { runtimes: readonly string[] }) {
           <span
             key={runtime}
             title={meta.label}
-            className="inline-flex items-center gap-1 rounded-full bg-white/5 px-2 py-0.5 text-[11px] text-gray-300 ring-1 ring-white/10"
+            className="inline-flex items-center gap-1 rounded-sm bg-white/5 px-2 py-0.5 text-[11px] text-gray-300 ring-1 ring-white/10"
           >
             <PlatformMark platform={platform} size={12} />
             <span className="mono">{runtime}</span>

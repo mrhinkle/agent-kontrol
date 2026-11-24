@@ -5,7 +5,7 @@ import { isCronNonEmpty, TRIGGER_OPTIONS } from "./SkillHelpers";
 import type { Trigger } from "./skills-types";
 
 const field =
-  "min-w-0 flex-1 rounded-lg border border-white/10 bg-[#0a0f1c] px-3 py-2 text-sm text-gray-200 outline-none focus-visible:ring-2 focus-visible:ring-[#19d2ff]/70 disabled:opacity-40 sm:max-w-xs";
+  "min-w-0 flex-1 rounded-lg border border-white/10 bg-bg px-3 py-2 text-sm text-gray-200 outline-none focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-40 sm:max-w-xs";
 
 export function SkillTriggerControl({
   skillId,
@@ -49,7 +49,7 @@ export function SkillTriggerControl({
                 value={option.value}
                 checked={trigger === option.value}
                 onChange={() => onTrigger(option.value)}
-                className="h-4 w-4 accent-[#f44800] focus-visible:ring-2 focus-visible:ring-[#19d2ff]/70"
+                className="h-4 w-4 accent-error focus-visible:ring-2 focus-visible:ring-accent/70"
               />
               {option.label}
             </label>
@@ -79,7 +79,7 @@ export function SkillTriggerControl({
             type="button"
             onClick={onSaveSchedule}
             disabled={!isCronNonEmpty(schedule)}
-            className="min-h-11 rounded-lg bg-[#f44800] px-3 text-sm font-semibold text-white hover:bg-[#ff5a10] disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#19d2ff]/70 md:min-h-8"
+            className="min-h-11 rounded-lg bg-accent px-3 text-sm font-semibold text-accent-ink hover:bg-accent-hover disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 md:min-h-8"
           >
             Save
           </button>

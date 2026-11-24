@@ -38,14 +38,14 @@ export function SkillSyncFeedback({ view }: { view: SkillSyncView | null }) {
           +{added} ~{changed} −{removed}
         </span>
       )}
-      {status === "busy" && <span className="text-xs text-[#ffb020]">A sync is already running.</span>}
+      {status === "busy" && <span className="text-xs text-warn">A sync is already running.</span>}
       {status === "failed" && (
         <span className="text-xs text-red-400">Sync failed{headline ? `: ${formatDiagnostic(headline)}` : "."}</span>
       )}
       {status === "ok" && notices.length > 0 && (
         <ul aria-label="Sync notices" className="m-0 flex list-none flex-col gap-1 p-0">
           {notices.map((item, index) => (
-            <li key={`${item.source}:${item.message}:${index}`} className="text-xs text-[#ffb020]">
+            <li key={`${item.source}:${item.message}:${index}`} className="text-xs text-warn">
               {formatDiagnostic(item)}
             </li>
           ))}
