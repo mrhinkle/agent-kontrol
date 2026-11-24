@@ -49,7 +49,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo)    REPO="${2:-}"; shift 2 || { echo "--repo needs owner/name" >&2; exit 2; } ;;
     --dry-run) DRY_RUN=1; shift ;;
-    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (there is no backfill mode)" >&2; exit 2 ;;
   esac
 done
