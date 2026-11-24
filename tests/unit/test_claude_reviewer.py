@@ -1448,6 +1448,20 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.h.gh_requests(), [])
         self.assertEqual(self.h.run(mode="live", sandbox_exec="/nonexistent/sandbox-exec"), 78)
 
+    def test_review_crossing_midnight_is_checked_and_charged_on_one_day(self):
+        self.h.ready_pull()
+        h = self.h
+        before = dt.datetime(2026, 11, 23, 23, 59, 50, tzinfo=dt.timezone.utc)
+        after = dt.datetime(2026, 11, 24, 0, 0, 30, tzinfo=dt.timezone.utc)
+        clock = lambda: after if any(c["argv"][0] == h.sandbox for c in h.popen_calls) else before
+        self.assertEqual(h.run(mode="live", clock=clock), 0, h.stderr)
+        state = os.path.join(h.tmp, "state")
+        with open(os.path.join(state, "spend-2026-11-23.json")) as f:
+            day = json.load(f)
+        self.assertEqual(len(day["invocations"]), 1, "charged on the day the cap was checked")
+        self.assertTrue(day["invocations"][0]["at"].startswith("2026-11-23T23:59:50"))
+        self.assertFalse(os.path.exists(os.path.join(state, "spend-2026-11-24.json")))
+
     def test_secret_path_outside_sandbox_boundary_refuses(self):
         self.h.ready_pull()
         self.assertEqual(self.h.run(mode="live", denied_roots=("/nonexistent-root",)), 78)

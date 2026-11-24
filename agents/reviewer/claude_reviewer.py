@@ -449,7 +449,10 @@ class Runner:
         if invalid.count(c.key) >= 2:
             return "escalate"  # AC 53
 
-        spend = ledger.SpendLedger(cfg.state_dir, self.clock().date())
+        # AC 13/42: one invocation timestamp picks the UTC day for both the cap check and the
+        # charge, so a review that crosses midnight is checked and charged on the same day.
+        invoked_at = self.clock()
+        spend = ledger.SpendLedger(cfg.state_dir, invoked_at.date())
         if spend.blocks(cfg.daily_cap_usd, cfg.daily_max_reviews):
             return "budget_stop"  # AC 13
         if self.claude_unavailable:
@@ -498,8 +501,7 @@ class Runner:
             self.claude_unavailable = True
             return "not_installed"
 
-        charged_at = self.clock()  # one reading: the ledger day and the charge time agree
-        spend = ledger.SpendLedger(cfg.state_dir, charged_at.date())
+        spend = ledger.SpendLedger(cfg.state_dir, invoked_at.date())  # reload: same day as the check
         if outcome is not None:
             # Timeout or non-zero exit: no valid cost was reported, so the day's spend is unknown.
             spend.halt()
@@ -514,7 +516,7 @@ class Runner:
             spend.halt()
             invalid.increment(c.key)
             return "invalid_output"
-        spend.charge(charged_at, cost)  # AC 42: charged even if validation fails below
+        spend.charge(invoked_at, cost)  # AC 42: charged even if validation fails below
         try:
             parsed = evidence.parse_model_result(result, lenses)
         except evidence.InvalidOutput:
