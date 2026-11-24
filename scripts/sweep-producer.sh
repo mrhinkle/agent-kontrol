@@ -93,10 +93,8 @@ CONFIG_OK='
     and ((.required_checks // []) | strs)
     and ((.review_start // {status_context: "x"}) | type == "object" and (.status_context | type == "string" and length > 0 and length <= 100))
     and ((has("pr_review") | not) or (.pr_review | prreview)))
-  and (if any(.repos[]; has("pr_review")) then
-         ([.repos[] | .queue, (.pr_review.queue // empty)] | map(ascii_downcase)) as $q
-         | ($q | unique | length) == ($q | length)
-       else true end)
+  and (([.repos[] | .queue, (.pr_review.queue // empty)] | map(ascii_downcase)) as $q
+       | ($q | unique | length) == ($q | length))
 '
 if ! jq -e "$CONFIG_OK" "$CONFIG_FILE" >/dev/null 2>&1; then
   log "config $CONFIG_FILE is invalid; nothing emitted"; exit 3

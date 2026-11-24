@@ -878,6 +878,8 @@ async function main() {
       ["queue equals the issue queue, case-folded", withReview({ queue: "ISSUES:acme/widgets" })],
       ["queue equals another repo's queue", baseConfig({ [REPO]: repoConfig(REPO, { pr_review: prReview({ queue: `issues:${OTHER}` }) }), [OTHER]: repoConfig(OTHER) })],
       ["two repos share a pr_review queue", baseConfig({ [REPO]: repoConfig(REPO, { pr_review: prReview() }), [OTHER]: repoConfig(OTHER, { pr_review: prReview() }) })],
+      ["two repos share an issue queue, no pr_review anywhere", baseConfig({ [REPO]: repoConfig(REPO, { queue: "issues:shared" }), [OTHER]: repoConfig(OTHER, { queue: "issues:shared" }) })],
+      ["two repos share an issue queue case-folded, no pr_review anywhere", baseConfig({ [REPO]: repoConfig(REPO, { queue: "Issues:Shared" }), [OTHER]: repoConfig(OTHER, { queue: "issues:shared" }) })],
       ["logins not an array", withReview({ reviewer_logins: BOT })],
       ["logins not an array while disabled", withReview({ enabled: false, reviewer_logins: null })],
       ["login with a space", withReview({ reviewer_logins: ["claude bot"] })],
