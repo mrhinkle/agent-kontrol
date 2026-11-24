@@ -1,0 +1,25 @@
+{
+  "enabled": false,
+  "mode": "dry-run",
+  "ak_url": "https://YOUR-DEPLOY.vercel.app",
+  "ak_credential_file": "/Users/OWNER/.config/agent-kontrol/claude-reviewer.env",
+  "github_app_id": 1,
+  "github_app_key_file": "/Users/OWNER/.config/agent-kontrol/claude-reviewer-app.pem",
+  "registry_path": "/Users/OWNER/.claude/fleet/identities/registry.json",
+  "state_dir": "/Users/OWNER/.local/state/claude-reviewer",
+  "queues": [
+    {"queue": "conference-os/pr-review", "repo": "mrhinkle/conference-os"}
+  ],
+  "lenses": ["correctness", "tests", "security", "scope", "contract", "maintainability"],
+  "model_mid": "sonnet",
+  "model_top": "opus",
+  "claude_path": "/Users/OWNER/.local/bin/claude",
+  "claude_timeout_seconds": 900,
+  "claude_oauth_token_file": "/Users/OWNER/.config/agent-kontrol/claude-reviewer-oauth-token",
+  "openssl_path": "/usr/bin/openssl",
+  "daily_cap_usd": 0,
+  "daily_max_reviews": 40,
+  "max_clone_bytes": 200000000,
+  "max_diff_lines": 5000,
+  "schedule_minutes": 15
+}
