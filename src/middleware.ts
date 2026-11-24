@@ -25,6 +25,7 @@ const PUBLIC_PATHS: RegExp[] = [
   /^\/api\/messages\/reply$/, // agent replies (token-authed in route)
   /^\/api\/progress\/ingest$/, // collector cron (token-authed in route)
   /^\/api\/usage\/ingest$/, // usage collector (token-authed in route)
+  /^\/api\/usage\/collect$/, // scheduled provider collection (CRON_SECRET, MC_TOKEN or session, checked in route)
   /^\/api\/webhooks\/github$/, // GitHub webhook (X-Hub-Signature-256 verified in route)
   /^\/api\/(mcp|sse|message)(\/.*)?$/, // MCP transports (token-authed in route)
   /^\/\.well-known\//, // OAuth AS + protected-resource metadata

@@ -2258,6 +2258,34 @@ export function openApiDocument(): Json {
           },
         }),
       },
+      "/api/usage/collect": {
+        get: operation({
+          operationId: "collectProviderUsage",
+          tags: ["usage"],
+          summary: "Collect provider billing for the last 30 complete UTC days.",
+          description:
+            "Operator route for a scheduler. Authenticate with Bearer CRON_SECRET (Vercel Cron), MC_TOKEN, or a dashboard session. An agent credential is denied with 403. Runs each provider whose management credentials are set on the deployment (OpenRouter, xAI, Claude API) and stores its report; a provider with no credentials is skipped. Providers are independent. The response lists each provider with published, skipped, or failed and a fact count. It never carries a cost, a key, or a provider response. GET and POST behave the same; the body is ignored.",
+          security: cookieOrBearer,
+          responses: {
+            "200": jsonResponse("ok and one result per provider; or a demo no-op without a database.", { type: "object" }),
+            ...flatErrors,
+            "502": jsonResponse("At least one configured provider failed. Same body, with ok false.", { type: "object" }),
+          },
+        }),
+        post: operation({
+          operationId: "collectProviderUsagePost",
+          tags: ["usage"],
+          summary: "Collect provider billing for the last 30 complete UTC days.",
+          description:
+            "Operator route for a scheduler. Authenticate with Bearer CRON_SECRET (Vercel Cron), MC_TOKEN, or a dashboard session. An agent credential is denied with 403. Runs each provider whose management credentials are set on the deployment (OpenRouter, xAI, Claude API) and stores its report; a provider with no credentials is skipped. Providers are independent. The response lists each provider with published, skipped, or failed and a fact count. It never carries a cost, a key, or a provider response. GET and POST behave the same; the body is ignored.",
+          security: cookieOrBearer,
+          responses: {
+            "200": jsonResponse("ok and one result per provider; or a demo no-op without a database.", { type: "object" }),
+            ...flatErrors,
+            "502": jsonResponse("At least one configured provider failed. Same body, with ok false.", { type: "object" }),
+          },
+        }),
+      },
       "/api/activity": {
         get: operation({
           operationId: "listActivity",

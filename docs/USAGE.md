@@ -34,6 +34,27 @@ All selected reports must be collected and validated before publishing begins. E
 
 A complete empty report displays $0; absent data is unknown. Partial windows show observed costs labeled partial. Legacy rows without a valid coverage receipt are unverified. Each report carries an identity and row count; rows removed by a later correction are excluded from current totals. A concurrent or interrupted import cannot publish a complete receipt for partially written facts. The latest report is authoritative; collecting a shorter window can make a larger dashboard window partial until the next full capture. Amounts are provider values, not recalculated from token rates. Negative/unsupported-currency reports fail closed. OpenRouter BYOK inference values are excluded from OpenRouter charges.
 
+## Scheduled collection on the deployment
+
+The deployment can collect provider billing itself, so nothing depends on a machine staying up. `GET /api/usage/collect` runs the same adapters as the command-line collector for the last 30 complete UTC days and stores each report. `vercel.json` schedules it once a day at 06:20 UTC on Vercel; on another host, call it from any scheduler.
+
+Set these on the deployment (Production only), not in a file on a machine:
+
+- `CRON_SECRET`: any long random value. Vercel Cron sends it as `Authorization: Bearer $CRON_SECRET`. Without it the scheduled call is refused; `MC_TOKEN` and a dashboard session still work for a manual run.
+- `MC_OPENROUTER_MANAGEMENT_KEY` for OpenRouter.
+- `MC_XAI_MANAGEMENT_KEY` and `MC_XAI_TEAM_ID` for xAI.
+- `MC_ANTHROPIC_ADMIN_KEY` for the Claude API.
+
+A provider with no credentials is skipped. Providers run at the same time and are independent: one failing or running long does not stop the others, and the response is 502 with that provider marked `failed`. The cause goes to the server log as a fixed message with no secret and no provider response. The response body names each provider and a fact count only.
+
+Run it once by hand after setting the variables:
+
+```bash
+curl -fsS -H "Authorization: Bearer $MC_TOKEN" https://your-dashboard.example/api/usage/collect
+```
+
+Collectors that read local files (Claude Code usage, Hermes) cannot run here; they stay on the machines that hold those files.
+
 ## Claude Code and recorded fees
 
 The separate [Claude usage collector](../agents/claude-usage-collector/README.md) scans local JSONL metadata with a stable operator-supplied machine label, deduplicates request chunks/copies and emits hashed identifiers. It does not alter the Claude lifecycle hook. Billing classification is explicit (`unknown` by default); it is not inferred from historical transcripts. Partial scans retain valid observations but cannot claim complete local coverage. Even a complete scan describes only the files scanned.

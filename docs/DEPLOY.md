@@ -150,6 +150,7 @@ With no `DATABASE_URL`, the dashboard shows sample data. MCP writes for `report_
 | `NEXT_PUBLIC_HERMES_VITALS_URL` | No | Link shown on the progress board. |
 | `MC_DB_DRIVER` | No | Driver override: `neon` or `pg`. |
 | `MC_DB_POOL_MAX` | No | pg pool size. Default 5. |
+| `CRON_SECRET` | No | Lets the scheduler call `GET /api/usage/collect` (daily provider billing; see [Usage](USAGE.md)). Vercel Cron sends it as a bearer token. Set it with the provider management keys named there. |
 | `MC_SKIP_MIGRATE` | No | Set to 1 to skip the automatic schema step. Set it on the Vercel Preview environment so preview builds never touch the production database. |
 | `MC_TRACE_RETENTION_DAYS` | No | Days to keep trace spans before they are deleted. A whole number of days from 1 to 999999; anything else (such as `1.5` or `14d`) is ignored and the default 30 is used. |
 | `MC_TRACE_CAPTURE_CONTENT` | No | Set to `1` to also store prompt and tool input and output in spans. Off by default; see [Telemetry and traces](TELEMETRY.md). |
