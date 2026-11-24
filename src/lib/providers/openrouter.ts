@@ -10,6 +10,11 @@ const CREDITS_URL = "https://openrouter.ai/api/v1/credits";
 export interface OpenRouterActivityDay { date: string; model?: string; endpoint?: string; usage?: number; requests?: number; prompt_tokens?: number; completion_tokens?: number; }
 export interface OpenRouterFixture { activity: unknown[]; credits?: { total_credits?: number; total_usage?: number }; }
 
+/** The live endpoint reports a day as "YYYY-MM-DD 00:00:00"; fixtures and older reports use "YYYY-MM-DD". */
+function activityDay(value: unknown): string {
+  return utcDay(typeof value === "string" ? value.replace(/ 00:00:00$/, "") : value);
+}
+
 function managementKey(): string {
   const key = process.env.MC_OPENROUTER_MANAGEMENT_KEY || process.env.OPENROUTER_MANAGEMENT_KEY;
   if (!key) throw new Error("MC_OPENROUTER_MANAGEMENT_KEY not set (management key required)");
@@ -19,7 +24,7 @@ function managementKey(): string {
 export function activityToFacts(account: AccountRecord, activity: unknown[]): UsageFact[] {
   const grouped = new Map<string, UsageFact>();
   for (const item of activity) {
-    const row = record(item), day = utcDay(row.date), model = modelName(row.model);
+    const row = record(item), day = activityDay(row.date), model = modelName(row.model);
     // Preserve the original identity so a full report corrects old endpoint collisions.
     const id = `or-activity:${day}:${model}`;
     const paid = nonnegative(row.usage);
