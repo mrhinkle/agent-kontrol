@@ -130,6 +130,8 @@ def _ledger_entries(rows: List[Any], schedule: Sequence[str], expected_phase: st
     for row in rows:
         if not isinstance(row, dict):
             raise Malformed("ledger line is not an object")
+        if row.get("reconciled") is True:
+            continue  # AC 84: a reconciled line is already_reviewed, never a post by this runner
         slot = row.get("scheduled_at")
         if not isinstance(slot, str) or SCHEDULE_RE.fullmatch(slot) is None:
             raise Malformed("ledger line scheduled_at")
@@ -158,8 +160,11 @@ def build(schedule: Sequence[str], receipts: Dict[str, dict], phase: str, state_
     records: List[dict] = []
     for slot in schedule:
         receipt = receipts.get(slot)
+        # AC 76/92: any receipt line for the slot means the run happened. Its HTTP status
+        # (non-2xx included) stays in the record for the owner; only a slot with no
+        # receipt line is a missing run.
         status = receipt.get("receipt_http_status") if receipt else None
-        received = receipt is not None and status is not None and 200 <= status < 300
+        received = receipt is not None
         if received:
             detail = receipt.get("detail") or {}
             record = {

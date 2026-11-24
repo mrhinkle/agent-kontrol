@@ -269,9 +269,11 @@ Tier C PRs reviewed by the runner do not count as fully reviewed.
    python3 -m agents.reviewer.retirement_report --schedule schedule-dry-run.txt \
      --state-dir <state_dir> --receipts <state_dir>/receipts.jsonl --phase dry-run --out dry-run.jsonl
    ```
-   `--schedule` lists every `scheduled_at` (ISO UTC, one per line). Exit 0 means every run has an
-   accepted receipt. Exit 1 means runs are missing (records are still written with
-   `missing_run: true`). Exit 2 means malformed input.
+   `--schedule` lists every `scheduled_at` (ISO UTC, one per line). Exit 0 means every scheduled
+   run has a receipt line (AC 92). Check `receipt_http_status` in each record: a non-2xx status
+   means the run happened but AK did not accept its receipt. Exit 1 means runs are missing
+   (records are still written with `missing_run: true`). Exit 2 means malformed input.
+   Reconciled `reviews.jsonl` lines (`reconciled: true`) are never counted as posts (AC 84).
 2. **Owner review.** Read `dry-run.jsonl` and compare the `would_be` bodies with the desktop loop's
    comments on the same PRs.
 3. **Switch.** Disable the `pr-review-loop` scheduled task in the Claude desktop app. Then set

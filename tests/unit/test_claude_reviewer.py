@@ -1372,6 +1372,27 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(h.receipt()["posted"], 1)
         self.assertEqual(len([r for r in h.gh_requests() if r["path"] == pull[1]]), 4, "429, retry, pre-clone, pre-post")
 
+    def test_post_2xx_without_review_object_is_not_posted(self):
+        post = ("POST", "/gh/repos/mrhinkle/conference-os/pulls/5/reviews")
+        bodies = [None, b"not json", {"message": "x"}, {"id": 0}, {"id": True}, [1],
+                  {"id": 9, "commit_id": "e" * 40}]
+        for payload in bodies:
+            with self.subTest(payload=payload):
+                h = Harness(self)
+                h.ready_pull()
+                h.fake.overrides[post] = (201, payload, {})
+                self.assertEqual(h.run(mode="live"), 0, h.stderr)
+                detail = h.receipt()
+                self.assertEqual(detail["github_error"], 1, detail)
+                self.assertEqual(detail["posted"], 0, detail)
+                self.assertEqual(h.state("reviews.jsonl"), [], "no ledger line for an unproven post")
+        h = Harness(self)
+        h.ready_pull()
+        head = h.fake.pulls[(REPO, 5)][-1]["head"]["sha"]
+        h.fake.overrides[post] = (201, {"id": 9, "commit_id": head}, {})
+        self.assertEqual(h.run(mode="live"), 0, h.stderr)
+        self.assertEqual(h.receipt()["posted"], 1)
+
     def test_clone_failure_classified(self):
         self.h.ready_pull()
         shutil.rmtree(os.path.join(self.h.tmp, "git", REPO + ".git"))
@@ -1560,7 +1581,9 @@ class RetirementReportTests(unittest.TestCase):
     def test_missing_run_exit_1(self):
         code, rows = self.run_report("live", [self.receipt(self.slots[0]), self.receipt(self.slots[2], status=500)])
         self.assertEqual(code, 1)
-        self.assertEqual([r["missing_run"] for r in rows], [False, True, True])
+        self.assertEqual([r["missing_run"] for r in rows], [False, True, False])
+        self.assertEqual((rows[2]["receipt_http_status"], rows[2]["observed_at"], rows[2]["app_login"]),
+                         (500, self.slots[2], BOT), "a rejected receipt is still a receipt")
         self.assertEqual(rows[1], {"scheduled_at": self.slots[1], "observed_at": None, "receipt_http_status": None,
                                    "app_login": None, "posted": [], "budget_total_microusd": 0, "sla_breaches": 0,
                                    "missing_run": True})
@@ -1572,6 +1595,28 @@ class RetirementReportTests(unittest.TestCase):
         self.assertEqual(rows[0]["posted"], [])
         self.assertEqual(rows[0]["would_be"][0]["phase"], "dry-run")
         self.assertEqual(rows[1]["would_be"], [])
+
+    def test_rejected_receipt_keeps_would_be(self):
+        self.jsonl(os.path.join(self.state, "would-be.jsonl"), [self.ledger_row(self.slots[1], phase="dry-run")])
+        code, rows = self.run_report("dry-run", [self.receipt(s, mode="dry-run", status=503 if s == self.slots[1] else 200)
+                                                 for s in self.slots])
+        self.assertEqual(code, 0, "every scheduled run has a receipt line")
+        self.assertFalse(rows[1]["missing_run"])
+        self.assertEqual(rows[1]["receipt_http_status"], 503)
+        self.assertEqual([w["number"] for w in rows[1]["would_be"]], [5])
+
+    def test_reconciled_lines_are_never_posts(self):
+        reconciled = [dict(self.ledger_row(s), reconciled=True) for s in self.slots] + [
+            dict(self.ledger_row(self.slots[0], phase="dry-run"), reconciled=True),
+            {"repo": REPO, "number": 5, "head_sha": "a" * 40, "reconciled": True, "posted_at": "2026-11-24T00:00:00Z"},
+        ]
+        self.jsonl(os.path.join(self.state, "reviews.jsonl"), reconciled + [self.ledger_row(self.slots[2])])
+        code, rows = self.run_report("live", [self.receipt(s) for s in self.slots])
+        self.assertEqual(code, 0)
+        self.assertEqual([len(r["posted"]) for r in rows], [0, 0, 1])
+        self.jsonl(os.path.join(self.state, "reviews.jsonl"), reconciled)
+        code, rows = self.run_report("dry-run", [self.receipt(s, mode="dry-run") for s in self.slots])
+        self.assertEqual(code, 0, "reconciled lines neither abort a dry-run report nor count as live posts")
 
     def test_malformed_inputs_exit_2(self):
         cases = {

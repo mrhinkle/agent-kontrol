@@ -302,6 +302,15 @@ class GitHubClient:
         outcome = classify(response.status, response.body, response.headers, self.clock())
         if outcome is not None:
             raise GitHubFailure(outcome, response.status)
+        # A 2xx is a post only when GitHub returns the review object it created. An empty,
+        # malformed or foreign body is github_error, so the runner never records a post it
+        # cannot prove (review of #178).
+        created = response.json()
+        review_id = created.get("id") if isinstance(created, dict) else None
+        if type(review_id) is not int or review_id <= 0:
+            raise GitHubFailure("github_error", response.status)
+        if "commit_id" in created and created["commit_id"] != head_sha:
+            raise GitHubFailure("github_error", response.status)
 
 
 def _has_next(headers) -> bool:
