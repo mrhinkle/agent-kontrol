@@ -165,3 +165,15 @@ def json_dumps(value: Any) -> str:
             return canonical_decimal(obj)
         raise TypeError("unserializable")
     return json.dumps(value, separators=(",", ":"), sort_keys=True, default=default)
+
+
+# The roots sandbox.sb denies to the Claude subprocess (AC 107). Kept in step with the
+# profile by a test. Every secret and state path must resolve under one of them.
+SANDBOX_DENIED_ROOTS = ("/Users", "/private/var/folders", "/private/tmp", "/Volumes", "/opt/homebrew/etc")
+
+
+def within_roots(path: str, roots) -> bool:
+    """True when the symlink-resolved path is one of `roots` or lies beneath one."""
+    real = os.path.realpath(path)
+    return any(real == root or real.startswith(root.rstrip("/") + "/") for root in roots)
+

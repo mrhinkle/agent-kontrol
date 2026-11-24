@@ -81,8 +81,11 @@ the run's temporary directory, plus the OAuth token. `GH_TOKEN`, `GITHUB_TOKEN`,
 the installation token and the AK token are never present.
 [`sandbox.sb`](sandbox.sb) denies reads and writes under `/Users`, `/private/var/folders`,
 `/private/tmp`, `/Volumes` and `/opt/homebrew/etc`. The exceptions are the clone, the isolated
-HOME, and (read-only) the Claude CLI install directory. Parent directories get metadata only. The
-App key, AK credential, OAuth token file, registry and `state_dir` must live outside those roots.
+HOME, and (read-only) the Claude CLI install directory. Parent directories get metadata only.
+Everything else on disk stays readable, so the App key, AK credential, OAuth token file, registry
+and `state_dir` must resolve (after symlinks) under one of the denied roots, for example
+`~/.config/claude-reviewer/`. The runner checks this before any review and refuses the run
+otherwise (exit 78).
 The runner does not run the PR's tests; green CI is already a readiness condition.
 
 Git runs with `GIT_CONFIG_NOSYSTEM=1`, `GIT_TERMINAL_PROMPT=0`, an empty global config in the

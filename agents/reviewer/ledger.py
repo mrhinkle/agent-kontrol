@@ -97,6 +97,9 @@ class SpendLedger:
         return self.total + self.estimate() > cap
 
     def charge(self, at: dt.datetime, cost: decimal.Decimal) -> None:
+        if not isinstance(cost, decimal.Decimal) or not cost.is_finite() or cost < 0:
+            self.halt()  # unknown spend: fail closed for the day (AC 25)
+            raise ReviewerError("non-finite or negative cost")
         self.invocations.append({"at": at.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
                                  "cost_usd": canonical_decimal(cost)})
         self._save()
@@ -136,13 +139,21 @@ class InvalidOutputLedger:
         return self.counts.get(key, 0)
 
     def increment(self, key: str) -> int:
+        if key not in self.counts and len(self.counts) >= INVALID_OUTPUT_MAX_KEYS:
+            # Make room only from heads below the escalation count; a head already at 2 must
+            # stay escalated (AC 53). With no room, the new head is escalated at once.
+            evictable = sorted(k for k, v in self.counts.items() if v < 2)
+            if not evictable:
+                self.counts[key] = 2
+                self._save()
+                return 2
+            del self.counts[evictable[0]]
         self.counts[key] = self.counts.get(key, 0) + 1
-        if len(self.counts) > INVALID_OUTPUT_MAX_KEYS:
-            for old in sorted(self.counts)[: len(self.counts) - INVALID_OUTPUT_MAX_KEYS]:
-                if old != key:
-                    del self.counts[old]
-        atomic_write(self.path, (json.dumps(self.counts, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8"))
+        self._save()
         return self.counts[key]
+
+    def _save(self) -> None:
+        atomic_write(self.path, (json.dumps(self.counts, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8"))
 
 
 def review_lines(state_dir: str) -> List[dict]:

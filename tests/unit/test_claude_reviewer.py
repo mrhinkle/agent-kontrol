@@ -788,7 +788,7 @@ class Harness:
         return base, head
 
     # -- run ------------------------------------------------------------------
-    def run(self, *, platform="darwin", sandbox_exec=None, clock=None, raw_config=None, **overrides):
+    def run(self, *, platform="darwin", sandbox_exec=None, clock=None, raw_config=None, denied_roots=None, **overrides):
         config = dict(self.config)
         config.update(overrides)
         with open(self.config_path, "w") as h:
@@ -816,6 +816,9 @@ class Harness:
                      environ={"PATH": os.path.join(self.tmp, "bin") + ":/usr/bin:/bin"})
         if clock is not None:
             seams["clock"] = clock
+        # The harness keeps every secret under its temp dir; treat that dir as a denied root
+        # (it already is on macOS, under /private/var/folders; on Linux CI it is /tmp).
+        seams["denied_roots"] = denied_roots if denied_roots is not None else (os.path.realpath(self.tmp),)
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(subprocess, "Popen", RecordingPopen), \
                 mock.patch.object(socket.socket, "connect", guarded_connect), \
@@ -1445,6 +1448,15 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.h.gh_requests(), [])
         self.assertEqual(self.h.run(mode="live", sandbox_exec="/nonexistent/sandbox-exec"), 78)
 
+    def test_secret_path_outside_sandbox_boundary_refuses(self):
+        self.h.ready_pull()
+        self.assertEqual(self.h.run(mode="live", denied_roots=("/nonexistent-root",)), 78)
+        self.assertEqual(self.h.claude_calls(), [])
+        self.assertEqual(self.h.fake.posted, [])
+        # The same run with the secrets inside a denied root proceeds.
+        self.assertEqual(self.h.run(mode="live"), 0, self.h.stderr)
+        self.assertEqual(len(self.h.fake.posted), 1)
+
     def test_secret_scan(self):
         """AC 85/108: no secret in stdout, stderr, logs, receipts, state files or temp files."""
         self.h.ready_pull(number=5)
@@ -1655,6 +1667,55 @@ class RetirementReportTests(unittest.TestCase):
         self.assertEqual(len(rows[0]["would_be"]), 1)
         self.assertEqual(rows[0]["budget_total_microusd"], 250000)
         self.assertTrue(rows[1]["missing_run"])
+
+
+class TestRoundTwoFindings(unittest.TestCase):
+    """Review of #178, round 2: sandbox roots, invalid-output eviction, non-finite cost."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_profile_denies_exactly_the_checked_roots(self):
+        import re
+        from agents.reviewer import common
+        with open(os.path.join(ROOT, "agents", "reviewer", "sandbox.sb"), encoding="utf-8") as f:
+            text = f.read()
+        block = text[text.index("(deny file-read* file-write*"):]
+        block = block[: block.index("))") + 2]
+        self.assertEqual(tuple(re.findall(r'\(subpath "([^"]+)"\)', block)), common.SANDBOX_DENIED_ROOTS)
+        self.assertTrue(common.within_roots("/Users/someone/key.pem", common.SANDBOX_DENIED_ROOTS))
+        self.assertFalse(common.within_roots("/etc/key.pem", common.SANDBOX_DENIED_ROOTS))
+        self.assertFalse(common.within_roots("/Usersx/key.pem", common.SANDBOX_DENIED_ROOTS))
+        link = os.path.join(self.tmp, "link")
+        os.symlink("/etc", link)
+        self.assertFalse(common.within_roots(os.path.join(link, "hosts"), (os.path.realpath(self.tmp),)),
+                         "a symlink out of a denied root does not count as inside it")
+
+    def test_escalated_heads_survive_eviction(self):
+        with mock.patch.object(ledger, "INVALID_OUTPUT_MAX_KEYS", 3):
+            inv = ledger.InvalidOutputLedger(self.tmp)
+            inv.increment("a"); inv.increment("a")          # escalated
+            inv.increment("b")                              # count 1, evictable
+            inv.increment("c"); inv.increment("c")          # escalated
+            self.assertEqual(inv.increment("d"), 1)         # evicts b, never a or c
+            self.assertEqual((inv.count("a"), inv.count("b"), inv.count("c")), (2, 0, 2))
+            inv.increment("d")                              # now a, c, d are all escalated
+            self.assertEqual(inv.increment("e"), 2, "no room: a new head escalates at once")
+            reloaded = ledger.InvalidOutputLedger(self.tmp)
+            self.assertEqual((reloaded.count("a"), reloaded.count("c"), reloaded.count("d"), reloaded.count("e")), (2, 2, 2, 2))
+
+    def test_non_finite_costs_never_charge(self):
+        for raw in (b'"NaN"', b'"Infinity"', b"NaN", b"Infinity", b"-Infinity", b"-1", b"true"):
+            envelope = b'{"type":"result","is_error":false,"subtype":"success","result":"x","total_cost_usd":' + raw + b"}"
+            with self.subTest(cost=raw), self.assertRaises((evidence.InvalidCost, evidence.InvalidOutput)):
+                evidence.parse_envelope(envelope)
+        spend = ledger.SpendLedger(self.tmp, dt.date(2026, 11, 24))
+        with self.assertRaises(rconfig.ReviewerError):
+            spend.charge(dt.datetime(2026, 11, 24, tzinfo=dt.timezone.utc), decimal.Decimal("NaN"))
+        self.assertTrue(spend.halted)
+        self.assertEqual(spend.count, 0)
+        self.assertTrue(ledger.SpendLedger(self.tmp, dt.date(2026, 11, 24)).blocks(decimal.Decimal(100), 40))
 
 
 class TestPartOneRouteContract(unittest.TestCase):

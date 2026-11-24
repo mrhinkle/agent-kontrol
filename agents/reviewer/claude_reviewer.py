@@ -30,7 +30,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import evidence, ledger
-from .common import (QUEUE_ID_RE, SHA_RE, ReviewerError, iso_instant, iso_z, parse_iso, strict_json, utc_now)
+from .common import (QUEUE_ID_RE, SANDBOX_DENIED_ROOTS, SHA_RE, ReviewerError, iso_instant, iso_z, parse_iso,
+                     strict_json, utc_now, within_roots)
 from .config import Config, ConfigError, Identity, load_ak_credential, load_config, load_oauth_token, load_registry
 from .github import FAILURES, GITHUB_API, GitHubClient, GitHubFailure, basic_auth_header, default_opener
 from .provenance import resolve
@@ -189,8 +190,10 @@ class Runner:
                  ak_opener=None, github_opener=None, clock: Callable[[], dt.datetime] = utc_now,
                  sleep: Callable[[float], None] = time.sleep, platform: str = sys.platform,
                  sandbox_exec: str = SANDBOX_EXEC, tmp_root: Optional[str] = None,
-                 environ: Optional[Dict[str, str]] = None, stdout=None):
+                 environ: Optional[Dict[str, str]] = None, stdout=None,
+                 denied_roots: Optional[Sequence[str]] = None):
         self.config = config
+        self.denied_roots = tuple(denied_roots) if denied_roots is not None else SANDBOX_DENIED_ROOTS
         self.github_api = github_api
         self.git_base = git_base.rstrip("/")
         self.ak_opener = ak_opener
@@ -248,6 +251,13 @@ class Runner:
         if self.platform != "darwin" or not os.path.isfile(self.sandbox_exec):
             self.counters["not_installed"] += 1  # AC 107: no read boundary on this OS
             return self._refuse("sandbox unavailable")
+        # The profile denies reads only under these roots, so a secret or state path anywhere
+        # else would be readable by the model. Refuse rather than run with it exposed (review of #178).
+        cfg = self.config
+        for path in (cfg.ak_credential_file, cfg.github_app_key_file, cfg.claude_oauth_token_file,
+                     cfg.registry_path, cfg.state_dir):
+            if not within_roots(path, self.denied_roots):
+                return self._refuse("secret path outside sandbox boundary")
         try:
             registry = load_registry(self.config.registry_path)
         except ReviewerError:
@@ -488,7 +498,8 @@ class Runner:
             self.claude_unavailable = True
             return "not_installed"
 
-        spend = ledger.SpendLedger(cfg.state_dir, self.clock().date())
+        charged_at = self.clock()  # one reading: the ledger day and the charge time agree
+        spend = ledger.SpendLedger(cfg.state_dir, charged_at.date())
         if outcome is not None:
             # Timeout or non-zero exit: no valid cost was reported, so the day's spend is unknown.
             spend.halt()
@@ -503,7 +514,7 @@ class Runner:
             spend.halt()
             invalid.increment(c.key)
             return "invalid_output"
-        spend.charge(self.clock(), cost)  # AC 42: charged even if validation fails below
+        spend.charge(charged_at, cost)  # AC 42: charged even if validation fails below
         try:
             parsed = evidence.parse_model_result(result, lenses)
         except evidence.InvalidOutput:
