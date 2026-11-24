@@ -20,6 +20,19 @@ async function main() {
   if (!batch.snapshot || batch.snapshot.credits_remaining == null) throw new Error("snapshot");
   console.log("openrouter_fixture_ok", paid, batch.snapshot.credits_remaining);
 
+  // The live activity endpoint reports the day as "YYYY-MM-DD 00:00:00".
+  const first = fixture.activity[0];
+  const live = await fetchUsageFromFixture(account, { activity: [{ ...first, date: `${first.date} 00:00:00` }] });
+  if (live.facts.length !== 1 || live.facts[0].first_seen_at !== `${first.date}T00:00:00.000Z`) throw new Error("live date form");
+  let rejected = false;
+  try {
+    await fetchUsageFromFixture(account, { activity: [{ ...first, date: `${first.date} 05:00:00` }] });
+  } catch (e: any) {
+    rejected = String(e.message).includes("Invalid report date");
+  }
+  if (!rejected) throw new Error("expected a non-midnight date to be rejected");
+  console.log("openrouter_live_date_ok");
+
   let threw = false;
   try {
     await openRouterAdapter.fetchUsage(account, new Date("2026-09-28"));
