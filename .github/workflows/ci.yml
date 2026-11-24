@@ -31,6 +31,8 @@ jobs:
       - run: pnpm run typecheck
       - run: pnpm run test:ui
       - run: pnpm test
+      - name: Claude Reviewer runner tests (#176)
+        run: python3 -m unittest tests.unit.test_claude_reviewer -v
       - run: pnpm run test:mcp
       - run: pnpm run build
 
