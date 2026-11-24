@@ -223,6 +223,10 @@ escaped-defect count stays near zero. **You know it is failing when** PRs sit gr
 **Seen in this fleet.** A gate that only accepted one reviewer identity sat dead for weeks
 while merges stalled; the fix was a second-vendor reviewer running as a GitHub App. A reviewer
 that "re-read" a PR after the Implementer force-pushed approved a head it had never seen.
+A desktop review loop that posted under the owner's own login, on Claude-authored PRs, with
+free-form comments, produced nothing the gate could count. Its replacement is
+`agents/reviewer/` (#176): a registered Claude App that consumes the `pr_review` queue and
+skips same-vendor work.
 
 **Gibson mapping.** `reviewer`, plus `security` and `ux-evaluator` lenses on the tiers that
 require them.
