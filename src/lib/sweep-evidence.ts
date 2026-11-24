@@ -1,5 +1,5 @@
 import type { Provenance } from "./actor";
-import { withTransaction, type Row, type SqlTag } from "./db";
+import { sql, withTransaction, type Row, type SqlTag } from "./db";
 import { slugify } from "./store";
 import { isTaskLane } from "./task-lane";
 import { dbInstant } from "./sweep-clock";
@@ -970,6 +970,138 @@ export async function writePrSnapshot(obs: PrSnapshotObservation, provenance: Pr
       where repo_key = ${key} and open and not (number = any(${listed}::int[]))
     `;
     return { outcome, observation_id: id, received_at: now };
+  });
+}
+
+// ------------------------------------------------------------------ reads
+
+export interface QueueRowItem {
+  number: number;
+  head_sha: string;
+  green_since: string | null;
+}
+
+export interface PrReviewQueueRow {
+  queue: string;
+  repo: string | null;
+  complete: boolean;
+  error: string | null;
+  observed_at: string | null;
+  received_at: string;
+  stale: boolean;
+  age_minutes: number;
+  stale_after_minutes: number;
+  ready: { count: number; refs: string[] } | null;
+  raw: { count: number } | null;
+  ready_items: QueueRowItem[] | null;
+}
+
+function utcIso(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const date = value instanceof Date ? value : new Date(String(value));
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+/** Stored items, re-checked on the way out: a malformed row is unmeasured, never trusted. */
+function storedItems(value: unknown, refs: unknown): QueueRowItem[] | null {
+  const list = typeof value === "string" ? JSON.parse(value) : value;
+  const refList = typeof refs === "string" ? JSON.parse(refs) : refs;
+  if (!Array.isArray(list) || !Array.isArray(refList) || list.length !== refList.length || list.length > REFS_MAX) return null;
+  const out: QueueRowItem[] = [];
+  for (let i = 0; i < list.length; i += 1) {
+    const item = list[i];
+    if (!isObject(item)) return null;
+    const number = item.number;
+    const head = item.head_sha;
+    if (typeof number !== "number" || !Number.isSafeInteger(number) || number < 1) return null;
+    if (typeof head !== "string" || !SHA.test(head)) return null;
+    if (refList[i] !== `#${number}`) return null;
+    const green = item.green_since === null || item.green_since === undefined ? null : utcIso(item.green_since);
+    out.push({ number, head_sha: head, green_since: green });
+  }
+  return out;
+}
+
+/**
+ * GET /api/sweep/queues?classification=pr_review (#176). One row per current
+ * sweep_queues projection row with classification pr_review, sorted by queue.
+ * sweep_observations is never read. Age and staleness come from one database
+ * instant: age_minutes = floor(max(0, now - received_at) / 60 s); stale is
+ * true only when the unrounded difference exceeds stale_after_minutes.
+ * green_since is joined from the open sweep_prs row whose repo, number, and
+ * stored head all match the ready item; otherwise null. Incomplete, stale,
+ * legacy (no ready_items), or malformed rows carry null ready, raw, and
+ * ready_items: an unmeasured queue is never reported as zero. Writes nothing.
+ */
+export async function readPrReviewQueues(): Promise<PrReviewQueueRow[]> {
+  const db = sql();
+  const now = await dbInstant(db);
+  const rows = await db`
+    select q.queue, q.repo, q.complete, q.error, q.observed_at, q.received_at, q.stale_after_minutes,
+           q.ready_count, q.raw_count, q.ready_refs,
+           floor(greatest(0, extract(epoch from (${now}::timestamptz - q.received_at))) / 60)::int as age_minutes,
+           ((${now}::timestamptz - q.received_at) > make_interval(mins => q.stale_after_minutes)) as stale,
+           case when q.ready_items is null then null else (
+             select coalesce(jsonb_agg(jsonb_build_object(
+                      'number', e.item->'number',
+                      'head_sha', e.item->'head_sha',
+                      'green_since', to_char(p.green_since at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+                    ) order by e.ord), '[]'::jsonb)
+             from jsonb_array_elements(case when jsonb_typeof(q.ready_items) = 'array' then q.ready_items else '[]'::jsonb end)
+                  with ordinality as e(item, ord)
+             left join sweep_prs p
+               on p.repo_key = lower(q.repo)
+              and p.open
+              and p.number = case when jsonb_typeof(e.item->'number') = 'number' then (e.item->>'number')::numeric end
+              and p.head_sha = e.item->>'head_sha'
+           ) end as ready_items
+    from sweep_queues q
+    where q.classification = 'pr_review'
+    order by q.queue
+  `;
+  return rows.map((row): PrReviewQueueRow => {
+    const base = {
+      queue: String(row.queue),
+      repo: row.repo === null || row.repo === undefined ? null : String(row.repo),
+      observed_at: utcIso(row.observed_at),
+      received_at: utcIso(row.received_at) ?? "",
+      stale: row.stale === true,
+      age_minutes: Number(row.age_minutes),
+      stale_after_minutes: Number(row.stale_after_minutes),
+    };
+    const unmeasured = (error: string | null, complete = false): PrReviewQueueRow => ({
+      ...base,
+      complete,
+      error: error === null ? null : error.slice(0, ERROR_MAX),
+      ready: null,
+      raw: null,
+      ready_items: null,
+    });
+    const complete = row.complete === true;
+    const error = row.error === null || row.error === undefined ? null : String(row.error);
+    if (row.ready_items === null || row.ready_items === undefined) return unmeasured("missing ready_items");
+    if (!complete) return unmeasured(error ?? "incomplete observation");
+    if (base.stale) return unmeasured("stale observation", true);
+    let items: QueueRowItem[] | null = null;
+    try {
+      items = storedItems(row.ready_items, row.ready_refs);
+    } catch {
+      items = null;
+    }
+    const readyCount = Number(row.ready_count);
+    const rawCount = Number(row.raw_count);
+    const refs = typeof row.ready_refs === "string" ? JSON.parse(row.ready_refs) : row.ready_refs;
+    if (items === null || !Number.isSafeInteger(readyCount) || !Number.isSafeInteger(rawCount) || row.ready_count === null || row.raw_count === null) {
+      return unmeasured("malformed ready_items");
+    }
+    return {
+      ...base,
+      complete: true,
+      error,
+      ready: { count: readyCount, refs: refs as string[] },
+      raw: { count: rawCount },
+      ready_items: items,
+    };
   });
 }
 

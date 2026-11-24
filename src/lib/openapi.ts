@@ -398,6 +398,67 @@ export function openApiDocument(): Json {
             ready: ref("SweepQueueCount"),
             raw: ref("SweepQueueCount"),
             stale_after_minutes: { type: "integer", minimum: 5, maximum: 1440, default: DEFAULT_STALE_MINUTES },
+            ready_items: {
+              type: "array",
+              maxItems: REFS_MAX,
+              description: "Required on every pr_review observation and refused on issue_dispatch. Exactly the PRs in ready.refs (#<number>, numeric order), each with the head it was ready at. An incomplete pr_review observation sends [].",
+              items: ref("SweepReadyItem"),
+            },
+          },
+        },
+        SweepReadyItem: {
+          type: "object",
+          additionalProperties: false,
+          required: ["number", "head_sha"],
+          properties: {
+            number: { type: "integer", minimum: 1 },
+            head_sha: { type: "string", pattern: "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+          },
+        },
+        SweepPrReviewQueueRow: {
+          type: "object",
+          additionalProperties: false,
+          required: ["queue", "repo", "complete", "error", "observed_at", "received_at", "stale", "age_minutes", "stale_after_minutes", "ready", "raw", "ready_items"],
+          description: "The current sweep_queues projection row for one pr_review queue id. ready, raw, and ready_items are null when the observation is incomplete, stale, written before ready_items existed (error missing ready_items, complete false), or malformed: an unmeasured queue is never a zero.",
+          properties: {
+            queue: { type: "string" },
+            repo: { type: ["string", "null"] },
+            complete: { type: "boolean" },
+            error: { type: ["string", "null"], maxLength: 300, description: "The observation's error; stale observation when a complete row is stale; missing ready_items for a legacy row." },
+            observed_at: { type: ["string", "null"], format: "date-time" },
+            received_at: { type: "string", format: "date-time", description: "Database receipt time of the applied observation." },
+            stale: { type: "boolean", description: "True only when database time minus received_at, unrounded, is greater than stale_after_minutes." },
+            age_minutes: { type: "integer", minimum: 0, description: "floor(max(0, database time - received_at) / 60 s), from the same instant as stale." },
+            stale_after_minutes: { type: "integer", minimum: 5, maximum: 1440 },
+            ready: {
+              type: ["object", "null"],
+              additionalProperties: false,
+              required: ["count", "refs"],
+              properties: {
+                count: { type: "integer", minimum: 0 },
+                refs: { type: "array", maxItems: REFS_MAX, items: { type: "string" } },
+              },
+            },
+            raw: {
+              type: ["object", "null"],
+              additionalProperties: false,
+              required: ["count"],
+              properties: { count: { type: "integer", minimum: 0 } },
+            },
+            ready_items: {
+              type: ["array", "null"],
+              maxItems: REFS_MAX,
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["number", "head_sha", "green_since"],
+                properties: {
+                  number: { type: "integer", minimum: 1 },
+                  head_sha: { type: "string", description: "Copied from the persisted observation, never derived from the PR number." },
+                  green_since: { type: ["string", "null"], format: "date-time", description: "From the open sweep_prs row whose repo, number, and stored head match this item; otherwise null." },
+                },
+              },
+            },
           },
         },
         SweepQueueCount: {
@@ -2560,6 +2621,30 @@ export function openApiDocument(): Json {
             "403": jsonResponse("trusted_writer_required, or insufficient_scope for an agent credential.", ref("Error")),
             "500": jsonResponse("internal_error, without the exception text.", ref("Error")),
             "503": jsonResponse("setup_required: no database.", ref("Error")),
+          },
+        }),
+      },
+      "/api/sweep/queues": {
+        get: operation({
+          operationId: "getSweepQueues",
+          tags: ["sweep"],
+          summary: "Read-only pr_review ready queues: the current projection row per queue id.",
+          description:
+            "Never writes. The query string must be exactly classification=pr_review; a missing, repeated, array-style (classification[]), padded, or other value is 400 validation_failed. Same access as GET /api/sweep: the dashboard session, MC_TOKEN, or an agent credential with progress:read. Returns one row per sweep_queues projection row with classification pr_review, sorted by queue; historical sweep_observations rows are never selected and producer configuration is never read, so a queue id with no projection row is not listed. Age and staleness are computed from one database instant.",
+          security: cookieOrBearer,
+          parameters: [{ name: "classification", in: "query", required: true, schema: { type: "string", enum: ["pr_review"] } }],
+          responses: {
+            "200": jsonResponse("Current rows.", {
+              type: "object",
+              additionalProperties: false,
+              required: ["queues"],
+              properties: { queues: { type: "array", items: ref("SweepPrReviewQueueRow") } },
+            }),
+            "400": jsonResponse("validation_failed: classification must be pr_review.", ref("Error")),
+            "401": jsonResponse("The credential is missing or not valid.", ref("Error")),
+            "403": jsonResponse("An agent credential does not have progress:read.", ref("Error")),
+            "500": jsonResponse("The read failed. internal_error, without the exception text.", ref("Error")),
+            "503": jsonResponse("setup_required: no database. Never an empty list.", ref("Error")),
           },
         }),
       },
