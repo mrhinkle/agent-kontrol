@@ -15,18 +15,21 @@ export const PRODUCER = path.join(__dirname, "sweep-producer.sh");
 export const FAKE_TOKEN = "ak-sweep-producer-test-token-not-a-secret";
 
 const STUB_GH = `#!/usr/bin/env bash
-# Fixture gh. GraphQL: <dir>/<owner>__<name>/<Operation>-<after|first>.{json,stderr,exit,sleep}
+# Fixture gh. GraphQL: <dir>/<owner>__<name>/<Operation>[-<number>]-<after|cursor|first>.{json,stderr,exit,sleep}
+# Each operation's query text is kept in <dir>/queries/<Operation>.graphql.
 fix="$SWEEP_FIX_DIR"
 if [[ "\${1:-}" == "auth" ]]; then exit 0; fi
-op=""; owner=""; name=""; after="first"; jqarg=0; search=0
+op=""; owner=""; name=""; after="first"; num=""; query=""; jqarg=0; search=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -f|-F)
       case "$2" in
-        query=*) op="$(printf '%s' "\${2#query=}" | sed -n 's/^query \\([A-Za-z]*\\).*/\\1/p' | head -1)" ;;
+        query=*) query="\${2#query=}"; op="$(printf '%s' "$query" | sed -n 's/^query \\([A-Za-z]*\\).*/\\1/p' | head -1)" ;;
         owner=*) owner="\${2#owner=}" ;;
         name=*) name="\${2#name=}" ;;
         after=*) after="\${2#after=}" ;;
+        cursor=*) after="\${2#cursor=}" ;;
+        number=*) num="\${2#number=}" ;;
       esac
       shift 2 ;;
     --jq) jqarg=1; shift 2 ;;
@@ -39,6 +42,8 @@ if [[ -z "$op" ]]; then
   if [[ $jqarg -eq 1 ]]; then echo 0; elif [[ $search -eq 1 ]]; then echo '{"total_count":0,"items":[]}'; else echo '[]'; fi
   exit 0
 fi
+mkdir -p "$fix/queries" && printf '%s' "$query" > "$fix/queries/$op.graphql"
+[[ -n "$num" ]] && op="$op-$num"
 base="$fix/\${owner}__\${name}/\${op}-\${after}"
 printf '%s/%s %s %s\\n' "$owner" "$name" "$op" "$after" >> "$fix/calls.log"
 [[ -f "$base.sleep" ]] && sleep "$(cat "$base.sleep")"
@@ -88,7 +93,10 @@ export interface PrFixture {
   commitOid?: string | null;
   contexts?: CtxFixture[] | null;
   contextsTruncated?: boolean;
-  reviews?: { state: string; oid: string }[];
+  /** Feeds both the snapshot's reviews(last: 100) and the pr_review SweepPrReviews pages. */
+  reviews?: { state: string; oid: string | null; login?: string | null }[];
+  /** The head SweepPrReviews reports (default: head), to move a head mid-collection. */
+  reviewHead?: string;
 }
 
 export class Fixture {
@@ -206,7 +214,7 @@ export class Fixture {
             }),
           },
         } } }] },
-        reviews: { totalCount: (pr.reviews ?? []).length, nodes: (pr.reviews ?? []).map((r) => ({ state: r.state, commit: { oid: r.oid } })) },
+        reviews: { totalCount: (pr.reviews ?? []).length, nodes: (pr.reviews ?? []).map((r) => ({ state: r.state, commit: r.oid === null ? null : { oid: r.oid } })) },
       };
     };
     const total = opts.total ?? list.length;
@@ -217,6 +225,7 @@ export class Fixture {
         data: { repository: { pullRequests: { totalCount: total, pageInfo: { hasNextPage: more, endCursor: more ? `p${p + 1}` : null }, nodes: list.slice(p * 50, p * 50 + 50).map(node) } } },
       }));
     }
+    for (const pr of list) this.reviews(repo, pr.number, pr.reviewHead ?? pr.head, pr.reviews ?? []);
     const heads = opts.heads ?? list.map((pr) => [pr.number, pr.head] as [number, string]);
     const hpages = Math.max(1, Math.ceil(heads.length / 100));
     for (let p = 0; p < hpages; p++) {
@@ -226,6 +235,37 @@ export class Fixture {
           nodes: heads.slice(p * 100, p * 100 + 100).map(([number, headRefOid]) => ({ number, headRefOid })) } } },
       }));
     }
+  }
+
+  /**
+   * SweepPrReviews pages of 100 for one PR: <Op>-<n>-first, then -r1, -r2, ...
+   * (each page's endCursor names the next). A login of null is a deleted author.
+   */
+  reviews(repo: string, number: number, head: string, list: { state: string; oid: string | null; login?: string | null }[]): void {
+    const pages = Math.max(1, Math.ceil(list.length / 100));
+    for (let p = 0; p < pages; p++) {
+      const more = p < pages - 1;
+      this.raw(repo, `SweepPrReviews-${number}`, p === 0 ? "first" : `r${p}`, JSON.stringify({
+        data: { repository: { pullRequest: {
+          number,
+          headRefOid: head,
+          reviews: {
+            pageInfo: { hasNextPage: more, endCursor: more ? `r${p + 1}` : null },
+            nodes: list.slice(p * 100, p * 100 + 100).map((r) => ({
+              state: r.state,
+              commit: r.oid === null ? null : { oid: r.oid },
+              author: r.login === null ? null : { login: r.login ?? "someone" },
+            })),
+          },
+        } } },
+      }));
+    }
+  }
+
+  /** The query text the producer last sent for an operation. */
+  query(op: string): string {
+    const f = path.join(this.dir, "queries", `${op}.graphql`);
+    return fs.existsSync(f) ? fs.readFileSync(f, "utf8") : "";
   }
 
   config(body: Json | null): string {

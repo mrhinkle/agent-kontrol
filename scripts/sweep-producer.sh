@@ -4,6 +4,9 @@
 # Measures the repository on GitHub and POSTs two observations to /api/ingest:
 #   sweep.queue        open issues classified ready / raw from the explicit config
 #   sweep.pr_snapshot  every open PR (at most 200) with head, checks, and review start
+# and a third when the repo's config sets "pr_review": {"enabled": true, ...}:
+#   sweep.queue        pr_review: open non-draft PRs green at head with no review at
+#                      that head by a configured reviewer login (#176)
 #
 #   ./sweep-producer.sh --repo owner/name             # one collection, posts when enabled
 #   ./sweep-producer.sh --repo owner/name --dry-run   # print the envelopes, post nothing
@@ -36,6 +39,7 @@ LOCK_WAIT="${MC_SWEEP_LOCK_WAIT:-300}"
 ISSUE_CAP=1000   # open issues measured per repo; more is an incomplete observation
 PR_CAP=200       # the intake's PRS_MAX
 REFS_CAP=50      # the intake's REFS_MAX; counts stay exact
+REVIEW_PAGE_CAP=30  # review pages of 100 read per PR; more is an incomplete pr_review observation
 
 log() { printf '[%s] sweep-producer: %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 
@@ -59,8 +63,21 @@ fi
 
 # ----------------------------------------------------------------- config
 
+# pr_review, when present, is exactly {enabled, queue, reviewer_logins}. Logins
+# are lower-cased before they are checked, and may not repeat after that. When
+# any repo has pr_review, every queue id in the file (issue and pr_review, all
+# repos) must be distinct after lower-casing: sweep_queues.queue is one key.
 CONFIG_OK='
   def strs: type == "array" and all(.[]; type == "string" and length > 0 and length <= 100);
+  def qid: type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$");
+  def login: type == "string" and (ascii_downcase | test("^[a-z0-9][a-z0-9-]{0,38}(\\[bot\\])?$"));
+  def prreview:
+    type == "object"
+    and (keys == ["enabled", "queue", "reviewer_logins"])
+    and (.enabled | type == "boolean")
+    and (.queue | qid)
+    and (.reviewer_logins | type == "array" and length <= 50 and all(.[]; login))
+    and ((.reviewer_logins | map(ascii_downcase) | unique | length) == (.reviewer_logins | length));
   type == "object"
   and (.enabled | type == "boolean")
   and (.source | type == "string" and test("^[a-z0-9][a-z0-9._-]{0,63}$"))
@@ -74,7 +91,12 @@ CONFIG_OK='
     and (.blocked_labels | strs)
     and ((.raw_exclude_labels // []) | strs)
     and ((.required_checks // []) | strs)
-    and ((.review_start // {status_context: "x"}) | type == "object" and (.status_context | type == "string" and length > 0 and length <= 100)))
+    and ((.review_start // {status_context: "x"}) | type == "object" and (.status_context | type == "string" and length > 0 and length <= 100))
+    and ((has("pr_review") | not) or (.pr_review | prreview)))
+  and (if any(.repos[]; has("pr_review")) then
+         ([.repos[] | .queue, (.pr_review.queue // empty)] | map(ascii_downcase)) as $q
+         | ($q | unique | length) == ($q | length)
+       else true end)
 '
 if ! jq -e "$CONFIG_OK" "$CONFIG_FILE" >/dev/null 2>&1; then
   log "config $CONFIG_FILE is invalid; nothing emitted"; exit 3
@@ -194,6 +216,20 @@ PR_HEADS_QUERY='query SweepPrHeads($owner: String!, $name: String!, $after: Stri
   }
 }'
 
+# One pull request's reviews, paged from the start until hasNextPage is false.
+# Not the snapshot's reviews(last: 100) window: every review is read (#176).
+REVIEWS_QUERY='query SweepPrReviews($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      number headRefOid
+      reviews(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { state commit { oid } author { login } }
+      }
+    }
+  }
+}'
+
 GH_ERR=""
 # gh_graphql <query> <after> <outfile> — 0 with a parsed page, else GH_ERR is a short
 # classified reason. stderr and the body are never echoed.
@@ -205,7 +241,24 @@ gh_graphql() {
   else
     bounded "$GH_TIMEOUT" gh api graphql -f "query=$query" -f "owner=$OWNER" -f "name=$NAME" >"$out" 2>"$errf"
   fi
-  rc=$?
+  gh_settle $? "$errf" "$out"
+}
+
+# gh_reviews_page <number> <cursor> <outfile> — one SweepPrReviews page, same contract.
+gh_reviews_page() {
+  local number="$1" cursor="$2" out="$3" errf
+  errf="$(mktemp "$TMP_DIR/gh-err.XXXXXX")"
+  if [[ -n "$cursor" ]]; then
+    bounded "$GH_TIMEOUT" gh api graphql -f "query=$REVIEWS_QUERY" -f "owner=$OWNER" -f "name=$NAME" -F "number=$number" -f "cursor=$cursor" >"$out" 2>"$errf"
+  else
+    bounded "$GH_TIMEOUT" gh api graphql -f "query=$REVIEWS_QUERY" -f "owner=$OWNER" -f "name=$NAME" -F "number=$number" >"$out" 2>"$errf"
+  fi
+  gh_settle $? "$errf" "$out"
+}
+
+# gh_settle <rc> <errfile> <outfile> — classify a finished gh call into GH_ERR.
+gh_settle() {
+  local rc="$1" errf="$2" out="$3"
   if [[ $rc -ne 0 ]]; then
     if grep -qi 'rate limit' "$errf" "$out" 2>/dev/null; then GH_ERR="GitHub rate limited"
     elif [[ $rc -eq 142 ]]; then GH_ERR="GitHub request timed out after ${GH_TIMEOUT}s"
@@ -518,8 +571,14 @@ PR_ROW='
   | with_entries(select(.value != null))
 '
 
-# collect_prs <outfile> — writes the snapshot body without seq.
+# collect_prs <outfile> — writes the snapshot body without seq, and keeps a copy
+# for the pr_review queue, which is derived from this same collection.
 collect_prs() {
+  collect_pr_snapshot "$1"
+  cp "$1" "$TMP_DIR/pr-snapshot.json"
+}
+
+collect_pr_snapshot() {
   local result="$1" nodes="$TMP_DIR/prs.jsonl" heads="$TMP_DIR/heads.jsonl" after="" page=0 first="" total out observed rows
   observed="$(now_iso)"
   pr_fail() {
@@ -566,6 +625,105 @@ collect_prs() {
   fi
   jq -nc --arg source "$SOURCE" --arg repo "$REPO" --arg at "$observed" --argjson stale "$STALE_AFTER" --argjson prs "$rows" \
     '{source: $source, repo: $repo, observed_at: $at, complete: true, stale_after_minutes: $stale, prs: $prs}' >"$result"
+}
+
+# ------------------------------------------------------------ pr_review queue
+
+REVIEWS_PAGE_OK='
+  def sha: type == "string" and test("^([0-9a-f]{40}|[0-9a-f]{64})$");
+  .data.repository.pullRequest as $p
+  | ($p | type == "object")
+  and ($p.number == $n)
+  and ($p.headRefOid | sha)
+  and ($p.reviews.pageInfo.hasNextPage | type == "boolean")
+  and (($p.reviews.pageInfo.hasNextPage | not) or ($p.reviews.pageInfo.endCursor | type == "string" and length > 0))
+  and ($p.reviews.nodes | type == "array")
+  and all($p.reviews.nodes[];
+    type == "object"
+    and (.state | type == "string")
+    and (.commit == null or (.commit | type == "object"))
+    and (.author == null or (.author | type == "object")))
+'
+
+# A review suppresses readiness only when it is submitted (not PENDING), at the
+# PR's current head, and by a configured reviewer login. A null author never does.
+REVIEW_SUPPRESSES='
+  any(.[];
+    .state != "PENDING"
+    and ((.commit // {}).oid // null) == $head
+    and (((.author // {}).login // null) as $l | $l != null and ($l | type == "string") and (($l | ascii_downcase) | IN($logins[]))))
+'
+
+# page_reviews <number> <head> <nodes-file> — 0 with every review node of the PR;
+# else REVIEW_ERR. Any failed, malformed, truncated, or moved page fails the whole read.
+REVIEW_ERR=""
+page_reviews() {
+  local number="$1" head="$2" nodes="$3" cursor="" page=0 out
+  : >"$nodes"
+  while :; do
+    page=$((page + 1))
+    if (( page > REVIEW_PAGE_CAP )); then REVIEW_ERR="PR #$number has more than $((REVIEW_PAGE_CAP * 100)) reviews"; return 1; fi
+    out="$TMP_DIR/reviews-$number-$page.json"
+    if ! gh_reviews_page "$number" "$cursor" "$out"; then REVIEW_ERR="$GH_ERR"; return 1; fi
+    if ! jq -e --argjson n "$number" "$REVIEWS_PAGE_OK" "$out" >/dev/null 2>&1; then
+      if jq -e '.data.repository.pullRequest.reviews.pageInfo.hasNextPage == true' "$out" >/dev/null 2>&1; then
+        REVIEW_ERR="a review page for PR #$number is truncated (no cursor)"
+      else
+        REVIEW_ERR="malformed GitHub response"
+      fi
+      return 1
+    fi
+    if [[ "$(jq -r '.data.repository.pullRequest.headRefOid' "$out")" != "$head" ]]; then
+      REVIEW_ERR="a PR head moved during collection"; return 1
+    fi
+    jq -c '.data.repository.pullRequest.reviews.nodes[]' "$out" >>"$nodes"
+    [[ "$(jq -r '.data.repository.pullRequest.reviews.pageInfo.hasNextPage' "$out")" == "true" ]] || return 0
+    cursor="$(jq -r '.data.repository.pullRequest.reviews.pageInfo.endCursor' "$out")"
+  done
+}
+
+# collect_pr_review <outfile> — the pr_review queue, from the snapshot this run
+# just collected plus every review of each candidate PR. Anything that makes
+# the snapshot incomplete, or a non-draft PR whose required checks are unknown,
+# makes this incomplete. A known red or pending check only excludes the PR.
+collect_pr_review() {
+  local result="$1" snap="$TMP_DIR/pr-snapshot.json" observed queue logins number head nodes suppressed="$TMP_DIR/suppressed.txt" unknown
+  queue="$(jq -r '.pr_review.queue | ascii_downcase' <<<"$REPO_CFG")"
+  logins="$(jq -c '.pr_review.reviewer_logins | map(ascii_downcase)' <<<"$REPO_CFG")"
+  observed="$(jq -r '.observed_at // empty' "$snap" 2>/dev/null)"
+  [[ -n "$observed" ]] || observed="$(now_iso)"
+  review_fail() {
+    jq -nc --arg source "$SOURCE" --arg queue "$queue" --arg repo "$REPO" --arg at "$observed" --arg err "$1" \
+      --argjson stale "$STALE_AFTER" \
+      '{source: $source, queue: $queue, classification: "pr_review", repo: $repo, observed_at: $at,
+        complete: false, error: ($err | .[:300]), ready_items: [], stale_after_minutes: $stale}' >"$result"
+  }
+  if [[ ! -s "$snap" ]]; then review_fail "the PR snapshot was not collected"; return 0; fi
+  if ! jq -e '.complete == true and (.prs | type == "array")' "$snap" >/dev/null 2>&1; then
+    review_fail "$(jq -r '.error // "the PR snapshot is incomplete"' "$snap" 2>/dev/null || echo "the PR snapshot is incomplete")"
+    return 0
+  fi
+  unknown="$(jq -r '[.prs[] | select(.draft | not) | select(.required_checks.state == "unknown") | .number] | sort | first // empty' "$snap")"
+  if [[ -n "$unknown" ]]; then review_fail "required checks are unknown for PR #$unknown"; return 0; fi
+  : >"$suppressed"
+  while read -r number head; do
+    [[ -n "$number" ]] || continue
+    nodes="$TMP_DIR/reviews-$number.jsonl"
+    if ! page_reviews "$number" "$head" "$nodes"; then review_fail "$REVIEW_ERR"; return 0; fi
+    if jq -se --arg head "$head" --argjson logins "$logins" "$REVIEW_SUPPRESSES" "$nodes" >/dev/null 2>&1; then
+      printf '%s\n' "$number" >>"$suppressed"
+    fi
+  done < <(jq -r '.prs[] | select((.draft | not) and .required_checks.state == "success") | "\(.number) \(.head_sha)"' "$snap")
+  jq -c --arg source "$SOURCE" --arg queue "$queue" --arg repo "$REPO" --arg at "$observed" \
+    --argjson stale "$STALE_AFTER" --argjson cap "$REFS_CAP" \
+    --argjson sup "$(jq -sc '.' "$suppressed")" '
+    (.prs | sort_by(.number)) as $all
+    | [$all[] | select((.draft | not) and .required_checks.state == "success" and ((.number | IN($sup[])) | not))] as $ready
+    | {source: $source, queue: $queue, classification: "pr_review", repo: $repo, observed_at: $at, complete: true,
+       ready: {count: ($ready | length), refs: ($ready[:$cap] | map("#\(.number)"))},
+       raw: {count: ($all | length), refs: ($all[:$cap] | map("#\(.number)"))},
+       ready_items: ($ready[:$cap] | map({number, head_sha})),
+       stale_after_minutes: $stale}' "$snap" >"$result" || review_fail "classification failed"
 }
 
 # ----------------------------------------------------------- state and POST
@@ -691,4 +849,7 @@ emit() {
 rc=0
 emit sweep.queue "queue:$(jq -r '.queue | ascii_downcase' <<<"$REPO_CFG")" collect_queue || rc=1
 emit sweep.pr_snapshot "pr:$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')" collect_prs || rc=1
+if [[ "$(jq -r '.pr_review.enabled // false' <<<"$REPO_CFG")" == "true" ]]; then
+  emit sweep.queue "queue:$(jq -r '.pr_review.queue | ascii_downcase' <<<"$REPO_CFG")" collect_pr_review || rc=1
+fi
 exit $rc
