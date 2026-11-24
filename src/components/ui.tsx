@@ -19,17 +19,18 @@ export const STATUS_STYLES: Record<AgentStatus | string, { label: string; dot: s
 
 /**
  * Task status styles, in the same palette: green running, amber review (needs
- * you), red failed, dim done. Queued and claimed use Gibson's floor blues;
- * cancelled is neutral gray. Text colors keep at least 4.5:1 contrast on cards.
+ * you), red failed, dim done. Queued is dim gray; claimed is Ion violet (an
+ * agent has picked it up); cancelled is faded and struck through, so no two
+ * statuses share a look. Text colors keep at least 4.5:1 contrast on cards.
  */
 export const TASK_STATUS_STYLES: Record<string, { label: string; dot: string; text: string; ring: string }> = {
   queued: { label: "QUEUED", dot: "bg-muted-dim", text: "text-muted", ring: "ring-muted-dim/50" },
-  claimed: { label: "CLAIMED", dot: "bg-muted", text: "text-muted", ring: "ring-muted/45" },
+  claimed: { label: "CLAIMED", dot: "bg-violet", text: "text-violet-text", ring: "ring-violet/45" },
   running: { label: "RUNNING", dot: "bg-success", text: "text-success", ring: "ring-success/40" },
   review: { label: "IN REVIEW", dot: "bg-warn", text: "text-warn", ring: "ring-warn/45" },
   done: { label: "DONE", dot: "bg-muted", text: "text-muted", ring: "ring-muted/35" },
   failed: { label: "FAILED", dot: "bg-error", text: "text-error", ring: "ring-error/45" },
-  cancelled: { label: "CANCELLED", dot: "bg-muted-dim", text: "text-muted", ring: "ring-muted-dim/40" },
+  cancelled: { label: "CANCELLED", dot: "bg-muted-dim/40", text: "text-muted", ring: "ring-muted-dim/40" },
 };
 
 export function TaskStatusChip({ status }: { status: string }) {
@@ -37,7 +38,7 @@ export function TaskStatusChip({ status }: { status: string }) {
   return (
     <span className={`inline-flex items-center gap-1.5 rounded-sm px-2.5 py-0.5 text-[11px] font-semibold ring-1 ${s.ring} ${s.text} bg-white/5 mono`}>
       <span aria-hidden className={`h-1.5 w-1.5 rounded-full ${s.dot} ${status === "running" ? "pulse-dot" : ""}`} />
-      {s.label}
+      <span className={status === "cancelled" ? "line-through" : undefined}>{s.label}</span>
     </span>
   );
 }

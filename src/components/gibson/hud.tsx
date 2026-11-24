@@ -82,7 +82,7 @@ export function StatusPill({ status }: { status: AgentStatus }) {
   const c = AGENT_STATUS_COLORS[status];
   return (
     <span
-      className="mono inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider"
+      className="mono inline-flex items-center gap-1.5 rounded-sm px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider"
       style={{ color: status === "done" || status === "offline" ? "#e8eaed" : c, backgroundColor: `${c}22`, boxShadow: `inset 0 0 0 1px ${c}66` }}
     >
       {AGENT_STATUS_LABELS[status]}
@@ -116,7 +116,7 @@ export function StatusBanner({
   return (
     <div className="flex min-w-0 flex-wrap items-center justify-center gap-1.5" role="status" aria-live="polite">
       <span
-        className="mono rounded-full px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em]"
+        className="mono rounded-sm px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em]"
         style={{ color: tone.fg, backgroundColor: tone.bg, boxShadow: `inset 0 0 0 1px ${tone.ring}` }}
       >
         {banner.level === "critical" ? "● " : banner.level === "attention" ? "▲ " : ""}
@@ -126,7 +126,7 @@ export function StatusBanner({
         const t = TONE[item.tone];
         const inner = <>{item.label}</>;
         const cls =
-          "mono rounded-full px-2 py-1 text-[10.5px] transition-colors hover:brightness-125 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent";
+          "mono rounded-sm px-2 py-1 text-[10.5px] transition-colors hover:brightness-125 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent";
         const style = { color: t.fg, backgroundColor: t.bg, boxShadow: `inset 0 0 0 1px ${t.ring}` };
         return item.key === "needs-you" ? (
           <Link key={item.key} href="/progress" className={cls} style={style} title="Open the Progress board">
@@ -430,7 +430,7 @@ export function TowerPanel({
       {agents.length > 0 && (
         <div className="mt-3 flex flex-wrap gap-1.5">
           {agents.map((a) => (
-            <button key={a.id} type="button" onClick={() => onSelectAgent(a.id)} className="inline-flex items-center gap-1.5 rounded-full border border-white/10 px-2 py-0.5 text-[11px] text-gray-200 hover:border-white/30">
+            <button key={a.id} type="button" onClick={() => onSelectAgent(a.id)} className="inline-flex items-center gap-1.5 rounded-sm border border-white/10 px-2 py-0.5 text-[11px] text-gray-200 hover:border-white/30">
               <StatusDot status={a.status} reducedMotion /> {a.label}
             </button>
           ))}
@@ -536,7 +536,7 @@ export function LegendPanel({
       </section>
 
       {(statusFilter.length > 0 || platformFilter.length > 0) && (
-        <button type="button" onClick={onClear} className="rounded-full border border-white/20 px-3 py-1 text-[11px] text-gray-200 hover:bg-white/10">
+        <button type="button" onClick={onClear} className="rounded-sm border border-white/20 px-3 py-1 text-[11px] text-gray-200 hover:bg-white/10">
           × Clear filters
         </button>
       )}
