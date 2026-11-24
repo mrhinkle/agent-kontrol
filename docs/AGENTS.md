@@ -17,6 +17,7 @@ This document describes the adapters that connect coding agents to Agent Kontrol
 | claude-usage-collector | No | No | No | No | Local Claude Code usage |
 | collect-provider-usage.ts | No | No | No | No | OpenRouter, Claude API, recorded Claude fees |
 | progress-collector | No (feeds the Progress board) | No | No | No | No |
+| reviewer (Claude Reviewer) | One receipt per run, disabled by default | No | No (consumes the `pr_review` queue) | No | Spend ledger per UTC day |
 
 "Via MCP" means the agent has to call the tool; it is not automatic. Every adapter that ends a session, or reports status `done` or `failed`, also gets an automatic note in shared memory (see [Memory (Notes)](MEMORY.md)). Any agent or SDK that can export OpenTelemetry can send traces to `/api/v1/traces` (see [Telemetry and traces](TELEMETRY.md)). A Cline and Roo Code adapter was proposed but is not included: its file locations have not been verified against a real install.
 
@@ -52,6 +53,10 @@ NousResearch hermes-agent (MIT, model-agnostic). Add the MCP server URL with an 
 
 `install.sh` installs `scripts/collect-progress.sh` as a launchd job that runs every 15 minutes; set `MC_PROGRESS_INTERVAL` seconds to change that. It needs `gh` (authenticated), `jq` and `curl`. It takes its repo list from the dashboard's Settings page on each tick and falls back to `progress.config.json` if the dashboard is unreachable or has no saved list. Install it on a machine that stays awake: missed ticks are permanent gaps. The installer also copies `scripts/sweep-producer.sh`, which posts absence-sweeper evidence only when a separate `sweep-producer.config.json` sets `enabled: true` (see [VELOCITY.md](VELOCITY.md#producer)).
 
+## reviewer
+
+`agents/reviewer/claude_reviewer.py` is the Claude Reviewer from [ROLES.md](ROLES.md#reviewer) (#176). It is **disabled by default** (`"enabled": false`), and only the owner may activate it: no PR installs, enables or schedules it. The scheduler files in `docs/examples/claude-reviewer.*.example` are inert. It reads the `pr_review` ready queue from `GET /api/sweep/queues?classification=pr_review` and skips same-vendor and unknown-provenance PRs (ROLES.md "Provenance has one reading"). Each remaining head is reviewed read-only in a fresh temporary clone, with `claude -p` under `sandbox-exec` and no write tools. In `live` mode it posts one `COMMENT` review with a `review-evidence:v1` body as a registered Claude GitHub App, never as the owner. It never invokes `gh`. Each run sends one `status` receipt to `/api/ingest`. A posted review is not proof of reducer recording: `src/lib/reducers.ts` records `review-evidence` only after a webhook-triggered current-head re-read, and only with `MC_REDUCERS` enabled. Details, the failure table and the retirement checklist are in [agents/reviewer/README.md](../agents/reviewer/README.md).
+
 ## usage-collector
 
 Read-only. It reads Hermes session usage and posts token counts, costs, model and billing metadata to `/api/usage/ingest`. It never sends prompts or completions. It installs as a launchd agent. Usage and Costs is experimental.
@@ -67,6 +72,7 @@ Read-only. It reads Hermes session usage and posts token counts, costs, model an
 | cowork-cloud | MCP connector | yes (report_status) | yes (check_inbox, reply_to_operator) | claim_task via MCP |
 | grok | dispatcher + MCP | yes | via MCP | yes via dispatcher |
 | hermes | MCP + cron | yes (report_status) | yes (check_inbox, reply_to_operator) | claim_task via MCP |
+| reviewer | scheduled runner (disabled by default, owner-only activation) | one receipt per run | no | no; reviews `pr_review` queue items in a read-only clone |
 
 ## Message delivery
 

@@ -1,0 +1,9 @@
+# Claude Reviewer runner (#176): one run every 15 minutes.
+# INERT EXAMPLE. Nothing installs this file, and no PR may install, enable or schedule it.
+# Activation is owner-only: D1 (App + registry), D2 (daily_cap_usd), D3 (host) and D5 (trust)
+# are recorded on #176 first. See agents/reviewer/README.md, "Activation (owner only)".
+# The config file holds paths to credential files, never secret values. Cron does not inherit an
+# interactive shell's PATH: set claude_path in the config to the absolute CLI path.
+# Start in "mode": "dry-run" for the 7-day retirement dry-run phase.
+#
+# */15 * * * * cd /absolute/path/to/agent-kontrol && /usr/bin/python3 -m agents.reviewer.claude_reviewer --config /absolute/path/to/private/reviewer.config.json >>"$HOME/Library/Logs/agent-kontrol-claude-reviewer.log" 2>&1

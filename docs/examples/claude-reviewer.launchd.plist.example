@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.peripety.agent-kontrol-claude-reviewer</string>
+  <key>Comment</key>
+  <string>INERT TEMPLATE (#176). Do not bootstrap this plist. No PR installs, enables or schedules it. Only the owner may install it at ~/Library/LaunchAgents, after D1, D2, D3 and D5 are recorded on #176 (see agents/reviewer/README.md). Start with "mode": "dry-run". The config holds credential file paths, never secret values.</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>-m</string>
+    <string>agents.reviewer.claude_reviewer</string>
+    <string>--config</string>
+    <string>/Users/OWNER/.local/state/claude-reviewer/reviewer.config.json</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/OWNER/Code/agent-kontrol</string>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Minute</key><integer>15</integer></dict>
+    <dict><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Minute</key><integer>45</integer></dict>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/OWNER/Library/Logs/agent-kontrol-claude-reviewer.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/OWNER/Library/Logs/agent-kontrol-claude-reviewer.log</string>
+</dict>
+</plist>
