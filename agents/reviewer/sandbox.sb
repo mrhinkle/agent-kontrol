@@ -1,0 +1,38 @@
+;; Read/write boundary for the Claude Reviewer's `claude -p` subprocess (#176, AC 107).
+;;
+;; The runner substitutes the @...@ placeholders with absolute, symlink-resolved paths and passes
+;; the result as `/usr/bin/sandbox-exec -p <profile> <claude argv>`. Paths containing `"` or `\`
+;; are refused before substitution.
+;;
+;; Everything under the denied roots is unreadable and unwritable except:
+;;   - the temporary clone (read/write: the model may only read it, but git and the CLI touch it),
+;;   - the isolated HOME / Claude config dir (read/write),
+;;   - the Claude CLI install directory (read-only).
+;; The App key, AK credential, Claude OAuth token file, registry and state_dir live outside
+;; those three roots, so they stay unreadable to the model.
+;;
+;; Later rules win in SBPL, so the allows follow the deny.
+
+(version 1)
+(allow default)
+
+(deny file-read* file-write*
+  (subpath "/Users")
+  (subpath "/private/var/folders")
+  (subpath "/private/tmp")
+  (subpath "/Volumes")
+  (subpath "/opt/homebrew/etc"))
+
+(allow file-read* file-write*
+  (subpath "@CLONE_DIR@")
+  (subpath "@HOME_DIR@"))
+
+(allow file-read*
+  (subpath "@CLAUDE_DIR@")
+  (subpath "@CLAUDE_REAL_DIR@"))
+
+;; Metadata only (stat, not contents or listings) for each ancestor directory of the roots
+;; above, as exact literals. Without it getcwd() fails inside the clone. The runner replaces
+;; the placeholder with `(literal "<dir>")` entries; a parent directory's listing stays denied.
+(allow file-read-metadata
+  @ANCESTOR_LITERALS@)
