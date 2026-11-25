@@ -34,8 +34,9 @@ describe("repoState freshness", () => {
   it("calls recent activity moving", () => {
     assert.equal(repoState(repo({ lastActivityAgo: 3_600_000 }), NOW).freshness, "moving");
   });
-  it("counts anything shipped in the window as moving even if pushes are old", () => {
-    assert.equal(repoState(repo({ lastActivityAgo: 5 * DAY, merged_prs: 2 }), NOW).freshness, "moving");
+  it("does not let merges counted over a long window hide stale activity", () => {
+    // 90d view: two merges three weeks ago, nothing since.
+    assert.equal(repoState(repo({ lastActivityAgo: 21 * DAY, merged_prs: 2, issues_closed: 4 }), NOW).freshness, "stale");
   });
   it("calls an idle repo with nothing open quiet, not stale", () => {
     assert.equal(repoState(repo({ lastActivityAgo: 9 * DAY, open_issues: 0, open_prs: 0 }), NOW).freshness, "idle");

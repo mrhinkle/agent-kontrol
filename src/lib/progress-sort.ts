@@ -39,11 +39,13 @@ export function repoState(r: RepoProgress, now: number): RepoState {
   const checked = ms(r.activity?.checked_at) ?? ms(r.last_collected_at) ?? now;
   const idleMs = last === null ? null : Math.max(0, Math.min(checked, now) - last);
   const hasOpenWork = (r.open_prs ?? 0) > 0 || (r.open_issues ?? 0) > 0;
-  const shipped = (r.merged_prs ?? 0) > 0 || (r.issues_closed ?? 0) > 0;
 
+  // Freshness is activity recency only. Merges and closes count over the
+  // selected window (up to 90d), so they cannot say whether a repo moved lately;
+  // a merge also updates its PR, so recent shipping already shows as activity.
   let freshness: Freshness;
-  if (idleMs === null) freshness = shipped ? "moving" : "unknown";
-  else if (idleMs < COOLING_AFTER_MS || shipped) freshness = "moving";
+  if (idleMs === null) freshness = "unknown";
+  else if (idleMs < COOLING_AFTER_MS) freshness = "moving";
   else if (!hasOpenWork) freshness = "idle";
   else if (idleMs < STALE_AFTER_MS) freshness = "cooling";
   else freshness = "stale";

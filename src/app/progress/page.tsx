@@ -459,7 +459,7 @@ export default function ProgressPage() {
           <p className="font-semibold text-error">
             {data?.last_sync ? (
               <>
-                The collector last reported <TimeAgo iso={data.last_sync} />. Every number below is frozen at that point.
+                The collector last reported <TimeAgo iso={data.last_sync} />. Merge, issue and queue counts below are frozen at that point.
               </>
             ) : (
               "The collector has never reported."
