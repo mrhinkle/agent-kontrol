@@ -1039,6 +1039,8 @@ class ContainmentHarness(Harness):
             "PATH": f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}",
             "FAKE_STATE": str(self.state), "FAKE_CHILD": FAKE_CHILD, "FAKE_DELAY": str(CHILD_DELAY),
             "FAKE_MODE": "ok",
+            # The fake CLI and its background child read these. run_cli passes an allowlist.
+            "MC_CHILD_ENV_ALLOW": "FAKE_STATE,FAKE_CHILD,FAKE_MODE,FAKE_DELAY,FAKE_IGNORE_TERM",
         })
         env.start()
         self.addCleanup(env.stop)
