@@ -41,11 +41,11 @@ The default list lives in `progress.config.json`. Operators change the live list
 
 PRs are checked by CI plus automated review bots. Address their findings or explain why not.
 
-Branch from `main`, open the PR against `main`, and squash-merge when CI is green. Do not use branch names that start with `release/`: the repository has a branch called `release`, and Git cannot hold both.
+Branch from `main`, open the PR against `main`, and squash-merge when CI is green.
 
 ## Releases
 
-- `main` is the integration branch. The maintainers deploy from a `release` branch (see [Releasing on Vercel](docs/DEPLOY.md)), so a merge to `main` is not a deployment.
+- `main` is the integration branch and the production branch: the maintainers' Vercel deployment builds production from every merge to `main`. Self-hosters who want to ship deliberately can track a separate branch instead (see [Releasing on Vercel](docs/DEPLOY.md)).
 - Version numbers follow semver. During 1.0 beta the REST API, the MCP tool names and the schema are kept stable; breaking one needs a changelog entry and a deprecation path.
 - A release is a version bump and a dated CHANGELOG entry in one PR, then a Git tag and a GitHub release (a prerelease while in beta).
 
