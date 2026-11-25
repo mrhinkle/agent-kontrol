@@ -7,7 +7,7 @@
  * "unavailable" row, never a zero. A 401, a rate limit, or the deadline is not
  * a per-owner failure: it propagates so the caller writes nothing for the phase.
  */
-import { isAbort, type ProgressGitHub } from "./github";
+import { GitHubAppNotInstalledError, GitHubAppTokenError, isAbort, type ProgressGitHub } from "./github";
 
 const PAGE_SIZE = 50;
 const OWNER_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/;
@@ -104,12 +104,15 @@ function stamp(clock: Clock): string {
   return new Date(ms).toISOString();
 }
 
-async function read(gh: ProgressGitHub, query: string, variables: Record<string, unknown>, clock: Clock) {
+async function read(gh: ProgressGitHub, query: string, variables: Record<string, unknown>, clock: Clock, owner: string) {
   let data: Record<string, unknown>;
   try {
-    data = await gh.graphql(query, variables);
+    data = await gh.graphql(query, variables, owner);
   } catch (err) {
     if (isAbort(err)) throw err;
+    // The App is not on this owner, or its token could not be minted: a distinct, explicit reason.
+    if (err instanceof GitHubAppNotInstalledError) throw new ReadFailed("app_not_installed");
+    if (err instanceof GitHubAppTokenError) throw new ReadFailed("app_token_failed");
     throw new ReadFailed("github_read_failed");
   }
   const checked = stamp(clock); // Taken after the API response, never before it.
@@ -158,7 +161,7 @@ async function ownerSweep(gh: ProgressGitHub, owner: string, clock: Clock, prior
   const listed: DiscoveredRepo[] = [];
   const rows: ActivityRow[] = [];
   for (;;) { // No search or repository-count cap; every cursor is followed.
-    const { data, checked } = await read(gh, OWNER_QUERY, { owner, cursor }, clock);
+    const { data, checked } = await read(gh, OWNER_QUERY, { owner, cursor }, clock, owner);
     const account = data.repositoryOwner;
     require_(typeof account.login === "string" && account.login.toLowerCase() === owner);
     const page = account.repositories;
@@ -287,7 +290,7 @@ export async function scanActivity(
     // Includes manual/legacy rows and retained rows after owner removal.
     directQueries += 1;
     try {
-      const { data, checked } = await read(gh, REPO_QUERY, { owner, name: repo }, clock);
+      const { data, checked } = await read(gh, REPO_QUERY, { owner, name: repo }, clock, owner);
       const { id, row } = parseRepo(data.repository, checked, undefined, name);
       require_(!seenIds.has(id), "duplicate_repository");
       seenIds.add(id);

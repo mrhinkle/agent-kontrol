@@ -18,7 +18,9 @@ agents/progress-collector/install.sh     # install the tick as a launchd job
 ```
 
 **Hosted deployments** (fleet.peripety.com) do not need a workstation: `GET /api/progress/collect`
-runs one tick on Vercel Cron every 5 minutes with the deployment's `GH_TOKEN`. Each run refreshes
+runs one tick on Vercel Cron every 5 minutes. It prefers a read-only GitHub App (`MC_GITHUB_APP_ID`,
+`MC_GITHUB_APP_PRIVATE_KEY`; one installation token per owner, see [Deploy](DEPLOY.md)) and falls back
+to `GH_TOKEN`. Each run refreshes
 the activity scan when it is over 15 minutes old and then collects the repos whose detailed
 snapshot is oldest, as many as fit in 240 seconds. One repo gets at most 90 seconds; a repo that
 runs over or fails is skipped for that run, so it cannot hold up the others. A repo costs about 21 seconds, almost all of it
