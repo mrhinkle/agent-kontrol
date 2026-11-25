@@ -20,7 +20,8 @@ agents/progress-collector/install.sh     # install the tick as a launchd job
 **Hosted deployments** (fleet.peripety.com) do not need a workstation: `GET /api/progress/collect`
 runs one tick on Vercel Cron every 5 minutes with the deployment's `GH_TOKEN`. Each run refreshes
 the activity scan when it is over 15 minutes old and then collects the repos whose detailed
-snapshot is oldest, as many as fit in 240 seconds. A repo costs about 21 seconds, almost all of it
+snapshot is oldest, as many as fit in 240 seconds. One repo gets at most 90 seconds; a repo that
+runs over or fails is skipped for that run, so it cannot hold up the others. A repo costs about 21 seconds, almost all of it
 the nine searches paced 2.2 s apart, so a run collects about 10 and 120 repos rotate in about an hour. Each repo's row carries the instant its own collection
 finished. `--backfill` and the sweep producer stay in the script. See [API](API.md#progress).
 The script and `agents/progress-collector/` remain for self-hosters; run one collector or the

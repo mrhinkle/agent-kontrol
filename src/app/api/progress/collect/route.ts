@@ -10,7 +10,8 @@ import type { Principal } from "@/lib/scopes";
 import { githubToken } from "@/lib/skills/source";
 
 export const dynamic = "force-dynamic";
-// The run stops starting new work at 240 s and starts no GitHub call after 285 s.
+// Limits (see progress-collect/run.ts): no repo starts after 240 s, no GitHub request runs past
+// 260 s, writes stop starting at 275 s, and one repo gets at most 90 s.
 export const maxDuration = 300;
 
 /**
@@ -24,8 +25,8 @@ export const maxDuration = 300;
  * Callers: Vercel Cron with `Authorization: Bearer $CRON_SECRET`, MC_TOKEN, or
  * the signed-in dashboard. An agent credential cannot call it.
  *
- * Response: { ok, activity: { ran, repos, status }, sweep: { collected, remaining,
- * rate_limited }, elapsed_ms }. 502 `github_auth` when GitHub refuses the token,
+ * Response: { ok, activity: { ran, repos, status }, sweep: { collected, skipped,
+ * remaining, rate_limited }, elapsed_ms }. 502 `github_auth` when GitHub refuses the token,
  * 503 `github_token_missing` when none is set, `skipped: "busy"` when another
  * run holds the lock. Never a token.
  */

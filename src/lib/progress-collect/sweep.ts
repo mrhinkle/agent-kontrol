@@ -452,6 +452,8 @@ export async function syncRepoDecisions(
   listings: RepoListings,
   settings: SweepSettings,
   sink: DecisionSink,
+  /** True once the run must stop writing; the rest is skipped and nothing is withdrawn. */
+  shouldStop: () => boolean = () => false,
 ): Promise<{ upserted: number; reconciled: boolean }> {
   const patterns = settings.decisionLabels;
   if (patterns.length === 0) return { upserted: 0, reconciled: false };
@@ -466,6 +468,7 @@ export async function syncRepoDecisions(
   let failed = false;
   let upserted = 0;
   for (const item of matches) {
+    if (shouldStop()) return { upserted, reconciled: false };
     const body = collectorDecisionBody(item, target.repo, short, patterns);
     let ok = false;
     try {
@@ -477,7 +480,7 @@ export async function syncRepoDecisions(
     else failed = true;
     seen.push(body.key);
   }
-  if (failed || truncated) return { upserted, reconciled: false };
+  if (failed || truncated || shouldStop()) return { upserted, reconciled: false };
   let reconciled = false;
   try {
     reconciled = await sink.reconcile({ repo: target.repo, source: "github-label", seen_keys: seen });

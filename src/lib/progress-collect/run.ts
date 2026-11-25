@@ -12,21 +12,44 @@
  */
 // ingestSnapshots stores a null field as NULL (its num() helper); SnapshotInput only types numbers.
 import type { IngestInput, SnapshotInput } from "../progress-store";
+import { progressEligible } from "../progress-activity";
 import type { OwnerSettingsBody, RepoSettingsBody } from "../settings-read";
 import { scanActivity, type DiscoveryResult } from "./activity";
 import {
   CollectDeadlineError,
   GitHubAuthError,
   GitHubRateLimitError,
+  GITHUB_FETCH_TIMEOUT_MS,
   ProgressGitHub,
+  RepoTimeCapError,
   type FetchLike,
 } from "./github";
 import { collectRepo, syncRepoDecisions, type DecisionSink, type SweepRepo, type SweepSettings } from "./sweep";
 
-/** Stop starting new work after this much wall time. */
+/**
+ * Time limits, all measured from the start of the run, against the route's
+ * maxDuration of 300 s:
+ * - no new repo starts after COLLECT_BUDGET_MS (240 s);
+ * - no GitHub request or wait runs past COLLECT_HARD_DEADLINE_MS (260 s): each
+ *   request's timeout is clipped to the time left, so the slowest possible
+ *   request still ends by 260 s, and the in-flight repo is then dropped, not written;
+ * - the one snapshot write and decision upserts that follow stop starting at
+ *   COLLECT_DB_DEADLINE_MS (275 s), leaving 25 s for the statement in flight
+ *   and the lock's commit.
+ */
+export const MAX_DURATION_MS = 300_000;
 export const COLLECT_BUDGET_MS = 240_000;
-/** No GitHub call starts after this; the in-flight repo is dropped, not written. */
-export const COLLECT_HARD_DEADLINE_MS = 285_000;
+export const COLLECT_HARD_DEADLINE_MS = 260_000;
+export const COLLECT_DB_DEADLINE_MS = 275_000;
+/** One repo may use at most this much; past it the repo is skipped for this run. */
+export const REPO_TIME_CAP_MS = 90_000;
+
+// The arithmetic the comment above claims, checked when the module loads.
+if (!(COLLECT_BUDGET_MS + GITHUB_FETCH_TIMEOUT_MS <= COLLECT_HARD_DEADLINE_MS &&
+  COLLECT_HARD_DEADLINE_MS < COLLECT_DB_DEADLINE_MS && COLLECT_DB_DEADLINE_MS + 10_000 <= MAX_DURATION_MS &&
+  REPO_TIME_CAP_MS < COLLECT_BUDGET_MS)) {
+  throw new Error("progress collector time limits do not fit maxDuration");
+}
 /** The activity scan reruns once its newest snapshot is this old. */
 export const ACTIVITY_REFRESH_MS = 15 * 60_000;
 
@@ -37,6 +60,8 @@ export interface CollectDeps {
   sleep?: (ms: number) => Promise<void>;
   budgetMs?: number;
   hardDeadlineMs?: number;
+  dbDeadlineMs?: number;
+  repoTimeCapMs?: number;
   searchSpacingMs?: number;
   searchRetryDelayMs?: number;
   settings: SweepSettings;
@@ -66,7 +91,13 @@ export interface CollectBody {
   ok: boolean;
   error?: "github_auth" | "rate_limited" | "collect_failed";
   activity: { ran: boolean; repos: number; status: ActivityStatus };
-  sweep: { collected: string[]; remaining: number; rate_limited: boolean };
+  sweep: {
+    collected: string[];
+    /** Repos given up on this run, with why. Nothing was written for them. */
+    skipped: { repo: string; reason: "repo_time_cap" | "deadline" | "error" }[];
+    remaining: number;
+    rate_limited: boolean;
+  };
   elapsed_ms: number;
 }
 
@@ -75,10 +106,15 @@ export interface CollectOutcome {
   body: CollectBody;
 }
 
-/** The dashboard list, filtered as `refresh_repos_from_dashboard`: gone repos dropped. */
+/**
+ * The dashboard list, limited to repos the board can show (`progressEligible`:
+ * not gone, not hidden, not excluded by the owner's fork/archive rule unless
+ * pinned). collect-progress.sh dropped only gone repos; the others cost budget
+ * for rows the board and the brief never display.
+ */
 export function sweepTargets(body: RepoSettingsBody): SweepRepo[] {
   return body.repos
-    .filter((r) => r.gone !== true)
+    .filter(progressEligible)
     .map((r) => ({ repo: r.repo, label: r.label, blockedLabel: r.blockedLabel ?? null, short: r.short ?? "" }));
 }
 
@@ -153,7 +189,7 @@ export async function runProgressCollection(deps: CollectDeps): Promise<CollectO
   const body: CollectBody = {
     ok: true,
     activity: { ran: false, repos: 0, status: "fresh" },
-    sweep: { collected: [], remaining: 0, rate_limited: false },
+    sweep: { collected: [], skipped: [], remaining: 0, rate_limited: false },
     elapsed_ms: 0,
   };
   const finish = (status: number): CollectOutcome => {
@@ -184,24 +220,41 @@ export async function runProgressCollection(deps: CollectDeps): Promise<CollectO
   const targets = rotationOrder(sweepTargets(repos), await deps.tickAges());
   let stoppedBy: "github_auth" | "rate_limited" | "deadline" | null = body.sweep.rate_limited ? "rate_limited" : null;
   let next = 0;
+  const dbDeadline = started + (deps.dbDeadlineMs ?? COLLECT_DB_DEADLINE_MS);
+  const repoCap = deps.repoTimeCapMs ?? REPO_TIME_CAP_MS;
   for (; next < targets.length && stoppedBy === null; next += 1) {
     if (deps.now() >= budgetEnd) break;
     const target = targets[next];
     let collected;
+    gh.setRepoDeadline(deps.now() + repoCap);
     try {
       collected = await collectRepo(gh, target, deps.settings, deps.now());
     } catch (err) {
       if (err instanceof GitHubAuthError) stoppedBy = "github_auth";
       else if (err instanceof GitHubRateLimitError) stoppedBy = "rate_limited";
-      else if (err instanceof CollectDeadlineError) stoppedBy = "deadline";
-      else throw err;
-      break;
+      else if (err instanceof CollectDeadlineError) {
+        stoppedBy = "deadline";
+        body.sweep.skipped.push({ repo: target.repo, reason: "deadline" });
+      } else {
+        // A slow or failing repo is given up for this run; the next oldest still gets its turn.
+        const reason = err instanceof RepoTimeCapError ? "repo_time_cap" : "error";
+        if (reason === "error") console.error(`[progress-collect] ${target.repo} failed; skipped this run`, err);
+        body.sweep.skipped.push({ repo: target.repo, reason });
+      }
+      continue;
+    } finally {
+      gh.setRepoDeadline(null);
+    }
+    if (deps.now() >= dbDeadline) {
+      body.sweep.skipped.push({ repo: target.repo, reason: "deadline" });
+      stoppedBy = "deadline";
+      continue;
     }
     const collectedAt = new Date(deps.now()).toISOString();
     const written = await deps.ingest({ collected_at: collectedAt, kind: "tick", repos: [collected.row as unknown as SnapshotInput] });
     if (written === 1) body.sweep.collected.push(target.repo);
     try {
-      await syncRepoDecisions(target, collected.listings, deps.settings, deps.decisions);
+      await syncRepoDecisions(target, collected.listings, deps.settings, deps.decisions, () => deps.now() >= dbDeadline);
     } catch (err) {
       console.error(`[progress-collect] decisions: sync failed for ${target.repo}`, err);
     }
@@ -214,7 +267,7 @@ export async function runProgressCollection(deps: CollectDeps): Promise<CollectO
     body.error = "github_auth";
     return finish(502);
   }
-  if (body.sweep.collected.length === 0 && targets.length > 0 && stoppedBy !== null) {
+  if (body.sweep.collected.length === 0 && targets.length > 0 && (stoppedBy !== null || body.sweep.skipped.length > 0)) {
     // Zero repos collected because of an error is never ok.
     body.ok = false;
     body.error = stoppedBy === "rate_limited" ? "rate_limited" : "collect_failed";

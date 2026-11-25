@@ -7,11 +7,14 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { GET } from "../../src/app/api/progress/collect/route";
+import { GET, maxDuration } from "../../src/app/api/progress/collect/route";
 import type { IngestInput } from "../../src/lib/progress-store";
 import type { OwnerSettingsBody, RepoSettingsBody } from "../../src/lib/settings-read";
-import { ProgressGitHub } from "../../src/lib/progress-collect/github";
-import { runProgressCollection, type CollectDeps } from "../../src/lib/progress-collect/run";
+import { CollectDeadlineError, GITHUB_FETCH_TIMEOUT_MS, ProgressGitHub, RepoTimeCapError } from "../../src/lib/progress-collect/github";
+import {
+  COLLECT_BUDGET_MS, COLLECT_DB_DEADLINE_MS, COLLECT_HARD_DEADLINE_MS, REPO_TIME_CAP_MS,
+  runProgressCollection, sweepTargets, type CollectDeps,
+} from "../../src/lib/progress-collect/run";
 import { briefMetrics, collectRepo, laneOf, syncRepoDecisions, type OpenPr, type SweepSettings } from "../../src/lib/progress-collect/sweep";
 import type { ReconcileInput, UpsertInput } from "../../src/lib/decisions";
 
@@ -279,6 +282,11 @@ describe("label-sourced decisions", () => {
     const again: ReconcileInput[] = [];
     await syncRepoDecisions(target, listings, SETTINGS, { async upsert() { return false; }, async reconcile(i) { again.push(i); return true; } });
     assert.deepEqual(again, [], "a failed upsert never withdraws");
+    const late: string[] = [];
+    await syncRepoDecisions(target, listings, SETTINGS,
+      { async upsert(b) { late.push(b.key); return true; }, async reconcile() { late.push("reconcile"); return true; } },
+      () => late.length >= 1);
+    assert.deepEqual(late, ["github:acme/app#2"], "past the write deadline: stop upserting and never withdraw");
     await syncRepoDecisions(target, { ...listings, prs: { ...listings.prs, complete: false } }, SETTINGS,
       { async upsert() { throw new Error("must not upsert"); }, async reconcile() { throw new Error("must not reconcile"); } });
   });
@@ -286,7 +294,7 @@ describe("label-sourced decisions", () => {
 
 /* ------------------------------------------------------------ the run */
 
-function repoRow(repo: string) {
+function repoRow(repo: string): Record<string, unknown> {
   return { repo, label: repo.split("/")[1], short: repo.split("/")[1], color: "#123456", blockedLabel: null };
 }
 
@@ -299,6 +307,7 @@ function harness(opts: {
   override?: FakeOptions["override"];
   costMs?: number;
   owners?: OwnerSettingsBody["owners"];
+  rows?: Record<string, Record<string, unknown>>;
 }) {
   const clock = { t: NOW };
   const repos = opts.repos ?? ["acme/a", "acme/b", "acme/c"];
@@ -317,7 +326,7 @@ function harness(opts: {
     settings: { ...SETTINGS, decisionLabels: [] },
     ingest: async (input) => { ingested.push(structuredClone(input)); return input.repos.length; },
     readOwners: async () => ({ writable: true, max: 50, version: "v", owners: opts.owners ?? [] }),
-    readRepos: async () => ({ source: "database", writable: true, max: 200, version: "v", repos: repos.map(repoRow) } as RepoSettingsBody),
+    readRepos: async () => ({ source: "database", writable: true, max: 200, version: "v", repos: repos.map((r) => ({ ...repoRow(r), ...(opts.rows?.[r] ?? {}) })) } as unknown as RepoSettingsBody),
     applyDiscovery: async (results) => { discovery.push(...results); return true; },
     latestActivityAt: async () => opts.latestActivity === undefined ? iso(1 / 60) : opts.latestActivity,
     tickAges: async () => new Map(Object.entries(opts.ages ?? {})),
@@ -514,5 +523,112 @@ describe("GET /api/progress/collect auth", () => {
     const body = await res.json();
     assert.equal(body.ok, false);
     assert.equal(body.error, "github_token_missing");
+  });
+});
+
+/* ------------------------------------------------------------ time limits */
+
+describe("time limits", () => {
+  it("the limits fit the route's maxDuration with at least 10 s to spare", () => {
+    assert.equal(maxDuration * 1000, 300_000);
+    assert.ok(COLLECT_BUDGET_MS + GITHUB_FETCH_TIMEOUT_MS <= COLLECT_HARD_DEADLINE_MS, "a request started at the budget ends by the deadline");
+    assert.ok(COLLECT_HARD_DEADLINE_MS < COLLECT_DB_DEADLINE_MS);
+    assert.ok(COLLECT_DB_DEADLINE_MS + 10_000 <= maxDuration * 1000);
+    assert.ok(REPO_TIME_CAP_MS <= 90_000 && REPO_TIME_CAP_MS < COLLECT_BUDGET_MS);
+  });
+
+  it("a request near the deadline gets a shortened timeout and is cut off at the deadline", async () => {
+    const started = Date.now();
+    let signal: AbortSignal | undefined;
+    const hanging = (_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      signal = init?.signal ?? undefined;
+      signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    });
+    const gh = new ProgressGitHub({ token: "t", fetchImpl: hanging, hardDeadline: started + 1_500 });
+    assert.ok(gh.requestTimeoutMs() <= 1_500, `timeout ${gh.requestTimeoutMs()}`);
+    await assert.rejects(gh.request("GET", "rate_limit"), CollectDeadlineError);
+    assert.ok(Date.now() - started < 4_000, "cut at the deadline, not after the 20 s timeout");
+    assert.equal(signal?.aborted, true);
+  });
+
+  it("no request starts with under a second left, and no wait sleeps past the deadline", async () => {
+    const clock = { t: NOW };
+    let fetched = 0;
+    let slept = 0;
+    const gh = new ProgressGitHub({ token: "t", now: () => clock.t, sleep: async (ms) => { slept += ms; clock.t += ms; },
+      fetchImpl: async () => { fetched += 1; clock.t += 100; return new Response("{}", { status: 502 }); },
+      hardDeadline: NOW + 900 });
+    await assert.rejects(gh.request("GET", "rate_limit"), CollectDeadlineError);
+    assert.equal(fetched, 0, "not started");
+    const gh2 = new ProgressGitHub({ token: "t", now: () => clock.t, sleep: async (ms) => { slept += ms; clock.t += ms; },
+      fetchImpl: async () => { fetched += 1; clock.t += 100; return new Response("{}", { status: 502 }); },
+      hardDeadline: clock.t + 10_000 });
+    await assert.rejects(gh2.searchCount("repo:acme/a is:issue"), CollectDeadlineError);
+    assert.equal(fetched, 1, "first attempt made");
+    assert.equal(slept, 0, "the 30 s retry wait would cross the deadline, so it is not slept");
+  });
+
+  it("a repo past its own time cap raises RepoTimeCapError, not the run deadline", async () => {
+    const clock = { t: NOW };
+    const gh = new ProgressGitHub({ token: "t", now: () => clock.t, sleep: async (ms) => { clock.t += ms; },
+      fetchImpl: async () => new Response("{}", { status: 200 }), hardDeadline: NOW + 200_000 });
+    gh.setRepoDeadline(NOW + 500);
+    await assert.rejects(gh.request("GET", "x"), RepoTimeCapError);
+    gh.setRepoDeadline(null);
+    await gh.request("GET", "x");
+  });
+});
+
+describe("a slow repo does not starve the rest", () => {
+  it("the oldest repo always stalls; it is skipped at its cap and the next repos are collected", async () => {
+    const h = harness({
+      repos: ["acme/stuck", "acme/a", "acme/b"],
+      ages: { "acme/a": iso(2), "acme/b": iso(1) },
+      override: (url, _op, body) => {
+        const stuck = url.includes("acme%2Fstuck") || url.includes("acme/stuck") || body?.variables?.name === "stuck";
+        if (!stuck) return null;
+        h.clock.t += 25_000; // every call to this repo takes 25 s and fails
+        return { status: 502, body: {} };
+      },
+    });
+    const out = await runProgressCollection(h.deps);
+    assert.deepEqual(out.body.sweep.skipped, [{ repo: "acme/stuck", reason: "repo_time_cap" }]);
+    assert.deepEqual(out.body.sweep.collected, ["acme/a", "acme/b"]);
+    assert.deepEqual(ticks(h.ingested).map((r) => r.repos[0].repo), ["acme/a", "acme/b"], "nothing written for the stalled repo");
+    assert.equal(out.body.ok, true);
+  });
+
+  it("a repo that throws unexpectedly is skipped and the run moves on", async () => {
+    // A null issue node makes the listing mapper throw a TypeError inside collectRepo.
+    const h = harness({ repos: ["acme/bad", "acme/a"], ages: { "acme/a": iso(1) },
+      override: (_url, op, body) => op === "ProgressOpenIssues" && body?.variables?.name === "bad"
+        ? { status: 200, body: { data: { repository: { issues: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [null] } } } } }
+        : null });
+    const out = await runProgressCollection(h.deps);
+    assert.deepEqual(out.body.sweep.skipped, [{ repo: "acme/bad", reason: "error" }]);
+    assert.deepEqual(out.body.sweep.collected, ["acme/a"]);
+    assert.deepEqual(ticks(h.ingested).map((r) => r.repos[0].repo), ["acme/a"]);
+  });
+
+  it("every attempted repo skipped and none collected is not ok", async () => {
+    const h = harness({ repos: ["acme/stuck"], override: () => { h.clock.t += 25_000; return { status: 502, body: {} }; } });
+    const out = await runProgressCollection(h.deps);
+    assert.deepEqual(out.body.sweep.collected, []);
+    assert.equal(out.status, 502);
+    assert.equal(out.body.ok, false);
+  });
+});
+
+describe("sweep eligibility", () => {
+  it("skips hidden and owner-excluded repos the board never shows; a pinned excluded repo stays", async () => {
+    const h = harness({ repos: ["acme/shown", "acme/hidden", "acme/fork", "acme/pinned-fork"], rows: {
+      "acme/hidden": { hidden: true },
+      "acme/fork": { ownerExcluded: true },
+      "acme/pinned-fork": { ownerExcluded: true, pinned: true },
+    } });
+    const out = await runProgressCollection(h.deps);
+    assert.deepEqual(out.body.sweep.collected, ["acme/shown", "acme/pinned-fork"]);
+    assert.equal(out.body.sweep.remaining, 0);
+    assert.deepEqual(sweepTargets(await h.deps.readRepos()).map((t) => t.repo), ["acme/shown", "acme/pinned-fork"]);
   });
 });

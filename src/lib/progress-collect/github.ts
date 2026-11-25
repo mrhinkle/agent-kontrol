@@ -44,6 +44,17 @@ export class CollectDeadlineError extends Error {
   }
 }
 
+/** This repo used up its own time cap. The run skips it and moves on. */
+export class RepoTimeCapError extends Error {
+  readonly name = "RepoTimeCapError";
+  constructor() {
+    super("repo_time_cap");
+  }
+}
+
+/** A request is not started unless at least this much time is left before the deadline. */
+export const MIN_REQUEST_MS = 1_000;
+
 /** A call that failed for an ordinary reason (5xx, 404, 422, network, bad JSON). */
 export class GitHubRequestError extends Error {
   readonly name = "GitHubRequestError";
@@ -54,7 +65,8 @@ export class GitHubRequestError extends Error {
 
 /** Errors that end the batch rather than becoming a null field. */
 export function isAbort(err: unknown): boolean {
-  return err instanceof GitHubAuthError || err instanceof GitHubRateLimitError || err instanceof CollectDeadlineError;
+  return err instanceof GitHubAuthError || err instanceof GitHubRateLimitError ||
+    err instanceof CollectDeadlineError || err instanceof RepoTimeCapError;
 }
 
 export interface ProgressGitHubOptions {
@@ -65,7 +77,10 @@ export interface ProgressGitHubOptions {
   timeoutMs?: number;
   searchSpacingMs?: number;
   searchRetryDelayMs?: number;
-  /** Epoch ms. No call starts after it. */
+  /**
+   * Epoch ms. No GitHub request or wait runs past it: each request's timeout is
+   * clipped to the time left, and none starts with under MIN_REQUEST_MS left.
+   */
   hardDeadline?: number;
 }
 
@@ -93,6 +108,7 @@ export class ProgressGitHub {
   private readonly searchSpacingMs: number;
   private readonly searchRetryDelayMs: number;
   private readonly hardDeadline: number;
+  private repoDeadline = Number.POSITIVE_INFINITY;
   private lastSearchAt: number | null = null;
   /** Number of HTTP requests sent. Reported for sizing, never a secret. */
   calls = 0;
@@ -109,8 +125,36 @@ export class ProgressGitHub {
     this.hardDeadline = opts.hardDeadline ?? Number.POSITIVE_INFINITY;
   }
 
-  private checkDeadline(): void {
-    if (this.now() > this.hardDeadline) throw new CollectDeadlineError();
+  /** Per-repo time cap (epoch ms), or null to clear it. */
+  setRepoDeadline(at: number | null): void {
+    this.repoDeadline = at ?? Number.POSITIVE_INFINITY;
+  }
+
+  /** The error for whichever limit is nearer. */
+  private limitError(): Error {
+    return this.repoDeadline < this.hardDeadline ? new RepoTimeCapError() : new CollectDeadlineError();
+  }
+
+  /** Milliseconds left before the nearer of the run deadline and the repo cap. */
+  private remaining(): number {
+    return Math.min(this.hardDeadline, this.repoDeadline) - this.now();
+  }
+
+  /** Throws unless `ms` more (at least MIN_REQUEST_MS) fits before the nearer deadline. */
+  private reserve(ms: number): void {
+    if (this.remaining() < Math.max(ms, MIN_REQUEST_MS)) throw this.limitError();
+  }
+
+  /** Sleeps only when the whole wait fits before the deadline; never sleeps past it. */
+  private async wait(ms: number): Promise<void> {
+    if (ms <= 0) return;
+    this.reserve(ms + MIN_REQUEST_MS);
+    await this.sleep(ms);
+  }
+
+  /** The timeout a request started now gets: never past the deadline. */
+  requestTimeoutMs(): number {
+    return Math.min(this.timeoutMs, this.remaining());
   }
 
   /**
@@ -118,12 +162,21 @@ export class ProgressGitHub {
    * GitHubRateLimitError on a rate limit, GitHubRequestError otherwise.
    */
   async request(method: "GET" | "POST", pathOrUrl: string, body?: unknown): Promise<unknown> {
-    this.checkDeadline();
+    this.reserve(MIN_REQUEST_MS);
+    const timeoutMs = this.requestTimeoutMs();
     const url = pathOrUrl.startsWith("https://") ? pathOrUrl : `${GITHUB_API}/${pathOrUrl.replace(/^\//, "")}`;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    // Clipped below the normal timeout means the deadline, not GitHub, ends this request.
+    const clipped = timeoutMs < this.timeoutMs;
+    let cutOff = false;
+    const timer = setTimeout(() => {
+      cutOff = clipped;
+      controller.abort();
+    }, timeoutMs);
     this.calls += 1;
     let res: Response;
+    let text: string;
+    // The timer covers the whole exchange, body included, so nothing outlives the deadline.
     try {
       res = await this.fetchImpl(url, {
         method,
@@ -137,12 +190,14 @@ export class ProgressGitHub {
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: controller.signal,
       });
+      text = await res.text();
     } catch {
+      // A request cut off by the deadline is the deadline, not a missing number.
+      if (cutOff || this.remaining() <= 0) throw this.limitError();
       throw new GitHubRequestError(0);
     } finally {
       clearTimeout(timer);
     }
-    const text = await res.text().catch(() => "");
     if (res.status === 401) throw new GitHubAuthError();
     if (isRateLimited(res.status, res.headers, text)) throw new GitHubRateLimitError();
     if (res.status < 200 || res.status >= 300) throw new GitHubRequestError(res.status);
@@ -170,9 +225,9 @@ export class ProgressGitHub {
   private async paceSearch(): Promise<void> {
     if (this.lastSearchAt !== null) {
       const wait = this.lastSearchAt + this.searchSpacingMs - this.now();
-      if (wait > 0) await this.sleep(wait);
+      await this.wait(wait);
     }
-    this.checkDeadline();
+    this.reserve(MIN_REQUEST_MS);
     this.lastSearchAt = this.now();
     this.searches += 1;
   }
@@ -188,7 +243,7 @@ export class ProgressGitHub {
       } catch (err) {
         if (isAbort(err)) throw err;
       }
-      if (attempt === 1) await this.sleep(this.searchRetryDelayMs);
+      if (attempt === 1) await this.wait(this.searchRetryDelayMs);
     }
     return null;
   }
