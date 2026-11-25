@@ -944,6 +944,9 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn(AK_TOKEN, json.dumps(env))
         self.assertTrue(env["HOME"].startswith(os.path.join(self.h.tmp, "work")))
         self.assertTrue(env["CLAUDE_CONFIG_DIR"].startswith(env["HOME"]))
+        # The CLI must not fall back to /tmp/claude-<uid>, which the sandbox denies.
+        self.assertEqual(env["CLAUDE_CODE_TMPDIR"], env["TMPDIR"])
+        self.assertTrue(env["TMPDIR"].startswith(env["HOME"]))
         self.assertTrue(call["cwd"].startswith(os.path.join(self.h.tmp, "work")))
         self.assertEqual(call["head"], head)  # detached at the exact head
         self.assertIn("git diff %s...%s" % (base, head), call["stdin"])
