@@ -49,10 +49,10 @@ function NewTaskForm({ onCreated, onCancel }: { onCreated: () => void; onCancel?
   }
 
   const input =
-    "bg-bg border border-white/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-accent w-full";
+    "bg-bg border border-fg/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-accent w-full";
 
   return (
-    <div className="rounded-xl border border-white/10 bg-panel p-4 mb-6">
+    <div className="rounded-xl border border-fg/10 bg-panel p-4 mb-6">
       <div className="text-sm font-semibold mb-3">Queue a task</div>
       <div className="grid gap-3">
         <input className={input} placeholder="Title — e.g. Fix the broken subscribe form on example.com"
@@ -108,7 +108,7 @@ function TaskRow({ t, onAction, onCancelTask }: { t: Task; onAction: () => void;
   }
 
   return (
-    <div className="rounded-xl border border-white/10 bg-panel p-4">
+    <div className="rounded-xl border border-fg/10 bg-panel p-4">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="font-medium flex items-center gap-2 flex-wrap">
@@ -135,7 +135,7 @@ function TaskRow({ t, onAction, onCancelTask }: { t: Task; onAction: () => void;
           )}
           {(t.status === "failed" || t.status === "cancelled") && (
             <button onClick={() => patch({ status: "queued" })}
-              className="text-[11px] text-gray-500 hover:text-white transition-colors" title="Requeue">
+              className="text-[11px] text-gray-500 hover:text-fg transition-colors" title="Requeue">
               ↻
             </button>
           )}
@@ -147,7 +147,7 @@ function TaskRow({ t, onAction, onCancelTask }: { t: Task; onAction: () => void;
         </div>
       )}
       {t.result && (
-        <div className={`mt-2 flex gap-2 border-l-2 pl-3 ${t.status === "failed" ? "border-red-500/50" : "border-white/10"}`}>
+        <div className={`mt-2 flex gap-2 border-l-2 pl-3 ${t.status === "failed" ? "border-red-500/50" : "border-fg/10"}`}>
           <span className="mono shrink-0 pt-[3px] text-[10px] uppercase tracking-wider text-gray-500">Result</span>
           <div className="min-w-0 flex-1">
             <CollapsibleMarkdown source={t.result} className="text-sm leading-relaxed text-gray-300" />

@@ -52,7 +52,7 @@ function AgentCard({ agent, events }: { agent: FleetAgent; events: Event[] }) {
       ? "border-warn/40 hover:border-warn/70"
       : agent.derived_status === "failed"
         ? "border-error/40 hover:border-error/70"
-        : "border-white/10 hover:border-white/20";
+        : "border-fg/10 hover:border-fg/20";
   return (
     <div className={`flex flex-col gap-3 rounded-xl border bg-panel p-4 transition-colors ${edge}`}>
       <div className="flex items-start justify-between gap-2">
@@ -136,7 +136,7 @@ function EventRow({ e, count, agent }: { e: Event; count: number; agent: FleetAg
   const name = agent ? agent.display_name ?? agent.id : e.agent_id;
   const tone = STATUS_STYLES[agent?.derived_status ?? "offline"] ?? STATUS_STYLES.offline;
   return (
-    <div className="grid grid-cols-[4rem_minmax(0,14rem)_minmax(0,1fr)] items-baseline gap-x-3 border-b border-white/5 py-1.5 text-sm last:border-0 max-sm:grid-cols-[4rem_minmax(0,1fr)]">
+    <div className="grid grid-cols-[4rem_minmax(0,14rem)_minmax(0,1fr)] items-baseline gap-x-3 border-b border-fg/5 py-1.5 text-sm last:border-0 max-sm:grid-cols-[4rem_minmax(0,1fr)]">
       <span className="mono text-xs text-gray-600">
         <TimeAgo iso={e.created_at} />
       </span>
@@ -149,7 +149,7 @@ function EventRow({ e, count, agent }: { e: Event; count: number; agent: FleetAg
         <span className="mono mr-2 text-xs text-gray-500">{e.kind}</span>
         {e.title ?? ""}
         {count > 1 && (
-          <span className="mono ml-2 rounded bg-white/5 px-1.5 text-[11px] text-gray-500" title={`${count} identical events in a row`}>
+          <span className="mono ml-2 rounded bg-fg/5 px-1.5 text-[11px] text-gray-500" title={`${count} identical events in a row`}>
             ×{count}
           </span>
         )}
@@ -213,7 +213,7 @@ export default function FleetPage() {
           Show heartbeats &amp; telemetry{!showBackground && feed.hidden > 0 ? ` (${feed.hidden} hidden)` : ""}
         </label>
       </PanelHeader>
-      <div className="rounded-xl border border-white/10 bg-panel px-4 py-2">
+      <div className="rounded-xl border border-fg/10 bg-panel px-4 py-2">
         {feed.items.map((it) => (
           <EventRow key={it.event.id} e={it.event} count={it.count} agent={byId.get(it.event.agent_id)} />
         ))}

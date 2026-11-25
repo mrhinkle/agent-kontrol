@@ -28,10 +28,10 @@ interface Loaded {
 }
 
 const input =
-  "w-full bg-bg border border-white/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-accent disabled:opacity-60";
+  "w-full bg-bg border border-fg/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-accent disabled:opacity-60";
 const primary =
   "bg-accent hover:bg-accent-hover text-accent-ink rounded-lg px-4 py-2 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed";
-const secondary = "border border-white/15 rounded-lg px-4 py-2 text-sm text-gray-200 hover:bg-white/5 disabled:opacity-50";
+const secondary = "border border-fg/15 rounded-lg px-4 py-2 text-sm text-gray-200 hover:bg-fg/5 disabled:opacity-50";
 
 function blank(): OwnerRow {
   return { owner: "", activity_days: ACTIVITY_DAYS_DEFAULT, include_forks: false, include_archived: false };
@@ -155,7 +155,7 @@ export function OwnerSettings() {
 
   if (loadError) {
     return (
-      <div className="rounded-xl border border-white/10 bg-panel p-6">
+      <div className="rounded-xl border border-fg/10 bg-panel p-6">
         <p className="text-sm text-red-400">{loadError}</p>
         <button className={`${secondary} mt-3`} onClick={() => void load()}>
           Retry
@@ -172,12 +172,12 @@ export function OwnerSettings() {
           ? "Name a GitHub user or organization. The collector keeps every repo allowed by the fork and archive settings, including inactive repos. Activity days filter the Progress board and brief only. Hide wins over pin."
           : "No database is connected (demo mode), so owners are read-only."}
       </div>
-      <div className="rounded-xl border border-white/10 bg-panel p-4 md:p-6">
+      <div className="rounded-xl border border-fg/10 bg-panel p-4 md:p-6">
         <ul className="space-y-4">
           {rows.map((row, index) => {
             const rowErrors = errors.filter((item) => item.index === index);
             return (
-              <li key={`${index}-${row.owner}`} className="rounded-lg border border-white/10 p-3">
+              <li key={`${index}-${row.owner}`} className="rounded-lg border border-fg/10 p-3">
                 <div className="grid gap-3 md:grid-cols-[minmax(0,1.4fr)_120px_auto_auto_auto]">
                   <label className="block">
                     <span className="mb-1 block text-xs text-gray-400">Owner</span>

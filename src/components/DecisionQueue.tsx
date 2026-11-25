@@ -6,7 +6,7 @@ import { decisionSourceHref, readOptions } from "@/lib/decision-format";
 import type { Decision } from "@/lib/decisions";
 
 const input =
-  "bg-bg border border-white/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-accent w-full";
+  "bg-bg border border-fg/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-accent w-full";
 
 export function DecisionCard({
   decision,
@@ -40,7 +40,7 @@ export function DecisionCard({
   }
 
   return (
-    <article className="rounded-xl border border-white/10 bg-panel p-4 mb-4">
+    <article className="rounded-xl border border-fg/10 bg-panel p-4 mb-4">
       <header className="flex items-baseline justify-between gap-3 mb-2">
         <h2 className="text-base font-semibold">{decision.title}</h2>
         <span className="text-xs text-gray-400 shrink-0">Age {decision.age_days} days</span>
@@ -105,7 +105,7 @@ export function DecisionCard({
               Defer until
               <input id={`defer-${decision.id}`} name="defer_until" type="date" className={`${input} mt-1`} />
             </label>
-            <button type="submit" className="rounded-lg border border-white/15 px-3 py-2 text-sm">
+            <button type="submit" className="rounded-lg border border-fg/15 px-3 py-2 text-sm">
               Defer
             </button>
           </form>

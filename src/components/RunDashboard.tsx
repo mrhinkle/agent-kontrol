@@ -13,10 +13,10 @@ export function RunDashboard({ metrics }: { metrics: RunMetrics | null }) {
       {metrics.demo ? <DemoPill /> : null}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h2 id="run-metrics" className="text-lg font-medium text-white">Run observability</h2>
+          <h2 id="run-metrics" className="text-lg font-medium text-fg">Run observability</h2>
           <p className="mt-1 text-xs text-gray-400">Completed runs in the last 24 hours, from the dispatcher and from the fleet wrappers (Grok lanes, Codex and spec reviews).</p>
         </div>
-        <form action="/observability"><button type="submit" className="rounded-md border border-white/20 px-3 py-2 text-sm text-gray-200 hover:bg-white/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent">Refresh</button></form>
+        <form action="/observability"><button type="submit" className="rounded-md border border-fg/20 px-3 py-2 text-sm text-gray-200 hover:bg-fg/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent">Refresh</button></form>
       </div>
       {metrics.truncated ? <p role="status" className="text-sm text-amber-200">Showing at most the 1,000 most recent stored records from each source (dispatcher and fleet wrappers). These metrics cover that sample.</p> : null}
       <dl className="grid grid-cols-2 gap-3 md:grid-cols-4">
@@ -26,25 +26,25 @@ export function RunDashboard({ metrics }: { metrics: RunMetrics | null }) {
           ["Run duration · p95", duration(totals.p95_duration_ms)],
           ["Failed runs", number(totals.failed_runs)],
         ].map(([label, value]) => (
-          <div key={label} className="rounded-xl border border-white/10 bg-panel p-4"><dt className="text-xs text-gray-400">{label}</dt><dd className="mt-2 text-xl font-semibold text-white">{value}</dd></div>
+          <div key={label} className="rounded-xl border border-fg/10 bg-panel p-4"><dt className="text-xs text-gray-400">{label}</dt><dd className="mt-2 text-xl font-semibold text-fg">{value}</dd></div>
         ))}
       </dl>
       <p className="text-xs leading-relaxed text-gray-400">Run duration measures the CLI process, including startup and tool work. Individual model-request latency is unavailable in this feed. Durations are known for {totals.runs_with_duration} of {totals.completed_runs} runs; the percentiles use only those. Fleet wrapper runs report no token counts, and a duration only when the wrapper sends one. Complete token reports: {totals.complete_usage_runs} of {totals.completed_runs} runs; {totals.runs_with_usage} have at least some usage data.</p>
-      <div className="overflow-x-auto rounded-xl border border-white/10 bg-panel">
+      <div className="overflow-x-auto rounded-xl border border-fg/10 bg-panel">
         <table className="w-full text-left text-sm">
           <caption className="px-4 py-3 text-left font-medium text-gray-200">Reported model usage · dispatcher runs</caption>
-          <thead className="border-y border-white/10 text-xs text-gray-400"><tr><th scope="col" className="px-4 py-3">Model</th><th scope="col" className="px-4 py-3">Runs</th><th scope="col" className="px-4 py-3">Input tokens</th><th scope="col" className="px-4 py-3">Output tokens</th></tr></thead>
-          <tbody className="divide-y divide-white/5 text-gray-300">
+          <thead className="border-y border-fg/10 text-xs text-gray-400"><tr><th scope="col" className="px-4 py-3">Model</th><th scope="col" className="px-4 py-3">Runs</th><th scope="col" className="px-4 py-3">Input tokens</th><th scope="col" className="px-4 py-3">Output tokens</th></tr></thead>
+          <tbody className="divide-y divide-fg/5 text-gray-300">
             {models.map((m) => <tr key={m.model}><th scope="row" className="px-4 py-3 font-normal">{m.model}</th><td className="px-4 py-3">{m.runs}</td><td className="px-4 py-3">{number(m.input_tokens)}</td><td className="px-4 py-3">{number(m.output_tokens)}</td></tr>)}
             {!models.length ? <tr><td colSpan={4} className="px-4 py-5 text-gray-400">No per-run model usage reported yet. Missing counts remain unavailable.</td></tr> : null}
           </tbody>
         </table>
       </div>
-      <div className="overflow-x-auto rounded-xl border border-white/10 bg-panel">
+      <div className="overflow-x-auto rounded-xl border border-fg/10 bg-panel">
         <table className="w-full text-left text-sm">
           <caption className="px-4 py-3 text-left font-medium text-gray-200">Recent completed runs</caption>
-          <thead className="border-y border-white/10 text-xs text-gray-400"><tr><th scope="col" className="px-4 py-3">Platform</th><th scope="col" className="px-4 py-3">Role</th><th scope="col" className="px-4 py-3">Outcome</th><th scope="col" className="px-4 py-3">Duration</th><th scope="col" className="px-4 py-3">Usage</th></tr></thead>
-          <tbody className="divide-y divide-white/5 text-gray-300">
+          <thead className="border-y border-fg/10 text-xs text-gray-400"><tr><th scope="col" className="px-4 py-3">Platform</th><th scope="col" className="px-4 py-3">Role</th><th scope="col" className="px-4 py-3">Outcome</th><th scope="col" className="px-4 py-3">Duration</th><th scope="col" className="px-4 py-3">Usage</th></tr></thead>
+          <tbody className="divide-y divide-fg/5 text-gray-300">
             {runs.slice(0, 30).map(({ event_id, run, platform, duration_known }) => <tr key={event_id}><th scope="row" className="px-4 py-3 font-normal">{platform}</th><td className="px-4 py-3">{run.role}</td><td className={`px-4 py-3 ${run.outcome === "completed" ? "text-emerald-300" : "text-red-300"}`}>{run.outcome}{run.error_class ? <span className="mt-1 block text-xs text-gray-400">{run.error_class.replaceAll("_", " ")}</span> : null}</td><td className="whitespace-nowrap px-4 py-3">{duration(duration_known === false ? null : run.duration_ms)}</td><td className="px-4 py-3">{run.usage_complete ? "Complete" : run.model_usage.length ? "Partial" : "Unavailable"}</td></tr>)}
             {!runs.length ? <tr><td colSpan={5} className="px-4 py-5 text-gray-400">No completed runs recorded in this window. Runs appear when a fleet wrapper finishes a lane or review, or when an updated dispatcher reports one.</td></tr> : null}
           </tbody>

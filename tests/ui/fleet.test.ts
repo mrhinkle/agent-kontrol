@@ -56,12 +56,14 @@ describe("live activity feed", () => {
   });
 });
 
-const THEME = readFileSync(new URL("../../src/app/globals.css", import.meta.url), "utf8");
+const CSS = readFileSync(new URL("../../src/app/globals.css", import.meta.url), "utf8");
+// The Gibson scene is always dark, so its colors match the [data-theme="dark"] tokens.
+const THEME = CSS.slice(CSS.indexOf('[data-theme="dark"] {'));
 
 describe("status colors match the Gibson", () => {
   it("uses the Gibson hex for every agent status dot", () => {
     for (const [status, hex] of Object.entries(AGENT_STATUS_COLORS)) {
-      // Dots name Ion tokens (bg-success); globals.css holds the value the Gibson uses.
+      // Dots name Ion tokens (bg-success); the dark tokens hold the value the Gibson uses.
       const token = STATUS_STYLES[status].dot.replace(/^bg-/, "");
       const value = new RegExp(`--color-${token}:\\s*(#[0-9a-f]{6})`, "i").exec(THEME)?.[1];
       assert.equal(value, hex, `${status}: ${STATUS_STYLES[status].dot} should resolve to ${hex}`);

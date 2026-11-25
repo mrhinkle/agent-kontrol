@@ -44,13 +44,13 @@ export default function TracesPage() {
       {error && !traces && <div className="text-sm text-red-400">Failed to load: {error}</div>}
       {!traces && !error && <div className="animate-pulse text-sm text-gray-500">Loading traces…</div>}
       {traces && traces.length === 0 && (
-        <div className="rounded-lg border border-white/10 p-6 text-sm text-gray-400">
+        <div className="rounded-lg border border-fg/10 p-6 text-sm text-gray-400">
           No traces yet. Install the Claude Code hook (it emits traces automatically), or point any OpenTelemetry exporter at{" "}
           <span className="mono">/api/v1/traces</span>. See the Help page “Telemetry and traces”.
         </div>
       )}
       {traces && traces.length > 0 && (
-        <div className="overflow-x-auto rounded-lg border border-white/10">
+        <div className="overflow-x-auto rounded-lg border border-fg/10">
           <table className="w-full text-left text-sm">
             <thead className="text-xs uppercase tracking-wide text-gray-500">
               <tr>
@@ -66,7 +66,7 @@ export default function TracesPage() {
               {traces.map((t) => {
                 const dur = t.ended_at ? Date.parse(t.ended_at) - Date.parse(t.started_at) : null;
                 return (
-                  <tr key={t.trace_id} className="border-t border-white/5 hover:bg-white/[0.03]">
+                  <tr key={t.trace_id} className="border-t border-fg/5 hover:bg-fg/[0.03]">
                     <td className="whitespace-nowrap px-3 py-2 text-gray-400">
                       <TimeAgo iso={t.started_at} />
                     </td>

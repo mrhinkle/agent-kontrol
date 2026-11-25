@@ -6,7 +6,7 @@ import type { Page } from "@/lib/history";
 export function Pager<T>({ page, onPage, noun }: { page: Page<T>; onPage: (p: number) => void; noun: string }) {
   if (page.pages <= 1) return null;
   const btn =
-    "rounded-md border border-white/10 px-2.5 py-1 text-xs text-gray-300 transition-colors hover:border-white/25 hover:text-white disabled:cursor-not-allowed disabled:opacity-40";
+    "rounded-md border border-fg/10 px-2.5 py-1 text-xs text-gray-300 transition-colors hover:border-fg/25 hover:text-fg disabled:cursor-not-allowed disabled:opacity-40";
   return (
     <nav className="mt-3 flex items-center justify-between gap-3 text-xs text-gray-500" aria-label={`${noun} pages`}>
       <span>

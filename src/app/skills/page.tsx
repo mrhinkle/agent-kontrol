@@ -8,7 +8,7 @@ import { categoryOptions, filterSkills, laneOptions, RUNTIME_FILTERS, skillsQuer
 import { useSkills } from "@/components/use-skills";
 
 const field =
-  "rounded-lg border border-white/10 bg-panel px-3 py-2 text-sm text-gray-200 outline-none focus-visible:ring-2 focus-visible:ring-accent/70";
+  "rounded-lg border border-fg/10 bg-panel px-3 py-2 text-sm text-gray-200 outline-none focus-visible:ring-2 focus-visible:ring-accent/70";
 
 export default function SkillsPage() {
   return (
@@ -128,7 +128,7 @@ function SkillsList() {
               />
             ))}
             {visible.length === 0 && (
-              <div className="rounded-xl border border-white/10 bg-panel px-4 py-8 text-sm text-gray-500">
+              <div className="rounded-xl border border-fg/10 bg-panel px-4 py-8 text-sm text-gray-500">
                 {skills.length === 0 ? "No skills yet." : "No skills match."}
               </div>
             )}

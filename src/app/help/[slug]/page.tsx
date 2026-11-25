@@ -27,7 +27,7 @@ export default async function HelpDocPage({ params }: { params: Promise<{ slug: 
               <Link
                 href={`/help/${d.slug}`}
                 aria-current={d.slug === slug ? "page" : undefined}
-                className={`block rounded px-2 py-1 ${d.slug === slug ? "bg-white/10 text-white" : "text-gray-400 hover:text-gray-200"}`}
+                className={`block rounded px-2 py-1 ${d.slug === slug ? "bg-fg/10 text-fg" : "text-gray-400 hover:text-gray-200"}`}
               >
                 {d.title}
               </Link>

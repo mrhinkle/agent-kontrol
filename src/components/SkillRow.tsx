@@ -181,15 +181,15 @@ export function SkillRow({
   }
 
   return (
-    <article className={`rounded-xl border border-white/10 bg-panel p-4 ${dimmed ? "opacity-60" : ""}`}>
+    <article className={`rounded-xl border border-fg/10 bg-panel p-4 ${dimmed ? "opacity-60" : ""}`}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
-            <Link href={skillDetailPath(skill.id)} className="mono font-medium text-gray-100 hover:text-white">
+            <Link href={skillDetailPath(skill.id)} className="mono font-medium text-gray-100 hover:text-fg">
               {skill.name}
             </Link>
             <SkillRuntimeChips runtimes={skill.runtimes} />
-            <span className="rounded-sm bg-white/5 px-2 py-0.5 text-[11px] text-gray-400 ring-1 ring-white/10" title="Category">
+            <span className="rounded-sm bg-fg/5 px-2 py-0.5 text-[11px] text-gray-400 ring-1 ring-fg/10" title="Category">
               {categoryLabel(skill.category)}
             </span>
             {flagged && (
@@ -248,7 +248,7 @@ export function SkillRow({
         <span className="mono">
           {skill.triggerCount7d} {skill.triggerCount7d === 1 ? "trigger" : "triggers"} · 7d
         </span>
-        <Link href={skillDetailPath(skill.id)} className="ml-auto text-gray-300 hover:text-white">
+        <Link href={skillDetailPath(skill.id)} className="ml-auto text-gray-300 hover:text-fg">
           Details
         </Link>
       </div>
@@ -266,7 +266,7 @@ function SkillRuntimeChips({ runtimes }: { runtimes: readonly string[] }) {
           <span
             key={runtime}
             title={meta.label}
-            className="inline-flex items-center gap-1 rounded-sm bg-white/5 px-2 py-0.5 text-[11px] text-gray-300 ring-1 ring-white/10"
+            className="inline-flex items-center gap-1 rounded-sm bg-fg/5 px-2 py-0.5 text-[11px] text-gray-300 ring-1 ring-fg/10"
           >
             <PlatformMark platform={platform} size={12} />
             <span className="mono">{runtime}</span>

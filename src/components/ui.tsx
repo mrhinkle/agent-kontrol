@@ -36,7 +36,7 @@ export const TASK_STATUS_STYLES: Record<string, { label: string; dot: string; te
 export function TaskStatusChip({ status }: { status: string }) {
   const s = TASK_STATUS_STYLES[status] ?? TASK_STATUS_STYLES.queued;
   return (
-    <span className={`inline-flex items-center gap-1.5 rounded-sm px-2.5 py-0.5 text-[11px] font-semibold ring-1 ${s.ring} ${s.text} bg-white/5 mono`}>
+    <span className={`inline-flex items-center gap-1.5 rounded-sm px-2.5 py-0.5 text-[11px] font-semibold ring-1 ${s.ring} ${s.text} bg-fg/5 mono`}>
       <span aria-hidden className={`h-1.5 w-1.5 rounded-full ${s.dot} ${status === "running" ? "pulse-dot" : ""}`} />
       <span className={status === "cancelled" ? "line-through" : undefined}>{s.label}</span>
     </span>
@@ -46,7 +46,7 @@ export function TaskStatusChip({ status }: { status: string }) {
 export function StatusChip({ status }: { status: string }) {
   const s = STATUS_STYLES[status] ?? STATUS_STYLES.offline;
   return (
-    <span className={`inline-flex items-center gap-1.5 rounded-sm px-2.5 py-0.5 text-[11px] font-semibold ring-1 ${s.ring} ${s.text} bg-white/5 mono`}>
+    <span className={`inline-flex items-center gap-1.5 rounded-sm px-2.5 py-0.5 text-[11px] font-semibold ring-1 ${s.ring} ${s.text} bg-fg/5 mono`}>
       <span className={`h-1.5 w-1.5 rounded-full ${s.dot} ${status === "active" ? "pulse-dot" : ""}`} />
       {s.label}
     </span>

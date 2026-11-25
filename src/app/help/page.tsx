@@ -21,7 +21,7 @@ export default function HelpIndex() {
       <ul className="grid gap-3 sm:grid-cols-2">
         {HELP_DOCS.map((d) => (
           <li key={d.slug}>
-            <Link href={`/help/${d.slug}`} className="block rounded-xl border border-white/10 bg-panel p-4 hover:border-white/25">
+            <Link href={`/help/${d.slug}`} className="block rounded-xl border border-fg/10 bg-panel p-4 hover:border-fg/25">
               <div className="font-semibold">{d.title}</div>
               <div className="mt-1 text-sm text-gray-400">{d.blurb}</div>
             </Link>

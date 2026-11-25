@@ -13,9 +13,9 @@ const PROGRESS_POLL_MS = 60_000;
 const PROGRESS_TIMEOUT_MS = 5_000;
 
 const TONE: Record<AttentionTone, { fg: string; bg: string; ring: string }> = {
-  red: { fg: "#f07178", bg: "#ff3b5c22", ring: "#ff3b5c88" },
-  amber: { fg: "#ffb020", bg: "#ffb02022", ring: "#ffb02088" },
-  cyan: { fg: "#6fe9ff", bg: "#19d2ff1a", ring: "#19d2ff66" },
+  red: { fg: "var(--color-error)", bg: "color-mix(in srgb, var(--color-error) 12%, transparent)", ring: "color-mix(in srgb, var(--color-error) 50%, transparent)" },
+  amber: { fg: "var(--color-warn)", bg: "color-mix(in srgb, var(--color-warn) 12%, transparent)", ring: "color-mix(in srgb, var(--color-warn) 50%, transparent)" },
+  cyan: { fg: "var(--color-accent)", bg: "color-mix(in srgb, var(--color-accent) 10%, transparent)", ring: "color-mix(in srgb, var(--color-accent) 40%, transparent)" },
 };
 
 interface Snapshot {

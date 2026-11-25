@@ -32,7 +32,7 @@ export function PreviewDialog({
         role="dialog"
         aria-modal="true"
         aria-labelledby="dry-run-title"
-        className="max-h-[80vh] w-full max-w-lg overflow-auto rounded-xl border border-white/10 bg-panel p-5 shadow-xl"
+        className="max-h-[80vh] w-full max-w-lg overflow-auto rounded-xl border border-fg/10 bg-panel p-5 shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
         <h2 id="dry-run-title" className="text-base font-semibold">
@@ -44,7 +44,7 @@ export function PreviewDialog({
         )}
         <ul className="mt-3 space-y-3">
           {preview.changes.map((change, i) => (
-            <li key={`${change.op}-${i}`} className="rounded-lg border border-white/10 p-3 text-sm text-gray-200">
+            <li key={`${change.op}-${i}`} className="rounded-lg border border-fg/10 p-3 text-sm text-gray-200">
               {changeDetails(change).map((line, j) => (
                 <p key={j} className={j === 0 ? "font-medium" : "mt-1 whitespace-pre-wrap text-gray-400"}>
                   {line}
@@ -56,7 +56,7 @@ export function PreviewDialog({
         <div className="mt-4 flex justify-end gap-2">
           <button
             type="button"
-            className="rounded-lg border border-white/15 px-4 py-2 text-sm text-gray-200 hover:bg-white/5 disabled:opacity-50"
+            className="rounded-lg border border-fg/15 px-4 py-2 text-sm text-gray-200 hover:bg-fg/5 disabled:opacity-50"
             onClick={onCancel}
             disabled={busy}
           >
