@@ -17,7 +17,10 @@ import type { OwnerSettingsBody, RepoSettingsBody } from "../settings-read";
 import { scanActivity, type DiscoveryResult } from "./activity";
 import {
   CollectDeadlineError,
+  GitHubAppNotInstalledError,
+  GitHubAppTokenError,
   GitHubAuthError,
+  type GitHubCredentials,
   GitHubRateLimitError,
   GITHUB_FETCH_TIMEOUT_MS,
   ProgressGitHub,
@@ -54,7 +57,9 @@ if (!(COLLECT_BUDGET_MS + GITHUB_FETCH_TIMEOUT_MS <= COLLECT_HARD_DEADLINE_MS &&
 export const ACTIVITY_REFRESH_MS = 15 * 60_000;
 
 export interface CollectDeps {
-  token: string;
+  /** GH_TOKEN shorthand; `credentials` wins when both are set. */
+  token?: string;
+  credentials?: GitHubCredentials;
   fetchImpl?: FetchLike;
   now: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -94,7 +99,7 @@ export interface CollectBody {
   sweep: {
     collected: string[];
     /** Repos given up on this run, with why. Nothing was written for them. */
-    skipped: { repo: string; reason: "repo_time_cap" | "deadline" | "error" }[];
+    skipped: { repo: string; reason: "repo_time_cap" | "deadline" | "error" | "app_not_installed" | "app_token_failed" }[];
     remaining: number;
     rate_limited: boolean;
   };
@@ -179,6 +184,7 @@ export async function runProgressCollection(deps: CollectDeps): Promise<CollectO
   const budgetEnd = started + (deps.budgetMs ?? COLLECT_BUDGET_MS);
   const gh = new ProgressGitHub({
     token: deps.token,
+    credentials: deps.credentials,
     fetchImpl: deps.fetchImpl,
     now: deps.now,
     sleep: deps.sleep,
@@ -237,7 +243,10 @@ export async function runProgressCollection(deps: CollectDeps): Promise<CollectO
         body.sweep.skipped.push({ repo: target.repo, reason: "deadline" });
       } else {
         // A slow or failing repo is given up for this run; the next oldest still gets its turn.
-        const reason = err instanceof RepoTimeCapError ? "repo_time_cap" : "error";
+        const reason = err instanceof RepoTimeCapError ? "repo_time_cap"
+          : err instanceof GitHubAppNotInstalledError ? "app_not_installed"
+          : err instanceof GitHubAppTokenError ? "app_token_failed"
+          : "error";
         if (reason === "error") console.error(`[progress-collect] ${target.repo} failed; skipped this run`, err);
         body.sweep.skipped.push({ repo: target.repo, reason });
       }

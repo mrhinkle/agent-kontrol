@@ -13,6 +13,8 @@
  * Anything else is an ordinary failure the caller turns into null or "unavailable".
  */
 
+import { githubAppJwt } from "../github-read";
+
 export const GITHUB_API = "https://api.github.com";
 export const GITHUB_API_VERSION = "2022-11-28";
 export const GITHUB_FETCH_TIMEOUT_MS = 20_000;
@@ -63,14 +65,78 @@ export class GitHubRequestError extends Error {
   }
 }
 
+/**
+ * The read-only GitHub App has no installation on this owner. Its repos are
+ * unavailable (`app_not_installed`), never zeros. Not a run-ending error.
+ */
+export class GitHubAppNotInstalledError extends Error {
+  readonly name = "GitHubAppNotInstalledError";
+  constructor(readonly owner: string) {
+    super("app_not_installed");
+  }
+}
+
+/**
+ * The installation lookup or token mint failed for this owner (not a 401, not
+ * "not installed"). Cached for the run; the owner's repos are skipped.
+ */
+export class GitHubAppTokenError extends Error {
+  readonly name = "GitHubAppTokenError";
+  constructor(readonly owner: string, readonly status: number) {
+    super("app_token_failed");
+  }
+}
+
 /** Errors that end the batch rather than becoming a null field. */
 export function isAbort(err: unknown): boolean {
   return err instanceof GitHubAuthError || err instanceof GitHubRateLimitError ||
     err instanceof CollectDeadlineError || err instanceof RepoTimeCapError;
 }
 
+/** Errors a repo's collection must not swallow into a null field. */
+export function mustPropagate(err: unknown): boolean {
+  return isAbort(err) || err instanceof GitHubAppNotInstalledError || err instanceof GitHubAppTokenError;
+}
+
+/**
+ * How the collector authenticates. `app`: a read-only GitHub App, with an
+ * installation token minted per owner. `token`: one GH_TOKEN for everything.
+ */
+export type GitHubCredentials =
+  | { kind: "token"; token: string }
+  | { kind: "app"; appId: string; privateKey: string };
+
+/**
+ * The collector's App settings, read directly from MC_GITHUB_APP_ID and
+ * MC_GITHUB_APP_PRIVATE_KEY. Deliberately not `githubAppConfig()` from
+ * github-read.ts: that also needs MC_GITHUB_APP_BOT_LOGIN and turns the
+ * reducers (#80) on, which this read-only App must not do.
+ */
+export function collectorAppCredentials(env: Record<string, string | undefined> = process.env): GitHubCredentials | null {
+  const appId = env.MC_GITHUB_APP_ID?.trim() ?? "";
+  const privateKey = env.MC_GITHUB_APP_PRIVATE_KEY?.trim() ?? "";
+  if (!appId || !privateKey) return null;
+  return { kind: "app", appId, privateKey };
+}
+
+/**
+ * What the hosted collector authenticates with: the read-only App when both of
+ * its variables are set, else GH_TOKEN, else GITHUB_TOKEN, else nothing (503).
+ */
+export function collectorCredentials(env: Record<string, string | undefined> = process.env): GitHubCredentials | null {
+  const app = collectorAppCredentials(env);
+  if (app) return app;
+  const token = env.GH_TOKEN?.trim() || env.GITHUB_TOKEN?.trim() || "";
+  return token ? { kind: "token", token } : null;
+}
+
+/** A minted installation token is reused until this close to its expiry. */
+export const TOKEN_REFRESH_MARGIN_MS = 60_000;
+
 export interface ProgressGitHubOptions {
-  token: string;
+  /** Shorthand for `credentials: { kind: "token", token }`. */
+  token?: string;
+  credentials?: GitHubCredentials;
   fetchImpl?: FetchLike;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -99,8 +165,16 @@ function isRateLimited(status: number, headers: Headers, text: string): boolean 
   return /rate limit/i.test(text);
 }
 
+type OwnerAuth =
+  | { kind: "token"; token: string; expiresAt: number }
+  | { kind: "not_installed" }
+  | { kind: "failed"; status: number };
+
 export class ProgressGitHub {
-  private readonly token: string;
+  private readonly credentials: GitHubCredentials;
+  private readonly ownerAuth = new Map<string, OwnerAuth>();
+  /** Installation tokens minted this run, for tests and sizing. */
+  mints = 0;
   private readonly fetchImpl: FetchLike;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -115,7 +189,9 @@ export class ProgressGitHub {
   searches = 0;
 
   constructor(opts: ProgressGitHubOptions) {
-    this.token = opts.token;
+    const credentials = opts.credentials ?? (opts.token !== undefined ? { kind: "token" as const, token: opts.token } : null);
+    if (!credentials) throw new Error("ProgressGitHub needs a token or App credentials");
+    this.credentials = credentials;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.now = opts.now ?? Date.now;
     this.sleep = opts.sleep ?? realSleep;
@@ -161,7 +237,76 @@ export class ProgressGitHub {
    * One request. Returns the parsed JSON body on 2xx. Throws GitHubAuthError on 401,
    * GitHubRateLimitError on a rate limit, GitHubRequestError otherwise.
    */
-  async request(method: "GET" | "POST", pathOrUrl: string, body?: unknown): Promise<unknown> {
+  async request(method: "GET" | "POST", pathOrUrl: string, body?: unknown, owner?: string): Promise<unknown> {
+    return this.exchange(method, pathOrUrl, body, await this.authorization(owner));
+  }
+
+  /**
+   * The Authorization header for a call about `owner`'s repos. With App
+   * credentials, an installation token for that owner, minted once and reused
+   * until a minute before it expires.
+   */
+  private async authorization(owner: string | undefined): Promise<string> {
+    if (this.credentials.kind === "token") return `Bearer ${this.credentials.token}`;
+    if (!owner) throw new Error("an App-authenticated call needs the repo owner");
+    const key = owner.toLowerCase();
+    const cached = this.ownerAuth.get(key);
+    if (cached?.kind === "not_installed") throw new GitHubAppNotInstalledError(owner);
+    if (cached?.kind === "failed") throw new GitHubAppTokenError(owner, cached.status);
+    if (cached?.kind === "token" && cached.expiresAt > this.now() + TOKEN_REFRESH_MARGIN_MS) return `Bearer ${cached.token}`;
+    const minted = await this.mint(owner);
+    this.ownerAuth.set(key, minted);
+    if (minted.kind === "not_installed") throw new GitHubAppNotInstalledError(owner);
+    if (minted.kind === "failed") throw new GitHubAppTokenError(owner, minted.status);
+    return `Bearer ${minted.token}`;
+  }
+
+  /** The App JWT. A key that cannot sign is the run's auth failure, like a 401. */
+  private appJwt(): string {
+    if (this.credentials.kind !== "app") throw new GitHubAuthError();
+    try {
+      return `Bearer ${githubAppJwt(this.credentials.appId, this.credentials.privateKey, this.now())}`;
+    } catch {
+      throw new GitHubAuthError();
+    }
+  }
+
+  /**
+   * Installation lookup (user, then org) and token mint for one owner. A 401 on
+   * an /app endpoint is GitHubAuthError (bad App ID or key). 404 on both lookups
+   * is not installed. Other failures are cached as failed for this run.
+   */
+  private async mint(owner: string): Promise<OwnerAuth> {
+    const jwt = this.appJwt();
+    const name = encodeURIComponent(owner);
+    let installation: unknown = null;
+    for (const path of [`users/${name}/installation`, `orgs/${name}/installation`]) {
+      try {
+        installation = await this.exchange("GET", path, undefined, jwt);
+        break;
+      } catch (err) {
+        if (!(err instanceof GitHubRequestError)) throw err;
+        if (err.status !== 404) return { kind: "failed", status: err.status };
+      }
+    }
+    const id = (installation as { id?: unknown } | null)?.id;
+    if (installation === null) return { kind: "not_installed" };
+    if (typeof id !== "number" || !Number.isSafeInteger(id)) return { kind: "failed", status: 200 };
+    let minted: unknown;
+    try {
+      minted = await this.exchange("POST", `app/installations/${id}/access_tokens`, undefined, jwt);
+    } catch (err) {
+      if (!(err instanceof GitHubRequestError)) throw err;
+      return { kind: "failed", status: err.status };
+    }
+    const body = minted as { token?: unknown; expires_at?: unknown } | null;
+    if (typeof body?.token !== "string" || body.token.length === 0) return { kind: "failed", status: 200 };
+    const expires = typeof body.expires_at === "string" ? Date.parse(body.expires_at) : Number.NaN;
+    this.mints += 1;
+    return { kind: "token", token: body.token, expiresAt: Number.isFinite(expires) ? expires : this.now() + 50 * 60_000 };
+  }
+
+  private async exchange(method: "GET" | "POST", pathOrUrl: string, body: unknown, authorization: string): Promise<unknown> {
     this.reserve(MIN_REQUEST_MS);
     const timeoutMs = this.requestTimeoutMs();
     const url = pathOrUrl.startsWith("https://") ? pathOrUrl : `${GITHUB_API}/${pathOrUrl.replace(/^\//, "")}`;
@@ -182,7 +327,7 @@ export class ProgressGitHub {
         method,
         headers: {
           accept: "application/vnd.github+json",
-          authorization: `Bearer ${this.token}`,
+          authorization,
           "x-github-api-version": GITHUB_API_VERSION,
           "user-agent": "agent-kontrol-progress-collector",
           ...(body === undefined ? {} : { "content-type": "application/json" }),
@@ -209,8 +354,8 @@ export class ProgressGitHub {
   }
 
   /** GraphQL `data`. Any `errors` entry fails the call; RATE_LIMITED is a rate limit. */
-  async graphql(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const json = (await this.request("POST", "graphql", { query, variables })) as Record<string, unknown> | null;
+  async graphql(query: string, variables: Record<string, unknown>, owner?: string): Promise<Record<string, unknown>> {
+    const json = (await this.request("POST", "graphql", { query, variables }, owner)) as Record<string, unknown> | null;
     if (!json || typeof json !== "object") throw new GitHubRequestError(200);
     const errors = json.errors;
     if (Array.isArray(errors) && errors.length > 0) {
@@ -233,15 +378,15 @@ export class ProgressGitHub {
   }
 
   /** One search page, retried once on an ordinary failure. Null when both attempts fail. */
-  private async search(params: Record<string, string>): Promise<Record<string, unknown> | null> {
+  private async search(params: Record<string, string>, owner?: string): Promise<Record<string, unknown> | null> {
     const qs = new URLSearchParams(params).toString();
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       await this.paceSearch();
       try {
-        const json = await this.request("GET", `search/issues?${qs}`);
+        const json = await this.request("GET", `search/issues?${qs}`, undefined, owner);
         if (json && typeof json === "object" && !Array.isArray(json)) return json as Record<string, unknown>;
       } catch (err) {
-        if (isAbort(err)) throw err;
+        if (mustPropagate(err)) throw err;
       }
       if (attempt === 1) await this.wait(this.searchRetryDelayMs);
     }
@@ -252,19 +397,37 @@ export class ProgressGitHub {
    * total_count for a search, as `search_count` in collect-progress.sh:
    * retried once, and null (never 0) when it still cannot be answered.
    */
-  async searchCount(q: string): Promise<number | null> {
-    const json = await this.search({ q, per_page: "1" });
+  async searchCount(q: string, owner?: string): Promise<number | null> {
+    const json = await this.search({ q, per_page: "1" }, owner);
     const total = json?.total_count;
     return typeof total === "number" && Number.isInteger(total) && total >= 0 ? total : null;
   }
 
   /** The first page of a search (`search_page`). total_count null and no items on failure. */
-  async searchPage(q: string, extra: Record<string, string> = {}): Promise<SearchPage> {
-    const json = await this.search({ q, per_page: "100", ...extra });
+  async searchPage(q: string, extra: Record<string, string> = {}, owner?: string): Promise<SearchPage> {
+    const json = await this.search({ q, per_page: "100", ...extra }, owner);
     const total = json?.total_count;
     if (!json || typeof total !== "number" || !Number.isInteger(total) || total < 0 || !Array.isArray(json.items)) {
       return { total_count: null, items: [] };
     }
     return { total_count: total, items: json.items.filter((i) => i && typeof i === "object") as Record<string, unknown>[] };
   }
+
+  /** The same calls, authenticated for one owner's repos. */
+  forOwner(owner: string): OwnerCalls {
+    return {
+      request: (method, path, body) => this.request(method, path, body, owner),
+      graphql: (query, variables) => this.graphql(query, variables, owner),
+      searchCount: (q) => this.searchCount(q, owner),
+      searchPage: (q, extra) => this.searchPage(q, extra, owner),
+    };
+  }
+}
+
+/** GitHub calls bound to one repo owner's credentials. */
+export interface OwnerCalls {
+  request(method: "GET" | "POST", path: string, body?: unknown): Promise<unknown>;
+  graphql(query: string, variables: Record<string, unknown>): Promise<Record<string, unknown>>;
+  searchCount(q: string): Promise<number | null>;
+  searchPage(q: string, extra?: Record<string, string>): Promise<SearchPage>;
 }

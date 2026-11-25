@@ -7,7 +7,7 @@ import { runProgressCollection } from "@/lib/progress-collect/run";
 import { defaultDeps, withCollectorLock } from "@/lib/progress-collect/store";
 import { cronAuthorized } from "@/lib/providers/scheduled";
 import type { Principal } from "@/lib/scopes";
-import { githubToken } from "@/lib/skills/source";
+import { collectorCredentials } from "@/lib/progress-collect/github";
 
 export const dynamic = "force-dynamic";
 // Limits (see progress-collect/run.ts): no repo starts after 240 s, no GitHub request runs past
@@ -19,8 +19,10 @@ export const maxDuration = 300;
  * One hosted tick of the progress collector (what scripts/collect-progress.sh
  * did on a workstation): the owner activity scan when its last run is over
  * 15 minutes old, then a detailed sweep of as many repos as fit, oldest first.
- * `vercel.json` schedules it every 5 minutes. GitHub is read with the
- * deployment's GH_TOKEN (or GITHUB_TOKEN).
+ * `vercel.json` schedules it every 5 minutes. GitHub is read through the
+ * read-only GitHub App when MC_GITHUB_APP_ID and MC_GITHUB_APP_PRIVATE_KEY are
+ * set (one installation token per repo owner), otherwise with GH_TOKEN (or
+ * GITHUB_TOKEN).
  *
  * Callers: Vercel Cron with `Authorization: Bearer $CRON_SECRET`, MC_TOKEN, or
  * the signed-in dashboard. An agent credential cannot call it.
@@ -42,16 +44,21 @@ async function collect(req: Request) {
   if (!isConfigured()) {
     return NextResponse.json({ ok: true, demo: true, note: "DATABASE_URL not set; nothing collected." });
   }
-  const token = githubToken();
-  if (!token) {
+  // Prefer the read-only GitHub App (a token per owner); otherwise GH_TOKEN / GITHUB_TOKEN.
+  const credentials = collectorCredentials();
+  if (!credentials) {
     return NextResponse.json(
-      { ok: false, error: "github_token_missing", note: "Set GH_TOKEN (or GITHUB_TOKEN) on the deployment." },
+      {
+        ok: false,
+        error: "github_token_missing",
+        note: "Set MC_GITHUB_APP_ID and MC_GITHUB_APP_PRIVATE_KEY (read-only GitHub App), or GH_TOKEN, on the deployment.",
+      },
       { status: 503 },
     );
   }
   try {
     const locked = await withCollectorLock(() =>
-      runWithPrincipal(principal, () => runProgressCollection(defaultDeps(token))),
+      runWithPrincipal(principal, () => runProgressCollection(defaultDeps(credentials))),
     );
     if (locked.busy) return NextResponse.json({ ok: true, skipped: "busy" });
     return NextResponse.json(locked.value.body, { status: locked.value.status });

@@ -12,6 +12,7 @@ import { readOwnerSettings, readRepoSettings } from "../settings-read";
 import { applyOwnerDiscovery, DiscoveryShortConflict, listWatchedOwners, ruleOf, sweepOf, type DiscoveryRequest } from "../watched-owners";
 import { loadTrackedRepos } from "../watched-repos";
 import type { DiscoveryResult } from "./activity";
+import type { GitHubCredentials } from "./github";
 import type { CollectDeps } from "./run";
 import type { DecisionSink, SweepSettings } from "./sweep";
 import { LANE_PR_CAP } from "./sweep";
@@ -110,9 +111,9 @@ export const decisionSink: DecisionSink = {
   },
 };
 
-export function defaultDeps(token: string): CollectDeps {
+export function defaultDeps(credentials: GitHubCredentials): CollectDeps {
   return {
-    token,
+    credentials,
     now: Date.now,
     settings: sweepSettings(),
     ingest: ingestSnapshots,

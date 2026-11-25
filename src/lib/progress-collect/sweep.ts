@@ -10,7 +10,7 @@
  */
 import type { SnapshotDetail } from "../progress-types";
 import { collectorDecisionBody, isDecisionLabel, type GhItem, type ReconcileInput, type UpsertInput } from "../decisions";
-import { isAbort, type ProgressGitHub } from "./github";
+import { mustPropagate, type OwnerCalls, type ProgressGitHub } from "./github";
 
 export interface SweepRepo {
   repo: string;
@@ -149,7 +149,7 @@ function checksOf(node: any): Check[] {
 
 /** Pages a created-desc GraphQL listing up to `limit` items. Ordinary failures end it as incomplete. */
 async function list<T>(
-  gh: ProgressGitHub,
+  gh: OwnerCalls,
   query: string,
   field: "issues" | "pullRequests",
   repo: string,
@@ -167,7 +167,7 @@ async function list<T>(
       conn = (data.repository as any)?.[field];
       if (!conn || !Array.isArray(conn.nodes)) return { items, complete: false };
     } catch (err) {
-      if (isAbort(err)) throw err;
+      if (mustPropagate(err)) throw err;
       return { items, complete: false };
     }
     for (const node of conn.nodes) items.push(map(node));
@@ -221,14 +221,14 @@ export function laneOf(commits: unknown, prefix: string, shared: readonly string
   return logins.length === 0 ? "human" : mostCommon(logins);
 }
 
-async function laneMixFor(gh: ProgressGitHub, repo: string, numbers: number[], settings: SweepSettings): Promise<Record<string, number>> {
+async function laneMixFor(gh: OwnerCalls, repo: string, numbers: number[], settings: SweepSettings): Promise<Record<string, number>> {
   const lanes: string[] = [];
   for (const n of numbers) {
     let lane = "unattributed";
     try {
       lane = laneOf(await gh.request("GET", `repos/${repo}/pulls/${n}/commits?per_page=100`), settings.laneBotPrefix, settings.sharedBotPrefixes) || "unattributed";
     } catch (err) {
-      if (isAbort(err)) throw err;
+      if (mustPropagate(err)) throw err;
     }
     lanes.push(lane);
   }
@@ -374,30 +374,32 @@ export async function collectRepo(
   nowMs: number,
 ): Promise<{ row: TickRow; listings: RepoListings }> {
   const { repo } = target;
+  // Every call about this repo uses its owner's credentials (per-owner App token, or GH_TOKEN).
+  const api = gh.forOwner(repo.split("/")[0]);
   const since = isoSeconds(nowMs - 86_400_000);
   const sinceDate = since.split("T")[0];
 
-  const open_issues = await gh.searchCount(`repo:${repo} is:issue is:open`);
-  const open_prs = await gh.searchCount(`repo:${repo} is:pr is:open`);
+  const open_issues = await api.searchCount(`repo:${repo} is:issue is:open`);
+  const open_prs = await api.searchCount(`repo:${repo} is:pr is:open`);
   const blocked_issues = target.blockedLabel
-    ? await gh.searchCount(`repo:${repo} is:issue is:open label:"${target.blockedLabel}"`)
+    ? await api.searchCount(`repo:${repo} is:issue is:open label:"${target.blockedLabel}"`)
     : null; // no such label in this repo - not tracked, not zero
-  const issues_closed_24h = await gh.searchCount(`repo:${repo} is:issue closed:>=${since}`);
-  const issues_opened_24h = await gh.searchCount(`repo:${repo} is:issue created:>=${since}`);
-  const total_issues_created = await gh.searchCount(`repo:${repo} is:issue`);
-  const total_issues_closed = await gh.searchCount(`repo:${repo} is:issue is:closed`);
-  const total_prs_merged = await gh.searchCount(`repo:${repo} is:pr is:merged`);
+  const issues_closed_24h = await api.searchCount(`repo:${repo} is:issue closed:>=${since}`);
+  const issues_opened_24h = await api.searchCount(`repo:${repo} is:issue created:>=${since}`);
+  const total_issues_created = await api.searchCount(`repo:${repo} is:issue`);
+  const total_issues_closed = await api.searchCount(`repo:${repo} is:issue is:closed`);
+  const total_prs_merged = await api.searchCount(`repo:${repo} is:pr is:merged`);
 
   // One search yields both the 24h merged count and the PR numbers for lane attribution.
-  const mergedPage = await gh.searchPage(`repo:${repo} is:pr is:merged merged:>=${since}`);
+  const mergedPage = await api.searchPage(`repo:${repo} is:pr is:merged merged:>=${since}`);
   const merged_prs_24h = mergedPage.total_count;
   const numbers = mergedPage.items.map((i) => i.number).filter((n): n is number => typeof n === "number").slice(0, settings.lanePrCap);
-  const lane_mix = await laneMixFor(gh, repo, numbers, settings);
+  const lane_mix = await laneMixFor(api, repo, numbers, settings);
 
   // Decisions need up to 2001 issues / 501 PRs; the brief reads the newest 200 / 100.
   const decisionsOn = settings.decisionLabels.length > 0;
-  const issues = await list(gh, OPEN_ISSUES_QUERY, "issues", repo, decisionsOn ? 2001 : 200, 100, mapIssue);
-  const prs = await list(gh, OPEN_PRS_QUERY, "pullRequests", repo, decisionsOn ? 501 : 100, 50, mapPr);
+  const issues = await list(api, OPEN_ISSUES_QUERY, "issues", repo, decisionsOn ? 2001 : 200, 100, mapIssue);
+  const prs = await list(api, OPEN_PRS_QUERY, "pullRequests", repo, decisionsOn ? 501 : 100, 50, mapPr);
   const prsForBrief = prs.items.slice(0, 100);
   const prsReadable = prs.complete || prs.items.length >= 100;
   const issuesReadable = issues.complete || issues.items.length >= 200;
@@ -411,7 +413,7 @@ export async function collectRepo(
     let mergedOk = true;
     const since72 = isoSeconds(nowMs - 72 * 3_600_000);
     for (let page = 1; page <= 2 && merged.length < 200; page += 1) {
-      const res = await gh.searchPage(`repo:${repo} is:pr is:merged merged:>=${since72}`, { sort: "created", order: "desc", page: String(page) });
+      const res = await api.searchPage(`repo:${repo} is:pr is:merged merged:>=${since72}`, { sort: "created", order: "desc", page: String(page) });
       if (res.total_count === null) {
         mergedOk = false;
         break;
