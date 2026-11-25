@@ -3,7 +3,7 @@ import type { SkillTriggerEvent, TriggerRunStatus } from "./skills-types";
 
 export function SkillTriggersTable({ triggers }: { triggers: readonly SkillTriggerEvent[] }) {
   return (
-    <section className="mt-4 rounded-xl border border-white/10 bg-panel">
+    <section className="mt-4 rounded-xl border border-fg/10 bg-panel">
       <h2 className="px-4 pt-4 text-sm font-semibold uppercase tracking-wider text-gray-400">Recent triggers</h2>
       {triggers.length === 0 ? (
         <p className="px-4 py-6 text-sm text-gray-500">No triggers yet.</p>
@@ -21,7 +21,7 @@ export function SkillTriggersTable({ triggers }: { triggers: readonly SkillTrigg
             </thead>
             <tbody>
               {triggers.map((trigger, index) => (
-                <tr key={`${trigger.at}-${trigger.agent}-${index}`} className="border-t border-white/5">
+                <tr key={`${trigger.at}-${trigger.agent}-${index}`} className="border-t border-fg/5">
                   <td className="px-4 py-2 text-gray-300">
                     <TimeAgo iso={trigger.at} />
                   </td>

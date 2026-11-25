@@ -62,21 +62,21 @@ export default function TraceDetail({ params }: { params: Promise<{ traceId: str
               {spans.length} spans · {formatDuration(wf.totalMs)} · {errors} {errors === 1 ? "error" : "errors"}
             </span>
           </div>
-          <div className="overflow-x-auto rounded-lg border border-white/10">
+          <div className="overflow-x-auto rounded-lg border border-fg/10">
             <div role="list" className="min-w-[640px]">
               {wf.rows.map((r) => (
                 <button
                   key={r.span.span_id}
                   role="listitem"
                   onClick={() => setSelected(r.span.span_id === selected ? null : r.span.span_id)}
-                  className={`grid w-full grid-cols-[minmax(160px,260px)_1fr_72px] items-center gap-3 border-b border-white/5 px-3 py-1.5 text-left text-sm last:border-b-0 hover:bg-white/[0.04] ${
-                    selected === r.span.span_id ? "bg-white/[0.06]" : ""
+                  className={`grid w-full grid-cols-[minmax(160px,260px)_1fr_72px] items-center gap-3 border-b border-fg/5 px-3 py-1.5 text-left text-sm last:border-b-0 hover:bg-fg/[0.04] ${
+                    selected === r.span.span_id ? "bg-fg/[0.06]" : ""
                   }`}
                 >
                   <span className="truncate" style={{ paddingLeft: `${Math.min(r.depth, 8) * 14}px` }}>
                     <span className={r.span.status === "error" ? "text-error" : ""}>{r.span.name}</span>
                   </span>
-                  <span className="relative h-3 rounded bg-white/5">
+                  <span className="relative h-3 rounded bg-fg/5">
                     <span
                       className={`absolute top-0 h-3 rounded ${r.span.status === "error" ? "bg-error" : KIND_COLOR[r.span.kind] ?? KIND_COLOR.other} ${r.open ? "animate-pulse" : ""}`}
                       style={{ left: `${r.offsetPct}%`, width: `${Math.min(r.widthPct, 100 - r.offsetPct)}%` }}
@@ -88,7 +88,7 @@ export default function TraceDetail({ params }: { params: Promise<{ traceId: str
             </div>
           </div>
           {chosen && (
-            <div className="mt-4 rounded-lg border border-white/10 p-4 text-sm">
+            <div className="mt-4 rounded-lg border border-fg/10 p-4 text-sm">
               <div className="mb-2 font-medium">{chosen.name}</div>
               <dl className="grid grid-cols-[120px_1fr] gap-y-1 text-xs">
                 <dt className="text-gray-500">Kind</dt>

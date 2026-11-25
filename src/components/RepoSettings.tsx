@@ -21,11 +21,11 @@ interface Loaded {
 }
 
 const input =
-  "w-full bg-bg border border-white/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-accent disabled:opacity-60";
+  "w-full bg-bg border border-fg/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-accent disabled:opacity-60";
 const primary =
   "bg-accent hover:bg-accent-hover text-accent-ink rounded-lg px-4 py-2 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed";
-const secondary = "border border-white/15 rounded-lg px-4 py-2 text-sm text-gray-200 hover:bg-white/5 disabled:opacity-50";
-const iconBtn = "rounded-md border border-white/10 px-2 py-1 text-xs text-gray-300 hover:bg-white/5 disabled:opacity-30";
+const secondary = "border border-fg/15 rounded-lg px-4 py-2 text-sm text-gray-200 hover:bg-fg/5 disabled:opacity-50";
+const iconBtn = "rounded-md border border-fg/10 px-2 py-1 text-xs text-gray-300 hover:bg-fg/5 disabled:opacity-30";
 const GRID = "md:grid md:grid-cols-[72px_minmax(0,2fr)_minmax(0,1.4fr)_minmax(0,0.8fr)_130px_minmax(0,1.2fr)_52px] md:items-start md:gap-3";
 
 export function RepoSettings() {
@@ -228,7 +228,7 @@ export function RepoSettings() {
 
   if (loadError) {
     return (
-      <div className="rounded-xl border border-white/10 bg-panel p-6">
+      <div className="rounded-xl border border-fg/10 bg-panel p-6">
         <p className="text-red-400 text-sm">{loadError}</p>
         <button className={`${secondary} mt-3`} onClick={() => void load()}>
           Retry
@@ -249,7 +249,7 @@ export function RepoSettings() {
       <div className="rounded-lg border border-accent/40 bg-accent/10 px-3 py-2 text-sm text-blue-100">{banner}</div>
 
       {autoRepos.length > 0 && (
-        <div className="rounded-xl border border-white/10 bg-panel p-4 md:p-6">
+        <div className="rounded-xl border border-fg/10 bg-panel p-4 md:p-6">
           <h3 className="text-sm font-medium text-gray-200">Discovered</h3>
           <p className="mt-1 text-xs text-gray-500">
             These stay collected. Pin keeps a quiet repo on the brief. Hide wins over pin. A repo marked gone is not shown, including when it is pinned.
@@ -259,8 +259,8 @@ export function RepoSettings() {
               const pinned = repo.pinned === true;
               const hidden = repo.hidden === true;
               return (
-                <li key={repo.repo} className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 px-3 py-2 text-sm">
-                  <span className="rounded bg-white/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-gray-300">auto</span>
+                <li key={repo.repo} className="flex flex-wrap items-center gap-3 rounded-lg border border-fg/10 px-3 py-2 text-sm">
+                  <span className="rounded bg-fg/10 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-gray-300">auto</span>
                   <span className="mono text-gray-100">{repo.repo}</span>
                   <span className="text-gray-400">{repo.label}</span>
                   {repo.gone && <span className="text-xs text-amber-300">gone</span>}
@@ -293,7 +293,7 @@ export function RepoSettings() {
         </div>
       )}
 
-      <div data-repo-settings className="rounded-xl border border-white/10 bg-panel p-4 md:p-6">
+      <div data-repo-settings className="rounded-xl border border-fg/10 bg-panel p-4 md:p-6">
         <div className={`hidden ${GRID} mb-2 text-[11px] uppercase tracking-wider text-gray-500`}>
           <span>Order</span>
           <span>Repo (owner/name)</span>
@@ -309,7 +309,7 @@ export function RepoSettings() {
             const e = grouped.rows[i] ?? {};
             const name = r.repo || `row ${i + 1}`;
             return (
-              <li key={r.id} className={`rounded-lg border border-white/10 p-3 md:border-0 md:p-0 ${GRID}`}>
+              <li key={r.id} className={`rounded-lg border border-fg/10 p-3 md:border-0 md:p-0 ${GRID}`}>
                 <div className="mb-2 flex gap-1 md:mb-0">
                   <button className={iconBtn} onClick={() => reorder(i, i - 1)} disabled={disabled || i === 0} aria-label={`Move ${name} up`}>
                     ↑
@@ -346,7 +346,7 @@ export function RepoSettings() {
                       value={/^#[0-9a-fA-F]{6}$/.test(r.color) ? r.color : "#00d8ff"}
                       disabled={disabled}
                       onChange={(ev) => edit(r.id, { color: ev.target.value })}
-                      className="h-9 w-10 cursor-pointer rounded-md border border-white/10 bg-transparent p-0.5 disabled:opacity-60"
+                      className="h-9 w-10 cursor-pointer rounded-md border border-fg/10 bg-transparent p-0.5 disabled:opacity-60"
                       aria-label={`Color for ${name}`}
                     />
                     <span className="mono text-xs text-gray-400">{r.color}</span>

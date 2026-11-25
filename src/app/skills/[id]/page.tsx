@@ -53,7 +53,7 @@ export default function SkillDetailPage() {
       </div>
 
       <div className="grid items-start gap-4 md:grid-cols-2">
-        <section className="min-w-0 rounded-xl border border-white/10 bg-panel p-4">
+        <section className="min-w-0 rounded-xl border border-fg/10 bg-panel p-4">
           <h2 className="mb-2 text-sm font-semibold uppercase tracking-wider text-gray-400">SKILL.md</h2>
           <CollapsibleMarkdown source={data.body ?? ""} className="text-sm leading-relaxed text-gray-300" />
           <h3 className="mt-4 text-xs font-semibold uppercase tracking-wider text-gray-500">References:</h3>

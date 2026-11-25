@@ -5,7 +5,7 @@ import { isCronNonEmpty, TRIGGER_OPTIONS } from "./SkillHelpers";
 import type { Trigger } from "./skills-types";
 
 const field =
-  "min-w-0 flex-1 rounded-lg border border-white/10 bg-bg px-3 py-2 text-sm text-gray-200 outline-none focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-40 sm:max-w-xs";
+  "min-w-0 flex-1 rounded-lg border border-fg/10 bg-bg px-3 py-2 text-sm text-gray-200 outline-none focus-visible:ring-2 focus-visible:ring-accent/70 disabled:opacity-40 sm:max-w-xs";
 
 export function SkillTriggerControl({
   skillId,

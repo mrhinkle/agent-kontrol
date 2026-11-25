@@ -160,7 +160,7 @@ export function Roster({
   const c = model.counts.byStatus;
   return (
     <nav aria-label="Agents" className="flex min-h-0 flex-col">
-      <div className="border-b border-white/10 px-4 py-3">
+      <div className="border-b border-fg/10 px-4 py-3">
         <h2 className="text-sm font-semibold text-gray-100">
           Agents <span className="text-gray-500">({model.counts.agents})</span>
         </h2>
@@ -197,8 +197,8 @@ export function Roster({
                     onMouseLeave={() => onHoverOrb(null)}
                     onFocus={() => onHoverOrb(o.id)}
                     onBlur={() => onHoverOrb(null)}
-                    className={`flex w-full items-start gap-2.5 border-l-2 px-4 py-2 text-left transition-colors hover:bg-white/5 focus-visible:bg-white/5 focus-visible:outline-none ${
-                      selected ? "border-white bg-white/[0.07]" : "border-transparent"
+                    className={`flex w-full items-start gap-2.5 border-l-2 px-4 py-2 text-left transition-colors hover:bg-fg/5 focus-visible:bg-fg/5 focus-visible:outline-none ${
+                      selected ? "border-fg bg-fg/[0.07]" : "border-transparent"
                     }`}
                   >
                     <span className="mt-1 flex items-center gap-1.5">
@@ -247,7 +247,7 @@ export function AgentPanel({
     <div className="p-4">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <h2 className="break-words text-base font-semibold text-white">{orb.label}</h2>
+          <h2 className="break-words text-base font-semibold text-fg">{orb.label}</h2>
           <div className="mt-1.5 flex flex-wrap items-center gap-2">
             <StatusPill status={orb.status} />
             <span className="mono inline-flex items-center gap-1.5 text-[11px] text-gray-300">
@@ -259,13 +259,13 @@ export function AgentPanel({
           type="button"
           onClick={onClose}
           aria-label="Close agent details"
-          className="-mr-1 -mt-1 rounded-md px-2 py-1 text-lg leading-none text-gray-400 hover:bg-white/5 hover:text-white"
+          className="-mr-1 -mt-1 rounded-md px-2 py-1 text-lg leading-none text-gray-400 hover:bg-fg/5 hover:text-fg"
         >
           ×
         </button>
       </div>
 
-      <section className="mt-4 rounded-lg border border-white/10 bg-black/25 p-3">
+      <section className="mt-4 rounded-lg border border-fg/10 bg-black/25 p-3">
         <h3 className="mono text-[10px] uppercase tracking-wider text-gray-500">
           {orb.currentTask ? "Current task" : orb.status === "active" || orb.status === "waiting" ? "Working on" : "Last session"}
         </h3>
@@ -330,7 +330,7 @@ export function AgentPanel({
       <div className="mt-4 flex flex-wrap gap-2">
         <Link
           href={`/history?agent=${encodeURIComponent(orb.id)}`}
-          className="rounded-lg border border-white/15 px-3 py-1.5 text-xs text-gray-100 hover:border-white/30 hover:bg-white/5"
+          className="rounded-lg border border-fg/15 px-3 py-1.5 text-xs text-gray-100 hover:border-fg/30 hover:bg-fg/5"
         >
           Open in History →
         </Link>
@@ -338,7 +338,7 @@ export function AgentPanel({
           <button
             type="button"
             onClick={() => onShowTower(orb.towerId as string)}
-            className="rounded-lg border border-white/15 px-3 py-1.5 text-xs text-gray-100 hover:border-white/30 hover:bg-white/5"
+            className="rounded-lg border border-fg/15 px-3 py-1.5 text-xs text-gray-100 hover:border-fg/30 hover:bg-fg/5"
           >
             Show {orb.project} tower
           </button>
@@ -348,7 +348,7 @@ export function AgentPanel({
       {orb.jobs.length > 1 && (
         <section className="mt-5">
           <h3 className="mono pb-1 text-[10px] uppercase tracking-wider text-gray-500">Recent sessions</h3>
-          <ul className="divide-y divide-white/5">
+          <ul className="divide-y divide-fg/5">
             {orb.jobs.slice(1).map((j) => (
               <li key={j.sessionId} className="py-2">
                 <div className="flex items-baseline gap-2 text-[12px]">
@@ -375,14 +375,14 @@ function FloorRow({ floor, selected, onSelect }: { floor: GibsonFloor; selected:
         type="button"
         onClick={onSelect}
         aria-pressed={selected}
-        className={`flex w-full items-center gap-2.5 border-l-2 px-2 py-2 text-left hover:bg-white/5 ${selected ? "border-white bg-white/5" : "border-transparent"}`}
+        className={`flex w-full items-center gap-2.5 border-l-2 px-2 py-2 text-left hover:bg-fg/5 ${selected ? "border-fg bg-fg/5" : "border-transparent"}`}
       >
         <span className="h-2.5 w-2.5 shrink-0 rounded-sm" style={{ backgroundColor: STATUS_COLORS[floor.status] }} />
         <span className="min-w-0 flex-1 text-[12.5px] leading-snug text-gray-200">{floor.title}</span>
         <span className="mono shrink-0 text-[10px] uppercase text-gray-400">{STATUS_LABELS[floor.status]}</span>
       </button>
       {selected && (
-        <div className="mb-2 ml-2 rounded-lg border border-white/10 bg-black/25 p-3 text-[12px]">
+        <div className="mb-2 ml-2 rounded-lg border border-fg/10 bg-black/25 p-3 text-[12px]">
           <p className="line-clamp-5 whitespace-pre-line leading-relaxed text-gray-400">{floor.description || "No description."}</p>
           <dl className="mono mt-2 grid grid-cols-2 gap-2 text-[10.5px] text-gray-300">
             <div>task #{floor.taskId}</div>
@@ -418,19 +418,19 @@ export function TowerPanel({
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <p className="mono text-[10px] uppercase tracking-wider text-gray-500">Project tower</p>
-          <h2 className="break-words text-base font-semibold text-white">{tower.label}</h2>
+          <h2 className="break-words text-base font-semibold text-fg">{tower.label}</h2>
           <p className="mono mt-1 text-[11px] text-gray-400">
             {open.length} open · {done.length} done (7d) · {agents.length} agent{agents.length === 1 ? "" : "s"} on it
           </p>
         </div>
-        <button type="button" onClick={onClose} aria-label="Close tower details" className="-mr-1 -mt-1 rounded-md px-2 py-1 text-lg leading-none text-gray-400 hover:bg-white/5 hover:text-white">
+        <button type="button" onClick={onClose} aria-label="Close tower details" className="-mr-1 -mt-1 rounded-md px-2 py-1 text-lg leading-none text-gray-400 hover:bg-fg/5 hover:text-fg">
           ×
         </button>
       </div>
       {agents.length > 0 && (
         <div className="mt-3 flex flex-wrap gap-1.5">
           {agents.map((a) => (
-            <button key={a.id} type="button" onClick={() => onSelectAgent(a.id)} className="inline-flex items-center gap-1.5 rounded-sm border border-white/10 px-2 py-0.5 text-[11px] text-gray-200 hover:border-white/30">
+            <button key={a.id} type="button" onClick={() => onSelectAgent(a.id)} className="inline-flex items-center gap-1.5 rounded-sm border border-fg/10 px-2 py-0.5 text-[11px] text-gray-200 hover:border-fg/30">
               <StatusDot status={a.status} reducedMotion /> {a.label}
             </button>
           ))}
@@ -456,7 +456,7 @@ function KeyToggle({ active, onClick, children }: { active: boolean; onClick: ()
       type="button"
       onClick={onClick}
       aria-pressed={active}
-      className={`flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-[12px] transition-colors hover:bg-white/5 ${active ? "bg-white/10 text-white" : "text-gray-300"}`}
+      className={`flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-[12px] transition-colors hover:bg-fg/5 ${active ? "bg-fg/10 text-fg" : "text-gray-300"}`}
     >
       {children}
     </button>
@@ -536,7 +536,7 @@ export function LegendPanel({
       </section>
 
       {(statusFilter.length > 0 || platformFilter.length > 0) && (
-        <button type="button" onClick={onClear} className="rounded-sm border border-white/20 px-3 py-1 text-[11px] text-gray-200 hover:bg-white/10">
+        <button type="button" onClick={onClear} className="rounded-sm border border-fg/20 px-3 py-1 text-[11px] text-gray-200 hover:bg-fg/10">
           × Clear filters
         </button>
       )}
@@ -555,14 +555,14 @@ export function LegendPanel({
 }
 
 export function Kbd({ children }: { children: ReactNode }) {
-  return <kbd className="rounded border border-white/20 bg-white/5 px-1 text-[10px] text-gray-200">{children}</kbd>;
+  return <kbd className="rounded border border-fg/20 bg-fg/5 px-1 text-[10px] text-gray-200">{children}</kbd>;
 }
 
 export function GibsonTooltip({ info }: { info: GibsonHoverInfo }) {
   const flipLeft = typeof window !== "undefined" && info.clientX > window.innerWidth - 320;
   return (
     <div
-      className="pointer-events-none fixed z-50 max-w-[19rem] rounded-lg border border-white/15 bg-bg/95 px-3 py-2 shadow-xl backdrop-blur"
+      className="pointer-events-none fixed z-50 max-w-[19rem] rounded-lg border border-fg/15 bg-bg/95 px-3 py-2 shadow-xl backdrop-blur"
       style={{
         left: flipLeft ? info.clientX - 14 : info.clientX + 16,
         top: info.clientY + 16,
@@ -571,7 +571,7 @@ export function GibsonTooltip({ info }: { info: GibsonHoverInfo }) {
       }}
       role="tooltip"
     >
-      <p className="text-[13px] font-medium leading-snug text-white">{info.label}</p>
+      <p className="text-[13px] font-medium leading-snug text-fg">{info.label}</p>
       <p className="mono mt-0.5 text-[10.5px] uppercase tracking-wider text-gray-400">{info.sub}</p>
       {info.detail && <p className="mt-1 line-clamp-2 text-[12px] leading-snug text-gray-300">{info.detail}</p>}
       {info.kind !== "floor" && <p className="mono mt-1 text-[10px] text-gray-500">click for details</p>}

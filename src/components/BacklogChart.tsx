@@ -90,7 +90,7 @@ export function BacklogChart({
 
   if (!geom) {
     return (
-      <div className="flex h-[220px] items-center justify-center rounded-lg border border-dashed border-white/10 px-6 text-center text-sm text-gray-500">
+      <div className="flex h-[220px] items-center justify-center rounded-lg border border-dashed border-fg/10 px-6 text-center text-sm text-gray-500">
         {emptyHint ?? "Not enough history yet — the graph fills in as the collector runs."}
       </div>
     );
@@ -119,7 +119,7 @@ export function BacklogChart({
       <div className="mb-2 flex flex-wrap items-baseline gap-x-4 gap-y-1 text-xs">
         <span className="mono text-gray-500">{point.date}</span>
         <span className="mono text-gray-400">
-          backlog <span className="font-semibold text-white tabular-nums">{backlog.toLocaleString()}</span>
+          backlog <span className="font-semibold text-fg tabular-nums">{backlog.toLocaleString()}</span>
         </span>
         <span className="mono text-gray-600">
           {point.created.toLocaleString()} created · {point.closed.toLocaleString()} closed
@@ -142,16 +142,15 @@ export function BacklogChart({
               x2={W - PAD.right}
               y1={geom.y(t)}
               y2={geom.y(t)}
-              stroke="rgba(255,255,255,0.07)"
+              className="stroke-fg/10"
               strokeWidth={1}
             />
             <text
               x={PAD.left - 8}
               y={geom.y(t) + 3.5}
               textAnchor="end"
-              className="mono"
+              className="mono fill-muted-dim"
               fontSize={10}
-              fill="#6b7c8f"
             >
               {t >= 1000 ? `${(t / 1000).toFixed(1)}k` : Math.round(t)}
             </text>
@@ -159,21 +158,21 @@ export function BacklogChart({
         ))}
 
         {/* the gap is the backlog */}
-        <path d={geom.area} fill="#f07178" fillOpacity={0.12} />
-        <path d={geom.line("created")} fill="none" stroke="#f07178" strokeWidth={1.75} />
-        <path d={geom.line("closed")} fill="none" stroke="#3ecf8e" strokeWidth={1.75} />
+        <path d={geom.area} className="fill-error" fillOpacity={0.12} />
+        <path d={geom.line("created")} fill="none" className="stroke-error" strokeWidth={1.75} />
+        <path d={geom.line("closed")} fill="none" className="stroke-success" strokeWidth={1.75} />
 
         <line
           x1={geom.x(idx)}
           x2={geom.x(idx)}
           y1={PAD.top}
           y2={H - PAD.bottom}
-          stroke="rgba(255,255,255,0.25)"
+          className="stroke-fg/30"
           strokeWidth={1}
           strokeDasharray="3 3"
         />
-        <circle cx={geom.x(idx)} cy={geom.y(point.created)} r={3} fill="#f07178" />
-        <circle cx={geom.x(idx)} cy={geom.y(point.closed)} r={3} fill="#3ecf8e" />
+        <circle cx={geom.x(idx)} cy={geom.y(point.created)} r={3} className="fill-error" />
+        <circle cx={geom.x(idx)} cy={geom.y(point.closed)} r={3} className="fill-success" />
 
         {labelIdx.map((i, n) => (
           <text
@@ -181,9 +180,8 @@ export function BacklogChart({
             x={geom.x(i)}
             y={H - 8}
             textAnchor={n === 0 ? "start" : n === labelIdx.length - 1 ? "end" : "middle"}
-            className="mono"
+            className="mono fill-muted-dim"
             fontSize={10}
-            fill="#6b7c8f"
           >
             {series[i].date.slice(5)}
           </text>
