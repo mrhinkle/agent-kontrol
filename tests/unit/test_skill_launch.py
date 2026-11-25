@@ -5,6 +5,8 @@ Context tests reuse the dispatcher Harness (real linked worktrees, fake api). Pr
 helper as a subprocess against a local fake pointer server, with a stub wrapper that follows the
 fleet-dispatch.sh hooks and stub CLIs. No network beyond 127.0.0.1, no real CLI, no host env file.
 """
+import argparse
+import io
 import json
 import os
 import signal
@@ -644,7 +646,9 @@ class TestDirect(ProcessHarness):
         cli = bindir / runtime
         cli.write_text(FAKE_DIRECT_CLI.format(py=sys.executable))
         cli.chmod(0o755)
-        env = {**self.env, **extra, "PATH": f"{bindir}{os.pathsep}{self.env['PATH']}"}
+        env = {**self.env, **extra, "PATH": f"{bindir}{os.pathsep}{self.env['PATH']}",
+               # The stub CLI reads STATE and STUB_MODE. Direct mode passes an allowlist, so name them.
+               "MC_CHILD_ENV_ALLOW": "STATE,STUB_MODE"}
         return subprocess.run(
             [sys.executable, str(HELPER), "direct", "--runtime", runtime, "--cwd", str(self.wt), "--lane", "lane-a",
              "--spec", str(self.base / "spec.md"), "--timeout", str(timeout), "--log", str(self.base / "d.log")]
@@ -707,6 +711,84 @@ class TestDirect(ProcessHarness):
         self.assertEqual(r.returncode, 124)
         self.assertIn("wall-timeout", r.stdout)
         self.assert_clean()
+
+
+class TestAllowlistedLaunch(unittest.TestCase):
+    def test_direct_mode_popen_env_excludes_mc_token(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        spec = base / "spec.md"
+        spec.write_text("do the thing\n")
+        log = base / "run.log"
+        ns = argparse.Namespace(
+            timeout=30, spec=str(spec), runtime="claude", cwd=str(base),
+            lane="lane-a", purpose="pilot", log=str(log),
+        )
+        ctx = mock.Mock(pointers_written=False, cwd=base)
+        proc = mock.Mock(pid=424242, returncode=0)
+        proc.poll.return_value = 0
+        signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        saved = {sig: signal.getsignal(sig) for sig in signals}
+        synthetic = {
+            "PATH": "/usr/bin",
+            "MC_TOKEN": "fixture-value-not-a-secret",
+            "MC_EVENT_TOKEN": "fixture-value-not-a-secret",
+            "MC_URL": "https://ak.example",
+            "ANTHROPIC_API_KEY": "fixture-value-not-a-secret",
+            "GH_TOKEN": "fixture-value-not-a-secret",
+        }
+        try:
+            with mock.patch.dict(os.environ, synthetic, clear=True), \
+                    mock.patch.object(sl, "prepare_context", return_value=ctx), \
+                    mock.patch.object(sl, "finish_context", return_value=mock.Mock(ok=True, note="clean")), \
+                    mock.patch.object(sl, "release_context"), \
+                    mock.patch.object(sl.md, "stop_group", return_value=True), \
+                    mock.patch.object(sl.subprocess, "Popen", return_value=proc) as popen, \
+                    mock.patch("sys.stdout", new=io.StringIO()):
+                rc = sl.main_direct(ns)
+        finally:
+            for sig, handler in saved.items():
+                signal.signal(sig, handler)
+        self.assertEqual(rc, 0)
+        self.assertIn("env", popen.call_args.kwargs)
+        env = popen.call_args.kwargs["env"]
+        self.assertNotIn("MC_TOKEN", env)
+        self.assertNotIn("MC_EVENT_TOKEN", env)
+        self.assertNotIn("GH_TOKEN", env)
+        self.assertIn("PATH", env)
+        self.assertIn("ANTHROPIC_API_KEY", env)
+        self.assertEqual(env["MC_URL"], "https://ak.example")
+
+    def test_main_worker_exec_strips_secrets_before_execvp(self):
+        seen = {}
+
+        def fake_execvp(_argv0, _argv):
+            seen["names"] = set(os.environ)
+            raise OSError("stopped")
+
+        ns = argparse.Namespace(args=["--", "worker-bin"])
+        synthetic = {
+            "PATH": "/usr/bin",
+            "MC_TOKEN": "fixture-value-not-a-secret",
+            "MC_EVENT_TOKEN": "fixture-value-not-a-secret",
+            "FLEET_DISPATCH_TOKEN": "fixture-value-not-a-secret",
+            "AK_SKILL_CONTROL": "/tmp/fixture.sock",
+            "AK_SKILL_NONCE": "fixture-nonce",
+        }
+        with mock.patch.dict(os.environ, synthetic, clear=True), \
+                mock.patch("os.setsid"), \
+                mock.patch.object(sl, "send_message", return_value={"ok": True}) as reg, \
+                mock.patch("os.execvp", side_effect=fake_execvp):
+            rc = sl.main_worker_exec(ns)
+        self.assertTrue(reg.called)
+        self.assertEqual(rc, 127)
+        self.assertNotIn("MC_TOKEN", seen["names"])
+        self.assertNotIn("MC_EVENT_TOKEN", seen["names"])
+        self.assertNotIn("AK_SKILL_CONTROL", seen["names"])
+        self.assertNotIn("AK_SKILL_NONCE", seen["names"])
+        self.assertIn("FLEET_DISPATCH_TOKEN", seen["names"])
+        self.assertIn("PATH", seen["names"])
 
 
 if __name__ == "__main__":

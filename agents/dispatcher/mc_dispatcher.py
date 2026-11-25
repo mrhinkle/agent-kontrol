@@ -76,6 +76,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import ak_pointers
+import child_env
 from dispatch_ready_bridge import bridge_frame_refusal, frame_untrusted_issue
 from run_telemetry import ParsedRun, build_detail, parse_cli_output, resumes_session
 
@@ -310,17 +311,18 @@ def stop_group_id(pgid: int, reap, grace: float) -> bool:
     return False
 
 
-def run_contained(cmd: list[str], cwd: Path, timeout: float) -> tuple[int, str, str]:
+def run_contained(cmd: list[str], cwd: Path, timeout: float, *, env: dict[str, str]) -> tuple[int, str, str]:
     """Run cmd in a new session and stop its whole process group before returning.
 
     Background children left by the CLI are stopped on exit, error, timeout, or
     exception, so none of them outlives the worktree lock. Output goes to temp
     files rather than pipes, so a child holding stdout open does not stall the wait.
+    env is the child's whole environment; the parent's environment is not inherited.
     """
     with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
         proc = subprocess.Popen(
             cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f,
-            start_new_session=True,
+            start_new_session=True, env=env,
         )
         timed_out = False
         try:
@@ -371,7 +373,9 @@ def run_cli(platform: str, prompt: str, cwd: Path, review: bool = False,
             return False, f"no CLI runner for platform {platform}", None
         try:
             # Returns only once the CLI's whole process group is stopped.
-            returncode, stdout, stderr = run_contained(cmd, cwd, TASK_TIMEOUT)
+            returncode, stdout, stderr = run_contained(
+                cmd, cwd, TASK_TIMEOUT, env=child_env.build_child_env(platform),
+            )
             finished = time.monotonic()
         except subprocess.TimeoutExpired:
             outcome, error_class = "timeout", "timeout"

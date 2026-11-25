@@ -96,6 +96,8 @@ worktree, you merge or delete it.
    the group (`setsid`, `setpgid`, or a daemonizing double fork into a new
    session) is not tracked and is unsupported; this is process-group
    bookkeeping, not a sandbox.
+   The CLI does not inherit the dispatcher's environment. See
+   [Child environment](#child-environment).
    - `claude -p "<prompt>" --output-format json --permission-mode acceptEdits`
      (cost captured from `total_cost_usd`)
    - `codex exec --sandbox workspace-write --json "<prompt>"`
@@ -192,6 +194,51 @@ the plist. Importing `mc_dispatcher` reads no file; only `main()` does.
   only if you accept the blast radius.
 - Anything requiring judgment or credentials beyond the repo should be an
   interactive Cowork/Claude session, not a dispatched task.
+
+## Child environment
+
+Dispatcher-launched CLIs and direct-mode CLIs (`ak_skill_launch.py direct`)
+start with an allowlisted environment, not a copy of the dispatcher's. A
+child receives:
+
+- base process names, when the dispatcher has them: `PATH`, `HOME`, `USER`,
+  `LOGNAME`, `SHELL`, `LANG`, `TERM`, `TMPDIR`, `TZ`, `SSH_AUTH_SOCK`,
+  `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY` and the lower-case
+  forms `http_proxy`, `https_proxy`, `no_proxy`, `all_proxy`,
+  `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`, and every name
+  starting with `LC_` or `XDG_`
+- non-secret Agent Kontrol settings: `MC_URL`, `MC_AGENT`, `MC_AGENT_NAME`,
+  `MC_TRACES`, `MC_TRACE_CAPTURE_CONTENT`
+- that CLI's own prefix: `ANTHROPIC_` and `CLAUDE_` for Claude (`claude` and
+  `claude-code`), `OPENAI_` and `CODEX_` for Codex, `XAI_` and `GROK_` for
+  Grok
+
+`MC_TOKEN` and `MC_EVENT_TOKEN` are never passed. The same is true of
+`MC_DASHBOARD_PASSWORD`, `MC_COOKIE_SECRET`, `MC_OAUTH_SECRET`,
+`CRON_SECRET`, `MC_CHILD_ENV_ALLOW`, and any other `MC_` name.
+
+`MC_CHILD_ENV_ALLOW` adds names. It is a comma-separated list read from the
+dispatcher's environment; whitespace around an entry is ignored. An entry is
+an exact name, or a prefix ending in one `*`. `FLEET_*` passes
+`FLEET_DISPATCH_TOKEN` and does not pass `FLEET`. A bare `*` or a `*`
+anywhere but the end is ignored. A name on the never-pass list is still
+omitted when the allow list matches it. Per-machine argv overrides
+(`MC_CLAUDE_ARGS`, `MC_CODEX_ARGS`, `MC_GROK_ARGS`) are read by the
+dispatcher and are not passed through as environment variables.
+
+`main_worker_exec` is deny-only. The worker under `fleet-dispatch.sh` has
+the never-pass names removed and then execs; the wrapper's other variables
+stay, including a dispatch token this repository does not know. Moving that
+path onto the allowlist is later work. The fleet-mode controller is
+unchanged: it is the operator's wrapper, not an agent, and it still receives
+the dispatcher's environment.
+
+The Claude Code hook still loads `~/.claude/mission-control.env` itself when
+that file exists, so telemetry from a dispatched `claude` run keeps working
+there. Where `MC_TOKEN` was supplied only through the dispatcher's
+environment, hook telemetry from dispatched Claude runs stops. A child
+running as the same OS user can still read `~/.claude/mission-control.env`
+and `~/.mission-control/env` on disk.
 
 ## Dispatch-ready handoff
 

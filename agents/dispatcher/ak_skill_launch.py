@@ -56,6 +56,7 @@ from pathlib import Path
 
 import ak_pointers
 import mc_dispatcher as md
+from child_env import build_child_env, strip_secret_env
 
 EX_SOFTWARE, EX_UNAVAILABLE, EX_CANTCREAT, EX_IOERR = 70, 69, 73, 74
 RUNTIMES = ("claude", "codex", "grok")
@@ -560,6 +561,7 @@ def main_worker_exec(ns: argparse.Namespace) -> int:
         return launch_failed(f"skills worker registration refused: {reply.get('error')}")
     for k in (CONTROL_ENV, NONCE_ENV):
         os.environ.pop(k, None)
+    strip_secret_env(os.environ)
     try:
         os.execvp(argv[0], argv)
     except OSError as e:
@@ -609,7 +611,8 @@ def main_direct(ns: argparse.Namespace) -> int:
         with open(ns.log, "ab") as log:
             try:
                 proc = subprocess.Popen(direct_argv(ns.runtime, prompt, ns.purpose), cwd=str(ctx.cwd), stdin=subprocess.DEVNULL,
-                                        stdout=log, stderr=log, start_new_session=True)
+                                        stdout=log, stderr=log, start_new_session=True,
+                                        env=build_child_env(ns.runtime))
                 ctx.register_worker(proc.pid)
                 deadline = start + ns.timeout
                 while proc.poll() is None and not abort and time.monotonic() < deadline:
