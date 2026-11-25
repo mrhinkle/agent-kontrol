@@ -2258,6 +2258,36 @@ export function openApiDocument(): Json {
           },
         }),
       },
+      "/api/progress/collect": {
+        get: operation({
+          operationId: "collectProgress",
+          tags: ["progress"],
+          summary: "Run one hosted progress-collector tick.",
+          description:
+            "Operator route for a scheduler; vercel.json runs it every 5 minutes. Authenticate with Bearer CRON_SECRET (Vercel Cron), MC_TOKEN, or a dashboard session. An agent credential is denied with 403. Reads GitHub with the deployment's GH_TOKEN (or GITHUB_TOKEN). Runs the owner activity scan when the newest kind=activity snapshot is 15 minutes old or absent, then collects as many board-eligible repos (not gone, hidden, or owner-excluded unless pinned) as fit in 240 seconds, never-collected and oldest kind=tick snapshot first. One repo may take at most 90 s; one over its cap or failing is listed in sweep.skipped and the run moves on. No GitHub request runs past 260 s. Each repo is written as its own kind=tick snapshot with its own collected_at, or not at all. A search GitHub cannot answer is stored as null, never 0. Body: ok, activity { ran, repos, status }, sweep { collected, skipped, remaining, rate_limited }, elapsed_ms. An overlapping run returns ok true with skipped busy and does nothing. GET and POST behave the same; the body is ignored. Never returns a token.",
+          security: cookieOrBearer,
+          responses: {
+            "200": jsonResponse("The tick result; skipped busy when another run holds the lock; or a demo no-op without a database.", { type: "object" }),
+            ...flatErrors,
+            "502": jsonResponse("GitHub refused the token (error github_auth), or no repo was collected because of a GitHub error. ok is false.", { type: "object" }),
+            "503": jsonResponse("No GH_TOKEN or GITHUB_TOKEN is set (error github_token_missing).", { type: "object" }),
+          },
+        }),
+        post: operation({
+          operationId: "collectProgressPost",
+          tags: ["progress"],
+          summary: "Run one hosted progress-collector tick.",
+          description:
+            "Operator route for a scheduler; vercel.json runs it every 5 minutes. Authenticate with Bearer CRON_SECRET (Vercel Cron), MC_TOKEN, or a dashboard session. An agent credential is denied with 403. Reads GitHub with the deployment's GH_TOKEN (or GITHUB_TOKEN). Runs the owner activity scan when the newest kind=activity snapshot is 15 minutes old or absent, then collects as many board-eligible repos (not gone, hidden, or owner-excluded unless pinned) as fit in 240 seconds, never-collected and oldest kind=tick snapshot first. One repo may take at most 90 s; one over its cap or failing is listed in sweep.skipped and the run moves on. No GitHub request runs past 260 s. Each repo is written as its own kind=tick snapshot with its own collected_at, or not at all. A search GitHub cannot answer is stored as null, never 0. Body: ok, activity { ran, repos, status }, sweep { collected, skipped, remaining, rate_limited }, elapsed_ms. An overlapping run returns ok true with skipped busy and does nothing. GET and POST behave the same; the body is ignored. Never returns a token.",
+          security: cookieOrBearer,
+          responses: {
+            "200": jsonResponse("The tick result; skipped busy when another run holds the lock; or a demo no-op without a database.", { type: "object" }),
+            ...flatErrors,
+            "502": jsonResponse("GitHub refused the token (error github_auth), or no repo was collected because of a GitHub error. ok is false.", { type: "object" }),
+            "503": jsonResponse("No GH_TOKEN or GITHUB_TOKEN is set (error github_token_missing).", { type: "object" }),
+          },
+        }),
+      },
       "/api/usage/collect": {
         get: operation({
           operationId: "collectProviderUsage",

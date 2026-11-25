@@ -95,6 +95,14 @@ describe("middleware with a dashboard password", () => {
     assert.equal((await middleware(req("/tasks", headers))).status, 307);
   });
 
+  it("lets the scheduled collectors' CRON_SECRET bearer reach the route, which checks it", async () => {
+    env.MC_DASHBOARD_PASSWORD = "pw";
+    env.MC_TOKEN = "tok";
+    for (const path of ["/api/usage/collect", "/api/progress/collect"]) {
+      assert.equal((await middleware(req(path, { authorization: "Bearer cron-secret" }))).status, 200, path);
+    }
+  });
+
   it("still 401s a non-credential bearer on API routes", async () => {
     env.MC_DASHBOARD_PASSWORD = "pw";
     env.MC_TOKEN = "tok";
