@@ -404,6 +404,8 @@ describe("runProgressCollection", () => {
     const out = await runProgressCollection(h.deps);
     assert.equal(out.body.activity.ran, true);
     assert.equal(out.body.activity.status, "partial");
+    assert.equal(out.status, 200, "a partial scan that wrote its unavailable rows is not a failed run");
+    assert.equal(out.body.ok, true);
     const activity = h.ingested.find((i) => i.kind === "activity")!;
     assert.equal(activity.repos.length, 1);
     const row = activity.repos[0] as any;
@@ -630,5 +632,58 @@ describe("sweep eligibility", () => {
     assert.deepEqual(out.body.sweep.collected, ["acme/shown", "acme/pinned-fork"]);
     assert.equal(out.body.sweep.remaining, 0);
     assert.deepEqual(sweepTargets(await h.deps.readRepos()).map((t) => t.repo), ["acme/shown", "acme/pinned-fork"]);
+  });
+});
+
+describe("zero sweep targets", () => {
+  const owners = [{ owner: "acme", include_forks: false, include_archived: false } as any];
+
+  it("no targets and no error is ok", async () => {
+    const h = harness({ repos: [] });
+    const out = await runProgressCollection(h.deps);
+    assert.equal(out.status, 200);
+    assert.equal(out.body.ok, true);
+    assert.deepEqual(out.body.sweep, { collected: [], skipped: [], remaining: 0, rate_limited: false });
+  });
+
+  it("no targets and no error, with the activity scan run and complete, is ok", async () => {
+    const h = harness({ repos: [], latestActivity: null });
+    const out = await runProgressCollection(h.deps);
+    assert.deepEqual(out.body.activity, { ran: true, repos: 0, status: "complete" });
+    assert.equal(out.status, 200);
+    assert.equal(out.body.ok, true);
+  });
+
+  it("no targets and the activity scan rate limited is 502 rate_limited", async () => {
+    const h = harness({ repos: [], latestActivity: null, owners,
+      override: () => ({ status: 429, body: { message: "slow down" } }) });
+    const out = await runProgressCollection(h.deps);
+    assert.equal(out.body.activity.status, "rate_limited");
+    assert.equal(out.status, 502);
+    assert.equal(out.body.ok, false);
+    assert.equal(out.body.error, "rate_limited");
+    assert.equal(out.body.sweep.rate_limited, true);
+    assert.deepEqual(h.ingested, []);
+  });
+
+  it("no targets and the activity scan failed outright is 502 collect_failed", async () => {
+    const h = harness({ repos: [], latestActivity: null, owners });
+    h.deps.readOwners = async () => ({ writable: true, max: 50, version: "v", owners: [{ owner: "not a valid owner!" } as any] });
+    const out = await runProgressCollection(h.deps);
+    assert.equal(out.body.activity.status, "failed");
+    assert.equal(out.status, 502);
+    assert.equal(out.body.error, "collect_failed");
+  });
+
+  it("an activity failure is not a run failure when the sweep still collected repos", async () => {
+    const h = harness({ repos: ["acme/a"], latestActivity: null, owners,
+      override: (_u, op) => op === "ProgressOwnerActivity" ? { status: 429, body: {} } : null });
+    // A GraphQL rate limit in the scan stops the sweep too, so this case uses a non-rate-limit failure.
+    h.deps.readOwners = async () => ({ writable: false, max: 50, version: "v", owners: [] });
+    const out = await runProgressCollection(h.deps);
+    assert.equal(out.body.activity.status, "settings_unavailable");
+    assert.deepEqual(out.body.sweep.collected, ["acme/a"]);
+    assert.equal(out.status, 200);
+    assert.equal(out.body.ok, true);
   });
 });

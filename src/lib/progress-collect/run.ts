@@ -267,10 +267,19 @@ export async function runProgressCollection(deps: CollectDeps): Promise<CollectO
     body.error = "github_auth";
     return finish(502);
   }
-  if (body.sweep.collected.length === 0 && targets.length > 0 && (stoppedBy !== null || body.sweep.skipped.length > 0)) {
-    // Zero repos collected because of an error is never ok.
+  // Zero repos collected because of an error is never ok. Two cases:
+  // - the sweep had repos to collect and collected none because of an error;
+  // - the activity scan ran and did not complete, and nothing at all was written
+  //   (no activity rows, no tick rows), which includes a run with no sweep targets.
+  // A scan that ended "partial" but wrote its unavailable rows wrote something, so it
+  // stays ok, as collect-progress.sh did. A run with no targets and no error is ok.
+  const sweepFailed = targets.length > 0 && body.sweep.collected.length === 0 &&
+    (stoppedBy !== null || body.sweep.skipped.length > 0);
+  const activityFailed = body.activity.ran && body.activity.status !== "complete" &&
+    body.activity.repos === 0 && body.sweep.collected.length === 0;
+  if (sweepFailed || activityFailed) {
     body.ok = false;
-    body.error = stoppedBy === "rate_limited" ? "rate_limited" : "collect_failed";
+    body.error = body.sweep.rate_limited ? "rate_limited" : "collect_failed";
     return finish(502);
   }
   return finish(200);
