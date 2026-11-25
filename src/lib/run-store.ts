@@ -23,6 +23,10 @@ export async function runMetrics(now = new Date()) {
     const run = parseRunTelemetry(row.detail);
     if (run) runs.push({ event_id: Number(row.id), agent_id: String(row.agent_id), platform: platformLabel(row.platform), run });
   }
+  // The two sources are separate launch paths, so one run is never in both: the dispatcher starts
+  // CLIs itself and never calls a fleet wrapper, and the wrappers never emit run_complete. Each
+  // source is capped at 1,000 rows, so the sample can hold up to 2,000; `truncated` is set when
+  // either source hit its cap, and the page says the cap is per source.
   // Fleet wrapper records (fleet-dispatch.sh, codex-review.sh, spec-review.sh) are stored as
   // ordinary milestone or error events. They are read here and shown as runs; nothing is copied.
   const wrapperRows = await db`

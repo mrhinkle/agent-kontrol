@@ -18,7 +18,7 @@ export function RunDashboard({ metrics }: { metrics: RunMetrics | null }) {
         </div>
         <form action="/observability"><button type="submit" className="rounded-md border border-white/20 px-3 py-2 text-sm text-gray-200 hover:bg-white/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent">Refresh</button></form>
       </div>
-      {metrics.truncated ? <p role="status" className="text-sm text-amber-200">Showing the most recent 1,000 stored records. These metrics cover that sample.</p> : null}
+      {metrics.truncated ? <p role="status" className="text-sm text-amber-200">Showing at most the 1,000 most recent stored records from each source (dispatcher and fleet wrappers). These metrics cover that sample.</p> : null}
       <dl className="grid grid-cols-2 gap-3 md:grid-cols-4">
         {[
           ["Completed runs", number(totals.completed_runs)],
