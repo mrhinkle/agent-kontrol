@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@neondatabase/serverless':
-        specifier: ^1.1.0
-        version: 1.2.0
+        specifier: ^1.2.1
+        version: 1.2.1
       '@react-three/drei':
         specifier: ^10.7.8
         version: 10.7.9(@react-three/fiber@9.8.2(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(three@0.187.0))(@types/react@19.3.0)(@types/three@0.187.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(three@0.187.0)
@@ -67,8 +67,8 @@ importers:
         specifier: ^0.187.0
         version: 0.187.0
       playwright:
-        specifier: ^1.65.0
-        version: 1.65.0
+        specifier: ^1.65.1
+        version: 1.65.1
       tailwindcss:
         specifier: ^4.3.5
         version: 4.3.5
@@ -453,8 +453,8 @@ packages:
     peerDependencies:
       three: '>= 0.159.0'
 
-  '@neondatabase/serverless@1.2.0':
-    resolution: {integrity: sha512-tnaqgixUengZQNd9ZrS3ytQfamJzLKY8QxgqWQTNHHtB+KrFQWk77JTbbpg4RD+J3qE4eO2lVytvGDX5Kj6FdQ==}
+  '@neondatabase/serverless@1.2.1':
+    resolution: {integrity: sha512-PI2JjuyEFE7oZDTkV/s6WP4KEceCwnjQHClfunhysuIATtvcVTBLdA4UgHTnJo7C0mkK+OZ6U7SV1NDnYa0HgA==}
     engines: {node: '>=19.0.0'}
 
   '@next/env@16.4.6':
@@ -1260,13 +1260,13 @@ packages:
     resolution: {integrity: sha512-wQ0b/W4Fr01qtpHlqSqspcj3EhBvimsdh0KlHhH8HRZnMsEa0ea2fTULOXOS9ccQr3om+GcGRk4e+isrZWV8qQ==}
     engines: {node: '>=16.20.0'}
 
-  playwright-core@1.65.0:
-    resolution: {integrity: sha512-vNSKgH6YqtN7cdT/L334zo0a+YwkrpicyrHJlWWPIm/Q+Nn2SWInil01oT0mbu96U4GgoRtCYQD9CzJQgju+lA==}
+  playwright-core@1.65.1:
+    resolution: {integrity: sha512-hqPpz7blSMPxWVdoeE1yiBSzXsKiVOd2k+kjCvmUywD2GPO2Dd9HfcWnq9NN0GHbNZDFgZ9JfBFr+X5/BLo0qw==}
     engines: {node: '>=20'}
     hasBin: true
 
-  playwright@1.65.0:
-    resolution: {integrity: sha512-F3AMWcR44qMBt4kq+6Kb6mX7bjGXshktKFOPULd7reED6ZJWevjbNRqysP7q+AATE9kdPEZBibex1BYsvpVoeA==}
+  playwright@1.65.1:
+    resolution: {integrity: sha512-vJ1FuoOrNwOKHUIVEvSt3jT1L+wjjDpwhwIstKtfvTh8XIG4FG4bIFuvNdMxi81LGfAhUgUZleVFaOLY4RIUUw==}
     engines: {node: '>=20'}
     hasBin: true
 
@@ -1833,7 +1833,7 @@ snapshots:
       promise-worker-transferable: 1.0.4
       three: 0.187.0
 
-  '@neondatabase/serverless@1.2.0': {}
+  '@neondatabase/serverless@1.2.1': {}
 
   '@next/env@16.4.6': {}
 
@@ -2576,11 +2576,11 @@ snapshots:
 
   pkce-challenge@5.0.1: {}
 
-  playwright-core@1.65.0: {}
+  playwright-core@1.65.1: {}
 
-  playwright@1.65.0:
+  playwright@1.65.1:
     dependencies:
-      playwright-core: 1.65.0
+      playwright-core: 1.65.1
 
   postcss@8.5.23:
     dependencies:
