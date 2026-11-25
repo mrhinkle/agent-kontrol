@@ -18,6 +18,7 @@ import { testSweeper } from "./pg-sweeper-tests";
 import { testProviderCosts } from "./pg-provider-costs-tests";
 import { testVelocityStore } from "./pg-velocity-tests";
 import { testProgressActivity } from "./pg-progress-activity-tests";
+import { testProgressCollectLock } from "./pg-progress-collect-tests";
 import { EVENT_FIXTURES, PING_PAYLOAD } from "../tests/ui/gh-event-fixtures";
 import { IdempotencyConflict, setIdempotencyClockForTests } from "../src/lib/idempotency";
 import { StaleWrite } from "../src/lib/revision";
@@ -408,6 +409,7 @@ async function main() {
   await testSweeper(tag, applyCanonicalSchema);
   await testVelocityStore();
   await testProgressActivity();
+  await testProgressCollectLock();
   await testProviderCosts();
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);

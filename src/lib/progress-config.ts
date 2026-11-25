@@ -129,6 +129,15 @@ export function repoConfig(repo: string): RepoConfig | undefined {
 export const LANE_BOT_PREFIX: string = config.laneBotPrefix;
 
 /**
+ * Bot-name prefixes that commit for several lanes, so their PRs stay
+ * unattributed (collect-progress.sh `sharedBotPrefixes`). Missing means none.
+ */
+export const SHARED_BOT_PREFIXES: readonly string[] = (() => {
+  const raw = (config as { sharedBotPrefixes?: unknown }).sharedBotPrefixes;
+  return Array.isArray(raw) ? raw.filter((item): item is string => typeof item === "string") : [];
+})();
+
+/**
  * Thresholds. Each one is the line past which the board says something out
  * loud in "Needs you" - every number here is a claim you can argue with, which
  * is the point of keeping them in one place.
