@@ -76,8 +76,8 @@ The argv is fixed (AC 86). The prompt goes on stdin and `cwd` is the clone:
     "Bash(wget:*)" "Bash(git push:*)" "Bash(git commit:*)" "Bash(git reset:*)" "Bash(git checkout:*)" "Bash(rm:*)"
 ```
 
-The environment is built from scratch: an isolated `HOME`, `CLAUDE_CONFIG_DIR` and `TMPDIR` inside
-the run's temporary directory, plus the OAuth token. `GH_TOKEN`, `GITHUB_TOKEN`, `GH_CONFIG_DIR`,
+The environment is built from scratch: an isolated `HOME`, `CLAUDE_CONFIG_DIR`, `TMPDIR` and
+`CLAUDE_CODE_TMPDIR` inside the run's temporary directory, plus the OAuth token. `GH_TOKEN`, `GITHUB_TOKEN`, `GH_CONFIG_DIR`,
 the installation token and the AK token are never present.
 [`sandbox.sb`](sandbox.sb) denies reads and writes under `/Users`, `/private/var/folders`,
 `/private/tmp`, `/Volumes` and `/opt/homebrew/etc`. The exceptions are the clone, the isolated

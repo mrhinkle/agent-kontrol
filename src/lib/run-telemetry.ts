@@ -83,7 +83,11 @@ export function parseRunTelemetry(value: unknown): RunTelemetry | null {
   return result;
 }
 
-export interface RunView { event_id: number; agent_id: string; platform: string; run: RunTelemetry }
+export interface RunView {
+  event_id: number; agent_id: string; platform: string; run: RunTelemetry;
+  /** False when the source reported no duration (fleet wrapper records). Absent means known. */
+  duration_known?: boolean;
+}
 
 export function summarizeRuns(rows: RunView[], since: number, until: number) {
   const unique = new Map<string, RunView>();
@@ -93,7 +97,8 @@ export function summarizeRuns(rows: RunView[], since: number, until: number) {
     unique.set(`${row.agent_id}:${run.run_id}`, { ...row, platform: platformLabel(row.platform), run });
   }
   const runs = [...unique.values()].sort((a, b) => Date.parse(b.run.ended_at) - Date.parse(a.run.ended_at));
-  const durations = runs.map((r) => r.run.duration_ms).sort((a, b) => a - b);
+  // A run with no reported duration counts as a run but never as a zero-length one.
+  const durations = runs.filter((r) => r.duration_known !== false).map((r) => r.run.duration_ms).sort((a, b) => a - b);
   const quantile = (q: number) => durations.length ? durations[Math.max(0, Math.ceil(q * durations.length) - 1)] : null;
   const models = new Map<string, { model: string; input_tokens: number | null; output_tokens: number | null; runs: number }>();
   for (const { run } of runs) {
@@ -112,6 +117,7 @@ export function summarizeRuns(rows: RunView[], since: number, until: number) {
     runs,
     totals: {
       completed_runs: runs.length,
+      runs_with_duration: durations.length,
       failed_runs: runs.filter(({ run }) => run.outcome !== "completed").length,
       runs_with_usage: runs.filter(({ run }) => run.usage_scope === "run" && run.model_usage.length).length,
       complete_usage_runs: runs.filter(({ run }) => run.usage_complete).length,

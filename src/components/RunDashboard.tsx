@@ -14,11 +14,11 @@ export function RunDashboard({ metrics }: { metrics: RunMetrics | null }) {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 id="run-metrics" className="text-lg font-medium text-white">Run observability</h2>
-          <p className="mt-1 text-xs text-gray-400">Completed dispatcher invocations in the last 24 hours.</p>
+          <p className="mt-1 text-xs text-gray-400">Completed runs in the last 24 hours, from the dispatcher and from the fleet wrappers (Grok lanes, Codex and spec reviews).</p>
         </div>
         <form action="/observability"><button type="submit" className="rounded-md border border-white/20 px-3 py-2 text-sm text-gray-200 hover:bg-white/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent">Refresh</button></form>
       </div>
-      {metrics.truncated ? <p role="status" className="text-sm text-amber-200">Showing the most recent 1,000 stored records. These metrics cover that sample.</p> : null}
+      {metrics.truncated ? <p role="status" className="text-sm text-amber-200">Showing at most the 1,000 most recent stored records from each source (dispatcher and fleet wrappers). These metrics cover that sample.</p> : null}
       <dl className="grid grid-cols-2 gap-3 md:grid-cols-4">
         {[
           ["Completed runs", number(totals.completed_runs)],
@@ -29,7 +29,7 @@ export function RunDashboard({ metrics }: { metrics: RunMetrics | null }) {
           <div key={label} className="rounded-xl border border-white/10 bg-panel p-4"><dt className="text-xs text-gray-400">{label}</dt><dd className="mt-2 text-xl font-semibold text-white">{value}</dd></div>
         ))}
       </dl>
-      <p className="text-xs leading-relaxed text-gray-400">Run duration measures the CLI process, including startup and tool work. Individual model-request latency is unavailable in this feed. Complete token reports: {totals.complete_usage_runs} of {totals.completed_runs} runs; {totals.runs_with_usage} have at least some usage data.</p>
+      <p className="text-xs leading-relaxed text-gray-400">Run duration measures the CLI process, including startup and tool work. Individual model-request latency is unavailable in this feed. Durations are known for {totals.runs_with_duration} of {totals.completed_runs} runs; the percentiles use only those. Fleet wrapper runs report no token counts, and a duration only when the wrapper sends one. Complete token reports: {totals.complete_usage_runs} of {totals.completed_runs} runs; {totals.runs_with_usage} have at least some usage data.</p>
       <div className="overflow-x-auto rounded-xl border border-white/10 bg-panel">
         <table className="w-full text-left text-sm">
           <caption className="px-4 py-3 text-left font-medium text-gray-200">Reported model usage · dispatcher runs</caption>
@@ -42,11 +42,11 @@ export function RunDashboard({ metrics }: { metrics: RunMetrics | null }) {
       </div>
       <div className="overflow-x-auto rounded-xl border border-white/10 bg-panel">
         <table className="w-full text-left text-sm">
-          <caption className="px-4 py-3 text-left font-medium text-gray-200">Recent completed invocations</caption>
+          <caption className="px-4 py-3 text-left font-medium text-gray-200">Recent completed runs</caption>
           <thead className="border-y border-white/10 text-xs text-gray-400"><tr><th scope="col" className="px-4 py-3">Platform</th><th scope="col" className="px-4 py-3">Role</th><th scope="col" className="px-4 py-3">Outcome</th><th scope="col" className="px-4 py-3">Duration</th><th scope="col" className="px-4 py-3">Usage</th></tr></thead>
           <tbody className="divide-y divide-white/5 text-gray-300">
-            {runs.slice(0, 30).map(({ event_id, run, platform }) => <tr key={event_id}><th scope="row" className="px-4 py-3 font-normal">{platform}</th><td className="px-4 py-3">{run.role}</td><td className={`px-4 py-3 ${run.outcome === "completed" ? "text-emerald-300" : "text-red-300"}`}>{run.outcome}{run.error_class ? <span className="mt-1 block text-xs text-gray-400">{run.error_class.replaceAll("_", " ")}</span> : null}</td><td className="whitespace-nowrap px-4 py-3">{duration(run.duration_ms)}</td><td className="px-4 py-3">{run.usage_complete ? "Complete" : run.model_usage.length ? "Partial" : "Unavailable"}</td></tr>)}
-            {!runs.length ? <tr><td colSpan={5} className="px-4 py-5 text-gray-400">No completed dispatcher invocations recorded in this window. The updated dispatcher must be activated before it reports runs.</td></tr> : null}
+            {runs.slice(0, 30).map(({ event_id, run, platform, duration_known }) => <tr key={event_id}><th scope="row" className="px-4 py-3 font-normal">{platform}</th><td className="px-4 py-3">{run.role}</td><td className={`px-4 py-3 ${run.outcome === "completed" ? "text-emerald-300" : "text-red-300"}`}>{run.outcome}{run.error_class ? <span className="mt-1 block text-xs text-gray-400">{run.error_class.replaceAll("_", " ")}</span> : null}</td><td className="whitespace-nowrap px-4 py-3">{duration(duration_known === false ? null : run.duration_ms)}</td><td className="px-4 py-3">{run.usage_complete ? "Complete" : run.model_usage.length ? "Partial" : "Unavailable"}</td></tr>)}
+            {!runs.length ? <tr><td colSpan={5} className="px-4 py-5 text-gray-400">No completed runs recorded in this window. Runs appear when a fleet wrapper finishes a lane or review, or when an updated dispatcher reports one.</td></tr> : null}
           </tbody>
         </table>
       </div>
