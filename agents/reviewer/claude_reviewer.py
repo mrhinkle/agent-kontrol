@@ -647,6 +647,9 @@ class Runner:
             "CLAUDE_CONFIG_DIR": os.path.join(home, ".claude"),
             "XDG_CONFIG_HOME": os.path.join(home, ".config"),
             "TMPDIR": os.path.join(home, "tmp"),
+            # Claude Code keeps scratch files in /tmp/claude-<uid> unless told otherwise; the sandbox
+            # denies /private/tmp, so without this the CLI exits at startup (EEXIST on mkdir).
+            "CLAUDE_CODE_TMPDIR": os.path.join(home, "tmp"),
             "LANG": "en_US.UTF-8",
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.path.join(home, ".gitconfig"),
