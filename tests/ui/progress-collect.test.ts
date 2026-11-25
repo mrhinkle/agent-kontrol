@@ -405,7 +405,7 @@ describe("runProgressCollection", () => {
     assert.deepEqual(h.discovery.map((d: any) => [d.owner, d.ok, d.error]), [["acme", false, "github_read_failed"]]);
   });
 
-  it("activity: runs when absent and records a complete owner scan", async () => {
+  it("activity: runs when absent and records a complete owner scan (owner saved as Acme, GitHub login acme)", async () => {
     const node = {
       id: "R_1", nameWithOwner: "acme/a", isArchived: false, isFork: false, pushedAt: iso(3),
       openPullRequests: { totalCount: 1 }, openIssues: { totalCount: 2 },
@@ -413,7 +413,7 @@ describe("runProgressCollection", () => {
       latestIssue: { totalCount: 5, nodes: [{ updatedAt: iso(1) }] },
     };
     const h = harness({ latestActivity: null, repos: ["acme/a"], budgetMs: 0,
-      owners: [{ owner: "acme", include_forks: false, include_archived: false } as any],
+      owners: [{ owner: "Acme", include_forks: false, include_archived: false } as any],
       override: (_u, op) => op === "ProgressOwnerActivity" ? { status: 200, body: { data: { repositoryOwner: { login: "acme",
         repositories: { totalCount: 1, pageInfo: { hasNextPage: false, endCursor: "c1" }, nodes: [node] } } } } } : null });
     const out = await runProgressCollection(h.deps);
@@ -422,6 +422,7 @@ describe("runProgressCollection", () => {
     assert.equal(row.open_prs, 1);
     assert.equal(row.detail.activity.open_issues, 2);
     assert.equal(row.detail.activity.status, "complete");
+    assert.deepEqual(h.discovery.map((d: any) => [d.owner, d.ok]), [["acme", true]]);
   });
 
   it("GitHub 401 -> 502 github_auth, nothing written", async () => {
