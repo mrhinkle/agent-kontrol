@@ -50,7 +50,7 @@ function useHeaderHeight(): number {
 
 function LoadingState() {
   return (
-    <div className="absolute inset-0 flex items-center justify-center bg-bg">
+    <div data-theme="dark" className="absolute inset-0 flex items-center justify-center bg-bg">
       <span className="mono animate-pulse text-sm tracking-[0.3em] text-accent">JACKING IN…</span>
     </div>
   );
@@ -62,7 +62,7 @@ const GibsonScene = dynamic(() => import("@/components/gibson/GibsonScene"), {
 });
 
 const toolBtn =
-  "mono min-h-[30px] min-w-[30px] rounded-md border border-white/15 bg-panel-elevated/90 px-2.5 text-[11px] text-gray-200 backdrop-blur transition-colors hover:border-white/35 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-40";
+  "mono min-h-[30px] min-w-[30px] rounded-md border border-fg/15 bg-panel-elevated/90 px-2.5 text-[11px] text-gray-200 backdrop-blur transition-colors hover:border-fg/35 hover:text-fg focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent disabled:opacity-40";
 
 export default function GibsonPage() {
   const { model, error } = useGibson();
@@ -169,13 +169,14 @@ export default function GibsonPage() {
 
   return (
     <div
+      data-theme="dark"
       className="fixed inset-x-0 bottom-0 z-[5] flex flex-col overflow-hidden bg-bg text-accent-core"
       style={{ top: headerH }}
     >
       {/* Top bar: title · status banner · drawn counts */}
-      <div className="flex flex-wrap items-center gap-x-6 gap-y-2 border-b border-white/10 bg-panel px-4 py-2.5">
+      <div className="flex flex-wrap items-center gap-x-6 gap-y-2 border-b border-fg/10 bg-panel px-4 py-2.5">
         <div className="shrink-0">
-          <h1 className="text-sm font-bold tracking-[0.24em] text-white">THE GIBSON</h1>
+          <h1 className="text-sm font-bold tracking-[0.24em] text-fg">THE GIBSON</h1>
           {c ? (
             <p className="mono text-[10.5px] text-gray-400" title="Every count is derived from what is drawn">
               <strong className="text-gray-200">{c.agents}</strong> agents · <strong className="text-gray-200">{c.machines}</strong> machines ·{" "}
@@ -193,7 +194,7 @@ export default function GibsonPage() {
       </div>
 
       <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[16.5rem_minmax(0,1fr)_21rem]">
-        <aside className="hidden min-h-0 border-r border-white/10 bg-bg lg:flex lg:flex-col">
+        <aside className="hidden min-h-0 border-r border-fg/10 bg-bg lg:flex lg:flex-col">
           {model && (
             <Roster
               model={model}
@@ -275,9 +276,9 @@ export default function GibsonPage() {
         </div>
 
         <aside
-          className={`min-h-0 flex-col border-l border-white/10 bg-bg ${panelOpen ? "absolute inset-y-0 right-0 z-20 flex w-[min(21rem,100vw)] lg:static lg:w-auto" : "hidden lg:flex"}`}
+          className={`min-h-0 flex-col border-l border-fg/10 bg-bg ${panelOpen ? "absolute inset-y-0 right-0 z-20 flex w-[min(21rem,100vw)] lg:static lg:w-auto" : "hidden lg:flex"}`}
         >
-          <div className="flex border-b border-white/10 text-[12px]" role="tablist">
+          <div className="flex border-b border-fg/10 text-[12px]" role="tablist">
             {(["details", "key"] as const).map((t) => (
               <button
                 key={t}
@@ -286,13 +287,13 @@ export default function GibsonPage() {
                 aria-selected={tab === t}
                 disabled={t === "details" && !hasDetails}
                 onClick={() => setPanelTab(t)}
-                className={`flex-1 px-3 py-2 capitalize transition-colors disabled:text-gray-600 ${tab === t ? "border-b-2 border-white text-white" : "text-gray-400 hover:text-gray-200"}`}
+                className={`flex-1 px-3 py-2 capitalize transition-colors disabled:text-gray-600 ${tab === t ? "border-b-2 border-fg text-fg" : "text-gray-400 hover:text-gray-200"}`}
               >
                 {t === "key" ? "Key & controls" : "Details"}
               </button>
             ))}
             {keyOpen && !hasDetails && (
-              <button type="button" onClick={() => setKeyOpen(false)} aria-label="Close key" className="px-3 text-gray-400 hover:text-white lg:hidden">
+              <button type="button" onClick={() => setKeyOpen(false)} aria-label="Close key" className="px-3 text-gray-400 hover:text-fg lg:hidden">
                 ×
               </button>
             )}

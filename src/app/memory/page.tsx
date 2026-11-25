@@ -125,7 +125,7 @@ export default function MemoryPage() {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Search notes…"
-          className="bg-panel border border-white/10 rounded-lg px-3 py-1.5 text-sm outline-none focus:border-accent w-64"
+          className="bg-panel border border-fg/10 rounded-lg px-3 py-1.5 text-sm outline-none focus:border-accent w-64"
         />
       </div>
 
@@ -133,11 +133,11 @@ export default function MemoryPage() {
 
       <div className="grid gap-3">
         {items.map((m) => (
-          <div key={m.id} className="rounded-xl border border-white/10 bg-panel p-4">
+          <div key={m.id} className="rounded-xl border border-fg/10 bg-panel p-4">
             <div className="flex items-center gap-3 text-xs text-gray-500 mb-1.5 flex-wrap">
               {m.key && <span className="mono text-accent">{m.key}</span>}
               {m.tags.map((t) => (
-                <span key={t} className="rounded-sm bg-white/5 px-2 py-0.5 mono">
+                <span key={t} className="rounded-sm bg-fg/5 px-2 py-0.5 mono">
                   #{t}
                 </span>
               ))}
@@ -147,7 +147,7 @@ export default function MemoryPage() {
               {m.key && (
                 <button
                   type="button"
-                  className="text-[11px] text-gray-500 hover:text-white"
+                  className="text-[11px] text-gray-500 hover:text-fg"
                   onClick={() => {
                     setFormError(null);
                     setPreview(null);
@@ -163,7 +163,7 @@ export default function MemoryPage() {
                 <textarea
                   value={draft.content}
                   onChange={(e) => setDraft({ ...draft, content: e.target.value })}
-                  className="min-h-24 w-full rounded-lg border border-white/10 bg-bg px-3 py-2 text-sm text-gray-200 outline-none focus:border-accent"
+                  className="min-h-24 w-full rounded-lg border border-fg/10 bg-bg px-3 py-2 text-sm text-gray-200 outline-none focus:border-accent"
                   aria-label={`Replacement for ${m.key}`}
                 />
                 <div className="mt-2 flex gap-2">
@@ -177,7 +177,7 @@ export default function MemoryPage() {
                   </button>
                   <button
                     type="button"
-                    className="rounded-lg border border-white/15 px-3 py-1.5 text-sm text-gray-200"
+                    className="rounded-lg border border-fg/15 px-3 py-1.5 text-sm text-gray-200"
                     onClick={() => setDraft(null)}
                   >
                     Back

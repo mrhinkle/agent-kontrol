@@ -35,7 +35,7 @@ export default function LoginPage() {
 
   return (
     <div className="flex items-center justify-center min-h-[60vh]">
-      <form onSubmit={submit} className="w-full max-w-sm rounded-xl border border-white/10 bg-panel p-6">
+      <form onSubmit={submit} className="w-full max-w-sm rounded-xl border border-fg/10 bg-panel p-6">
         <div className="flex items-center gap-2 mb-4">
           <span className="inline-block h-2.5 w-2.5 rounded-full bg-error pulse-dot" />
           <span className="font-semibold">Agent Kontrol</span>
@@ -49,7 +49,7 @@ export default function LoginPage() {
           autoFocus
           value={password}
           onChange={(e) => setPassword(e.target.value)}
-          className="w-full bg-bg border border-white/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-accent mb-3"
+          className="w-full bg-bg border border-fg/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-accent mb-3"
         />
         {error && <div className="text-red-400 text-sm mb-3">{error}</div>}
         <button

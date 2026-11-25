@@ -7,7 +7,7 @@ import { shortSha } from "./SkillHelpers";
 import type { SkillSyncView, SkillUpstream } from "./skills-types";
 
 const control =
-  "rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-semibold text-gray-200 hover:bg-white/10 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70";
+  "rounded-lg border border-fg/10 bg-fg/5 px-3 py-1.5 text-xs font-semibold text-gray-200 hover:bg-fg/10 disabled:opacity-40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70";
 
 export function SkillUpstreamHeader({ upstream, onSynced }: { upstream: SkillUpstream; onSynced: () => void }) {
   const [pending, setPending] = useState(false);

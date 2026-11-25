@@ -23,10 +23,10 @@ type Credential = {
 };
 
 const input =
-  "w-full bg-bg border border-white/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-accent";
+  "w-full bg-bg border border-fg/10 rounded-lg px-3 py-2 text-sm outline-none focus:border-accent";
 const primary =
   "bg-accent hover:bg-accent-hover text-accent-ink rounded-lg px-4 py-2 text-sm font-medium disabled:opacity-50";
-const secondary = "border border-white/15 rounded-lg px-3 py-1.5 text-sm text-gray-200 hover:bg-white/5 disabled:opacity-50";
+const secondary = "border border-fg/15 rounded-lg px-3 py-1.5 text-sm text-gray-200 hover:bg-fg/5 disabled:opacity-50";
 
 const LIMIT_RANGE = `${RATE_LIMIT_MIN} to ${RATE_LIMIT_MAX.toLocaleString("en-US")}`;
 
@@ -144,7 +144,7 @@ function LimitEditor({ credential, onSaved }: { credential: Credential; onSaved:
   }
   return (
     <form
-      className="mt-3 w-full space-y-3 rounded-lg border border-white/10 p-3"
+      className="mt-3 w-full space-y-3 rounded-lg border border-fg/10 p-3"
       aria-label={`Request limits for ${credential.label}`}
       onSubmit={(e) => {
         e.preventDefault();
@@ -317,7 +317,7 @@ export function CredentialSettings() {
       )}
 
       <form
-        className="space-y-3 rounded-xl border border-white/10 bg-panel p-4"
+        className="space-y-3 rounded-xl border border-fg/10 bg-panel p-4"
         onSubmit={(e) => {
           e.preventDefault();
           void create();
@@ -367,7 +367,7 @@ export function CredentialSettings() {
       {credentials && credentials.length > 0 && (
         <ul className="space-y-2">
           {credentials.map((credential) => (
-            <li key={credential.id} className="rounded-xl border border-white/10 bg-panel p-4 text-sm">
+            <li key={credential.id} className="rounded-xl border border-fg/10 bg-panel p-4 text-sm">
               <div className="flex flex-wrap items-baseline justify-between gap-2">
                 <span className="font-medium">{credential.label}</span>
                 <span className="font-mono text-xs text-gray-400">{credential.token_prefix}…</span>

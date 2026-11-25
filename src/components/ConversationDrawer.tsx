@@ -121,7 +121,7 @@ export function ConversationDrawer({ agent }: { agent: FleetAgent }) {
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center justify-between gap-2 rounded-lg border border-white/10 bg-bg px-2.5 py-1.5 text-xs text-gray-300 hover:border-white/20 transition-colors"
+        className="w-full flex items-center justify-between gap-2 rounded-lg border border-fg/10 bg-bg px-2.5 py-1.5 text-xs text-gray-300 hover:border-fg/20 transition-colors"
       >
         <span className="font-medium">
           {open ? "Hide conversation" : "Conversation"}
@@ -142,7 +142,7 @@ export function ConversationDrawer({ agent }: { agent: FleetAgent }) {
       </button>
 
       {open && (
-        <div className="mt-2 rounded-lg border border-white/10 bg-bg p-2.5 flex flex-col gap-2">
+        <div className="mt-2 rounded-lg border border-fg/10 bg-bg p-2.5 flex flex-col gap-2">
           {setupRequired ? (
             <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-2 text-[11px] text-amber-50">
               <div className="font-semibold text-amber-100">Two-way messaging isn&apos;t set up yet</div>
@@ -169,8 +169,8 @@ export function ConversationDrawer({ agent }: { agent: FleetAgent }) {
                       key={m.id}
                       className={`rounded-md px-2 py-1.5 text-[11px] leading-snug ${
                         inbound
-                          ? "bg-[#152038] text-gray-200 self-end ml-6"
-                          : "bg-[#13281f] text-emerald-50 self-start mr-6"
+                          ? "bg-accent/10 text-gray-200 self-end ml-6"
+                          : "bg-success/10 text-gray-200 self-start mr-6"
                       }`}
                     >
                       <div className="flex items-center justify-between gap-2 mb-0.5">
@@ -197,7 +197,7 @@ export function ConversationDrawer({ agent }: { agent: FleetAgent }) {
                     if (e.key === "Enter") void send();
                   }}
                   placeholder={`Message ${agent.display_name ?? agent.id}…`}
-                  className="flex-1 bg-panel border border-white/10 rounded-lg px-2.5 py-1.5 text-xs outline-none focus:border-accent"
+                  className="flex-1 bg-panel border border-fg/10 rounded-lg px-2.5 py-1.5 text-xs outline-none focus:border-accent"
                 />
                 <button
                   type="button"

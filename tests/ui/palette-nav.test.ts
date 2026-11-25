@@ -14,16 +14,22 @@ const contrast = (a: string, b: string) => {
   const [hi, lo] = [lum(a), lum(b)].sort((x, y) => y - x);
   return (hi + 0.05) / (lo + 0.05);
 };
-// Classes name Ion tokens (bg-success, text-muted); globals.css holds their values.
-const THEME = readFileSync(new URL("../../src/app/globals.css", import.meta.url), "utf8");
-const hexOf = (cls: string) => {
+// Classes name Ion tokens (bg-success, text-muted); globals.css holds their values:
+// light in the @theme block, dark under [data-theme="dark"].
+const CSS = readFileSync(new URL("../../src/app/globals.css", import.meta.url), "utf8");
+const THEMES = {
+  light: CSS.slice(CSS.indexOf("@theme {"), CSS.indexOf("@theme inline")),
+  dark: CSS.slice(CSS.indexOf('[data-theme="dark"] {')),
+};
+const hexOf = (cls: string, theme: keyof typeof THEMES = "dark") => {
   const token = /^(?:bg|text|ring)-([a-z-]+?)(?:\/\d+)?$/.exec(cls)?.[1];
-  const m = token ? new RegExp(`--color-${token}:\\s*(#[0-9a-f]{6})`, "i").exec(THEME) : null;
-  assert.ok(m, `no Ion token for ${cls}`);
+  const m = token ? new RegExp(`--color-${token}:\\s*(#[0-9a-f]{6})`, "i").exec(THEMES[theme]) : null;
+  assert.ok(m, `no Ion ${theme} token for ${cls}`);
   return m[1];
 };
-// Chips sit on an Ion panel (#12151a) with a white/5 fill: 0.95*panel + 0.05*white.
-const CHIP_BG = "#1e2125";
+// Chips are an Ion panel with an fg/5 fill: 0.95*panel + 0.05*fg.
+// Dark: #12151a + 5% #e8eaed. Light: #ffffff + 5% #0d1117.
+const CHIP_BG = { dark: "#1e2125", light: "#f3f4f4" };
 
 describe("task status chips use the Fleet/Gibson palette", () => {
   it("green running, amber review, red failed, dim done", () => {
@@ -38,10 +44,12 @@ describe("task status chips use the Fleet/Gibson palette", () => {
     for (const st of ["queued", "claimed", "running", "review", "done", "failed", "cancelled"]) assert.ok(TASK_STATUS_STYLES[st], st);
   });
 
-  it("chip text meets WCAG AA (4.5:1) for small text, for task and agent chips", () => {
-    for (const [name, s] of [...Object.entries(TASK_STATUS_STYLES), ...Object.entries(STATUS_STYLES).map(([k, v]) => [`agent:${k}`, v] as const)]) {
-      const ratio = contrast(hexOf(s.text), CHIP_BG);
-      assert.ok(ratio >= 4.5, `${name}: ${ratio.toFixed(2)}:1`);
+  it("chip text meets WCAG AA (4.5:1) for small text, for task and agent chips, in both themes", () => {
+    for (const theme of ["light", "dark"] as const) {
+      for (const [name, s] of [...Object.entries(TASK_STATUS_STYLES), ...Object.entries(STATUS_STYLES).map(([k, v]) => [`agent:${k}`, v] as const)]) {
+        const ratio = contrast(hexOf(s.text, theme), CHIP_BG[theme]);
+        assert.ok(ratio >= 4.5, `${theme} ${name}: ${ratio.toFixed(2)}:1`);
+      }
     }
   });
 });

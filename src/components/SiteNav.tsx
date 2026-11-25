@@ -50,7 +50,7 @@ export function SiteNav() {
             ? "bg-accent/15 text-accent"
             : l.accent
               ? "text-accent/80 hover:text-accent"
-              : "text-gray-400 hover:text-white";
+              : "text-gray-400 hover:text-fg";
           return (
             <Link
               key={l.href}

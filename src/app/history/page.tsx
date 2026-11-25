@@ -47,7 +47,7 @@ function History() {
           <select
             value={agentId ?? ""}
             onChange={(e) => setAgent(e.target.value || null)}
-            className="rounded-md border border-white/10 bg-panel px-2 py-1 text-sm text-gray-200 focus:border-white/30 focus:outline-none"
+            className="rounded-md border border-fg/10 bg-panel px-2 py-1 text-sm text-gray-200 focus:border-fg/30 focus:outline-none"
           >
             <option value="">All agents ({agents.length})</option>
             {agentId && !selected && <option value={agentId}>{agentId} (not reporting)</option>}
@@ -67,7 +67,7 @@ function History() {
       </div>
 
       {agentId && !selected ? (
-        <div className="rounded-lg border border-white/10 bg-panel px-4 py-6 text-sm text-gray-400">
+        <div className="rounded-lg border border-fg/10 bg-panel px-4 py-6 text-sm text-gray-400">
           No agent with id <span className="mono text-gray-200">{agentId}</span> is in the fleet right now. It may have been renamed or
           stopped reporting.{" "}
           <Link href="/history" className="text-gray-200 underline underline-offset-2">
@@ -143,7 +143,7 @@ function HistoryLists({
           Hide heartbeats & telemetry{backgroundCount > 0 && hideBackground ? ` (${backgroundCount} hidden)` : ""}
         </label>
       </div>
-      <ol className="relative pl-5 before:absolute before:bottom-0 before:left-1.5 before:top-0 before:w-px before:bg-white/10">
+      <ol className="relative pl-5 before:absolute before:bottom-0 before:left-1.5 before:top-0 before:w-px before:bg-fg/10">
         {ePage.items.map((e) => (
           <li key={e.id} className="relative pb-4">
             <span className={`absolute -left-5 top-1.5 h-2.5 w-2.5 rounded-full ring-4 ring-bg ${eventDot(e)}`} />
@@ -165,7 +165,7 @@ function HistoryLists({
 function SessionRow({ h, now, showAgent, onAgent }: { h: HistorySession; now: number; showAgent: boolean; onAgent: (id: string) => void }) {
   const { session: s, title } = h;
   return (
-    <div className="flex items-start gap-4 rounded-lg border border-white/10 bg-panel px-4 py-3 text-sm">
+    <div className="flex items-start gap-4 rounded-lg border border-fg/10 bg-panel px-4 py-3 text-sm">
       <div className="pt-0.5">
         <StatusChip status={s.status} />
       </div>
@@ -178,7 +178,7 @@ function SessionRow({ h, now, showAgent, onAgent }: { h: HistorySession; now: nu
         </div>
         <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-500">
           {showAgent && (
-            <button type="button" onClick={() => onAgent(h.agentId)} className="text-gray-400 hover:text-white" title="Show only this agent">
+            <button type="button" onClick={() => onAgent(h.agentId)} className="text-gray-400 hover:text-fg" title="Show only this agent">
               {h.agentName}
             </button>
           )}

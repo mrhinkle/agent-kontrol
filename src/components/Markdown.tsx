@@ -78,7 +78,7 @@ function renderBlock(b: Block, key: number): ReactNode {
       return <p key={key}>{renderInlines(b.c)}</p>;
     case "code":
       return (
-        <pre key={key} className="overflow-x-auto rounded-md border border-white/10 bg-black/40 px-3 py-2 text-[12px] leading-relaxed text-gray-200">
+        <pre key={key} className="overflow-x-auto rounded-md border border-fg/10 bg-black/40 px-3 py-2 text-[12px] leading-relaxed text-gray-200">
           <code className="mono" data-lang={b.lang ?? undefined}>
             {b.v}
           </code>
@@ -86,7 +86,7 @@ function renderBlock(b: Block, key: number): ReactNode {
       );
     case "quote":
       return (
-        <blockquote key={key} className="space-y-2 border-l-2 border-white/15 pl-3 text-gray-400">
+        <blockquote key={key} className="space-y-2 border-l-2 border-fg/15 pl-3 text-gray-400">
           {b.c.map((c, i) => renderBlock(c, i))}
         </blockquote>
       );
@@ -97,15 +97,15 @@ function renderBlock(b: Block, key: number): ReactNode {
         </p>
       );
     case "hr":
-      return <hr key={key} className="border-white/10" />;
+      return <hr key={key} className="border-fg/10" />;
     case "table":
       return (
-        <div key={key} className="overflow-x-auto rounded-md border border-white/10">
+        <div key={key} className="overflow-x-auto rounded-md border border-fg/10">
           <table className="w-full border-collapse text-left text-[13px]">
-            <thead className="bg-white/5 text-gray-300">
+            <thead className="bg-fg/5 text-gray-300">
               <tr>
                 {b.head.map((h, i) => (
-                  <th key={i} className="border-b border-white/10 px-3 py-1.5 font-semibold">
+                  <th key={i} className="border-b border-fg/10 px-3 py-1.5 font-semibold">
                     {renderInlines(h)}
                   </th>
                 ))}
@@ -113,7 +113,7 @@ function renderBlock(b: Block, key: number): ReactNode {
             </thead>
             <tbody>
               {b.rows.map((r, i) => (
-                <tr key={i} className="border-b border-white/5 last:border-0 align-top">
+                <tr key={i} className="border-b border-fg/5 last:border-0 align-top">
                   {r.map((c, j) => (
                     <td key={j} className="px-3 py-1.5">
                       {renderInlines(c)}
@@ -159,7 +159,7 @@ function renderInlines(nodes: Inline[]): ReactNode[] {
         return <br key={i} />;
       case "code":
         return (
-          <code key={i} className="mono rounded bg-white/10 px-1 py-px text-[0.9em] text-gray-100">
+          <code key={i} className="mono rounded bg-fg/10 px-1 py-px text-[0.9em] text-gray-100">
             {n.v}
           </code>
         );
