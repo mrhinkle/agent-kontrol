@@ -55,6 +55,16 @@ The updated dispatcher emits `kind=run_complete` with a strict `mc.run.v2` metad
 - A run becomes a timed Langfuse `agent` span. Per-model totals become child **span metadata**, with `usage_scope=run_total` and `latency_scope=not_measured`. They are not fabricated model generations. Langfuse's native generation token/latency charts are not populated by this aggregate adapter.
 - The local dashboard reads the latest 1,000 stored completed records for 24 hours, clearly labeling a truncated sample. It distinguishes usage availability from complete coverage. Counts include successful and failed completed invocations; individual failures have coarse error classes.
 
+## Fleet wrapper runs
+
+Most fleet work does not go through the dispatcher. The fleet wrappers (`fleet-dispatch.sh`, `codex-review.sh`, `spec-review.sh`) post one milestone or error event to `/api/ingest` when a lane or review ends, under an agent id of `fleet-<kind>-<host>`. The `/observability` page reads those stored events and shows them as runs beside dispatcher runs. Nothing is copied or rewritten, and no machine needs a change.
+
+- Role: `dispatch` is a worker run; `review` and `spec-review` are review runs.
+- Outcome comes from the wrapper's exit code and outcome word. A review that reached any verdict is a completed run; the verdict is not a failure. Timeouts and stalls are `timeout`, exit 126 or 127 is `unavailable`, a missing verdict is a `protocol error`, anything else non-zero is a `process error`. The wrapper's text is not shown.
+- Duration is known only when the wrapper sends `elapsed_s` in the event detail. Today neither wrapper does (the dispatcher's elapsed time goes into the summary, which events do not store), so these runs show "Unavailable" and are left out of the percentiles. The page says how many runs have a known duration.
+- Token counts are never available from a wrapper record.
+- These runs are not sent to Langfuse as timed spans. Langfuse still receives each wrapper record as a plain activity event, as before.
+
 ## Fleet coverage and remaining native instrumentation
 
 Updating the server alone does not update a running local dispatcher. Activate the dispatcher changes separately on approved machines, using `mc_dispatcher.py` together with `run_telemetry.py` and `ak_pointers.py`, which it imports. No daemon was installed/restarted by this change. The obsolete Codex `--full-auto` default is replaced with the supported `--sandbox workspace-write`. An explicit old `MC_CODEX_ARGS` override still needs correction during approved activation. Other dispatcher review/autonomy behavior is unchanged.
