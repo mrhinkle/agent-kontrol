@@ -1,5 +1,6 @@
 import { isConfigured, sql } from "./db";
 import { parseRunTelemetry, platformLabel, summarizeRuns, type RunView } from "./run-telemetry";
+import { wrapperRunView } from "./wrapper-runs";
 
 export async function runMetrics(now = new Date()) {
   const until = now.getTime(), since = until - 86400_000;
@@ -22,7 +23,23 @@ export async function runMetrics(now = new Date()) {
     const run = parseRunTelemetry(row.detail);
     if (run) runs.push({ event_id: Number(row.id), agent_id: String(row.agent_id), platform: platformLabel(row.platform), run });
   }
-  return { ...summarizeRuns(runs, since, until), demo: false, truncated: rows.length > 1000, window: "24h" };
+  // The two sources are separate launch paths, so one run is never in both: the dispatcher starts
+  // CLIs itself and never calls a fleet wrapper, and the wrappers never emit run_complete. Each
+  // source is capped at 1,000 rows, so the sample can hold up to 2,000; `truncated` is set when
+  // either source hit its cap, and the page says the cap is per source.
+  // Fleet wrapper records (fleet-dispatch.sh, codex-review.sh, spec-review.sh) are stored as
+  // ordinary milestone or error events. They are read here and shown as runs; nothing is copied.
+  const wrapperRows = await db`
+    select e.id, e.agent_id, a.platform, e.detail, e.created_at from events e
+    left join agents a on a.id = e.agent_id
+    where e.kind in ('milestone', 'error') and e.agent_id like 'fleet-%' and e.created_at >= ${new Date(since).toISOString()}::timestamptz
+    order by e.created_at desc, e.id desc limit 1001
+  `;
+  for (const row of wrapperRows.slice(0, 1000)) {
+    const view = wrapperRunView({ id: row.id, agent_id: String(row.agent_id), platform: row.platform, created_at: row.created_at, detail: row.detail });
+    if (view) runs.push(view);
+  }
+  return { ...summarizeRuns(runs, since, until), demo: false, truncated: rows.length > 1000 || wrapperRows.length > 1000, window: "24h" };
 }
 
 export type RunMetrics = Awaited<ReturnType<typeof runMetrics>>;
