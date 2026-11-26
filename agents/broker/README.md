@@ -162,7 +162,7 @@ Stopping the process drops every placeholder, because they live only in memory. 
 
 Operator recipe. This plist has not been loaded.
 
-Status: not run
+Status: not yet run
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -199,7 +199,7 @@ The curl command must fail to connect. Replace `8765` with the configured port.
 
 Operator recipe. This unit has not been started.
 
-Status: not run
+Status: not yet run
 
 ```ini
 [Unit]

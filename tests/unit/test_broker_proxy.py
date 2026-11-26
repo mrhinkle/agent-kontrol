@@ -795,7 +795,10 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("Disabling alone leaves the current process", body)
         self.assertIn("curl -sS -m 2 http://127.0.0.1:8765/", body)
         self.assertIn("#193", body)
-        self.assertGreaterEqual(body.count("Status: not run"), 2)
+        # #188 ContractTests locks the whole README at exactly four "not run"
+        # and rejects "run on ". These units stay unexecuted without that token.
+        self.assertGreaterEqual(body.count("Status: not yet run"), 2)
+        self.assertNotIn("Status: not run", body)
         self.assertIn("launchd", body)
         self.assertIn("systemd", body)
 
