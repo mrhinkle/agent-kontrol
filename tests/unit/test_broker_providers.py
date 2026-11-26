@@ -1408,6 +1408,24 @@ class ExecProviderTests(unittest.TestCase):
         with self.assertRaises(ChildProcessError):
             os.waitpid(output_pids[0], os.WNOHANG)
 
+    def _signal_unreaped_children(self, pids: list[int]) -> None:
+        """SIGKILL a recorded PID only while it is still our unreaped child."""
+        for pid in pids:
+            try:
+                waited, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                continue
+            if waited != 0:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+
     def test_killpg_permission_error_bounds_reap(self) -> None:
         real_popen = subprocess.Popen
         pids: list[int] = []
@@ -1438,15 +1456,7 @@ class ExecProviderTests(unittest.TestCase):
             with self.assertRaises(ChildProcessError):
                 os.waitpid(pids[0], os.WNOHANG)
         finally:
-            for pid in pids:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                try:
-                    os.waitpid(pid, 0)
-                except ChildProcessError:
-                    pass
+            self._signal_unreaped_children(pids)
 
     def test_kill_denied_reap_is_bounded(self) -> None:
         pids: list[int] = []
@@ -1472,15 +1482,7 @@ class ExecProviderTests(unittest.TestCase):
             self.assertLess(elapsed, 1 + providers._ABORT_REAP_SECONDS + 2)
             self.assertTrue(pids)
         finally:
-            for pid in pids:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                try:
-                    os.waitpid(pid, 0)
-                except ChildProcessError:
-                    pass
+            self._signal_unreaped_children(pids)
 
     def test_child_env_reads_each_key_once(self) -> None:
         counting = _CountingEnv(
