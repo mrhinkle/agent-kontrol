@@ -99,10 +99,20 @@ export function UsageCostPanels({ data }: { data: UsageSummary }) {
           <div className="mt-4 grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
             <div><p className="text-xs text-gray-400">Recorded subscription fees</p><p className="mt-1 text-2xl font-semibold tabular-nums">{dollars(data.grok.subscription_fees_usd)}</p><p className="mt-1 text-xs text-gray-400">{data.grok.fee_records ? `${data.grok.fee_records} verified payment record(s) in the selected rolling window` : "No verified fee records in this window"}</p></div>
             <div><p className="text-xs text-gray-400">Grok through OpenRouter</p><p className="mt-1 text-2xl font-semibold tabular-nums">{dollars(data.grok.openrouter_cost_usd)}</p><p className="mt-1 text-xs text-gray-400">Included in OpenRouter above for the completed UTC days.{data.grok.openrouter_coverage !== "complete" && " Observed charges only; period total is not verified."}</p></div>
-            <div><p className="text-xs text-gray-400">Local Grok usage</p><p className="mt-1 text-2xl font-semibold">Unavailable</p><p className="mt-1 text-xs text-gray-400">Local records may include inherited or rolled-up usage, so they cannot establish a reliable total.</p></div>
+            <div><p className="text-xs text-gray-400">Local Grok CLI usage</p>
+              {data.grok.local_usage_status === "unavailable"
+                ? <><p className="mt-1 text-2xl font-semibold">Unavailable</p><p className="mt-1 text-xs text-gray-400">No Grok CLI collection received.</p></>
+                : <><p className="mt-1 text-2xl font-semibold tabular-nums">{data.grok.model_calls ? `${format(data.grok.model_calls)} calls` : "No observations"}</p><p className="mt-1 text-xs text-gray-400">{format(data.grok.turns)} turn(s) · {format(data.grok.input_tokens)} input / {format(data.grok.output_tokens)} output · {format(data.grok.cache_read_tokens)} cache read{data.grok.local_usage_status === "partial" ? " · partial scan" : ""}</p></>}
+            </div>
             {data.grok.shadow && <ShadowValue shadow={data.grok.shadow} vendor="xAI" />}
           </div>
+          {data.grok.shadow && <ShadowByModel shadow={data.grok.shadow} />}
+          {data.grok.reported_estimate_usd !== null && <p className="mt-3 text-xs text-gray-400">The Grok CLI also recorded its own estimate of {dollars(data.grok.reported_estimate_usd)} for these turns. This is not a charge.</p>}
+          {data.grok.local_usage_status !== "unavailable" && <p className="mt-3 text-xs text-gray-400">Grok records tokens per turn, not per call, so the long-prompt rate is judged on the average prompt per call. Each turn is counted once, even when a resumed session repeats it.</p>}
           <p className="mt-4 text-xs text-gray-400">Grok API billing, subscription payments and OpenRouter charges remain separate. No subscription price is assumed.</p>
+          {data.grok.machines.length > 0 && <ul className="mt-3 space-y-1 text-xs text-gray-400">
+            {data.grok.machines.map((machine) => <li key={machine.account_id} className="break-words">{machine.account_id.replace("grok-cli:", "")} · {machine.status === "complete" ? "scan complete" : "partial or unverified scan"} · collected {timestamp(machine.collected_at)}{machine.since && machine.until ? ` · ${machine.since.slice(0, 10)} to ${machine.until.slice(0, 10)}` : ""}</li>)}
+          </ul>}
         </section>
       )}
       {local && (
