@@ -129,7 +129,11 @@ class UpstreamError(Exception):
 
 def _fail(message: str) -> None:
     """Raise ``ValueError`` with no chained context (paths ride on OSError)."""
-    exc = ValueError(message)
+    _raise_clean(ValueError(message))
+
+
+def _raise_clean(exc: BaseException) -> None:
+    """Raise a sanitized error. ``__context__`` must not carry upstream text."""
     try:
         raise exc from None
     finally:
@@ -541,7 +545,7 @@ def _parse_target(target: str) -> _ParsedTarget:
     except _BadRequest:
         raise
     except ValueError:
-        raise _BadRequest()
+        _raise_clean(_BadRequest())
     if _has_controls(decoded_path_bytes) or _has_controls(decoded_query_bytes):
         raise _BadRequest()
     if b"\\" in decoded_path_bytes or b"\\" in decoded_query_bytes:
@@ -655,7 +659,7 @@ def _iter_chunked(rfile: object, max_bytes: int, placeholders: object):
         try:
             size = int(size_text, 16)
         except ValueError:
-            raise _Abort("bad_request")
+            _raise_clean(_Abort("bad_request"))
         if size < 0:
             raise _Abort("bad_request")
         if size == 0:
@@ -828,12 +832,9 @@ class TLSUpstream:
         except _Abort:
             self.close()
             raise
-        except AssertionError:
-            self.close()
-            raise
         except Exception as exc:
             self.close()
-            raise UpstreamError(_classify(exc))
+            _raise_clean(UpstreamError(_classify(exc)))
         return _LiveResponse(resp, self)
 
     def close(self) -> None:
@@ -857,7 +858,7 @@ class _LiveResponse:
         try:
             return self._resp.read(max_bytes)
         except Exception as exc:
-            raise UpstreamError(_classify(exc))
+            _raise_clean(UpstreamError(_classify(exc)))
 
 
 def default_upstream_factory(service_config: dict, timeout_seconds: object) -> TLSUpstream:
@@ -1006,7 +1007,7 @@ def _read_request(handler: BaseHTTPRequestHandler):
     try:
         text = line.decode("iso-8859-1").rstrip("\r\n")
     except UnicodeDecodeError:
-        raise _BadRequest()
+        _raise_clean(_BadRequest())
     parts = text.split(" ")
     if len(parts) != 3:
         raise _BadRequest()
@@ -1018,7 +1019,7 @@ def _read_request(handler: BaseHTTPRequestHandler):
     try:
         headers = http.client.parse_headers(handler.rfile)
     except (http.client.LineTooLong, http.client.HTTPException, socket.timeout, TimeoutError, OSError):
-        raise _BadRequest()
+        _raise_clean(_BadRequest())
     if getattr(headers, "defects", None):
         raise _BadRequest()
     for name, value in headers.items():
@@ -1139,24 +1140,55 @@ def _write_bytes(handler: BaseHTTPRequestHandler, data: bytes) -> None:
     handler.wfile.flush()
 
 
-def _stream_response(handler: BaseHTTPRequestHandler, response: object, secret_values: tuple) -> bool:
-    """Return True when a secret was found. No secret byte is written."""
+def _write_limited(handler: BaseHTTPRequestHandler, data: bytes, written: int, limit: int | None) -> int:
+    """Write ``data`` and return the new total. Never pass a declared length."""
+    if not data:
+        return written
+    if limit is None:
+        _write_bytes(handler, data)
+        return written + len(data)
+    room = limit - written
+    if room <= 0:
+        return written
+    if len(data) > room:
+        data = data[:room]
+    _write_bytes(handler, data)
+    return written + len(data)
+
+
+def _stream_response(handler: BaseHTTPRequestHandler, response: object, secret_values: tuple, limit: int | None) -> bool:
+    """Return True when a secret was found in the bytes the client was owed.
+
+    A Content-Length the upstream does not fill raises ``UpstreamError`` after
+    the bytes that did arrive. Nothing past that length is written.
+    """
     scanner = _SecretScan(secret_values)
+    written = 0
+
+    def take(safe: bytes, hit: bool) -> bool | None:
+        nonlocal written
+        room = None if limit is None else limit - written
+        secret_in_window = hit and (room is None or len(safe) < room)
+        written = _write_limited(handler, safe, written, limit)
+        if secret_in_window:
+            return True
+        if limit is not None and written >= limit:
+            return False
+        return None
+
     while True:
         chunk = response.read_chunk(_READ_CHUNK)
         if not chunk:
             break
-        safe, hit = scanner.feed(chunk)
-        if safe:
-            _write_bytes(handler, safe)
-        if hit:
-            return True
-    safe, hit = scanner.finish()
-    if safe and not hit:
-        _write_bytes(handler, safe)
-    elif hit and safe:
-        _write_bytes(handler, safe)
-    return hit
+        outcome = take(*scanner.feed(chunk))
+        if outcome is not None:
+            return outcome
+    outcome = take(*scanner.finish())
+    if outcome is not None:
+        return outcome
+    if limit is not None and written < limit:
+        raise UpstreamError("malformed")
+    return False
 
 
 def _serve_one(handler: BaseHTTPRequestHandler) -> None:
@@ -1168,6 +1200,8 @@ def _serve_one(handler: BaseHTTPRequestHandler) -> None:
     except (OSError, AttributeError):
         pass
     logged = False
+    service_name = "-"
+    prefix = "-"
     try:
         parsed_request = _read_request(handler)
         if parsed_request is None:
@@ -1227,19 +1261,35 @@ def _serve_one(handler: BaseHTTPRequestHandler) -> None:
             handler, state, service, secret, secrets, parsed,
             headers, method, mode, length, prefix, service_name,
         )
-    except AssertionError:
-        raise
     except _BadRequest:
-        if not logged:
+        if getattr(handler, "_ak_head_sent", False):
+            _upstream_failure_after_head(handler, service_name, prefix, secrets, logged)
+        elif not logged:
             _emit("-", getattr(handler, "command", "-"), "-", 400, "bad_request", secrets)
             logged = True
             _send_json(handler, 400, "bad_request")
     except Exception:
-        if not logged:
+        if getattr(handler, "_ak_head_sent", False):
+            _upstream_failure_after_head(handler, service_name, prefix, secrets, logged)
+        elif not logged:
             _emit("-", getattr(handler, "command", "-"), "-", 502, "upstream_error", secrets)
             _send_json(handler, 502, "upstream_error")
     finally:
         handler.close_connection = True
+
+
+def _upstream_failure_after_head(handler: BaseHTTPRequestHandler, service_name: str, prefix: str, secrets: tuple, logged: bool) -> None:
+    """The status line is already on the wire. Close; do not write a refusal."""
+    if not logged:
+        _emit(
+            service_name,
+            getattr(handler, "command", "-"),
+            prefix,
+            getattr(handler, "_ak_upstream_status", 502),
+            "upstream_error",
+            secrets,
+        )
+    _close_writer(handler)
 
 
 def _authorize(headers: http.client.HTTPMessage, service: dict, state: _State):
@@ -1269,6 +1319,8 @@ def _request_leak(parsed: _ParsedTarget, headers: http.client.HTTPMessage, servi
         return True
     header_name = service["header"].lower()
     for name, value in _header_items(headers):
+        if _contains_text(name, known):
+            return True
         if name.lower() == header_name:
             continue
         if _contains_text(value, known):
@@ -1367,8 +1419,6 @@ def _forward_open(
         _emit(service_name, method, prefix, "-", abort.reason, secrets)
         _close_writer(handler)
         return True
-    except AssertionError:
-        raise
     except Exception:
         _emit(service_name, method, prefix, 502, "upstream_error", secrets)
         _send_json(handler, 502, "upstream_error")
@@ -1385,13 +1435,16 @@ def _forward_open(
         _emit(service_name, method, prefix, status, "-", secrets)
         _close_writer(handler)
         return True
+    handler._ak_head_sent = True
+    handler._ak_upstream_status = status
     send_body = method != "HEAD" and status >= 200 and status not in _NO_BODY
     if not send_body:
         _emit(service_name, method, prefix, status, "-", secrets)
         _close_writer(handler)
         return True
+    limit = int(valid_length) if valid_length is not None else None
     try:
-        hit = _stream_response(handler, response, secrets)
+        hit = _stream_response(handler, response, secrets, limit)
     except UpstreamError:
         _emit(service_name, method, prefix, status, "upstream_error", secrets)
         _close_writer(handler)

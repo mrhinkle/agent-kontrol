@@ -39,6 +39,8 @@ ONE_MIB = 1024 * 1024
 
 _OLD_CONNECT = None
 _OLD_CONNECT_EX = None
+_OLD_GETADDRINFO = None
+_SOCKET_TRIPS: list = []
 
 
 def _host_of(address: object) -> object:
@@ -47,28 +49,46 @@ def _host_of(address: object) -> object:
     return None
 
 
-def _guard_check(address: object) -> None:
-    host = _host_of(address)
-    if host in ("127.0.0.1", "::1", b"127.0.0.1", b"::1"):
-        return
-    raise AssertionError("socket guard blocked non-fixture connect")
+def _loopback_host(host: object) -> bool:
+    if isinstance(host, bytes):
+        try:
+            host = host.decode("ascii")
+        except UnicodeDecodeError:
+            return False
+    if isinstance(host, str) and host[:1] == "[" and host[-1:] == "]":
+        host = host[1:-1]
+    return host in ("127.0.0.1", "::1")
 
 
 def _install_guard() -> None:
-    global _OLD_CONNECT, _OLD_CONNECT_EX
+    global _OLD_CONNECT, _OLD_CONNECT_EX, _OLD_GETADDRINFO
     _OLD_CONNECT = socket.socket.connect
     _OLD_CONNECT_EX = socket.socket.connect_ex
+    _OLD_GETADDRINFO = socket.getaddrinfo
 
     def connect(self: socket.socket, address: object) -> object:
-        _guard_check(address)
+        host = _host_of(address)
+        if not _loopback_host(host):
+            _SOCKET_TRIPS.append(("connect", host))
+            raise OSError("socket guard blocked non-fixture connect")
         return _OLD_CONNECT(self, address)
 
     def connect_ex(self: socket.socket, address: object) -> int:
-        _guard_check(address)
+        host = _host_of(address)
+        if not _loopback_host(host):
+            _SOCKET_TRIPS.append(("connect_ex", host))
+            return 1
         return _OLD_CONNECT_EX(self, address)
+
+    def getaddrinfo(host: object, port: object, *args: object, **kwargs: object):
+        if not _loopback_host(host):
+            _SOCKET_TRIPS.append(("getaddrinfo", host))
+            raise socket.gaierror(socket.EAI_NONAME, "socket guard blocked non-fixture resolve")
+        return _OLD_GETADDRINFO(host, port, *args, **kwargs)
 
     socket.socket.connect = connect  # type: ignore[assignment]
     socket.socket.connect_ex = connect_ex  # type: ignore[assignment]
+    socket.getaddrinfo = getaddrinfo  # type: ignore[assignment]
 
 
 def _restore_guard() -> None:
@@ -76,6 +96,8 @@ def _restore_guard() -> None:
         socket.socket.connect = _OLD_CONNECT  # type: ignore[assignment]
     if _OLD_CONNECT_EX is not None:
         socket.socket.connect_ex = _OLD_CONNECT_EX  # type: ignore[assignment]
+    if _OLD_GETADDRINFO is not None:
+        socket.getaddrinfo = _OLD_GETADDRINFO  # type: ignore[assignment]
 
 
 def setUpModule() -> None:
@@ -83,7 +105,19 @@ def setUpModule() -> None:
 
 
 def tearDownModule() -> None:
-    _restore_guard()
+    try:
+        if _SOCKET_TRIPS:
+            leftover = list(_SOCKET_TRIPS)
+            raise AssertionError("socket guard trips: %s" % (leftover,))
+    finally:
+        _restore_guard()
+
+
+class _GuardedCase(unittest.TestCase):
+    def tearDown(self) -> None:
+        trips = list(_SOCKET_TRIPS)
+        del _SOCKET_TRIPS[:]
+        self.assertEqual(trips, [])
 
 
 class Clock:
@@ -175,6 +209,17 @@ def _parse_response(raw: bytes) -> tuple:
         name, value = line.split(b":", 1)
         headers.setdefault(name.lower(), []).append(value.strip())
     return status, headers, body, raw
+
+
+def _join_after_shutdown(server: object, thread: threading.Thread) -> None:
+    """Shutdown (and server_close) before join, so join is not stuck in serve_forever."""
+    shutdown = getattr(server, "shutdown", None)
+    if shutdown is not None:
+        shutdown()
+    closer = getattr(server, "server_close", None)
+    if closer is not None:
+        closer()
+    thread.join(5)
 
 
 def _exchange(port: int, payload: bytes, timeout: float = 5, on_first_body: object = None, shutdown: bool = True) -> bytes:
@@ -339,6 +384,26 @@ class GateResponse:
         return b""
 
 
+class RaisingResponse:
+    """One body chunk, then an unexpected error. The head has already been sent."""
+
+    def __init__(self, first: bytes, exc: BaseException) -> None:
+        self.status = 200
+        self.headers = [
+            ("Content-Type", "text/plain"),
+            ("Content-Length", "200"),
+        ]
+        self._first = first
+        self._exc = exc
+        self.reads = 0
+
+    def read_chunk(self, _max_bytes: int) -> bytes:
+        self.reads += 1
+        if self.reads == 1:
+            return self._first
+        raise self._exc
+
+
 class Harness:
     def __init__(self, test: unittest.TestCase, secret: str = SECRET, services: list | None = None, clock: Clock | None = None, **overrides: object) -> None:
         self.test = test
@@ -363,8 +428,7 @@ class Harness:
         self.port = self.server.bound_port
 
     def stop(self) -> None:
-        self.server.shutdown()
-        self.thread.join(5)
+        _join_after_shutdown(self.server, self.thread)
 
     def mint(self, task: str = "task-1", services: list | None = None) -> dict:
         return self.store.mint(task, services or ["openrouter"])
@@ -402,7 +466,7 @@ def _one_log(test: unittest.TestCase, cap: ListHandler) -> dict:
     return obj
 
 
-class StoreTests(unittest.TestCase):
+class StoreTests(_GuardedCase):
     def _store(self, now: float = 1000, ttl: int = 10) -> tuple:
         clock = Clock(now)
         store = broker.PlaceholderStore(clock=clock)
@@ -534,7 +598,7 @@ class _Stat:
         self.st_uid = uid
 
 
-class ConfigTests(unittest.TestCase):
+class ConfigTests(_GuardedCase):
     def setUp(self) -> None:
         self.root = Path(tempfile.mkdtemp(prefix="ak-broker-"))
         self.addCleanup(lambda: shutil.rmtree(self.root, ignore_errors=True))
@@ -866,7 +930,7 @@ class _LoopUpstream:
         self._conn.close()
 
 
-class ProxyTests(unittest.TestCase):
+class ProxyTests(_GuardedCase):
     def _harness(self, **kwargs: object) -> Harness:
         return Harness(self, **kwargs)
 
@@ -921,9 +985,7 @@ class ProxyTests(unittest.TestCase):
         httpd.seen = []
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(httpd.shutdown)
-        self.addCleanup(httpd.server_close)
-        self.addCleanup(lambda: thread.join(5))
+        self.addCleanup(_join_after_shutdown, httpd, thread)
         port = httpd.server_address[1]
 
         def factory(service_config: dict, timeout_seconds: object) -> _LoopUpstream:
@@ -936,8 +998,7 @@ class ProxyTests(unittest.TestCase):
         server = broker.BrokerServer(_config(providers), store, factory)
         serve = threading.Thread(target=server.serve_forever, daemon=True)
         serve.start()
-        self.addCleanup(server.shutdown)
-        self.addCleanup(lambda: serve.join(5))
+        self.addCleanup(_join_after_shutdown, server, serve)
         placeholder = store.mint("task-1", ["openrouter"])["openrouter"]
         raw = _exchange(
             server.bound_port,
@@ -1082,6 +1143,20 @@ class ProxyTests(unittest.TestCase):
                 _assert_absent(self, raw, placeholder, "placeholder")
         self.assertEqual(harness.recorder.factory_calls, [])
 
+    def test_placeholder_header_name_is_leak(self) -> None:
+        harness = self._harness()
+        placeholder = harness.mint()["openrouter"]
+        raw = harness.exchange(
+            "GET",
+            "/openrouter/api/v1/x",
+            harness.auth(placeholder) + [(placeholder, "x")],
+        )
+        _assert_error(self, raw, 403, "placeholder_leak")
+        _assert_absent(self, raw, placeholder, "placeholder")
+        self.assertEqual(harness.recorder.factory_calls, [])
+        self.assertEqual(harness.recorder.calls, [])
+        self.assertEqual(harness.recorder.opened, 0)
+
     def test_body_size_boundary_for_leaks(self) -> None:
         harness = self._harness()
         placeholder = harness.mint()["openrouter"]
@@ -1117,6 +1192,33 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(obj["reason"], "placeholder_leak")
         self.assertGreaterEqual(harness.recorder.opened, 1)
         _assert_absent(self, raw, placeholder, "placeholder")
+
+    def test_placeholder_split_across_chunks_is_refused(self) -> None:
+        harness = self._harness()
+        placeholder = harness.mint()["openrouter"]
+        token = placeholder.encode("ascii")
+        mid = len(token) // 2
+        left, right = token[:mid], token[mid:]
+        self.assertGreater(len(left), 0)
+        self.assertGreater(len(right), 0)
+        self.assertNotIn(token, left)
+        self.assertNotIn(token, right)
+        payload = (
+            "POST /openrouter/api/v1/x HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Authorization: Bearer %s\r\nTransfer-Encoding: chunked\r\n\r\n" % placeholder
+        ).encode("ascii")
+        payload += b"%x\r\n" % len(left) + left + b"\r\n"
+        payload += b"%x\r\n" % len(right) + right + b"\r\n"
+        payload += b"0\r\n\r\n"
+        cap, _root = self._logs()
+        raw = _exchange(harness.port, payload, timeout=5)
+        self.assertNotEqual(_parse_response(raw)[0], 200)
+        _assert_absent(self, raw, placeholder, "placeholder")
+        obj = _one_log(self, cap)
+        self.assertEqual(obj["status"], "-")
+        self.assertEqual(obj["reason"], "placeholder_leak")
+        received = b"".join(call["body"] for call in harness.recorder.calls)
+        self.assertEqual(received, b"")
 
     def test_encoded_dotdot_rejected_not_prefix_matched(self) -> None:
         harness = self._harness()
@@ -1208,8 +1310,7 @@ class ProxyTests(unittest.TestCase):
         server = broker.BrokerServer(_config(providers), store, recorder.factory)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(server.shutdown)
-        self.addCleanup(lambda: thread.join(5))
+        self.addCleanup(_join_after_shutdown, server, thread)
         placeholder = store.mint("task-split", ["openrouter"])["openrouter"]
         cap, _root = self._logs()
         raw = _exchange(
@@ -1235,8 +1336,7 @@ class ProxyTests(unittest.TestCase):
         server = broker.BrokerServer(_config(providers), store, recorder.factory)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(server.shutdown)
-        self.addCleanup(lambda: thread.join(5))
+        self.addCleanup(_join_after_shutdown, server, thread)
         placeholder = store.mint("task-carry", ["openrouter"])["openrouter"]
         raw = _exchange(
             server.bound_port,
@@ -1244,8 +1344,7 @@ class ProxyTests(unittest.TestCase):
         )
         _assert_absent(self, raw, secret, "secret")
         self.assertIn(b"SAFE", raw)
-        server.shutdown()
-        thread.join(5)
+        _join_after_shutdown(server, thread)
 
         tiny = "~"
         tiny_root = root / "tiny"
@@ -1258,8 +1357,7 @@ class ProxyTests(unittest.TestCase):
         server = broker.BrokerServer(_config(providers), store, recorder.factory)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(server.shutdown)
-        self.addCleanup(lambda: thread.join(5))
+        self.addCleanup(_join_after_shutdown, server, thread)
         placeholder = store.mint("task-tiny", ["openrouter"])["openrouter"]
         cap, _root = self._logs()
         raw = _exchange(
@@ -1281,8 +1379,7 @@ class ProxyTests(unittest.TestCase):
         server = broker.BrokerServer(_config(providers), store, recorder.factory)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(server.shutdown)
-        self.addCleanup(lambda: thread.join(5))
+        self.addCleanup(_join_after_shutdown, server, thread)
         placeholder = store.mint("task-short", ["openrouter"])["openrouter"]
         raw = _exchange(
             server.bound_port,
@@ -1325,9 +1422,7 @@ class ProxyTests(unittest.TestCase):
         httpd.payload = b"FOLLOWED-CANARY"
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(httpd.shutdown)
-        self.addCleanup(httpd.server_close)
-        self.addCleanup(lambda: thread.join(5))
+        self.addCleanup(_join_after_shutdown, httpd, thread)
         fixture = httpd.server_address[1]
         harness = self._harness()
         harness.recorder.status = 302
@@ -1404,6 +1499,39 @@ class ProxyTests(unittest.TestCase):
         self.assertNotIn(b"transfer-encoding", headers)
         self.assertEqual(headers.get(b"connection"), [b"close"])
         self.assertEqual(headers.get(b"x-keep"), [b"stay"])
+
+    def test_truncated_content_length_is_upstream_error(self) -> None:
+        harness = self._harness()
+        harness.recorder.headers = [("Content-Type", "text/plain"), ("Content-Length", "5")]
+        harness.recorder.chunks = [b"hi"]
+        placeholder = harness.mint()["openrouter"]
+        cap, _root = self._logs()
+        raw = harness.exchange("GET", "/openrouter/api/v1/x", harness.auth(placeholder))
+        _status, headers, body, _raw = _parse_response(raw)
+        self.assertEqual(headers.get(b"content-length"), [b"5"])
+        self.assertLess(len(body), 5)
+        self.assertNotIn(b'{"error"', raw)
+        obj = _one_log(self, cap)
+        self.assertEqual(obj["reason"], "upstream_error")
+        self.assertEqual(obj["status"], 200)
+
+    def test_runtime_error_after_head_writes_no_refusal(self) -> None:
+        harness = self._harness()
+        first = b"A" * 80
+        harness.recorder.response = RaisingResponse(first, RuntimeError("injected-runtime-detail"))
+        placeholder = harness.mint()["openrouter"]
+        cap, root_cap = self._logs()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            raw = harness.exchange("GET", "/openrouter/api/v1/x", harness.auth(placeholder))
+        _status, _headers, body, _raw = _parse_response(raw)
+        self.assertIn(b"A" * 40, body)
+        self.assertNotIn(b'{"error"', raw)
+        self.assertNotIn(b"injected-runtime-detail", raw)
+        obj = _one_log(self, cap)
+        self.assertEqual(obj["reason"], "upstream_error")
+        blob = "\n".join(cap.lines + root_cap.lines) + stderr.getvalue()
+        self.assertNotIn("injected-runtime-detail", blob)
 
     def test_body_too_large(self) -> None:
         harness = self._harness(max_request_body_bytes=100)
@@ -1575,6 +1703,7 @@ class ProxyTests(unittest.TestCase):
             server = broker.BrokerServer(_config(providers, services=services), store, recorder.factory)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
+            self.addCleanup(_join_after_shutdown, server, thread)
             placeholder = store.mint("task-1", ["openrouter"])["openrouter"]
             raw = _exchange(
                 server.bound_port,
@@ -1583,8 +1712,7 @@ class ProxyTests(unittest.TestCase):
             self.assertEqual(_parse_response(raw)[0], 200)
             self.assertEqual(len(calls), 1)
             port = server.bound_port
-            server.shutdown()
-            thread.join(5)
+            _join_after_shutdown(server, thread)
             with self.assertRaises(OSError):
                 socket.create_connection(("127.0.0.1", port), timeout=2)
             store2 = broker.PlaceholderStore()
@@ -1592,8 +1720,7 @@ class ProxyTests(unittest.TestCase):
             server2 = broker.BrokerServer(_config(providers, services=services), store2, recorder2.factory)
             thread2 = threading.Thread(target=server2.serve_forever, daemon=True)
             thread2.start()
-            self.addCleanup(server2.shutdown)
-            self.addCleanup(lambda: thread2.join(5))
+            self.addCleanup(_join_after_shutdown, server2, thread2)
             raw = _exchange(
                 server2.bound_port,
                 _request_bytes("GET", "/openrouter/api/v1/x", [("Authorization", "Bearer " + placeholder)]),
