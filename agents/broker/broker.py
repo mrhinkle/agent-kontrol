@@ -91,6 +91,18 @@ _REQUEST_DROP = frozenset((
     # Framing is generated from the body mode, so the inbound length is not copied.
     "content-length",
 ))
+# Credential injection must not be able to replace framing or hop-by-hop fields.
+_OWNED_HEADERS = frozenset((
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "te",
+    "trailer",
+    "upgrade",
+    "proxy-connection",
+))
 _RESPONSE_HOP = frozenset((
     "connection",
     "keep-alive",
@@ -268,6 +280,9 @@ def _check_service(service: object, seen: set[str]) -> dict:
     upstream = _check_upstream(service["upstream"])
     header = service["header"]
     if type(header) is not str or _TOKEN_RE.fullmatch(header) is None:
+        _fail("invalid broker config: header")
+    lowered_header = header.lower()
+    if lowered_header in _OWNED_HEADERS or lowered_header.startswith("proxy-"):
         _fail("invalid broker config: header")
     template = service["template"]
     if type(template) is not str or template.count("{secret}") != 1:
@@ -999,6 +1014,19 @@ def _resolve_secrets(config: dict) -> dict[str, str]:
     return resolved
 
 
+class _HeaderBlock:
+    """Remember the line ``parse_headers`` stopped on. It also stops at EOF."""
+
+    def __init__(self, rfile: object) -> None:
+        self._rfile = rfile
+        self.terminator = b""
+
+    def readline(self, size: int = -1) -> bytes:
+        line = self._rfile.readline(size)
+        self.terminator = line
+        return line
+
+
 def _read_request(handler: BaseHTTPRequestHandler):
     try:
         line = handler.rfile.readline(_MAX_LINE + 1)
@@ -1020,10 +1048,16 @@ def _read_request(handler: BaseHTTPRequestHandler):
         raise _BadRequest()
     if _TOKEN_RE.fullmatch(method) is None:
         raise _BadRequest()
+    # parse_headers keeps its own line-size and header-count limits and stops
+    # at the first blank line. It does not read the body. EOF and a bare LF
+    # are not a terminated header block.
+    reader = _HeaderBlock(handler.rfile)
     try:
-        headers = http.client.parse_headers(handler.rfile)
+        headers = http.client.parse_headers(reader)
     except (http.client.LineTooLong, http.client.HTTPException, socket.timeout, TimeoutError, OSError):
         _raise_clean(_BadRequest())
+    if reader.terminator != b"\r\n":
+        raise _BadRequest()
     if getattr(headers, "defects", None):
         raise _BadRequest()
     for name, value in headers.items():
@@ -1034,7 +1068,22 @@ def _read_request(handler: BaseHTTPRequestHandler):
     return method, target, version, headers
 
 
-def _body_mode(headers: http.client.HTTPMessage) -> tuple:
+def _decimal_length(raw: str, limit_digits: int) -> int | None:
+    """Parse a decimal length. ``None`` means do not call ``int``.
+
+    Leading zeros are stripped first. An all-zero string is 0. A remaining
+    digit count above ``limit_digits`` is already over the caller's limit, and
+    ``int`` of thousands of digits can raise ``ValueError``.
+    """
+    stripped = raw.lstrip("0")
+    if not stripped:
+        return 0
+    if len(stripped) > limit_digits:
+        return None
+    return int(stripped)
+
+
+def _body_mode(headers: http.client.HTTPMessage, max_body: int) -> tuple:
     lengths = _values(headers, "content-length")
     codings = _values(headers, "transfer-encoding")
     if lengths and codings:
@@ -1053,8 +1102,11 @@ def _body_mode(headers: http.client.HTTPMessage) -> tuple:
     raw = lengths[0].strip()
     if _CL_RE.fullmatch(raw) is None:
         raise _BadRequest()
-    normalized = str(int(raw))
-    return "length", int(normalized)
+    parsed = _decimal_length(raw, len(str(max_body)))
+    if parsed is None:
+        # Known over the limit. The caller emits 413 without reading a body.
+        return "length", max_body + 1
+    return "length", parsed
 
 
 def _outbound_headers(items: list, service: dict, secret: str, length: int | None, chunked: bool) -> list:
@@ -1081,7 +1133,7 @@ def _forward_target(parsed: _ParsedTarget) -> str:
     return parsed.raw_remainder
 
 
-def _response_plan(response: object, service: dict, secret_values: tuple):
+def _response_plan(response: object, service: dict, secret_values: tuple, max_body: int):
     status = getattr(response, "status", None)
     if type(status) is not int or not 100 <= status <= 599:
         raise UpstreamError("malformed")
@@ -1110,7 +1162,7 @@ def _response_plan(response: object, service: dict, secret_values: tuple):
             continue
         if lname == service["header"].lower():
             continue
-        if _contains_text(value, secret_values):
+        if _contains_text(name, secret_values) or _contains_text(value, secret_values):
             continue
         filtered.append((name, value))
     if encodings and (len(encodings) != 1 or encodings[0].strip().lower() != "identity"):
@@ -1120,7 +1172,11 @@ def _response_plan(response: object, service: dict, secret_values: tuple):
     valid_length = None
     if len(content_lengths) == 1 and _CL_RE.fullmatch(content_lengths[0].strip()) is not None:
         if not _contains_text(content_lengths[0], secret_values):
-            valid_length = str(int(content_lengths[0].strip()))
+            raw_length = content_lengths[0].strip()
+            parsed_length = _decimal_length(raw_length, len(str(max_body)))
+            if parsed_length is None:
+                raise UpstreamError("malformed")
+            valid_length = str(parsed_length)
     elif content_lengths:
         raise UpstreamError("malformed")
     return status, filtered, valid_length
@@ -1218,7 +1274,7 @@ def _serve_one(handler: BaseHTTPRequestHandler) -> None:
         service_name = "-"
         prefix = "-"
         try:
-            mode, length = _body_mode(headers)
+            mode, length = _body_mode(headers, state.config["max_request_body_bytes"])
             parsed = _parse_target(target)
         except _BadRequest:
             _emit("-", method, "-", 400, "bad_request", secrets)
@@ -1429,7 +1485,9 @@ def _forward_open(
         _send_json(handler, 502, "upstream_error")
         return True
     try:
-        status, filtered, valid_length = _response_plan(response, service, secrets)
+        status, filtered, valid_length = _response_plan(
+            response, service, secrets, handler.server.state.config["max_request_body_bytes"],
+        )
     except UpstreamError:
         _emit(service_name, method, prefix, 502, "upstream_error", secrets)
         _send_json(handler, 502, "upstream_error")
@@ -1589,6 +1647,22 @@ class BrokerServer:
         return "<broker 127.0.0.1:%s>" % self.bound_port
 
 
+def _configure_cli_logging() -> None:
+    """Give the CLI process a stderr log. Embedding code is not touched.
+
+    Called from ``main`` only, and only when ``ak.broker`` has no handlers, so
+    a host that already configured logging keeps that configuration.
+    """
+    log = logging.getLogger("ak.broker")
+    if log.handlers:
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
+    log.propagate = False
+
+
 def main(argv: list[str] | None = None) -> int:
     """``python3 agents/broker/broker.py --config PATH``. Non-zero before bind on failure."""
     if argv is None:
@@ -1603,6 +1677,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         sys.stderr.write("%s\n" % exc)
         return 1
+    _configure_cli_logging()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

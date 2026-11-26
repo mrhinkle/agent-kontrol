@@ -22,6 +22,7 @@ import stat
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import unittest
 from pathlib import Path
@@ -223,7 +224,7 @@ def _join_after_shutdown(server: object, thread: threading.Thread) -> None:
     thread.join(5)
 
 
-def _exchange(port: int, payload: bytes, timeout: float = 5, on_first_body: object = None, shutdown: bool = True) -> bytes:
+def _exchange(port: int, payload: bytes, timeout: float = 5, on_first_body: object = None, shutdown: bool = True, accept_partial: bool = False) -> bytes:
     sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     sock.settimeout(timeout)
@@ -240,6 +241,8 @@ def _exchange(port: int, payload: bytes, timeout: float = 5, on_first_body: obje
             try:
                 block = sock.recv(65536)
             except socket.timeout:
+                if not accept_partial:
+                    raise AssertionError("receive timed out after %d bytes" % len(data))
                 break
             if not block:
                 break
@@ -311,16 +314,21 @@ class Recorder:
                     recorder.on_request()
                 if recorder.fail is not None:
                     raise recorder.fail
-                body = bytearray()
-                for piece in body_chunks:
-                    if piece:
-                        body.extend(piece)
-                recorder.calls.append({
+                # Record before the body iterator runs so an abort still shows
+                # the blocks that already reached this double.
+                call = {
                     "method": method,
                     "target": target,
                     "headers": [(name, value) for name, value in headers],
-                    "body": bytes(body),
-                })
+                    "body": bytearray(),
+                }
+                recorder.calls.append(call)
+                try:
+                    for piece in body_chunks:
+                        if piece:
+                            call["body"].extend(piece)
+                finally:
+                    call["body"] = bytes(call["body"])
                 if recorder.response is not None:
                     return recorder.response
                 chunks = list(recorder.chunks)
@@ -684,9 +692,13 @@ class ConfigTests(_GuardedCase):
         with self.assertRaises(ValueError) as ctx:
             broker.load_config(str(path))
         self.assertEqual(str(ctx.exception), "invalid broker config")
-        _write(path, text.replace('"port": 8765', '"port": NaN', 1), 0o600)
-        with self.assertRaises(ValueError):
+        nan_text = json.dumps(_config(self.providers, port=8765)).replace('"port": 8765', '"port": NaN', 1)
+        self.assertNotIn('"bind": "0.0.0.0"', nan_text)
+        self.assertEqual(nan_text.count('"bind"'), 1)
+        _write(path, nan_text, 0o600)
+        with self.assertRaises(ValueError) as ctx:
             broker.load_config(str(path))
+        self.assertEqual(str(ctx.exception), "invalid broker config")
 
     def test_field_rules_and_port_zero(self) -> None:
         path = self.root / "broker.json"
@@ -723,6 +735,44 @@ class ConfigTests(_GuardedCase):
         for config, fragment in cases:
             with self.subTest(fragment=fragment, secret=config["services"][0]["secret"] if config["services"] else None):
                 self._refuse(config, fragment)
+
+    def test_owned_credential_header_rejected(self) -> None:
+        message = "invalid broker config: header"
+        names = (
+            "Host",
+            "host",
+            "Content-Length",
+            "Transfer-Encoding",
+            "Connection",
+            "Keep-Alive",
+            "TE",
+            "Trailer",
+            "Upgrade",
+            "Proxy-Connection",
+            "Proxy-Authorization",
+        )
+        path = self.root / "broker.json"
+        for header in names:
+            with self.subTest(header=header):
+                config = _config(self.providers, port=8765, services=[_service(header=header)])
+                _write(path, json.dumps(config), 0o600)
+                with self.assertRaises(ValueError) as ctx:
+                    broker.load_config(str(path))
+                exc = ctx.exception
+                self.assertEqual(str(exc), message)
+                self.assertEqual(exc.args, (message,))
+                self.assertIsNone(exc.__context__)
+                self.assertIsNone(exc.__cause__)
+                self.assertNotIn(header, str(exc))
+                rendered = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                self.assertNotIn(header, rendered)
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    code = broker.main(["--config", str(path)])
+                self.assertEqual(code, 1)
+                err = stderr.getvalue()
+                self.assertEqual(err, message + "\n")
+                self.assertNotIn(header, err)
 
     def test_upstream_bad_port_text_is_not_in_the_error(self) -> None:
         bad_port = "abc"
@@ -1216,7 +1266,10 @@ class ProxyTests(_GuardedCase):
         self.assertEqual(obj["status"], "-")
         self.assertEqual(obj["reason"], "placeholder_leak")
         joined = b"".join(call["body"] for call in harness.recorder.calls)
+        padding = b"a" * (ONE_MIB - len(placeholder))
         _assert_absent(self, joined, placeholder, "placeholder")
+        self.assertLessEqual(len(joined), ONE_MIB)
+        self.assertTrue(padding.startswith(joined))
 
     def test_chunked_leak_aborts_without_refusal_body(self) -> None:
         harness = self._harness()
@@ -1258,7 +1311,9 @@ class ProxyTests(_GuardedCase):
         self.assertEqual(obj["status"], "-")
         self.assertEqual(obj["reason"], "placeholder_leak")
         received = b"".join(call["body"] for call in harness.recorder.calls)
-        self.assertEqual(received, b"")
+        _assert_absent(self, received, placeholder, "placeholder")
+        self.assertLessEqual(len(received), ONE_MIB)
+        self.assertFalse(received and token.startswith(received))
 
     def test_encoded_dotdot_rejected_not_prefix_matched(self) -> None:
         harness = self._harness()
@@ -1331,6 +1386,27 @@ class ProxyTests(_GuardedCase):
         self.assertEqual(headers.get(b"x-ok"), [b"visible"])
         self.assertNotIn(b"authorization", headers)
         self.assertNotIn(b"x-echo", headers)
+        _assert_absent(self, raw, SECRET, "secret")
+
+    def test_response_drops_secret_in_header_name(self) -> None:
+        harness = self._harness()
+        name = "X-" + SECRET
+        self.assertRegex(name, r"\A[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
+        harness.recorder.headers = [
+            ("Content-Type", "text/plain"),
+            ("Content-Length", "4"),
+            (name, "visible-value"),
+            ("X-Ok", "kept"),
+        ]
+        harness.recorder.chunks = [b"safe"]
+        placeholder = harness.mint()["openrouter"]
+        raw = harness.exchange("GET", "/openrouter/api/v1/x", harness.auth(placeholder))
+        status, headers, body, _raw = _parse_response(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"safe")
+        self.assertEqual(headers.get(b"x-ok"), [b"kept"])
+        self.assertEqual(headers.get(b"content-type"), [b"text/plain"])
+        _assert_absent(self, raw, name, "header-name")
         _assert_absent(self, raw, SECRET, "secret")
 
     def test_secret_split_across_chunks_is_not_written(self) -> None:
@@ -1660,6 +1736,34 @@ class ProxyTests(_GuardedCase):
         self.assertEqual(obj["status"], "-")
         self.assertEqual(obj["reason"], "bad_request")
 
+    def test_oversized_content_length_is_413_and_malformed(self) -> None:
+        harness = self._harness()
+        placeholder = harness.mint()["openrouter"]
+        huge = "9" * 5000
+        payload = (
+            "POST /openrouter/api/v1/x HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Authorization: Bearer %s\r\nContent-Length: %s\r\n\r\n" % (placeholder, huge)
+        ).encode("ascii")
+        before = len(harness.recorder.factory_calls)
+        raw = _exchange(harness.port, payload, timeout=3, shutdown=False)
+        _assert_error(self, raw, 413, "body_too_large")
+        self.assertEqual(len(harness.recorder.factory_calls), before)
+        self.assertEqual(harness.recorder.calls, [])
+        harness.recorder.headers = [
+            ("Content-Type", "text/plain"),
+            ("Content-Length", huge),
+        ]
+        harness.recorder.chunks = [b"ok"]
+        cap, _root = self._logs()
+        raw = harness.exchange("GET", "/openrouter/api/v1/x", harness.auth(placeholder), timeout=5)
+        _assert_error(self, raw, 502, "upstream_error")
+        obj = _one_log(self, cap)
+        self.assertEqual(obj["status"], 502)
+        self.assertEqual(obj["reason"], "upstream_error")
+        self.assertEqual(obj["service"], "openrouter")
+        self.assertNotEqual(obj["prefix"], "-")
+        _assert_absent(self, raw, SECRET, "secret")
+
     def test_request_content_length_leading_zeros(self) -> None:
         harness = self._harness()
         placeholder = harness.mint()["openrouter"]
@@ -1676,6 +1780,18 @@ class ProxyTests(_GuardedCase):
         self.assertEqual(sent["body"], b"hello")
         lengths = [value for name, value in sent["headers"] if name.lower() == "content-length"]
         self.assertEqual(lengths, ["5"])
+        payload = (
+            "POST /openrouter/api/v1/x HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Authorization: Bearer %s\r\nContent-Length: 000\r\n\r\n" % placeholder
+        ).encode("ascii")
+        raw = _exchange(harness.port, payload, timeout=5)
+        status, _headers, body, _raw = _parse_response(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"ok")
+        sent = harness.recorder.calls[-1]
+        self.assertEqual(sent["body"], b"")
+        lengths = [value for name, value in sent["headers"] if name.lower() == "content-length"]
+        self.assertEqual(lengths, ["0"])
 
     def test_response_content_length_leading_zeros(self) -> None:
         harness = self._harness()
@@ -1717,6 +1833,31 @@ class ProxyTests(_GuardedCase):
         obj = _one_log(self, cap)
         self.assertEqual(obj["status"], "-")
         self.assertEqual(obj["reason"], "bad_request")
+
+    def test_header_block_without_crlf_blank_line_is_bad_request(self) -> None:
+        harness = self._harness()
+        placeholder = harness.mint()["openrouter"]
+        head = (
+            "GET /openrouter/api/v1/x HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Authorization: Bearer %s\r\n" % placeholder
+        ).encode("ascii")
+        before = len(harness.recorder.factory_calls)
+        raw = _exchange(harness.port, head, timeout=3, shutdown=True)
+        if not raw:
+            self.assertNotIn(b"HTTP/1.1 2", raw)
+        else:
+            self.assertNotEqual(_parse_response(raw)[0], 200)
+            _assert_error(self, raw, 400, "bad_request")
+        self.assertEqual(len(harness.recorder.factory_calls), before)
+        self.assertEqual(harness.recorder.calls, [])
+        bare = head + b"\n"
+        raw = _exchange(harness.port, bare, timeout=3, shutdown=True)
+        _assert_error(self, raw, 400, "bad_request")
+        self.assertEqual(len(harness.recorder.factory_calls), before)
+        raw = _exchange(harness.port, head + b"\r\n", timeout=3, shutdown=True)
+        self.assertEqual(_parse_response(raw)[0], 200)
+        self.assertEqual(len(harness.recorder.factory_calls), before + 1)
 
     def test_request_line_bare_lf_is_bad_request(self) -> None:
         harness = self._harness()
@@ -1915,6 +2056,116 @@ class ProxyTests(_GuardedCase):
         _assert_absent(self, blob, fresh, "placeholder")
         _assert_absent(self, blob, alive, "placeholder")
         self.assertNotIn("injected-", blob)
+
+    def test_cli_logs_forward_and_refusal_on_stderr(self) -> None:
+        log = logging.getLogger("ak.broker")
+        saved_handlers = list(log.handlers)
+        saved_level = log.level
+        saved_propagate = log.propagate
+        for handler in saved_handlers:
+            log.removeHandler(handler)
+
+        def restore_log() -> None:
+            for handler in list(log.handlers):
+                log.removeHandler(handler)
+                handler.close()
+            for handler in saved_handlers:
+                log.addHandler(handler)
+            log.setLevel(saved_level)
+            log.propagate = saved_propagate
+
+        self.addCleanup(restore_log)
+        root = Path(tempfile.mkdtemp(prefix="ak-broker-cli-"))
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        providers = _provider_tree(root, {"KEY": SECRET})
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        path = root / "broker.json"
+        _write(path, json.dumps(_config(providers, port=port)), 0o600)
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), _CaptureHandler)
+        httpd.seen = []
+        httpd.payload = b"cli-ok"
+        fix_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        fix_thread.start()
+        self.addCleanup(_join_after_shutdown, httpd, fix_thread)
+        fixture_port = httpd.server_address[1]
+        servers: list = []
+        real_server = broker.BrokerServer
+
+        def capturing(config: dict, store: object, upstream_factory: object = None) -> object:
+            if upstream_factory is None:
+                server = real_server(config, store)
+            else:
+                server = real_server(config, store, upstream_factory)
+            servers.append((server, store))
+            return server
+
+        def factory(_service_config: dict, timeout_seconds: object) -> object:
+            return _LoopUpstream(fixture_port, timeout_seconds)
+
+        stderr = io.StringIO()
+        outcome: dict = {}
+
+        def run() -> None:
+            outcome["code"] = broker.main(["--config", str(path)])
+
+        with mock.patch.object(broker, "default_upstream_factory", factory):
+            with mock.patch.object(broker, "BrokerServer", capturing):
+                with contextlib.redirect_stderr(stderr):
+                    thread = threading.Thread(target=run, daemon=True)
+                    thread.start()
+                    self.addCleanup(lambda: thread.join(2))
+                    bound = False
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        if outcome.get("code") is not None:
+                            break
+                        try:
+                            sock = socket.create_connection(("127.0.0.1", port), timeout=0.2)
+                        except OSError:
+                            time.sleep(0.05)
+                            continue
+                        sock.close()
+                        if servers:
+                            bound = True
+                            break
+                    self.assertTrue(bound, stderr.getvalue() or outcome)
+                    server, store = servers[0]
+                    self.addCleanup(server.shutdown)
+                    placeholder = store.mint("task-cli", ["openrouter"])["openrouter"]
+                    raw = _exchange(
+                        port,
+                        _request_bytes(
+                            "GET",
+                            "/openrouter/api/v1/x",
+                            [("Authorization", "Bearer " + placeholder)],
+                        ),
+                        timeout=5,
+                    )
+                    self.assertEqual(_parse_response(raw)[0], 200)
+                    raw = _exchange(
+                        port,
+                        _request_bytes("GET", "/openrouter/api/v1/x", []),
+                        timeout=5,
+                    )
+                    _assert_error(self, raw, 401, "missing_placeholder")
+                    server.shutdown()
+                    thread.join(5)
+        text = stderr.getvalue()
+        _assert_absent(self, text, SECRET, "secret")
+        _assert_absent(self, text, placeholder, "placeholder")
+        records = []
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            self.assertFalse(line.startswith("INFO"))
+            records.append(json.loads(line))
+        pairs = [(item["status"], item["reason"]) for item in records]
+        self.assertIn((200, "-"), pairs)
+        self.assertIn((401, "missing_placeholder"), pairs)
+        self.assertEqual(len(httpd.seen), 1)
 
     def test_tls_verification_stays_on(self) -> None:
         text = (BROKER / "broker.py").read_text()

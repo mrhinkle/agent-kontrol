@@ -11,7 +11,7 @@
       "upstream": "https://openrouter.ai",
       "header": "Authorization",
       "template": "Bearer {secret}",
-      "secret": "secretref://file/lanes/OPENROUTER_API_KEY",
+      "secret": "secretref://file/default/OPENROUTER_API_KEY",
       "methods": ["GET", "POST"],
       "path_prefixes": ["/api/v1/"]
     }
