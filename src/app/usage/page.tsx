@@ -1,7 +1,7 @@
 "use client";
 
 import { UsageCostPanels } from "@/components/usage-cost-panels";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   DEFAULT_USAGE_WINDOW,
   USAGE_WINDOWS,
@@ -69,6 +69,50 @@ export default function UsagePage() {
   const [data, setData] = useState<UsageSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [hiddenCards, setHiddenCards] = useState<string[]>([]);
+  const [hideError, setHideError] = useState<string | null>(null);
+
+  // Hidden cards are display only. If this read fails, every card is shown.
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/usage/hidden-cards", { cache: "no-store" })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((json: { hidden?: unknown } | null) => {
+        if (!cancelled && Array.isArray(json?.hidden)) setHiddenCards(json.hidden.filter((k): k is string => typeof k === "string"));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const setCardsHidden = useCallback(async (cards: string[], hidden: boolean) => {
+    setHideError(null);
+    const apply = (on: boolean) => (cur: string[]) => on ? [...new Set([...cur, ...cards])] : cur.filter((k) => !cards.includes(k));
+    setHiddenCards(apply(hidden));
+    try {
+      const res = await fetch("/api/usage/hidden-cards", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cards, hidden }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = (await res.json()) as { hidden?: unknown };
+      if (Array.isArray(json.hidden)) setHiddenCards(json.hidden.filter((k): k is string => typeof k === "string"));
+    } catch {
+      // Re-read the stored list rather than undoing this change alone: another
+      // write may have landed in between. If that read fails too, undo locally.
+      try {
+        const res = await fetch("/api/usage/hidden-cards", { cache: "no-store" });
+        const json = res.ok ? ((await res.json()) as { hidden?: unknown }) : null;
+        if (!Array.isArray(json?.hidden)) throw new Error("no list");
+        setHiddenCards(json.hidden.filter((k): k is string => typeof k === "string"));
+      } catch {
+        setHiddenCards(apply(!hidden));
+      }
+      setHideError(hidden ? "Could not save: the box is shown again." : "Could not save: the boxes stay hidden.");
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -168,7 +212,8 @@ export default function UsagePage() {
         </div>
       )}
 
-      {data && !setupRequired && <UsageCostPanels data={data} />}
+      {hideError && <div role="alert" className="text-xs text-amber-200">{hideError}</div>}
+      {data && !setupRequired && <UsageCostPanels data={data} hidden={hiddenCards} onSetHidden={setCardsHidden} />}
 
       {empty && (
         <div className="rounded-xl border border-fg/10 bg-panel px-5 py-8 text-center text-sm text-gray-400">

@@ -105,6 +105,7 @@ Machine-readable contract: [`GET /api/openapi.json`](/api/openapi.json) (OpenAPI
 | GET | `/api/traces/:traceId` | Cookie or bearer | The spans of one trace |
 | GET | `/api/usage` | Cookie, bearer, or `usage:read` | Usage ledger |
 | POST | `/api/usage/ingest` | Bearer | Ingest usage facts |
+| GET, PUT | `/api/usage/hidden-cards` | Session or MC_TOKEN | Usage cards hidden because no tracking is connected. Display only |
 | GET | `/api/skill-bundles` | Session or MC_TOKEN | Download a gzip tar of the skill tree for one runtime. Operator only |
 | POST | `/api/login` | Own (rate-limited) | Dashboard password login |
 | POST | `/api/watch/beat` | `akc_` `watch:write` | Store one host liveness beat. The credential must be bound to `source` |
@@ -398,6 +399,7 @@ A request that sends `Authorization`, including a valid `MC_TOKEN` or a valid ag
 Usage and Costs is experimental.
 
 - `GET /api/usage?window=24h|7d|30d`, or `?since=ISO&until=ISO` — the usage ledger. The default window is a rolling 7 days. An agent credential needs `usage:read`. That scope does not grant ingest. `claude.shadow` and `grok.shadow` give the API-equivalent value of subscription tokens at published list prices: `usd` (null when nothing could be priced, never 0 for unpriced usage), `status`, `unavailable_reason`, `rate_version`, `rates_checked_at`, `priced_requests`, `unpriced_requests`, `unpriced`, `unknown_models`, `excluded_api_requests`, `unclassified_requests` and `by_model`. Rows marked API-billed are left out. It is an estimate, never a charge. `grok` also gives the Grok CLI collection: `local_usage_status` (`complete`, `partial` or `unavailable`), `turns`, `model_calls`, token totals, `reported_estimate_usd` (the Grok CLI's own figure for the same rows, API-billed rows left out; a cross-check) and `machines`. See [Shadow costs](USAGE.md#shadow-costs).
+- `GET /api/usage/hidden-cards`, `PUT /api/usage/hidden-cards {cards, hidden}` — dashboard session or `MC_TOKEN`; an agent credential is 403. The Usage and Costs cards the operator hid because no tracking or feed is connected, stored in `usage_hidden_cards` for the deployment. Keys are `provider:<account_id>`, `grok:local`, `grok:openrouter`, `grok:shadow` and `claude:shadow`. `cards` takes 1 to 50 keys; an unknown key is 400 `validation_failed`. Display only: no total reads it, and a stored key hides a card only while that card has no data. Without a database the list is kept in memory (`demo: true`). See [Hiding cards with no data source](USAGE.md#hiding-cards-with-no-data-source).
 - `POST /api/usage/ingest` — bearer `MC_TOKEN` — body `{collected_at?, kind?, facts: UsageFact[], snapshot?}`. This route is separate from `POST /api/ingest`, which is liveness only. An agent credential is denied, including one that holds `usage:read`.
 
 ### Traces

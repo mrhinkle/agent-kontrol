@@ -895,3 +895,13 @@ create table if not exists reducer_locks (
   token text not null,
   expires_at timestamptz not null
 );
+
+-- Usage page cards the operator hid (see supabase/migrations/20261126_usage_hidden_cards.sql).
+-- Additive: one new table. Display only: nothing reads it to compute a total.
+-- One row per hidden card for the whole deployment (there is one dashboard
+-- account). A stored key applies only while that card has no data source;
+-- the page shows a card that has data even when its key is here.
+create table if not exists usage_hidden_cards (
+  card_key text primary key check (card_key ~ '^(provider:[a-z0-9._:-]{1,100}|grok:(local|openrouter|shadow)|claude:shadow)$'),
+  hidden_at timestamptz not null default now()
+);

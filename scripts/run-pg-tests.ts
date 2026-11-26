@@ -16,6 +16,7 @@ import { sql, sqlTransaction, withTransaction } from "../src/lib/db";
 import { insertGhEvent, signBody } from "../src/lib/gh-events";
 import { testSweeper } from "./pg-sweeper-tests";
 import { testProviderCosts } from "./pg-provider-costs-tests";
+import { testUsageHiddenCards } from "./pg-usage-hidden-cards-tests";
 import { testVelocityStore } from "./pg-velocity-tests";
 import { testProgressActivity } from "./pg-progress-activity-tests";
 import { testProgressCollectLock } from "./pg-progress-collect-tests";
@@ -411,6 +412,7 @@ async function main() {
   await testProgressActivity();
   await testProgressCollectLock();
   await testProviderCosts();
+  await testUsageHiddenCards();
 
   console.log(`test:pg ok (driver override: ${driverOverride ?? "auto"})`);
 }
