@@ -60,6 +60,10 @@ _CL_RE = re.compile(r"[0-9]+\Z")
 _SMALL_BODY = 1024 * 1024
 _READ_CHUNK = 65536
 _MAX_LINE = 65536
+# Response Content-Length is not the request body limit. 19 digits covers
+# any length that fits in a signed 64-bit integer. A longer digit string
+# is malformed and is never passed to int().
+_MAX_RESPONSE_LENGTH_DIGITS = 19
 
 _REDIRECTS = frozenset((300, 301, 302, 303, 305, 307, 308))
 _NO_BODY = frozenset((204, 304))
@@ -1015,7 +1019,11 @@ def _resolve_secrets(config: dict) -> dict[str, str]:
 
 
 class _HeaderBlock:
-    """Remember the line ``parse_headers`` stopped on. It also stops at EOF."""
+    """Remember the line ``parse_headers`` stopped on. It also stops at EOF.
+
+    Every header line must end in CRLF. A bare LF raises before the next
+    byte is read, so a following body is not consumed.
+    """
 
     def __init__(self, rfile: object) -> None:
         self._rfile = rfile
@@ -1024,6 +1032,8 @@ class _HeaderBlock:
     def readline(self, size: int = -1) -> bytes:
         line = self._rfile.readline(size)
         self.terminator = line
+        if line and not line.endswith(b"\r\n"):
+            raise _BadRequest()
         return line
 
 
@@ -1049,8 +1059,8 @@ def _read_request(handler: BaseHTTPRequestHandler):
     if _TOKEN_RE.fullmatch(method) is None:
         raise _BadRequest()
     # parse_headers keeps its own line-size and header-count limits and stops
-    # at the first blank line. It does not read the body. EOF and a bare LF
-    # are not a terminated header block.
+    # at the first blank line. It does not read the body. Every header line
+    # must end in CRLF. EOF and a bare LF are not a terminated header block.
     reader = _HeaderBlock(handler.rfile)
     try:
         headers = http.client.parse_headers(reader)
@@ -1133,7 +1143,7 @@ def _forward_target(parsed: _ParsedTarget) -> str:
     return parsed.raw_remainder
 
 
-def _response_plan(response: object, service: dict, secret_values: tuple, max_body: int):
+def _response_plan(response: object, service: dict, secret_values: tuple):
     status = getattr(response, "status", None)
     if type(status) is not int or not 100 <= status <= 599:
         raise UpstreamError("malformed")
@@ -1173,7 +1183,7 @@ def _response_plan(response: object, service: dict, secret_values: tuple, max_bo
     if len(content_lengths) == 1 and _CL_RE.fullmatch(content_lengths[0].strip()) is not None:
         if not _contains_text(content_lengths[0], secret_values):
             raw_length = content_lengths[0].strip()
-            parsed_length = _decimal_length(raw_length, len(str(max_body)))
+            parsed_length = _decimal_length(raw_length, _MAX_RESPONSE_LENGTH_DIGITS)
             if parsed_length is None:
                 raise UpstreamError("malformed")
             valid_length = str(parsed_length)
@@ -1485,9 +1495,7 @@ def _forward_open(
         _send_json(handler, 502, "upstream_error")
         return True
     try:
-        status, filtered, valid_length = _response_plan(
-            response, service, secrets, handler.server.state.config["max_request_body_bytes"],
-        )
+        status, filtered, valid_length = _response_plan(response, service, secrets)
     except UpstreamError:
         _emit(service_name, method, prefix, 502, "upstream_error", secrets)
         _send_json(handler, 502, "upstream_error")

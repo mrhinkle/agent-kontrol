@@ -1265,9 +1265,11 @@ class ProxyTests(_GuardedCase):
         obj = _one_log(self, cap)
         self.assertEqual(obj["status"], "-")
         self.assertEqual(obj["reason"], "placeholder_leak")
-        joined = b"".join(call["body"] for call in harness.recorder.calls)
+        self.assertEqual(len(harness.recorder.calls), 1)
+        joined = harness.recorder.calls[0]["body"]
         padding = b"a" * (ONE_MIB - len(placeholder))
         _assert_absent(self, joined, placeholder, "placeholder")
+        self.assertGreater(len(joined), 0)
         self.assertLessEqual(len(joined), ONE_MIB)
         self.assertTrue(padding.startswith(joined))
 
@@ -1310,9 +1312,13 @@ class ProxyTests(_GuardedCase):
         obj = _one_log(self, cap)
         self.assertEqual(obj["status"], "-")
         self.assertEqual(obj["reason"], "placeholder_leak")
-        received = b"".join(call["body"] for call in harness.recorder.calls)
+        # Upstream is already open. The first chunk is a prefix of the
+        # placeholder, so the scanner holds it and aborts before yielding.
+        self.assertEqual(len(harness.recorder.calls), 1)
+        received = harness.recorder.calls[0]["body"]
         _assert_absent(self, received, placeholder, "placeholder")
         self.assertLessEqual(len(received), ONE_MIB)
+        self.assertEqual(received, b"")
         self.assertFalse(received and token.startswith(received))
 
     def test_encoded_dotdot_rejected_not_prefix_matched(self) -> None:
@@ -1793,6 +1799,29 @@ class ProxyTests(_GuardedCase):
         lengths = [value for name, value in sent["headers"] if name.lower() == "content-length"]
         self.assertEqual(lengths, ["0"])
 
+    def test_large_response_content_length_is_forwarded(self) -> None:
+        harness = self._harness()
+        payload = b"x" * 12582912
+        self.assertEqual(len(payload), 12582912)
+        harness.recorder.response = BytesResponse(payload)
+        placeholder = harness.mint()["openrouter"]
+        raw = harness.exchange("GET", "/openrouter/api/v1/x", harness.auth(placeholder), timeout=60)
+        status, headers, body, _raw = _parse_response(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get(b"content-length"), [b"12582912"])
+        self.assertEqual(body, payload)
+
+    def test_response_length_ignores_request_body_limit(self) -> None:
+        harness = self._harness(max_request_body_bytes=1000)
+        payload = b"y" * 50000
+        harness.recorder.response = BytesResponse(payload)
+        placeholder = harness.mint()["openrouter"]
+        raw = harness.exchange("GET", "/openrouter/api/v1/x", harness.auth(placeholder), timeout=30)
+        status, headers, body, _raw = _parse_response(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get(b"content-length"), [b"50000"])
+        self.assertEqual(body, payload)
+
     def test_response_content_length_leading_zeros(self) -> None:
         harness = self._harness()
         placeholder = harness.mint()["openrouter"]
@@ -1834,6 +1863,66 @@ class ProxyTests(_GuardedCase):
         self.assertEqual(obj["status"], "-")
         self.assertEqual(obj["reason"], "bad_request")
 
+    def test_bare_lf_header_line_is_bad_request(self) -> None:
+        harness = self._harness()
+        placeholder = harness.mint()["openrouter"]
+        before = len(harness.recorder.factory_calls)
+        samples = [
+            (
+                "POST /openrouter/api/v1/x HTTP/1.1\r\n"
+                "Host: a\n"
+                "X: b\n"
+                "Authorization: Bearer %s\r\n"
+                "Content-Length: 5\r\n"
+                "\r\n"
+                "hello"
+            ),
+            (
+                "POST /openrouter/api/v1/x HTTP/1.1\r\n"
+                "Host: 127.0.0.1\r\n"
+                "X-Mid: bare\n"
+                "Authorization: Bearer %s\r\n"
+                "Content-Length: 5\r\n"
+                "\r\n"
+                "hello"
+            ),
+        ]
+        for sample in samples:
+            with self.subTest(sample=sample.split("\n", 2)[1]):
+                raw = _exchange(harness.port, (sample % placeholder).encode("ascii"), timeout=3, shutdown=True)
+                self.assertTrue(raw.startswith(b"HTTP/1.1 400"))
+                _assert_error(self, raw, 400, "bad_request")
+                self.assertEqual(len(harness.recorder.factory_calls), before)
+                self.assertEqual(harness.recorder.calls, [])
+
+    def test_crlf_header_block_forwards_exact_body(self) -> None:
+        harness = self._harness()
+        placeholder = harness.mint()["openrouter"]
+        body = b"hello-body"
+        length_payload = (
+            "POST /openrouter/api/v1/x HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Authorization: Bearer %s\r\n"
+            "Content-Length: %d\r\n"
+            "\r\n" % (placeholder, len(body))
+        ).encode("ascii") + body
+        raw = _exchange(harness.port, length_payload, timeout=5)
+        self.assertEqual(_parse_response(raw)[0], 200)
+        self.assertEqual(len(harness.recorder.calls), 1)
+        self.assertEqual(harness.recorder.calls[0]["body"], body)
+        chunked = (
+            "POST /openrouter/api/v1/x HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Authorization: Bearer %s\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "\r\n"
+            "%x\r\n" % (placeholder, len(body))
+        ).encode("ascii") + body + b"\r\n0\r\n\r\n"
+        raw = _exchange(harness.port, chunked, timeout=5)
+        self.assertEqual(_parse_response(raw)[0], 200)
+        self.assertEqual(len(harness.recorder.calls), 2)
+        self.assertEqual(harness.recorder.calls[1]["body"], body)
+
     def test_header_block_without_crlf_blank_line_is_bad_request(self) -> None:
         harness = self._harness()
         placeholder = harness.mint()["openrouter"]
@@ -1844,17 +1933,16 @@ class ProxyTests(_GuardedCase):
         ).encode("ascii")
         before = len(harness.recorder.factory_calls)
         raw = _exchange(harness.port, head, timeout=3, shutdown=True)
-        if not raw:
-            self.assertNotIn(b"HTTP/1.1 2", raw)
-        else:
-            self.assertNotEqual(_parse_response(raw)[0], 200)
-            _assert_error(self, raw, 400, "bad_request")
+        self.assertTrue(raw.startswith(b"HTTP/1.1 400"))
+        _assert_error(self, raw, 400, "bad_request")
         self.assertEqual(len(harness.recorder.factory_calls), before)
         self.assertEqual(harness.recorder.calls, [])
         bare = head + b"\n"
         raw = _exchange(harness.port, bare, timeout=3, shutdown=True)
+        self.assertTrue(raw.startswith(b"HTTP/1.1 400"))
         _assert_error(self, raw, 400, "bad_request")
         self.assertEqual(len(harness.recorder.factory_calls), before)
+        self.assertEqual(harness.recorder.calls, [])
         raw = _exchange(harness.port, head + b"\r\n", timeout=3, shutdown=True)
         self.assertEqual(_parse_response(raw)[0], 200)
         self.assertEqual(len(harness.recorder.factory_calls), before + 1)
