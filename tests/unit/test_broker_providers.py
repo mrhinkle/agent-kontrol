@@ -1433,7 +1433,7 @@ class ExecProviderTests(unittest.TestCase):
                         "exec failed: recipe=recipe timeout",
                     )
             elapsed = time.monotonic() - started
-            self.assertLess(elapsed, 1 + 2)
+            self.assertLess(elapsed, 1 + providers._ABORT_REAP_SECONDS + 2)
             self.assertTrue(pids)
             with self.assertRaises(ChildProcessError):
                 os.waitpid(pids[0], os.WNOHANG)
@@ -1443,15 +1443,10 @@ class ExecProviderTests(unittest.TestCase):
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                deadline = time.monotonic() + 2
-                while True:
-                    try:
-                        waited, _status = os.waitpid(pid, os.WNOHANG)
-                    except ChildProcessError:
-                        break
-                    if waited == pid or time.monotonic() >= deadline:
-                        break
-                    time.sleep(0.01)
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
 
     def test_kill_denied_reap_is_bounded(self) -> None:
         pids: list[int] = []
