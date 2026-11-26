@@ -126,3 +126,105 @@ Command: `sops -d --extract '["{name}"]' <file>`
 Example reference: `secretref://exec/sops/openrouter_api_key`
 
 Status: not run
+
+## Running the broker
+
+The broker is a host process. It listens on `127.0.0.1` only.
+
+```bash
+python3 agents/broker/broker.py --config /var/lib/agent-kontrol/broker.json
+```
+
+The config file is JSON. It must be a regular file, not a symlink, owned by the effective uid, mode `0600` or `0400`. Copy `config.example.json`, replace the operator substitutions, and `chmod 600` the copy.
+
+Every field is required.
+
+- `bind` is exactly `127.0.0.1`. Any other address is refused before a socket is created.
+- `port` is an integer from 1 to 65535. `0` is rejected in the file. Tests pass an ephemeral port only through the in-memory server API.
+- `providers` is an absolute path of a provider config, as described above.
+- `placeholder_ttl_seconds` is a positive integer. A placeholder is expired when the monotonic clock is greater than or equal to `minted_at + ttl`.
+- `upstream_timeout_seconds` is a positive integer. It bounds the upstream connection, including the TLS handshake.
+- `max_request_body_bytes` is a positive integer. A request with a known length over the limit is refused with `413` before any upstream connection. A chunked body that crosses the limit while it is already streaming aborts both connections.
+- `services` is a non-empty list. Each service object has exactly these fields:
+  - `name`: 1–40 characters from `[a-z0-9-]`, unique among services.
+  - `upstream`: an `https://` origin with no path, query, fragment, or userinfo. TLS verification stays on. Redirects are not followed.
+  - `header`: the header the upstream uses for its credential. The name is matched without case sensitivity.
+  - `template`: the header value, containing the text `{secret}` once. The usual form is `Bearer {secret}`.
+  - `secret`: a `secretref://` reference. A literal key is refused at startup. The value is resolved once, through the provider file, before the socket is created, and is not resolved again per request.
+  - `methods`: a non-empty list of uppercase method tokens.
+  - `path_prefixes`: a non-empty list of prefixes that start with `/`. After the path is normalized, it must start with one of them. `/api/v1/` matches `/api/v1/x` and does not match `/api/v1` or `/api/v1x`.
+
+If resolution fails, the process exits non-zero and names the service and the provider. It does not print the secret. Each request writes one JSON line to the logger `ak.broker` with the keys `service`, `method`, `prefix`, `status`, and `reason`. That line does not include the target, a header value, the body, the secret, or a placeholder.
+
+Stopping the process drops every placeholder, because they live only in memory. A later start resolves secrets again and will not accept placeholders minted by the previous process.
+
+### launchd
+
+Operator recipe. This plist has not been loaded.
+
+Status: not yet run
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.peripety.ak-broker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/ABS/PATH/agents/broker/broker.py</string>
+    <string>--config</string>
+    <string>/ABS/PATH/broker.json</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+</dict>
+</plist>
+```
+
+`launchctl bootout` unloads the job. Unloading is not the same thing as leaving the plist in place.
+
+```bash
+launchctl bootout gui/$(id -u)/com.peripety.ak-broker
+curl -sS -m 2 http://127.0.0.1:8765/
+```
+
+The curl command must fail to connect. Replace `8765` with the configured port.
+
+### systemd
+
+Operator recipe. This unit has not been started.
+
+Status: not yet run
+
+```ini
+[Unit]
+Description=Agent Kontrol secret broker
+
+[Service]
+ExecStart=/usr/bin/python3 /ABS/PATH/agents/broker/broker.py --config /ABS/PATH/broker.json
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+Save it as `~/.config/systemd/user/ak-broker.service`.
+
+`systemctl --user stop ak-broker` ends the running process. `systemctl --user disable ak-broker` keeps a future login from starting it. If the unit was enabled, run both. Stopping alone leaves the enablement in place. Disabling alone leaves the current process running.
+
+```bash
+systemctl --user stop ak-broker
+systemctl --user disable ak-broker
+curl -sS -m 2 http://127.0.0.1:8765/
+```
+
+The curl command must fail to connect.
+
+### Same OS user
+
+A lane that runs as the same OS user as the broker can still read the broker's files and its process memory. The placeholder keeps the secret out of the lane's environment. It does not hide the broker from that user. Separating the OS user is #193.
