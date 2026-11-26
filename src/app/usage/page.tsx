@@ -1,13 +1,21 @@
 "use client";
 
 import { UsageCostPanels } from "@/components/usage-cost-panels";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   DEFAULT_USAGE_WINDOW,
   USAGE_WINDOWS,
   type UsageTimeWindow,
 } from "@/lib/usage-window";
 import type { UsageSummary } from "@/lib/usage-types";
+import { createHiddenCardsWriter } from "@/lib/usage-hidden-writer";
+
+/** The `hidden` list from a hidden-cards response; throws when it is missing. */
+function hiddenKeys(json: unknown): string[] {
+  const list = (json as { hidden?: unknown } | null)?.hidden;
+  if (!Array.isArray(list)) throw new Error("no hidden list");
+  return list.filter((k): k is string => typeof k === "string");
+}
 
 function Panel({
   title,
@@ -69,6 +77,47 @@ export default function UsagePage() {
   const [data, setData] = useState<UsageSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [hiddenCards, setHiddenCards] = useState<string[]>([]);
+  const [hideError, setHideError] = useState<string | null>(null);
+
+  // Hidden cards are display only. If the first read fails, every card is shown.
+  // Writes go out one at a time in the order they were made (usage-hidden-writer.ts),
+  // and the first read never replaces the list once a write was made.
+  const [writer] = useState(() => createHiddenCardsWriter({
+    send: async (cards, hidden) => {
+      const res = await fetch("/api/usage/hidden-cards", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cards, hidden }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return hiddenKeys(await res.json());
+    },
+    reload: async () => {
+      const res = await fetch("/api/usage/hidden-cards", { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return hiddenKeys(await res.json());
+    },
+    setList: setHiddenCards,
+    setError: setHideError,
+  }));
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/usage/hidden-cards", { cache: "no-store" })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((json: unknown) => {
+        if (!cancelled && json && !writer.started()) setHiddenCards(hiddenKeys(json));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [writer]);
+
+  const setCardsHidden = useCallback((cards: string[], hidden: boolean) => {
+    void writer.write(cards, hidden);
+  }, [writer]);
 
   useEffect(() => {
     let cancelled = false;
@@ -168,7 +217,8 @@ export default function UsagePage() {
         </div>
       )}
 
-      {data && !setupRequired && <UsageCostPanels data={data} />}
+      {hideError && <div role="alert" className="text-xs text-amber-200">{hideError}</div>}
+      {data && !setupRequired && <UsageCostPanels data={data} hidden={hiddenCards} onSetHidden={setCardsHidden} />}
 
       {empty && (
         <div className="rounded-xl border border-fg/10 bg-panel px-5 py-8 text-center text-sm text-gray-400">

@@ -92,6 +92,14 @@ npx tsx scripts/collect-provider-usage.ts --provider claude-fee --fee-file /path
 - Grok: `grok_cli` rows from the Grok usage collector are priced at xAI list prices. `grok-4.7-build` and `grok-4.6-build` (Grok Build's model IDs) use the standard grok-4.7 and grok-4.6 rates, which match the Grok CLI's own cost figure; the "Grok 4.7 Fast (Grok Build only)" listing would double it. Reasoning tokens are already inside output tokens and are not priced again. Grok records tokens per turn, and a turn covers many model calls, so the 200K long-prompt tier is decided on the average prompt per call (it under-counts when only a few calls were long). The summary is `grok.shadow`, with Grok's own figure beside it as `grok.reported_estimate_usd`. With no Grok collection received, `grok.shadow` is unavailable with `unavailable_reason: "no_token_feed"`. Grok through OpenRouter is metered spend, not shadow cost.
 - Every row is priced at the current table, including rows older than its check date. The UI shows the check date.
 
+## Hiding cards with no data source
+
+A card on Usage and Costs that has no tracking or feed behind it has a **Hide** button on the card itself: a provider marked "Not connected" with no cost, "Local Grok CLI usage: Unavailable", "Grok through OpenRouter" when OpenRouter is not connected, and an API-equivalent value card with no rows at all. Hidden cards are listed above the panels with a **Show N hidden** button that brings them back.
+
+- The list is stored in `usage_hidden_cards`, one row per card for the deployment, so it follows the operator to any browser. Without a database it lasts until the server restarts.
+- A card with data cannot be hidden. The Hide button is only drawn on cards with no data, and a stored key is ignored while its card has data, so a card comes back by itself when its feed connects. An API-equivalent card that shows "N requests not priced" has data and stays visible.
+- Hiding is display only. Totals, the daily provider table and `GET /api/usage` are unchanged, and a hidden "Not available" value is never counted as $0.
+
 ## Operation and activation
 
 These CLIs are manual and dry-run by default. This change does not install or activate a recurring job, provision provider keys, change production environment values or alter existing velocity/Hermes schedules. Production activation requires the existing authorized credential and release flow. Verify a real provider response, non-demo ingest receipt, persisted readback and rendered coverage before describing an integration as live. Optional future daily scheduling should run the same 30-day refresh so provider corrections are captured.

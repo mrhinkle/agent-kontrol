@@ -139,6 +139,17 @@ const sessionOnly = [{ cookieAuth: [] }];
 /** Dashboard session or MC_TOKEN. Not the generic bearer that accepts an agent credential. */
 const operatorSessionOrMcToken = [{ cookieAuth: [] }, { mcToken: [] }];
 
+/** GET and PUT /api/usage/hidden-cards answer the same shape. */
+const hiddenUsageCards: Json = {
+  type: "object",
+  required: ["hidden", "demo"],
+  additionalProperties: false,
+  properties: {
+    hidden: { type: "array", items: { type: "string" }, description: "Hidden card keys, sorted." },
+    demo: { type: "boolean", description: "True when no database is connected and the list is kept in memory." },
+  },
+};
+
 /** Server-set. A request body cannot write these. */
 const actorType: Json = {
   type: ["string", "null"],
@@ -2222,6 +2233,41 @@ export function openApiDocument(): Json {
           ],
           responses: {
             "200": jsonResponse("Usage summary. Stays 200 with setup_required when the table is missing.", { type: "object" }),
+            ...flatErrors,
+          },
+        }),
+      },
+      "/api/usage/hidden-cards": {
+        get: operation({
+          operationId: "listHiddenUsageCards",
+          tags: ["usage"],
+          summary: "Usage cards hidden because they have no data source.",
+          description: "Usage and Costs cards the operator hid because no tracking or feed is connected. Display only: no total reads this list. A stored key hides a card only while that card has no data; the page shows a card with data even when its key is stored. Keys are provider:<account_id>, grok:local, grok:openrouter, grok:shadow and claude:shadow. Dashboard session or MC_TOKEN. An agent credential is denied with 403. Without a database the list is kept in memory and demo is true.",
+          security: operatorSessionOrMcToken,
+          responses: {
+            "200": jsonResponse("hidden (sorted card keys) and demo.", hiddenUsageCards),
+            ...flatErrors,
+          },
+        }),
+        put: operation({
+          operationId: "setHiddenUsageCards",
+          tags: ["usage"],
+          summary: "Hide or show Usage cards that have no data source.",
+          description: "Usage and Costs cards the operator hid because no tracking or feed is connected. Display only: no total reads this list. A stored key hides a card only while that card has no data; the page shows a card with data even when its key is stored. Keys are provider:<account_id>, grok:local, grok:openrouter, grok:shadow and claude:shadow. Dashboard session or MC_TOKEN. An agent credential is denied with 403. Without a database the list is kept in memory and demo is true. Body: cards (1 to 50 card keys) and hidden (true to hide, false to show). An unknown key or a non-boolean hidden is 400 validation_failed and writes nothing.",
+          security: operatorSessionOrMcToken,
+          requestBody: {
+            required: true,
+            content: { "application/json": { schema: {
+              type: "object",
+              required: ["cards", "hidden"],
+              properties: {
+                cards: { type: "array", minItems: 1, maxItems: 50, items: { type: "string" } },
+                hidden: { type: "boolean" },
+              },
+            } } },
+          },
+          responses: {
+            "200": jsonResponse("The hidden list after the write, and demo.", hiddenUsageCards),
             ...flatErrors,
           },
         }),
