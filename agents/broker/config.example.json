@@ -1,0 +1,19 @@
+{
+  "bind": "127.0.0.1",
+  "port": 8765,
+  "providers": "/abs/path/providers.json",
+  "placeholder_ttl_seconds": 3600,
+  "upstream_timeout_seconds": 60,
+  "max_request_body_bytes": 1048576,
+  "services": [
+    {
+      "name": "openrouter",
+      "upstream": "https://openrouter.ai",
+      "header": "Authorization",
+      "template": "Bearer {secret}",
+      "secret": "secretref://file/lanes/OPENROUTER_API_KEY",
+      "methods": ["GET", "POST"],
+      "path_prefixes": ["/api/v1/"]
+    }
+  ]
+}
