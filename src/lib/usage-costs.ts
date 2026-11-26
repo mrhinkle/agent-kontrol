@@ -1,6 +1,7 @@
 /** Provider invoices and local Claude observations never enter Hermes attribution. */
 import type { AccountSnapshot } from "./providers/types";
-import type { ClaudeUsageSummary, GrokUsageSummary, ProviderCostSummary, UsageFact } from "./usage-types";
+import { lookupShadowRate, shadowCostForFact, SHADOW_RATE_VERSION, SHADOW_RATES_CHECKED_AT } from "./shadow-rates";
+import type { ClaudeUsageSummary, GrokUsageSummary, ProviderCostSummary, ShadowCostSummary, UsageFact } from "./usage-types";
 
 const DAY = 86_400_000;
 const accounts = [
@@ -62,6 +63,47 @@ export function providerCosts(facts: UsageFact[], snapshots: AccountSnapshot[], 
   });
 }
 
+/**
+ * API-equivalent value of subscription usage rows. Unpriced rows are counted, never
+ * valued at $0; the total is null when nothing in the window could be priced. Rows the
+ * operator marked API-billed are left out (they are metered spend) and counted.
+ */
+export function shadowCosts(rows: UsageFact[], opts: { noFeed?: boolean } = {}): ShadowCostSummary {
+  const unpriced = { missing_model: 0, unknown_model: 0, missing_tokens: 0 };
+  const unknown = new Set<string>();
+  const models = new Map<string, ShadowCostSummary["by_model"][number]>();
+  let usd = 0, priced = 0, missing = 0, api = 0, unclassified = 0;
+  for (const f of rows) {
+    const requests = f.api_call_count && f.api_call_count > 0 ? f.api_call_count : 1;
+    // API-billed tokens already appear as metered spend; pricing them again would double count.
+    const mode = f.detail?.billing_mode;
+    if (mode === "api") { api += requests; continue; }
+    const cost = shadowCostForFact(f);
+    if (cost.status === "unavailable") {
+      unpriced[cost.reason] += requests; missing += requests;
+      if (cost.reason === "unknown_model" && unknown.size < 20) unknown.add(f.model.slice(0, 120));
+      continue;
+    }
+    priced += requests; usd += cost.usd;
+    if (mode !== "subscription") unclassified += requests;
+    const m = models.get(cost.model) ?? { model: cost.model, requests: 0, usd: 0, long_prompt_requests: 0, source_url: lookupShadowRate(cost.model)!.source_url };
+    m.requests += requests; m.usd += cost.usd;
+    if (cost.tier === "long_prompt") m.long_prompt_requests += requests;
+    models.set(cost.model, m);
+  }
+  const round = (n: number) => Math.round(n * 1e10) / 1e10;
+  const reason = opts.noFeed ? "no_token_feed" : !rows.length ? "no_rows" : priced + missing === 0 ? "only_api_billed" : !priced ? "no_priced_rows" : null;
+  return {
+    usd: priced ? round(usd) : null,
+    status: !priced ? "unavailable" : missing ? "partial" : "priced",
+    unavailable_reason: reason, basis: "api_list_price", cache_write_basis: "5m_rate_lower_bound",
+    rate_version: SHADOW_RATE_VERSION, rates_checked_at: SHADOW_RATES_CHECKED_AT,
+    priced_requests: priced, unpriced_requests: missing, unpriced, unknown_models: [...unknown].sort(),
+    excluded_api_requests: api, unclassified_requests: unclassified,
+    by_model: [...models.values()].map((m) => ({ ...m, usd: round(m.usd) })).sort((a, b) => b.usd - a.usd || a.model.localeCompare(b.model)),
+  };
+}
+
 export function claudeUsage(facts: UsageFact[], snapshots: AccountSnapshot[], window: { since: string; until: string }): ClaudeUsageSummary {
   const rows = facts.filter((f) => f.source === "claude_code" && within(f, window.since, window.until));
   const priced = rows.filter((f) => f.cost_status === "local_reported_estimate");
@@ -81,6 +123,7 @@ export function claudeUsage(facts: UsageFact[], snapshots: AccountSnapshot[], wi
       const c = coverage(s, "claude_code");
       return { account_id: s.account_id, collected_at: s.collected_at, status: c?.status ?? "unverified", since: c?.since ?? null, until: c?.until ?? null };
     }),
+    shadow: shadowCosts(rows),
   };
 }
 
@@ -91,5 +134,7 @@ export function grokUsage(facts: UsageFact[], snapshots: AccountSnapshot[], wind
     /^x-ai\/grok(?:[-.:/]|$)/.test(f.model) && f.cost_status !== "provider_usage_only" && within(f, providerWindow.since, providerWindow.until));
   return { subscription_fees_usd: fees.length ? money(fees) : null, fee_records: fees.length,
     openrouter_cost_usd: routed.length || openrouter.coverage === "complete" ? money(routed) : null,
-    openrouter_coverage: openrouter.coverage, local_usage_status: "unavailable" };
+    openrouter_coverage: openrouter.coverage, local_usage_status: "unavailable",
+    // No Grok subscription token feed exists yet. OpenRouter Grok rows are metered spend, not shadow.
+    shadow: shadowCosts([], { noFeed: true }) };
 }

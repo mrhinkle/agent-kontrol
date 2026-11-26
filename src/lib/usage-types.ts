@@ -130,6 +130,32 @@ export interface ClaudeUsageSummary {
   fee_records: number;
   billing_modes: { subscription: number; api: number; unknown: number };
   machines: { account_id: string; collected_at: string; status: "complete" | "partial" | "unverified"; since: string | null; until: string | null }[];
+  /** API-equivalent value of the observed tokens. An estimate, never a charge. */
+  shadow: ShadowCostSummary;
+}
+
+/**
+ * What subscription usage would have cost at the vendor's published API prices.
+ * `usd` is null, never 0, when no row in the window could be priced.
+ */
+export interface ShadowCostSummary {
+  usd: number | null;
+  status: "priced" | "partial" | "unavailable";
+  unavailable_reason: "no_token_feed" | "no_rows" | "only_api_billed" | "no_priced_rows" | null;
+  basis: "api_list_price";
+  /** Collectors report one cache-write total, priced at the 5-minute rate: a lower bound. */
+  cache_write_basis: "5m_rate_lower_bound";
+  rate_version: string;
+  rates_checked_at: string;
+  priced_requests: number;
+  unpriced_requests: number;
+  unpriced: { missing_model: number; unknown_model: number; missing_tokens: number };
+  /** Requests the operator marked as API-billed: already metered spend, so left out. */
+  excluded_api_requests: number;
+  /** Priced requests whose payment method was not recorded; included in `usd`. */
+  unclassified_requests: number;
+  unknown_models: string[];
+  by_model: { model: string; requests: number; usd: number; long_prompt_requests: number; source_url: string }[];
 }
 
 export interface GrokUsageSummary {
@@ -138,4 +164,6 @@ export interface GrokUsageSummary {
   openrouter_cost_usd: number | null;
   openrouter_coverage: ProviderCostSummary["coverage"];
   local_usage_status: "unavailable";
+  /** Unavailable until a Grok token feed exists; rates are already in the table. */
+  shadow: ShadowCostSummary;
 }
