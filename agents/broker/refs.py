@@ -16,8 +16,12 @@ _INVALID = "invalid secret reference"
 
 
 def _raise_invalid() -> None:
-    # Raised outside an except handler so __context__ stays empty.
-    raise ValueError(_INVALID) from None
+    # ``from None`` still stores a caller's handled exception on __context__.
+    exc = ValueError(_INVALID)
+    try:
+        raise exc from None
+    finally:
+        exc.__context__ = None
 
 
 def _valid_name(name: str) -> bool:

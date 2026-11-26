@@ -11,6 +11,7 @@ import json
 import os
 import re
 import selectors
+import signal
 import stat
 import subprocess
 import time
@@ -35,8 +36,32 @@ if hasattr(os, "O_NONBLOCK"):
 
 
 def _raise(message: str) -> None:
-    """Raise a clean ValueError. Call this outside an except block."""
-    raise ValueError(message) from None
+    """Raise a clean ValueError with no chained context.
+
+    ``raise ... from None`` still stores the caller's handled exception on
+    ``__context__``. Clear it before the exception leaves this function.
+    """
+    exc = ValueError(message)
+    try:
+        raise exc from None
+    finally:
+        exc.__context__ = None
+
+
+def _fs_encodable(text: str) -> bool:
+    failed = False
+    try:
+        os.fsencode(text)
+    except UnicodeEncodeError:
+        failed = True
+    return not failed
+
+
+def _close_fd(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        return
 
 
 def _stat_ok(st: os.stat_result) -> bool:
@@ -53,13 +78,13 @@ def _open_checked(path: str, safety_error: str) -> int:
     """Open ``path`` no-follow and return the fd only after fstat succeeds."""
     # os.open raises ValueError (not OSError) for an embedded NUL, and that
     # message includes the path. Reject it before the call.
-    if type(path) is not str or path == "" or "\x00" in path:
+    if type(path) is not str or path == "" or "\x00" in path or not _fs_encodable(path):
         _raise(safety_error)
     failed = False
     fd = -1
     try:
         fd = os.open(path, _OPEN_FLAGS)
-    except OSError:
+    except (OSError, UnicodeEncodeError):
         failed = True
     if failed:
         _raise(safety_error)
@@ -73,7 +98,7 @@ def _open_checked(path: str, safety_error: str) -> int:
         ok = info is not None and _stat_ok(info)
     finally:
         if not ok:
-            os.close(fd)
+            _close_fd(fd)
     if not ok:
         _raise(safety_error)
     return fd
@@ -100,7 +125,7 @@ def _read_text(path: str, safety_error: str, read_error: str) -> str:
     try:
         data = _read_fd(fd, read_error)
     finally:
-        os.close(fd)
+        _close_fd(fd)
     failed = False
     try:
         text = data.decode("utf-8")
@@ -133,7 +158,7 @@ def _parse_json(text: str) -> object:
             object_pairs_hook=_no_duplicate_keys,
             parse_constant=_reject_constant,
         )
-    except (ValueError, TypeError, json.JSONDecodeError):
+    except (ValueError, TypeError, json.JSONDecodeError, RecursionError):
         failed = True
     if failed:
         _raise(_INVALID_CONFIG)
@@ -151,7 +176,7 @@ def _validate_recipe(recipe: object) -> None:
     if any(type(part) is not str for part in argv):
         _raise(_INVALID_CONFIG)
     # bool is a subclass of int; type() is int rejects true/false.
-    if argv[0] == "" or any("\x00" in part for part in argv):
+    if argv[0] == "" or any("\x00" in part or not _fs_encodable(part) for part in argv):
         _raise(_INVALID_CONFIG)
     if not any("{name}" in part for part in argv):
         _raise(_INVALID_CONFIG)
@@ -180,7 +205,12 @@ def _validate_config(data: object) -> None:
         for key, path in section.items():
             if type(key) is not str or _ID_RE.fullmatch(key) is None:
                 _raise(_INVALID_CONFIG)
-            if type(path) is not str or "\x00" in path or not os.path.isabs(path):
+            if (
+                type(path) is not str
+                or "\x00" in path
+                or not os.path.isabs(path)
+                or not _fs_encodable(path)
+            ):
                 _raise(_INVALID_CONFIG)
     if "exec" in data:
         section = data["exec"]
@@ -206,7 +236,9 @@ def load_config(path: str) -> dict:
 
 def _parse_env(text: str, error: str) -> dict[str, str]:
     values: dict[str, str] = {}
-    for line in text.splitlines():
+    for line in text.split("\n"):
+        if line.endswith("\r"):
+            line = line[:-1]
         if line.strip() == "":
             continue
         if line.lstrip().startswith("#"):
@@ -246,7 +278,7 @@ def _resolve_file(source: str, name: str, config: dict) -> str:
     if not isinstance(files, dict) or source not in files:
         _raise(_INVALID_CONFIG)
     path = files[source]
-    if type(path) is not str or "\x00" in path or not os.path.isabs(path):
+    if type(path) is not str or "\x00" in path or not os.path.isabs(path) or not _fs_encodable(path):
         _raise(_INVALID_CONFIG)
     safety = "unsafe file: provider=file source=%s" % source
     content = "invalid provider file: provider=file source=%s" % source
@@ -260,13 +292,15 @@ def _resolve_file(source: str, name: str, config: dict) -> str:
 def _child_env(recipe: dict, environ: Mapping[str, str]) -> dict[str, str]:
     child: dict[str, str] = {}
     for key in _BASE_ENV:
-        if key in environ and type(environ[key]) is str:
-            child[key] = environ[key]
+        value = environ.get(key)
+        if type(value) is str:
+            child[key] = value
     for key in recipe.get("env", ()):
         if key in _BASE_ENV or key.startswith("MC_"):
             continue
-        if key in environ and type(environ[key]) is str:
-            child[key] = environ[key]
+        value = environ.get(key)
+        if type(value) is str:
+            child[key] = value
     return child
 
 
@@ -282,24 +316,29 @@ def _spawn(source: str, argv: list[str], env: dict[str, str]) -> subprocess.Pope
             shell=False,
             env=env,
             bufsize=0,
+            start_new_session=True,
         )
-    except OSError:
+    except (OSError, ValueError):
         failed = True
     if failed or proc is None:
         _raise("exec failed: recipe=%s not found" % source)
     return proc
 
 
-def _kill_reap(proc: subprocess.Popen) -> None:
-    if proc.poll() is None:
+def _abort(proc: subprocess.Popen) -> None:
+    """SIGKILL the recipe session, then reap the direct child.
+
+    A grandchild can still be in the session after the direct child has
+    exited. Do not return while this pid is unreaped.
+    """
+    pid = proc.pid
+    if type(pid) is int and pid > 0:
         try:
-            proc.kill()
-        except OSError:
+            os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
             pass
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        pass
+    while proc.poll() is None:
+        proc.wait()
 
 
 def _close_pipes(proc: subprocess.Popen) -> None:
@@ -317,52 +356,62 @@ def _pump(
     stdout: bytearray,
     stderr: bytearray,
     deadline: float,
-) -> tuple[bool, bool]:
-    """Read both pipes until EOF, the deadline, or either stream passes the cap.
+) -> tuple[bool, bool, bool]:
+    """Read both pipes until EOF, the deadline, a cap, or a read failure.
 
-    The cap is 1,048,576 bytes inclusive. Crossing it is ``bad output`` and
-    outranks a timeout and a non-zero exit.
+    The third value is a selector or ``os.read`` failure. A zero-byte read
+    is EOF. The cap is 1,048,576 bytes inclusive. Crossing it is
+    ``bad output`` and outranks a timeout and a non-zero exit.
     """
     exceeded = False
     timed_out = False
-    selector = selectors.DefaultSelector()
+    broken = False
+    selector = None
     try:
-        selector.register(proc.stdout, selectors.EVENT_READ, stdout)
-        selector.register(proc.stderr, selectors.EVENT_READ, stderr)
-        open_streams = 2
-        while open_streams:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                timed_out = True
-                break
-            events = selector.select(timeout=remaining)
-            if not events:
-                timed_out = True
-                break
-            for key, _mask in events:
-                failed = False
-                try:
-                    chunk = os.read(key.fd, _READ_CHUNK)
-                except OSError:
-                    failed = True
-                    chunk = b""
-                if failed or chunk == b"":
-                    try:
-                        selector.unregister(key.fileobj)
-                    except (KeyError, ValueError):
-                        pass
-                    open_streams -= 1
-                    continue
-                buf = key.data
-                if len(buf) + len(chunk) > _OUTPUT_LIMIT:
-                    exceeded = True
+        try:
+            selector = selectors.DefaultSelector()
+            selector.register(proc.stdout, selectors.EVENT_READ, stdout)
+            selector.register(proc.stderr, selectors.EVENT_READ, stderr)
+        except OSError:
+            broken = True
+        if not broken and selector is not None:
+            open_streams = 2
+            while open_streams:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
                     break
-                buf.extend(chunk)
-            if exceeded:
-                break
+                events = selector.select(timeout=remaining)
+                if not events:
+                    timed_out = True
+                    break
+                for key, _mask in events:
+                    try:
+                        chunk = os.read(key.fd, _READ_CHUNK)
+                    except OSError:
+                        broken = True
+                        break
+                    if chunk == b"":
+                        try:
+                            selector.unregister(key.fileobj)
+                        except (KeyError, ValueError):
+                            pass
+                        open_streams -= 1
+                        continue
+                    buf = key.data
+                    if len(buf) + len(chunk) > _OUTPUT_LIMIT:
+                        exceeded = True
+                        break
+                    buf.extend(chunk)
+                if exceeded or broken:
+                    break
     finally:
-        selector.close()
-    return exceeded, timed_out
+        if selector is not None:
+            try:
+                selector.close()
+            except OSError:
+                pass
+    return exceeded, timed_out, broken
 
 
 def _wait_until(proc: subprocess.Popen, deadline: float) -> bool:
@@ -414,20 +463,19 @@ def _run_exec(source: str, argv: list[str], env: dict[str, str], timeout: int) -
     deadline = time.monotonic() + timeout
     exceeded = False
     timed_out = False
+    broken = False
     try:
-        exceeded, timed_out = _pump(proc, stdout, stderr, deadline)
-        if exceeded or timed_out:
-            _kill_reap(proc)
-        else:
+        exceeded, timed_out, broken = _pump(proc, stdout, stderr, deadline)
+        if not exceeded and not timed_out and not broken:
             timed_out = _wait_until(proc, deadline)
-            if timed_out:
-                _kill_reap(proc)
     finally:
-        if proc.poll() is None:
-            _kill_reap(proc)
+        if exceeded or timed_out or broken or proc.poll() is None:
+            _abort(proc)
         _close_pipes(proc)
+    if broken or exceeded:
+        _raise("exec failed: recipe=%s bad output" % source)
     code = proc.returncode if type(proc.returncode) is int else None
-    return _finish(source, bytes(stdout), exceeded, timed_out, code)
+    return _finish(source, bytes(stdout), False, timed_out, code)
 
 
 def _resolve_exec(source: str, name: str, config: dict, environ: Mapping[str, str]) -> str:

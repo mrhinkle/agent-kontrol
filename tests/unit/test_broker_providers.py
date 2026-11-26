@@ -13,11 +13,14 @@ import io
 import json
 import logging
 import os
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
 from unittest import mock
 
@@ -108,9 +111,126 @@ elif mode == "envcheck":
     dest = sys.argv[3]
     with open(dest, "w", encoding="utf-8") as handle:
         handle.write("\\n".join(sorted(os.environ)))
+elif mode == "close-sleep":
+    for fd in (1, 2):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    time.sleep(20)
+elif mode == "helper-sleep":
+    pidfile = sys.argv[3]
+    pid = os.fork()
+    if pid == 0:
+        with open(pidfile, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
+        time.sleep(60)
+        os._exit(0)
+    for _ in range(500):
+        if os.path.exists(pidfile) and os.path.getsize(pidfile) > 0:
+            break
+        time.sleep(0.01)
+    os._exit(0)
 else:
     raise SystemExit(2)
 """
+
+
+def _drain_fd(fd: int) -> bytes:
+    os.set_blocking(fd, False)
+    chunks: list[bytes] = []
+    while True:
+        try:
+            block = os.read(fd, 65536)
+        except BlockingIOError:
+            break
+        if not block:
+            break
+        chunks.append(block)
+    os.close(fd)
+    return b"".join(chunks)
+
+
+def _captured_stdio(fn):
+    """Run ``fn`` while OS fds 1 and 2 point at pipes. Return captured bytes and ``fn()``."""
+    out_r, out_w = os.pipe()
+    err_r, err_w = os.pipe()
+    saved_out = os.dup(1)
+    saved_err = os.dup(2)
+    try:
+        os.dup2(out_w, 1)
+        os.dup2(err_w, 2)
+        result = fn()
+    finally:
+        os.dup2(saved_out, 1)
+        os.dup2(saved_err, 2)
+        os.close(saved_out)
+        os.close(saved_err)
+        os.close(out_w)
+        os.close(err_w)
+        out = _drain_fd(out_r)
+        err = _drain_fd(err_r)
+    return out, err, result
+
+
+class _CountingEnv(Mapping):
+    """First lookup returns the seeded value. Later lookups return a different string."""
+
+    def __init__(self, values: dict[str, object]) -> None:
+        self.values = values
+        self.reads: list[str] = []
+
+    def __getitem__(self, key: str) -> object:
+        self.reads.append(key)
+        if key not in self.values:
+            raise KeyError(key)
+        if self.reads.count(key) == 1:
+            return self.values[key]
+        return "read-%d" % self.reads.count(key)
+
+    def __iter__(self):
+        return iter(self.values)
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+
+def _pid_dead(pid: int) -> bool:
+    """True when ``pid`` is gone or is a zombie.
+
+    A killed grandchild is reparented to PID 1. macOS init reaps it, so
+    ``os.kill`` raises. The Python 3.9 CI container's shell does not, and
+    the pid stays a zombie until the container exits. SIGKILL can still be
+    pending for a moment after ``killpg`` returns, so callers retry.
+    """
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+    stat_path = "/proc/%d/stat" % pid
+    try:
+        with open(stat_path, encoding="ascii") as handle:
+            raw = handle.read()
+    except OSError:
+        raw = ""
+    if raw:
+        state = raw.rsplit(")", 1)[-1].split()[0]
+        return state == "Z"
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def _assert_pid_dead(test: unittest.TestCase, pid: int) -> None:
+    deadline = time.monotonic() + 2
+    while True:
+        if _pid_dead(pid):
+            return
+        if time.monotonic() >= deadline:
+            test.fail("pid %s is still running" % pid)
+        time.sleep(0.01)
 
 
 def _expect(test: unittest.TestCase, fn, message: str) -> None:
@@ -198,6 +318,25 @@ class ParseReferenceTests(unittest.TestCase):
         for value in (None, b"secretref://file/a/b", 1):
             with self.subTest(value=type(value).__name__):
                 _expect(self, lambda item=value: refs.parse_reference(item), "invalid secret reference")
+
+    def test_context_cleared_inside_caller_handler(self) -> None:
+        try:
+            raise KeyError("marker")
+        except KeyError:
+            with self.assertRaises(ValueError) as caught:
+                refs.parse_reference("bogus")
+            exc = caught.exception
+            self.assertEqual(str(exc), "invalid secret reference")
+            self.assertIsNone(exc.__cause__)
+            self.assertIsNone(exc.__context__)
+            self.assertTrue(exc.__suppress_context__)
+            with self.assertRaises(ValueError) as resolved:
+                providers.resolve(("bogus",), {"file": {}}, environ={})
+            failure = resolved.exception
+            self.assertEqual(str(failure), "invalid secret reference")
+            self.assertIsNone(failure.__cause__)
+            self.assertIsNone(failure.__context__)
+            self.assertTrue(failure.__suppress_context__)
 
     def test_ac1_accepts_grammar(self) -> None:
         cases = [
@@ -372,6 +511,46 @@ class LoadConfigTests(unittest.TestCase):
         self._reject('{"exec": {"recipe": {"argv": ["x\\u0000", "{name}"]}}}')
         self._reject('{"file": {"src": "/tmp/a\\u0000b"}}')
 
+    def test_deep_json_nesting_is_invalid_config(self) -> None:
+        raw = "[" * 200000
+        self._reject(raw)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "providers.json"
+            _write(path, raw, 0o600)
+            _expect(
+                self,
+                lambda: providers.resolve(
+                    ("file", "src", "KEY"),
+                    {},
+                    environ={},
+                    config_path=str(path),
+                ),
+                "invalid provider config",
+            )
+
+    def test_unencodable_argv_and_paths_are_invalid_config(self) -> None:
+        self._reject('{"exec": {"recipe": {"argv": ["/bin/echo", "\\ud800{name}"]}}}')
+        self._reject('{"file": {"src": "/tmp/\\ud800"}}')
+        _expect(self, lambda: providers.load_config("/tmp/\ud800"), "invalid provider config")
+        _expect(
+            self,
+            lambda: providers.resolve(
+                ("file", "src", "KEY"),
+                {"file": {"src": "/tmp/\ud800"}},
+                environ={},
+            ),
+            "invalid provider config",
+        )
+        _expect(
+            self,
+            lambda: providers.resolve(
+                ("exec", "recipe", "n"),
+                {"exec": {"recipe": {"argv": ["/bin/echo", "\ud800{name}"]}}},
+                environ={},
+            ),
+            "invalid provider config",
+        )
+
     def test_accepts_minimal_and_bounds(self) -> None:
         loaded = self._load(
             json.dumps(
@@ -473,6 +652,16 @@ class FileProviderTests(unittest.TestCase):
         self.assertEqual(self._resolve("KEY=VALUE=MORE\n", "KEY"), "VALUE=MORE")
         self.assertEqual(self._resolve("FOO=a\nfoo=b\n", "foo"), "b")
 
+    def test_form_feed_does_not_split_env_lines(self) -> None:
+        text = "A=abc\x0cB=x\n"
+        self.assertEqual(self._resolve(text, "A"), "abc\x0cB=x")
+        _expect(
+            self,
+            lambda: self._resolve(text, name="B"),
+            "missing key: provider=file source=src name=B",
+        )
+        self.assertEqual(self._resolve("KEY=hello\r\n", "KEY"), "hello")
+
     def test_ac2_invalid_lines(self) -> None:
         cases = [
             "NOEQUALS\n",
@@ -566,6 +755,92 @@ class FileProviderTests(unittest.TestCase):
             self.assertEqual(str(caught.exception), "unsafe file: provider=file source=src")
             self.assertNotIn(FIXTURE, str(caught.exception))
             self.assertNotIn("pathmarker", str(caught.exception))
+
+    def test_fstat_oserror_is_unsafe_or_invalid_config(self) -> None:
+        def boom(fd: int):
+            raise OSError("fstat failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            secret = root / "secrets.env"
+            _write(secret, "KEY=value\n", 0o600)
+            body = {"file": {"src": str(secret)}}
+            with mock.patch.object(providers.os, "fstat", boom):
+                _expect(
+                    self,
+                    lambda: providers.resolve(("file", "src", "KEY"), body, environ={}),
+                    "unsafe file: provider=file source=src",
+                )
+            config = root / "providers.json"
+            _write(config, json.dumps(body), 0o600)
+            with mock.patch.object(providers.os, "fstat", boom):
+                _expect(
+                    self,
+                    lambda: providers.load_config(str(config)),
+                    "invalid provider config",
+                )
+                _expect(
+                    self,
+                    lambda: providers.resolve(
+                        ("file", "src", "KEY"),
+                        body,
+                        environ={},
+                        config_path=str(config),
+                    ),
+                    "invalid provider config",
+                )
+
+    def test_close_oserror_does_not_mask_or_escape(self) -> None:
+        real_close = os.close
+
+        def boom_close(fd: int) -> None:
+            real_close(fd)
+            raise OSError("close failed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            secret = root / "secrets.env"
+            _write(secret, "KEY=" + FIXTURE + "\n", 0o600)
+            body = {"file": {"src": str(secret)}}
+            with mock.patch.object(providers.os, "close", boom_close):
+                self.assertEqual(
+                    providers.resolve(("file", "src", "KEY"), body, environ={}),
+                    FIXTURE,
+                )
+            _write(secret, "KEY=" + FIXTURE + "\n", 0o644)
+            with mock.patch.object(providers.os, "close", boom_close):
+                _expect(
+                    self,
+                    lambda: providers.resolve(("file", "src", "KEY"), body, environ={}),
+                    "unsafe file: provider=file source=src",
+                )
+            _write(secret, "KEY=value\n", 0o600)
+            real_read = os.read
+
+            def boom_read(fd: int, size: int) -> bytes:
+                if stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise OSError("read failed")
+                return real_read(fd, size)
+
+            with mock.patch.object(providers.os, "read", boom_read):
+                with mock.patch.object(providers.os, "close", boom_close):
+                    _expect(
+                        self,
+                        lambda: providers.resolve(("file", "src", "KEY"), body, environ={}),
+                        "invalid provider file: provider=file source=src",
+                    )
+            config = root / "providers.json"
+            _write(config, json.dumps({"file": {"src": "/tmp/x"}}), 0o600)
+            with mock.patch.object(providers.os, "close", boom_close):
+                loaded = providers.load_config(str(config))
+                self.assertEqual(loaded["file"]["src"], "/tmp/x")
+            _write(config, json.dumps({"file": {"src": "/tmp/x"}}), 0o644)
+            with mock.patch.object(providers.os, "close", boom_close):
+                _expect(
+                    self,
+                    lambda: providers.load_config(str(config)),
+                    "invalid provider config",
+                )
 
     def test_ac3_symlink_directory_and_nofollow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -838,18 +1113,28 @@ class ExecProviderTests(unittest.TestCase):
     def test_ac4_streams_are_not_forwarded(self) -> None:
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            value = self._run("status") if False else None
-            try:
-                self._run("ok")
-            except ValueError:
-                pass
-            value = self._run("nl")
+
+        def run() -> str:
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                _expect(
+                    self,
+                    lambda: self._run("status"),
+                    "exec failed: recipe=recipe status=4",
+                )
+                self.assertEqual(self._run("ok"), "ok")
+                return self._run("nl")
+
+        fd_out, fd_err, value = _captured_stdio(run)
         self.assertEqual(value, "hello")
         self.assertNotIn("hello", stdout.getvalue())
         self.assertNotIn("hello", stderr.getvalue())
         self.assertNotIn(FIXTURE, stdout.getvalue())
         self.assertNotIn(FIXTURE, stderr.getvalue())
+        self.assertNotIn(b"hello", fd_out)
+        self.assertNotIn(b"hello", fd_err)
+        self.assertNotIn(FIXTURE.encode("utf-8"), fd_out)
+        self.assertNotIn(FIXTURE.encode("utf-8"), fd_err)
+        self.assertNotIn(b"stub-stderr-marker", fd_err)
 
     def test_ac4_environment_and_substitution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -929,23 +1214,227 @@ class ExecProviderTests(unittest.TestCase):
             root = Path(tmp)
             stub = _install_stub(root)
             seen: dict = {}
-            real = providers._run_exec
 
             def wrap(source: str, argv: list[str], env: dict[str, str], timeout: int) -> str:
                 seen["timeout"] = timeout
                 seen["env"] = dict(env)
-                return real(source, argv, env, timeout)
+                return "ok"
 
-            dest = root / "keys.txt"
-            config = _recipe([str(stub), "{name}", "envcheck", str(dest)])
-            with mock.patch.object(providers, "_run_exec", wrap):
-                providers.resolve(("exec", "recipe", "n"), config, environ=None)
+            parent = {
+                "PATH": "/usr/bin:/bin",
+                "HOME": "/tmp/broker-home",
+                "USER": "tester",
+                "LANG": "C",
+                "TMPDIR": "/tmp",
+                "MC_TOKEN": FIXTURE,
+                "NOT_LISTED": FIXTURE,
+            }
+            config = _recipe([str(stub), "{name}", "envcheck", str(root / "keys.txt")])
+            with mock.patch.object(providers.os, "environ", parent):
+                with mock.patch.object(providers, "_run_exec", wrap):
+                    providers.resolve(("exec", "recipe", "n"), config, environ=None)
             self.assertEqual(seen["timeout"], 10)
-            keys = set(seen["env"])
-            self.assertTrue(keys)
-            self.assertTrue(keys <= {"PATH", "HOME", "USER", "LANG", "TMPDIR"})
-            self.assertFalse(any(key.startswith("MC_") for key in keys))
+            self.assertEqual(
+                seen["env"],
+                {
+                    "PATH": "/usr/bin:/bin",
+                    "HOME": "/tmp/broker-home",
+                    "USER": "tester",
+                    "LANG": "C",
+                    "TMPDIR": "/tmp",
+                },
+            )
             self.assertNotIn(FIXTURE, json.dumps(seen["env"]))
+            seen.clear()
+            empty_parent = {"MC_TOKEN": FIXTURE, "NOT_LISTED": FIXTURE}
+            with mock.patch.object(providers.os, "environ", empty_parent):
+                with mock.patch.object(providers, "_run_exec", wrap):
+                    self.assertEqual(
+                        providers.resolve(("exec", "recipe", "n"), config, environ=None),
+                        "ok",
+                    )
+            self.assertEqual(seen["env"], {})
+            self.assertNotIn(FIXTURE, json.dumps(seen["env"]))
+
+    def test_launch_encoding_errors_are_not_found(self) -> None:
+        base = {
+            "HOME": "/tmp/broker-home",
+            "USER": "tester",
+            "LANG": "C",
+            "TMPDIR": "/tmp",
+        }
+        _expect(
+            self,
+            lambda: self._run("ok", environ=dict(base, PATH="/usr/bin\x00")),
+            "exec failed: recipe=recipe not found",
+        )
+        _expect(
+            self,
+            lambda: self._run("ok", environ=dict(base, PATH="\ud800")),
+            "exec failed: recipe=recipe not found",
+        )
+        _expect(
+            self,
+            lambda: self._run(
+                "ok",
+                env=["CUSTOM"],
+                environ=dict(base, PATH="/usr/bin", CUSTOM="a\x00b"),
+            ),
+            "exec failed: recipe=recipe not found",
+        )
+
+    def test_pipe_read_error_is_bad_output(self) -> None:
+        real_read = os.read
+        real_popen = subprocess.Popen
+        pipe_fds: set[int] = set()
+        seen = {"pipes": 0}
+
+        class Track(subprocess.Popen):
+            def __init__(self, args, **kwargs):
+                real_popen.__init__(self, args, **kwargs)
+                if self.stdout is not None:
+                    pipe_fds.add(self.stdout.fileno())
+                if self.stderr is not None:
+                    pipe_fds.add(self.stderr.fileno())
+
+        def flaky(fd: int, size: int) -> bytes:
+            if fd in pipe_fds:
+                seen["pipes"] += 1
+                if seen["pipes"] == 1:
+                    return b"partial-value"
+                raise OSError("pipe read failed")
+            return real_read(fd, size)
+
+        with mock.patch.object(providers.subprocess, "Popen", Track):
+            with mock.patch.object(providers.os, "read", flaky):
+                with self.assertRaises(ValueError) as caught:
+                    self._run("ok")
+        self.assertEqual(str(caught.exception), "exec failed: recipe=recipe bad output")
+        self.assertNotIn("partial-value", str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertGreaterEqual(seen["pipes"], 2)
+
+    def test_selector_setup_error_is_bad_output(self) -> None:
+        pids: list[int] = []
+        real_popen = subprocess.Popen
+
+        class Remember(subprocess.Popen):
+            def __init__(self, args, **kwargs):
+                real_popen.__init__(self, args, **kwargs)
+                pids.append(self.pid)
+
+        def boom(*_args, **_kwargs):
+            raise OSError("selector failed")
+
+        started = time.monotonic()
+        with mock.patch.object(providers.subprocess, "Popen", Remember):
+            with mock.patch.object(providers.selectors, "DefaultSelector", boom):
+                _expect(
+                    self,
+                    lambda: self._run("sleep", timeout=2),
+                    "exec failed: recipe=recipe bad output",
+                )
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertTrue(pids)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(pids[0], os.WNOHANG)
+
+    def test_timeout_kills_helper_process_group(self) -> None:
+        helper = None
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                pidfile = Path(tmp) / "helper.pid"
+
+                def run() -> None:
+                    self._run("helper-sleep", timeout=1, extra=[str(pidfile)])
+
+                _expect(self, run, "exec failed: recipe=recipe timeout")
+                helper = int(pidfile.read_text())
+                _assert_pid_dead(self, helper)
+        finally:
+            if helper is not None:
+                try:
+                    os.kill(helper, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(helper, os.WNOHANG)
+                except ChildProcessError:
+                    pass
+
+    def test_closed_stdio_sleep_is_timeout(self) -> None:
+        started = time.monotonic()
+        _expect(
+            self,
+            lambda: self._run("close-sleep", timeout=1),
+            "exec failed: recipe=recipe timeout",
+        )
+        self.assertLess(time.monotonic() - started, 8)
+
+    def test_abort_reaps_direct_child(self) -> None:
+        real_popen = subprocess.Popen
+
+        def remember(pids: list[int]):
+            class Remember(subprocess.Popen):
+                def __init__(self, args, **kwargs):
+                    real_popen.__init__(self, args, **kwargs)
+                    pids.append(self.pid)
+
+            return Remember
+
+        timeout_pids: list[int] = []
+        with mock.patch.object(providers.subprocess, "Popen", remember(timeout_pids)):
+            _expect(
+                self,
+                lambda: self._run("sleep", timeout=1),
+                "exec failed: recipe=recipe timeout",
+            )
+        self.assertTrue(timeout_pids)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(timeout_pids[0], os.WNOHANG)
+
+        output_pids: list[int] = []
+        with mock.patch.object(providers.subprocess, "Popen", remember(output_pids)):
+            _expect(
+                self,
+                lambda: self._run("plusone"),
+                "exec failed: recipe=recipe bad output",
+            )
+        self.assertTrue(output_pids)
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(output_pids[0], os.WNOHANG)
+
+    def test_child_env_reads_each_key_once(self) -> None:
+        counting = _CountingEnv(
+            {
+                "PATH": 5,
+                "EXTRA": "once-value",
+                "MC_TOKEN": FIXTURE,
+            }
+        )
+        seen: dict = {}
+
+        def wrap(source: str, argv: list[str], env: dict[str, str], timeout: int) -> str:
+            seen["env"] = dict(env)
+            return "ok"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = _install_stub(Path(tmp))
+            config = _recipe([str(stub), "{name}"], env=["EXTRA", "MC_TOKEN", "PATH"])
+            with mock.patch.object(providers, "_run_exec", wrap):
+                self.assertEqual(
+                    providers.resolve(("exec", "recipe", "n"), config, environ=counting),
+                    "ok",
+                )
+        self.assertNotIn("PATH", seen["env"])
+        self.assertEqual(seen["env"].get("EXTRA"), "once-value")
+        self.assertNotIn("MC_TOKEN", seen["env"])
+        self.assertEqual(counting.reads.count("PATH"), 1)
+        self.assertEqual(counting.reads.count("EXTRA"), 1)
+        self.assertEqual(counting.reads.count("MC_TOKEN"), 0)
+        self.assertNotIn(FIXTURE, json.dumps(seen["env"]))
 
     def test_missing_recipe_is_invalid_config(self) -> None:
         _expect(
@@ -1083,6 +1572,10 @@ class ContractTests(unittest.TestCase):
         self.assertIn("secretref://exec/onepassword/Prod/OpenRouter/credential", readme)
         self.assertIn("secretref://exec/keychain/openrouter-api-key", readme)
         self.assertIn("secretref://exec/sops/openrouter_api_key", readme)
+        self.assertIn(
+            "The name grammar allows a leading `-`, so a recipe should put `--` before `{name}` wherever the target command accepts it.",
+            readme,
+        )
         example = json.loads((BROKER / "providers.example.json").read_text())
         self.assertEqual(example["exec"]["onepassword"]["argv"], ["op", "read", "op://{name}"])
         self.assertEqual(example["exec"]["onepassword"]["env"], ["OP_SERVICE_ACCOUNT_TOKEN"])
@@ -1106,6 +1599,7 @@ class ContractTests(unittest.TestCase):
         self.assertLess(text.index('python-version: "3.12"'), build)
         after = text[build:]
         self.assertIn("python:3.9-slim", after)
+        self.assertIn('--user "$(id -u):$(id -g)"', after)
         self.assertIn(
             "python3.9 -m unittest discover -s tests/unit -p 'test_broker*.py' -v",
             after,
@@ -1126,6 +1620,7 @@ class ContractTests(unittest.TestCase):
             "time",
             "refs",
             "collections",
+            "signal",
         }
         for name in ("refs.py", "providers.py"):
             tree = ast.parse((BROKER / name).read_text())

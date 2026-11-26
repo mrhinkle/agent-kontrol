@@ -37,7 +37,7 @@ jobs:
       - run: pnpm run build
       - name: Broker tests and syntax (Python 3.9)
         run: >-
-          docker run --rm -v "$PWD:/w" -w /w python:3.9-slim
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/w" -w /w python:3.9-slim
           sh -ec "python3.9 -m unittest discover -s tests/unit -p 'test_broker*.py' -v && python3.9 -m py_compile agents/broker/*.py"
 
   postgres:

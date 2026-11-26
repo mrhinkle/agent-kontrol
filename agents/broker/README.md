@@ -34,6 +34,8 @@ JSON object. The only top-level keys are `file` and `exec`. Both are optional an
 - `env`: optional list of variable names (`[A-Za-z_][A-Za-z0-9_]*`). Default `[]`.
 - `timeout_seconds`: optional integer from 1 to 300. Default `10`.
 
+The name grammar allows a leading `-`, so a recipe should put `--` before `{name}` wherever the target command accepts it.
+
 Unknown keys, duplicate JSON members, `NaN`, `Infinity`, and a boolean `timeout_seconds` are rejected.
 
 The child environment is `PATH`, `HOME`, `USER`, `LANG`, and `TMPDIR` when they are set, plus the recipe's `env` names when they are set. Unset names are omitted. A recipe cannot override the five base names. Every `MC_*` name is omitted even when listed. Stdout and stderr are captured, not forwarded. Each stream is capped at 1,048,576 bytes. Stdout must be strict UTF-8. Exactly one trailing `\n` is removed.
