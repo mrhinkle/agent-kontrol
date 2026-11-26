@@ -55,7 +55,7 @@ _PLACEHOLDER_RE = re.compile(r"akp_[A-Za-z0-9_-]+\Z")
 _ENCODED_SLASH_RE = re.compile(r"%2f", re.IGNORECASE)
 _ENCODED_BACKSLASH_RE = re.compile(r"%5c", re.IGNORECASE)
 _HEX_RE = re.compile(r"[0-9A-Fa-f]+\Z")
-_CL_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+_CL_RE = re.compile(r"[0-9]+\Z")
 
 _SMALL_BODY = 1024 * 1024
 _READ_CHUNK = 65536
@@ -249,7 +249,11 @@ def _check_upstream(value: object) -> str:
         or not parts.hostname
     ):
         _fail("invalid broker config: upstream")
-    if parts.port is not None and not 1 <= parts.port <= 65535:
+    try:
+        port = parts.port
+    except ValueError:
+        _fail("invalid broker config: upstream")
+    if port is not None and not 1 <= port <= 65535:
         _fail("invalid broker config: upstream")
     return value
 
@@ -653,7 +657,7 @@ def _iter_chunked(rfile: object, max_bytes: int, placeholders: object):
     total = 0
     while True:
         line = _read_chunk_line(rfile)
-        size_text = line[:-2].split(b";", 1)[0].strip()
+        size_text = line[:-2].split(b";", 1)[0]
         if not size_text or _HEX_RE.fullmatch(size_text.decode("ascii", "replace")) is None:
             raise _Abort("bad_request")
         try:
@@ -687,7 +691,7 @@ def _read_trailers(rfile: object, placeholders: object) -> None:
         if b":" not in line:
             raise _Abort("bad_request")
         raw_name, raw_value = line[:-2].split(b":", 1)
-        name = raw_name.strip()
+        name = raw_name
         if not name or _TOKEN_RE.fullmatch(name.decode("latin-1")) is None:
             raise _Abort("bad_request")
         if _has_controls(raw_value):
@@ -1002,7 +1006,7 @@ def _read_request(handler: BaseHTTPRequestHandler):
         return None
     if not line:
         return None
-    if len(line) > _MAX_LINE or not line.endswith((b"\r\n", b"\n")):
+    if len(line) > _MAX_LINE or not line.endswith(b"\r\n"):
         raise _BadRequest()
     try:
         text = line.decode("iso-8859-1").rstrip("\r\n")
@@ -1049,7 +1053,8 @@ def _body_mode(headers: http.client.HTTPMessage) -> tuple:
     raw = lengths[0].strip()
     if _CL_RE.fullmatch(raw) is None:
         raise _BadRequest()
-    return "length", int(raw)
+    normalized = str(int(raw))
+    return "length", int(normalized)
 
 
 def _outbound_headers(items: list, service: dict, secret: str, length: int | None, chunked: bool) -> list:
@@ -1115,7 +1120,7 @@ def _response_plan(response: object, service: dict, secret_values: tuple):
     valid_length = None
     if len(content_lengths) == 1 and _CL_RE.fullmatch(content_lengths[0].strip()) is not None:
         if not _contains_text(content_lengths[0], secret_values):
-            valid_length = content_lengths[0].strip()
+            valid_length = str(int(content_lengths[0].strip()))
     elif content_lengths:
         raise UpstreamError("malformed")
     return status, filtered, valid_length

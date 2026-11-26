@@ -22,6 +22,7 @@ import stat
 import sys
 import tempfile
 import threading
+import traceback
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -722,6 +723,45 @@ class ConfigTests(_GuardedCase):
         for config, fragment in cases:
             with self.subTest(fragment=fragment, secret=config["services"][0]["secret"] if config["services"] else None):
                 self._refuse(config, fragment)
+
+    def test_upstream_bad_port_text_is_not_in_the_error(self) -> None:
+        bad_port = "abc"
+        message = "invalid broker config: upstream"
+        config = _config(
+            self.providers,
+            port=8765,
+            services=[_service(upstream="https://host:%s" % bad_port)],
+        )
+        path = self.root / "broker.json"
+        _write(path, json.dumps(config), 0o600)
+
+        def hidden(text: str) -> None:
+            self.assertNotIn(bad_port, text)
+            self.assertNotIn("'" + bad_port + "'", text)
+            for size in range(1, len(bad_port) + 1):
+                for start in range(0, len(bad_port) - size + 1):
+                    part = bad_port[start:start + size]
+                    if part in message:
+                        continue
+                    self.assertNotIn(part, text)
+
+        with self.assertRaises(ValueError) as ctx:
+            broker.load_config(str(path))
+        exc = ctx.exception
+        self.assertEqual(str(exc), message)
+        self.assertEqual(exc.args, (message,))
+        self.assertIsNone(exc.__context__)
+        self.assertIsNone(exc.__cause__)
+        rendered = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        hidden(str(exc))
+        hidden(rendered)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = broker.main(["--config", str(path)])
+        self.assertEqual(code, 1)
+        err = stderr.getvalue()
+        self.assertEqual(err, message + "\n")
+        hidden(err)
 
     def test_literal_and_malformed_secret_names_service_only(self) -> None:
         for secret in (CANARY, "", "not-a-reference", "secretref://", "secretref://nope/a/b"):
@@ -1618,6 +1658,82 @@ class ProxyTests(_GuardedCase):
         self.assertNotIn(b'{"error"', raw)
         obj = _one_log(self, cap)
         self.assertEqual(obj["status"], "-")
+        self.assertEqual(obj["reason"], "bad_request")
+
+    def test_request_content_length_leading_zeros(self) -> None:
+        harness = self._harness()
+        placeholder = harness.mint()["openrouter"]
+        payload = (
+            "POST /openrouter/api/v1/x HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Authorization: Bearer %s\r\nContent-Length: 0005\r\n\r\nhello" % placeholder
+        ).encode("ascii")
+        raw = _exchange(harness.port, payload, timeout=5)
+        status, _headers, body, _raw = _parse_response(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"ok")
+        self.assertEqual(len(harness.recorder.calls), 1)
+        sent = harness.recorder.calls[0]
+        self.assertEqual(sent["body"], b"hello")
+        lengths = [value for name, value in sent["headers"] if name.lower() == "content-length"]
+        self.assertEqual(lengths, ["5"])
+
+    def test_response_content_length_leading_zeros(self) -> None:
+        harness = self._harness()
+        placeholder = harness.mint()["openrouter"]
+        harness.recorder.headers = [("Content-Type", "text/plain"), ("Content-Length", "0005")]
+        harness.recorder.chunks = [b"hello"]
+        raw = harness.exchange("GET", "/openrouter/api/v1/x", harness.auth(placeholder))
+        status, headers, body, _raw = _parse_response(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"hello")
+        self.assertEqual(headers.get(b"content-length"), [b"5"])
+
+    def test_chunk_size_whitespace_is_bad_request(self) -> None:
+        harness = self._harness()
+        placeholder = harness.mint()["openrouter"]
+        cap, _root = self._logs()
+        head = (
+            "POST /openrouter/api/v1/x HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Authorization: Bearer %s\r\nTransfer-Encoding: chunked\r\n\r\n"
+            " 5\r\nhello\r\n0\r\n\r\n" % placeholder
+        ).encode("ascii")
+        raw = _exchange(harness.port, head, timeout=3)
+        self.assertNotIn(b'{"error"', raw)
+        obj = _one_log(self, cap)
+        self.assertEqual(obj["status"], "-")
+        self.assertEqual(obj["reason"], "bad_request")
+
+    def test_trailer_name_whitespace_is_bad_request(self) -> None:
+        harness = self._harness()
+        placeholder = harness.mint()["openrouter"]
+        cap, _root = self._logs()
+        head = (
+            "POST /openrouter/api/v1/x HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Authorization: Bearer %s\r\nTransfer-Encoding: chunked\r\n\r\n"
+            "0\r\nX-T : v\r\n\r\n" % placeholder
+        ).encode("ascii")
+        raw = _exchange(harness.port, head, timeout=3)
+        self.assertNotIn(b'{"error"', raw)
+        obj = _one_log(self, cap)
+        self.assertEqual(obj["status"], "-")
+        self.assertEqual(obj["reason"], "bad_request")
+
+    def test_request_line_bare_lf_is_bad_request(self) -> None:
+        harness = self._harness()
+        placeholder = harness.mint()["openrouter"]
+        cap, _root = self._logs()
+        payload = (
+            "GET /openrouter/api/v1/x HTTP/1.1\n"
+            "Host: 127.0.0.1\r\n"
+            "Authorization: Bearer %s\r\n"
+            "\r\n" % placeholder
+        ).encode("ascii")
+        before = len(harness.recorder.factory_calls)
+        raw = _exchange(harness.port, payload, timeout=3)
+        _assert_error(self, raw, 400, "bad_request")
+        self.assertEqual(len(harness.recorder.factory_calls), before)
+        obj = _one_log(self, cap)
+        self.assertEqual(obj["status"], 400)
         self.assertEqual(obj["reason"], "bad_request")
 
     def test_malformed_request_is_json_not_html(self) -> None:
