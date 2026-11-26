@@ -1,13 +1,21 @@
 "use client";
 
 import { UsageCostPanels } from "@/components/usage-cost-panels";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   DEFAULT_USAGE_WINDOW,
   USAGE_WINDOWS,
   type UsageTimeWindow,
 } from "@/lib/usage-window";
 import type { UsageSummary } from "@/lib/usage-types";
+import { createHiddenCardsWriter } from "@/lib/usage-hidden-writer";
+
+/** The `hidden` list from a hidden-cards response; throws when it is missing. */
+function hiddenKeys(json: unknown): string[] {
+  const list = (json as { hidden?: unknown } | null)?.hidden;
+  if (!Array.isArray(list)) throw new Error("no hidden list");
+  return list.filter((k): k is string => typeof k === "string");
+}
 
 function Panel({
   title,
@@ -73,56 +81,43 @@ export default function UsagePage() {
   const [hideError, setHideError] = useState<string | null>(null);
 
   // Hidden cards are display only. If the first read fails, every card is shown.
-  // Each write takes a sequence number; only the newest write's response (or its
-  // recovery read) may replace the list, and the first read never overwrites a write.
-  const writeSeq = useRef(0);
-  const keys = (v: unknown): string[] | null => Array.isArray(v) ? v.filter((k): k is string => typeof k === "string") : null;
-
-  useEffect(() => {
-    let cancelled = false;
-    fetch("/api/usage/hidden-cards", { cache: "no-store" })
-      .then((res) => (res.ok ? res.json() : null))
-      .then((json: { hidden?: unknown } | null) => {
-        const list = keys(json?.hidden);
-        if (!cancelled && writeSeq.current === 0 && list) setHiddenCards(list);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const setCardsHidden = useCallback(async (cards: string[], hidden: boolean) => {
-    const seq = ++writeSeq.current;
-    const latest = () => seq === writeSeq.current;
-    setHideError(null);
-    const apply = (on: boolean) => (cur: string[]) => on ? [...new Set([...cur, ...cards])] : cur.filter((k) => !cards.includes(k));
-    setHiddenCards(apply(hidden));
-    try {
+  // Writes go out one at a time in the order they were made (usage-hidden-writer.ts),
+  // and the first read never replaces the list once a write was made.
+  const [writer] = useState(() => createHiddenCardsWriter({
+    send: async (cards, hidden) => {
       const res = await fetch("/api/usage/hidden-cards", {
         method: "PUT",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ cards, hidden }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const list = keys(((await res.json()) as { hidden?: unknown }).hidden);
-      if (list && latest()) setHiddenCards(list);
-    } catch {
-      // A newer write owns the display: its response is the stored list, so it settles this one too.
-      if (!latest()) return;
-      // Re-read the stored list rather than undoing this change alone: another
-      // write may have landed in between. If that read fails too, undo locally.
-      try {
-        const res = await fetch("/api/usage/hidden-cards", { cache: "no-store" });
-        const list = res.ok ? keys(((await res.json()) as { hidden?: unknown }).hidden) : null;
-        if (!list) throw new Error("no list");
-        if (latest()) setHiddenCards(list);
-      } catch {
-        if (latest()) setHiddenCards(apply(!hidden));
-      }
-      setHideError(hidden ? "Could not save: the box is shown again." : "Could not save: the boxes stay hidden.");
-    }
-  }, []);
+      return hiddenKeys(await res.json());
+    },
+    reload: async () => {
+      const res = await fetch("/api/usage/hidden-cards", { cache: "no-store" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return hiddenKeys(await res.json());
+    },
+    setList: setHiddenCards,
+    setError: setHideError,
+  }));
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/usage/hidden-cards", { cache: "no-store" })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((json: unknown) => {
+        if (!cancelled && json && !writer.started()) setHiddenCards(hiddenKeys(json));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [writer]);
+
+  const setCardsHidden = useCallback((cards: string[], hidden: boolean) => {
+    void writer.write(cards, hidden);
+  }, [writer]);
 
   useEffect(() => {
     let cancelled = false;
