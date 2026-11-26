@@ -139,6 +139,17 @@ const sessionOnly = [{ cookieAuth: [] }];
 /** Dashboard session or MC_TOKEN. Not the generic bearer that accepts an agent credential. */
 const operatorSessionOrMcToken = [{ cookieAuth: [] }, { mcToken: [] }];
 
+/** GET and PUT /api/usage/hidden-cards answer the same shape. */
+const hiddenUsageCards: Json = {
+  type: "object",
+  required: ["hidden", "demo"],
+  additionalProperties: false,
+  properties: {
+    hidden: { type: "array", items: { type: "string" }, description: "Hidden card keys, sorted." },
+    demo: { type: "boolean", description: "True when no database is connected and the list is kept in memory." },
+  },
+};
+
 /** Server-set. A request body cannot write these. */
 const actorType: Json = {
   type: ["string", "null"],
@@ -2234,7 +2245,7 @@ export function openApiDocument(): Json {
           description: "Usage and Costs cards the operator hid because no tracking or feed is connected. Display only: no total reads this list. A stored key hides a card only while that card has no data; the page shows a card with data even when its key is stored. Keys are provider:<account_id>, grok:local, grok:openrouter, grok:shadow and claude:shadow. Dashboard session or MC_TOKEN. An agent credential is denied with 403. Without a database the list is kept in memory and demo is true.",
           security: operatorSessionOrMcToken,
           responses: {
-            "200": jsonResponse("hidden (sorted card keys) and demo.", { type: "object" }),
+            "200": jsonResponse("hidden (sorted card keys) and demo.", hiddenUsageCards),
             ...flatErrors,
           },
         }),
@@ -2256,7 +2267,7 @@ export function openApiDocument(): Json {
             } } },
           },
           responses: {
-            "200": jsonResponse("The hidden list after the write, and demo.", { type: "object" }),
+            "200": jsonResponse("The hidden list after the write, and demo.", hiddenUsageCards),
             ...flatErrors,
           },
         }),

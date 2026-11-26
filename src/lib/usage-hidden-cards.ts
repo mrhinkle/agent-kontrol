@@ -59,6 +59,10 @@ export function parseHiddenCardsWrite(body: unknown):
     return { ok: false, field: "cards", message: `cards must be a list of 1 to ${MAX_CARDS_PER_WRITE} card keys.` };
   }
   const bad = row.cards.find((c) => !isCardKey(c));
-  if (bad !== undefined) return { ok: false, field: "cards", message: `Unknown card key: ${String(bad).slice(0, 120)}` };
+  if (bad !== undefined) {
+    // Never stringify a caller's object: one with a non-callable toString throws.
+    const message = typeof bad === "string" ? `Unknown card key: ${bad.slice(0, 120)}` : "Each card key must be a string.";
+    return { ok: false, field: "cards", message };
+  }
   return { ok: true, cards: [...new Set(row.cards as string[])], hidden: row.hidden };
 }

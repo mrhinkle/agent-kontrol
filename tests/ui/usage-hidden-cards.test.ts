@@ -167,11 +167,16 @@ describe("GET/PUT /api/usage/hidden-cards without a database", () => {
 
   it("refuses bad bodies and writes nothing", async () => {
     delete process.env.DATABASE_URL; delete process.env.MC_DASHBOARD_PASSWORD;
-    for (const body of ["{", { cards: ["claude:local"], hidden: true }, { cards: [], hidden: true }, { cards: ["grok:local"], hidden: "yes" }, { cards: Array(51).fill("grok:local"), hidden: true }]) {
+    for (const body of ["{", { cards: ["claude:local"], hidden: true }, { cards: [], hidden: true }, { cards: ["grok:local"], hidden: "yes" }, { cards: Array(51).fill("grok:local"), hidden: true }, { cards: [{ toString: null }], hidden: true }, { cards: [7], hidden: true }]) {
       const res = await put(body);
       assert.equal(res.status, 400, JSON.stringify(body));
     }
     assert.deepEqual((await (await GET(new Request(url))).json()).hidden, []);
+  });
+
+  it("names a string key in the error and never stringifies an object key", () => {
+    assert.deepEqual(parseHiddenCardsWrite({ cards: [{ toString: null }], hidden: true }), { ok: false, field: "cards", message: "Each card key must be a string." });
+    assert.deepEqual(parseHiddenCardsWrite({ cards: ["claude:local"], hidden: true }), { ok: false, field: "cards", message: "Unknown card key: claude:local" });
   });
 
   it("parses a valid write and de-duplicates its keys", () => {
