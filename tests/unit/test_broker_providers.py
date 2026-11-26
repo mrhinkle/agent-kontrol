@@ -31,7 +31,14 @@ FIXTURE = "fixture-value-not-a-secret"
 API_FIXTURE = "sk-fixture-not-a-secret-123"
 LIMIT = 1048576
 
-_STUB = """#!/usr/bin/python3
+# The slim image has no /usr/bin/python3. Exec the stub with this interpreter.
+_INTERPRETER = sys.executable
+if not _INTERPRETER or not os.path.isabs(_INTERPRETER):
+    raise RuntimeError(
+        "sys.executable must be a non-empty absolute path to build the exec stub"
+    )
+
+_STUB = "#!" + _INTERPRETER + """
 import json
 import os
 import signal
@@ -1097,12 +1104,14 @@ class ContractTests(unittest.TestCase):
         text = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
         build = text.index("pnpm run build")
         self.assertLess(text.index('python-version: "3.12"'), build)
-        self.assertLess(build, text.index('python-version: "3.9"'))
+        after = text[build:]
+        self.assertIn("python:3.9-slim", after)
         self.assertIn(
             "python3.9 -m unittest discover -s tests/unit -p 'test_broker*.py' -v",
-            text,
+            after,
         )
-        self.assertIn("python3.9 -m py_compile agents/broker/*.py", text)
+        self.assertIn("python3.9 -m py_compile agents/broker/*.py", after)
+        self.assertNotIn('python-version: "3.9"', text)
 
     def test_stdlib_only_and_no_package_init(self) -> None:
         self.assertFalse((BROKER / "__init__.py").exists())
