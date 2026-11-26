@@ -329,10 +329,11 @@ def _spawn(source: str, argv: list[str], env: dict[str, str]) -> subprocess.Pope
 
 
 def _abort(proc: subprocess.Popen) -> None:
-    """SIGKILL the recipe session, then reap the direct child.
+    """SIGKILL the recipe session and reap the direct child within ``_ABORT_REAP_SECONDS``.
 
     A grandchild can still be in the session after the direct child has
-    exited.
+    exited. ``_abort`` may return with the child unreaped if every kill
+    is denied.
     """
     # The group kill is safe because _abort only runs while the direct child is unreaped, so its PID (and group id) cannot be reused; this assumes nothing else in the broker process calls os.wait() or waitpid(-1).
     pid = proc.pid

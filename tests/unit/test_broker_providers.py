@@ -65,8 +65,8 @@ elif mode == "plain":
     sys.stdout.write("hello")
 elif mode == "sleep":
     time.sleep(5)
-elif mode == "sleep6":
-    time.sleep(6)
+elif mode == "sleep30":
+    time.sleep(30)
 elif mode == "bad-sleep":
     sys.stdout.buffer.write(b"\\xff")
     sys.stdout.buffer.flush()
@@ -1429,11 +1429,11 @@ class ExecProviderTests(unittest.TestCase):
                 with mock.patch.object(providers.subprocess, "Popen", remember()):
                     _expect(
                         self,
-                        lambda: self._run("sleep6", timeout=1),
+                        lambda: self._run("sleep30", timeout=1),
                         "exec failed: recipe=recipe timeout",
                     )
             elapsed = time.monotonic() - started
-            self.assertLess(elapsed, 1 + providers._ABORT_REAP_SECONDS + 1)
+            self.assertLess(elapsed, 1 + 2)
             self.assertTrue(pids)
             with self.assertRaises(ChildProcessError):
                 os.waitpid(pids[0], os.WNOHANG)
@@ -1452,6 +1452,40 @@ class ExecProviderTests(unittest.TestCase):
                     if waited == pid or time.monotonic() >= deadline:
                         break
                     time.sleep(0.01)
+
+    def test_kill_denied_reap_is_bounded(self) -> None:
+        pids: list[int] = []
+
+        def deny_killpg(pid: int, sig: int) -> None:
+            raise PermissionError(pid)
+
+        def deny_kill(self: subprocess.Popen) -> None:
+            if type(self.pid) is int:
+                pids.append(self.pid)
+            raise PermissionError(self.pid)
+
+        started = time.monotonic()
+        try:
+            with mock.patch.object(providers.os, "killpg", deny_killpg):
+                with mock.patch.object(subprocess.Popen, "kill", deny_kill):
+                    _expect(
+                        self,
+                        lambda: self._run("sleep30", timeout=1),
+                        "exec failed: recipe=recipe timeout",
+                    )
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1 + providers._ABORT_REAP_SECONDS + 2)
+            self.assertTrue(pids)
+        finally:
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
 
     def test_child_env_reads_each_key_once(self) -> None:
         counting = _CountingEnv(
