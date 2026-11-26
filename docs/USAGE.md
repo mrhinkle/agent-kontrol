@@ -6,9 +6,10 @@ The page separates three accounting views. Never add them into a single spend to
 
 - **Hermes attribution:** existing session/profile/cron/model totals, from `hermes_state` only, in a rolling window. Provider invoices may cover the same activity.
 - **Provider billing:** OpenRouter inference charges and direct Claude API cost reports, over the corresponding last 1, 7 or 30 completed UTC days. OpenRouter balance is the latest collected balance, not a historical balance. Anthropic cost is after discounts, before credits; separate Priority Tier commitment fees are outside this API.
+- **API-equivalent value (shadow cost):** what the tokens used under a flat-rate subscription would have cost at the vendor's published API list prices. It is an estimate and never a charge. It never enters provider billing or any paid total. See [Shadow costs](#shadow-costs).
 - **Claude subscription/local usage:** recorded subscription payments by payment date, plus local Claude Code request and token observations. Local token value is an estimate only when explicitly present in the source; an absent estimate or fee is unknown. Local usage cannot establish extra-usage charges and does not cover claude.ai or unscanned devices.
 
-No assumed subscription price, new price table or schema migration is required. Existing tables are `usage_facts` and `account_snapshots`; model-price estimates for Hermes are unchanged.
+No assumed subscription price or schema migration is required. Shadow costs use their own dated rate table in `src/lib/shadow-rates.ts`. Existing tables are `usage_facts` and `account_snapshots`; model-price estimates for Hermes are unchanged.
 
 ## Provider collector
 
@@ -76,6 +77,18 @@ The example amount is synthetic, not a plan price. Use the actual payment amount
 npx tsx scripts/collect-provider-usage.ts --provider claude-fee --fee-file /path/to/fee.json
 # Add --env-file /path/to/collector.env --publish only when ready to record it.
 ```
+
+## Shadow costs
+
+`src/lib/shadow-rates.ts` holds one versioned, dated table of per-million-token API list prices: input, output, cache read, 5-minute and 1-hour cache writes, and any prompt-size tier. Each rate names its source page, [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing) or [xAI pricing](https://docs.x.ai/docs/pricing). The current table was checked on 2026-11-26.
+
+- The shadow cost is computed when `GET /api/usage` builds the summary. It is not stored, so a corrected rate reprices every row. The stored `shadow_cost_usd` column keeps its meaning: a value the source itself reported.
+- Claude: each Claude Code request row is priced by exact model ID (a routing prefix or `-YYYYMMDD` snapshot suffix is removed; nothing else is matched). Claude Haiku 5.5 requests over 100,000 prompt tokens use the higher tier. The summary is `claude.shadow`.
+- Billing mode: rows the operator marked `api` are left out and counted in `excluded_api_requests`, because API-billed tokens are already metered spend. Rows marked `unknown` are priced and counted in `unclassified_requests`.
+- Cache writes: collectors report one cache-write total, so writes are priced at the 5-minute rate. The estimate is a lower bound when 1-hour writes occur.
+- Unavailable, never $0: a row with no model, an unknown model, missing input or output counts, an invalid cache counter, or no tokens at all is counted in `unpriced` and left out of the total. `usd` is `null` when nothing in the window could be priced, and `status` is `partial` when only some rows were priced.
+- Grok: xAI rates are in the table, but no Grok subscription token feed exists yet, so `grok.shadow` is unavailable with `unavailable_reason: "no_token_feed"`. Grok through OpenRouter is metered spend, not shadow cost.
+- Every row is priced at the current table, including rows older than its check date. The UI shows the check date.
 
 ## Operation and activation
 
