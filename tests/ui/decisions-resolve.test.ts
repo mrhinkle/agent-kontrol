@@ -1066,7 +1066,7 @@ describe("decision resolve", { concurrency: false }, () => {
     assert.equal(WRITEBACK_LOCK_LEASE_SECONDS, 180);
     assert.equal(GITHUB_FETCH_TIMEOUT_MS, 15_000);
     const route = fs.readFileSync("src/app/api/[transport]/route.ts", "utf8");
-    assert.match(route, /maxDuration:\s*60/);
+    assert.match(route, /export const maxDuration = 60;/);
     const src = fs.readFileSync("src/lib/decision-writeback.ts", "utf8");
     assert.match(src, /signal:\s*AbortSignal\.timeout\(GITHUB_FETCH_TIMEOUT_MS\)/);
     assert.ok(WRITEBACK_LOCK_LEASE_SECONDS > 60);

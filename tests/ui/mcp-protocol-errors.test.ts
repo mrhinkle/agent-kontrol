@@ -290,11 +290,11 @@ describe("MCP SDK errors, quota, and success", { concurrency: false }, () => {
     const body = await rpc(res);
     assert.equal(body.id, 4);
     assert.equal(body.result.isError, true);
-    assert.match(body.result.content[0].text, /-32602/);
+    assert.match(body.result.content[0].text, /Invalid arguments for tool remember/);
     assert.equal(body.result.structuredContent.code, "mcp_tool_error");
     assert.equal(body.result.structuredContent.retryable, false);
     assert.equal(typeof body.result.structuredContent.cause, "string");
-    assert.match(body.result.structuredContent.cause, /-32602/);
+    assert.match(body.result.structuredContent.cause, /Invalid arguments for tool remember/);
     assert.equal(body.result.structuredContent.code === "mcp_invalid_params", false);
     assert.equal(demoStoreSize().notes, 0);
   });
@@ -311,7 +311,7 @@ describe("MCP SDK errors, quota, and success", { concurrency: false }, () => {
       assert.equal(message.error, undefined);
       assert.equal(message.result.isError, true);
       const text = message.result.content[0].text as string;
-      assert.match(text, /-32602/);
+      assert.match(text, /Invalid arguments for tool remember/);
       assert.match(text, /maximum of 4096/);
       assert.equal(message.result.structuredContent.code, "mcp_tool_error");
       assert.equal(message.result.structuredContent.retryable, false);
@@ -345,7 +345,7 @@ describe("MCP SDK errors, quota, and success", { concurrency: false }, () => {
     assert.equal(below.message.error, undefined);
     assert.equal(below.message.result.isError, true);
     const belowText = below.message.result.content[0].text as string;
-    assert.match(belowText, /-32602/);
+    assert.match(belowText, /Invalid arguments for tool remember/);
     assert.equal(belowText.includes("maximum of 4096"), false);
     assert.equal(below.message.result.structuredContent.code, "mcp_tool_error");
     assert.equal(below.message.result.structuredContent.retryable, false);
@@ -354,7 +354,7 @@ describe("MCP SDK errors, quota, and success", { concurrency: false }, () => {
     const invalid = await messageOf(await post(token, toolCall(703, "remember", { tags: [1] })));
     assert.equal(invalid.message.id, 703);
     assert.equal(invalid.message.result.isError, true);
-    assert.match(invalid.message.result.content[0].text, /-32602/);
+    assert.match(invalid.message.result.content[0].text, /Invalid arguments for tool remember/);
     assert.equal(invalid.message.result.structuredContent.code, "mcp_tool_error");
     assert.equal(demoStoreSize().notes, 0);
 
@@ -406,7 +406,7 @@ describe("MCP SDK errors, quota, and success", { concurrency: false }, () => {
     assert.equal(typeof methodBody.error.data.fix, "string");
   });
 
-  it("teaches a native JSON-RPC parse error under error.data", async () => {
+  it("teaches a native JSON-RPC invalid request under error.data", async () => {
     env.MC_TOKEN = "test-mc-token";
     const malformed = await post("test-mc-token", "{");
     assert.equal(malformed.status, 400);
@@ -419,9 +419,11 @@ describe("MCP SDK errors, quota, and success", { concurrency: false }, () => {
     assert.equal(res.status, 400);
     assert.match(res.headers.get("content-type") ?? "", /application\/json/);
     const body = await res.json() as any;
-    assert.equal(body.id, null);
-    assert.equal(body.error.code, -32700);
-    assert.equal(body.error.data.code, "mcp_parse_error");
+    // @modelcontextprotocol/server 2.x answers a request without "jsonrpc" as
+    // Invalid Request (-32600) and echoes its id; 1.x called it a parse error.
+    assert.equal(body.id, 11);
+    assert.equal(body.error.code, -32600);
+    assert.equal(body.error.data.code, "mcp_invalid_request");
     assert.equal(body.error.data.cause, body.error.message);
     assert.equal(body.error.data.retryable, false);
     assert.equal(typeof body.error.data.fix, "string");
