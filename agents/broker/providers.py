@@ -22,6 +22,7 @@ import refs
 _INVALID_CONFIG = "invalid provider config"
 _OUTPUT_LIMIT = 1048576
 _READ_CHUNK = 65536
+_ABORT_REAP_SECONDS = 5
 _BASE_ENV = ("PATH", "HOME", "USER", "LANG", "TMPDIR")
 _ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 _KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -295,9 +296,11 @@ def _child_env(recipe: dict, environ: Mapping[str, str]) -> dict[str, str]:
         value = environ.get(key)
         if type(value) is str:
             child[key] = value
+    seen: set[str] = set()
     for key in recipe.get("env", ()):
-        if key in _BASE_ENV or key.startswith("MC_"):
+        if key in seen or key in _BASE_ENV or key.startswith("MC_"):
             continue
+        seen.add(key)
         value = environ.get(key)
         if type(value) is str:
             child[key] = value
@@ -329,16 +332,24 @@ def _abort(proc: subprocess.Popen) -> None:
     """SIGKILL the recipe session, then reap the direct child.
 
     A grandchild can still be in the session after the direct child has
-    exited. Do not return while this pid is unreaped.
+    exited.
     """
+    # The group kill is safe because _abort only runs while the direct child is unreaped, so its PID (and group id) cannot be reused; this assumes nothing else in the broker process calls os.wait() or waitpid(-1).
     pid = proc.pid
     if type(pid) is int and pid > 0:
         try:
             os.killpg(pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
-    while proc.poll() is None:
-        proc.wait()
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        proc.wait(timeout=_ABORT_REAP_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _close_pipes(proc: subprocess.Popen) -> None:

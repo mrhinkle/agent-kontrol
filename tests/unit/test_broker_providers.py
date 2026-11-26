@@ -65,6 +65,8 @@ elif mode == "plain":
     sys.stdout.write("hello")
 elif mode == "sleep":
     time.sleep(5)
+elif mode == "sleep6":
+    time.sleep(6)
 elif mode == "bad-sleep":
     sys.stdout.buffer.write(b"\\xff")
     sys.stdout.buffer.flush()
@@ -1406,6 +1408,51 @@ class ExecProviderTests(unittest.TestCase):
         with self.assertRaises(ChildProcessError):
             os.waitpid(output_pids[0], os.WNOHANG)
 
+    def test_killpg_permission_error_bounds_reap(self) -> None:
+        real_popen = subprocess.Popen
+        pids: list[int] = []
+
+        def remember():
+            class Remember(subprocess.Popen):
+                def __init__(self, args, **kwargs):
+                    real_popen.__init__(self, args, **kwargs)
+                    pids.append(self.pid)
+
+            return Remember
+
+        def deny_killpg(pid: int, sig: int) -> None:
+            raise PermissionError(pid)
+
+        started = time.monotonic()
+        try:
+            with mock.patch.object(providers.os, "killpg", deny_killpg):
+                with mock.patch.object(providers.subprocess, "Popen", remember()):
+                    _expect(
+                        self,
+                        lambda: self._run("sleep6", timeout=1),
+                        "exec failed: recipe=recipe timeout",
+                    )
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1 + providers._ABORT_REAP_SECONDS + 1)
+            self.assertTrue(pids)
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(pids[0], os.WNOHANG)
+        finally:
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                deadline = time.monotonic() + 2
+                while True:
+                    try:
+                        waited, _status = os.waitpid(pid, os.WNOHANG)
+                    except ChildProcessError:
+                        break
+                    if waited == pid or time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.01)
+
     def test_child_env_reads_each_key_once(self) -> None:
         counting = _CountingEnv(
             {
@@ -1435,6 +1482,25 @@ class ExecProviderTests(unittest.TestCase):
         self.assertEqual(counting.reads.count("EXTRA"), 1)
         self.assertEqual(counting.reads.count("MC_TOKEN"), 0)
         self.assertNotIn(FIXTURE, json.dumps(seen["env"]))
+
+    def test_duplicate_env_name_is_read_once(self) -> None:
+        counting = _CountingEnv({"DUP": "first", "LATER": "second"})
+        seen: dict = {}
+
+        def wrap(source: str, argv: list[str], env: dict[str, str], timeout: int) -> str:
+            seen["env"] = env
+            return "ok"
+
+        with mock.patch.object(providers, "_run_exec", wrap):
+            providers.resolve(
+                ("exec", "recipe", "n"),
+                _recipe(["/bin/echo", "{name}"], env=["DUP", "LATER", "DUP"]),
+                environ=counting,
+            )
+        self.assertEqual(
+            (counting.reads.count("DUP"), seen["env"]["DUP"], list(seen["env"])),
+            (1, "first", ["DUP", "LATER"]),
+        )
 
     def test_missing_recipe_is_invalid_config(self) -> None:
         _expect(
