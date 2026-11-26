@@ -770,11 +770,11 @@ describe("documented MCP error triggers", () => {
     assert.equal(res.status, 200);
     const result = toolBody(text);
     assert.equal(result.isError, true);
-    assert.match(result.content?.[0].text ?? "", /-32602/);
+    assert.match(result.content?.[0].text ?? "", /Invalid arguments for tool remember/);
     assert.equal(text.includes('"code":"missing_field"'), false);
     assert.equal(result.structuredContent?.code, "mcp_tool_error");
     assert.equal(result.structuredContent?.retryable, false);
-    assert.match(result.structuredContent?.cause ?? "", /-32602/);
+    assert.match(result.structuredContent?.cause ?? "", /Invalid arguments for tool remember/);
     assert.equal(typeof result.structuredContent?.fix, "string");
     assert.equal(sqlCalls, sqlBefore);
   });
