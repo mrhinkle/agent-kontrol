@@ -1,5 +1,5 @@
 import type { McpServerOptions } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { createMcpHandler, getPublicOrigin, withMcpAuth } from "mcp-handler";
+import { createMcpHandler, getPublicOrigin, withMcpAuth, type McpHandlerOptions } from "mcp-handler";
 import { z } from "zod";
 import { currentActor, runWithPrincipal } from "@/lib/actor";
 import { activityDetail, readReceipt, withReceipt } from "@/lib/activity";
@@ -59,7 +59,16 @@ async function guardTool(label: string, run: () => Promise<McpToolResult>): Prom
  * can report what it's doing, see what the rest of the fleet is doing,
  * and read/write shared memory.
  */
-const mcpServerOptions: McpServerOptions = {
+/**
+ * mcp-handler 2.x passes everything except its own handler options
+ * (serverInfo, verboseLogs, onEvent, maxSubscriptions, telemetry, ...)
+ * straight to the SDK's McpServer, so maxToolInputElements still applies.
+ * Its McpHandlerOptions type is built on the SDK's ServerOptions, which
+ * leaves that McpServer option out, hence the intersection.
+ * The route's time limit is the `maxDuration` export above; 2.x has no
+ * basePath or maxDuration options of its own.
+ */
+const mcpServerOptions: McpHandlerOptions & McpServerOptions = {
   maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS,
 };
 
@@ -708,10 +717,6 @@ const handler = createMcpHandler(
     );
   },
   mcpServerOptions,
-  {
-    basePath: "/api",
-    maxDuration: 60,
-  }
 );
 
 /**
