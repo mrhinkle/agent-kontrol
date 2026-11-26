@@ -13,7 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- mcp-handler 2.4 (on `@modelcontextprotocol/server` 2.4) serves `/api/mcp`. Two MCP error shapes change. A tool argument validation error is still an `isError` result with `code` `mcp_tool_error`, but its text and `cause` no longer include `MCP error -32602`. They read `Invalid arguments for tool <name>: ...`. A request body without `"jsonrpc"` is `400` Invalid Request (`-32600`, `mcp_invalid_request`) with the request's `id`, not Parse error (`-32700`) with `id` null. The 4096-element `tools/call` limit and the 60 second route limit are unchanged.
+- mcp-handler 2.4 (on `@modelcontextprotocol/server` 2.4) serves `/api/mcp`. Two MCP error shapes change. A tool argument validation error is still an `isError` result with `code` `mcp_tool_error`, but its text and `cause` no longer include `MCP error -32602`. They read `Invalid arguments for tool <name>: ...`. A request body without `"jsonrpc"` is `400` Invalid Request (`-32600`, `mcp_invalid_request`) with the request's `id`, not Parse error (`-32700`) with `id` null. The 4096-element `tools/call` limit and the 60 second route limit are unchanged. The route answers MCP on `/api/mcp` only; any other `/api/<x>` that reaches it, including the removed `/api/sse` and `/api/message`, is `404` `not_found`.
 - Dispatched CLIs no longer inherit the dispatcher's environment. The child receives an allowlisted environment. Operators who relied on an exported variable such as `GH_TOKEN` must name it in `MC_CHILD_ENV_ALLOW`. The dispatcher's own credentials stay in the dispatcher.
 
 ### Fixed

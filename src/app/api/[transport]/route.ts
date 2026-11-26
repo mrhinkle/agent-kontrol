@@ -864,7 +864,15 @@ const authed = withMcpAuth(
   },
 );
 
+/**
+ * mcp-handler 1.x matched only its own endpoints under basePath "/api".
+ * 2.x serves every request it receives, and this [transport] segment
+ * catches any unclaimed /api/<x>, so keep MCP on /api/mcp alone.
+ */
+const MCP_PATH = "/api/mcp";
+
 async function serve(req: Request): Promise<Response> {
+  if (new URL(req.url).pathname !== MCP_PATH) return apiError("not_found");
   return runWithMcpRequest(async () => enrichMcpResponse(await authed(req)));
 }
 
