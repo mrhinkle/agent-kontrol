@@ -132,9 +132,23 @@ export function grokUsage(facts: UsageFact[], snapshots: AccountSnapshot[], wind
   const fees = facts.filter((f) => f.source === "subscription_fee" && f.account_id === "supergrok-subscription" && within(f, window.since, window.until));
   const routed = currentProviderFacts(facts, snapshots).filter((f) => f.source === "provider_api" && f.account_id === "openrouter-shared" &&
     /^x-ai\/grok(?:[-.:/]|$)/.test(f.model) && f.cost_status !== "provider_usage_only" && within(f, providerWindow.since, providerWindow.until));
+  // Grok CLI rows: one per turn and model, from agents/grok-usage-collector. OpenRouter
+  // Grok rows are metered spend and never enter the shadow value.
+  const rows = facts.filter((f) => f.source === "grok_cli" && within(f, window.since, window.until));
+  // The cross-check covers the same rows as the estimate: API-billed rows are left out of both.
+  const reported = rows.filter((f) => f.cost_status === "local_reported_estimate" && f.detail?.billing_mode !== "api");
+  const machines = snapshots.filter((s) => s.account_id.startsWith("grok-cli:")).map((s) => {
+    const c = coverage(s, "grok_cli");
+    return { account_id: s.account_id, collected_at: s.collected_at, status: c?.status ?? "unverified" as const, since: c?.since ?? null, until: c?.until ?? null };
+  });
+  const local_usage_status = !machines.length ? "unavailable" : machines.every((m) => m.status === "complete") ? "complete" : "partial";
   return { subscription_fees_usd: fees.length ? money(fees) : null, fee_records: fees.length,
     openrouter_cost_usd: routed.length || openrouter.coverage === "complete" ? money(routed) : null,
-    openrouter_coverage: openrouter.coverage, local_usage_status: "unavailable",
-    // No Grok subscription token feed exists yet. OpenRouter Grok rows are metered spend, not shadow.
-    shadow: shadowCosts([], { noFeed: true }) };
+    openrouter_coverage: openrouter.coverage, local_usage_status,
+    turns: rows.length, model_calls: sum(rows, "api_call_count"), input_tokens: sum(rows, "input_tokens"),
+    output_tokens: sum(rows, "output_tokens"), cache_read_tokens: sum(rows, "cache_read_tokens"),
+    reasoning_tokens: sum(rows, "reasoning_tokens"),
+    reported_estimate_usd: reported.length ? Math.round(sum(reported, "shadow_cost_usd") * 1e10) / 1e10 : null,
+    machines,
+    shadow: machines.length || rows.length ? shadowCosts(rows) : shadowCosts([], { noFeed: true }) };
 }

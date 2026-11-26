@@ -60,6 +60,8 @@ Collectors that read local files (Claude Code usage, Hermes) cannot run here; th
 
 The separate [Claude usage collector](../agents/claude-usage-collector/README.md) scans local JSONL metadata with a stable operator-supplied machine label, deduplicates request chunks/copies and emits hashed identifiers. It does not alter the Claude lifecycle hook. Billing classification is explicit (`unknown` by default); it is not inferred from historical transcripts. Partial scans retain valid observations but cannot claim complete local coverage. Even a complete scan describes only the files scanned.
 
+The [Grok usage collector](../agents/grok-usage-collector/README.md) does the same for the Grok CLI. It reads only each session's `usage.json` under `~/.grok/sessions` (the file `grok usage <session-id>` prints) and emits one row per turn and model with `source=grok_cli` and `account_id=grok-cli:<machine>`. Session totals are never read, because they can include history inherited on resume or fork; each turn is counted once by its own identity. Grok's own per-turn cost figure (`costUsdTicks`) is kept as `shadow_cost_usd` with `cost_status=local_reported_estimate`. `grok.local_usage_status` reflects each machine's newest scan as that scan reported it; like the Claude machine list, it does not check that the scan's interval covers the selected window, so each machine line shows the scanned interval.
+
 To record an actual Claude subscription payment, create a private JSON file:
 
 ```json
@@ -87,7 +89,7 @@ npx tsx scripts/collect-provider-usage.ts --provider claude-fee --fee-file /path
 - Billing mode: rows the operator marked `api` are left out and counted in `excluded_api_requests`, because API-billed tokens are already metered spend. Rows marked `unknown` are priced and counted in `unclassified_requests`.
 - Cache writes: collectors report one cache-write total, so writes are priced at the 5-minute rate. The estimate is a lower bound when 1-hour writes occur.
 - Unavailable, never $0: a row with no model, an unknown model, missing input or output counts, an invalid cache counter, or no tokens at all is counted in `unpriced` and left out of the total. `usd` is `null` when nothing in the window could be priced, and `status` is `partial` when only some rows were priced.
-- Grok: xAI rates are in the table, but no Grok subscription token feed exists yet, so `grok.shadow` is unavailable with `unavailable_reason: "no_token_feed"`. Grok through OpenRouter is metered spend, not shadow cost.
+- Grok: `grok_cli` rows from the Grok usage collector are priced at xAI list prices. `grok-4.7-build` and `grok-4.6-build` (Grok Build's model IDs) use the standard grok-4.7 and grok-4.6 rates, which match the Grok CLI's own cost figure; the "Grok 4.7 Fast (Grok Build only)" listing would double it. Reasoning tokens are already inside output tokens and are not priced again. Grok records tokens per turn, and a turn covers many model calls, so the 200K long-prompt tier is decided on the average prompt per call (it under-counts when only a few calls were long). The summary is `grok.shadow`, with Grok's own figure beside it as `grok.reported_estimate_usd`. With no Grok collection received, `grok.shadow` is unavailable with `unavailable_reason: "no_token_feed"`. Grok through OpenRouter is metered spend, not shadow cost.
 - Every row is priced at the current table, including rows older than its check date. The UI shows the check date.
 
 ## Operation and activation

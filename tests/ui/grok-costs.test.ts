@@ -137,7 +137,7 @@ it("isolates Grok fees and OpenRouter subset, removes corrected rows, and distin
   assert.deepEqual(data.fleet, { ...baseline.fleet, subscription_fees_usd: 12 });
   for (const key of ["by_profile", "by_model", "by_cron", "top_sessions", "claude", "providers"] as const) assert.deepEqual(data[key], baseline[key]);
   const html = renderToStaticMarkup(createElement(UsageCostPanels, { data }));
-  assert.match(html, /Included in OpenRouter/); assert.match(html, /inherited or rolled-up usage/); assert.doesNotMatch(html, /\$23\.00/);
+  assert.match(html, /Included in OpenRouter/); assert.match(html, /No Grok CLI collection received/); assert.equal(data.grok?.local_usage_status, "unavailable"); assert.doesNotMatch(html, /\$23\.00/);
   const missing = aggregateUsageFacts([], window); assert.equal(missing.grok?.openrouter_cost_usd, null);
   const correction = completedBatch("openrouter-shared", "openrouter", since, until, []);
   const corrected = aggregateUsageFacts(batch.facts, { ...window, snapshots: [correction.snapshot!] });

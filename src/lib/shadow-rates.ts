@@ -91,14 +91,27 @@ export const SHADOW_RATES: readonly ShadowRate[] = [
 const BY_MODEL = new Map(SHADOW_RATES.map((rate) => [rate.model, rate]));
 
 /**
+ * Explicit aliases only. Grok Build reports its models as `grok-4.x-build`. The Grok
+ * CLI's own cost figure (costUsdTicks) matches the standard grok-4.7/4.6 rates on the
+ * median turn, not the "Grok 4.7 Fast (Cursor and Grok Build only)" listing, which
+ * comes out at twice that figure. Decided with the operator on 2026-11-26.
+ */
+const ALIASES: ReadonlyMap<string, string> = new Map([
+  ["grok-4.7-build", "grok-4.7"],
+  ["grok-4.6-build", "grok-4.6"],
+]);
+
+/**
  * Exact model ID after removing a routing prefix (`anthropic/`, `x-ai/`, `xai/`) or
- * an Anthropic snapshot date suffix (`-YYYYMMDD`). No partial or fuzzy matching:
+ * an Anthropic snapshot date suffix (`-YYYYMMDD`), or a listed alias. No partial or fuzzy matching:
  * an unrecognised model is unpriced, never priced as a lookalike.
  */
 export function lookupShadowRate(model: string | null | undefined): ShadowRate | null {
   if (typeof model !== "string") return null;
   const bare = model.trim().replace(/^(?:anthropic|x-ai|xai)\//, "");
   if (!bare) return null;
+  const alias = ALIASES.get(bare);
+  if (alias) return BY_MODEL.get(alias) ?? null;
   return BY_MODEL.get(bare) ?? (/^claude-.*-\d{8}$/.test(bare) ? BY_MODEL.get(bare.replace(/-\d{8}$/, "")) ?? null : null);
 }
 
@@ -108,7 +121,7 @@ export type ShadowCost =
   | { status: "priced"; usd: number; model: string; tier: "standard" | "long_prompt" }
   | { status: "unavailable"; reason: ShadowUnavailableReason };
 
-type TokenFact = Pick<UsageFact, "model" | "input_tokens" | "output_tokens" | "cache_read_tokens" | "cache_write_tokens">;
+type TokenFact = Pick<UsageFact, "model" | "input_tokens" | "output_tokens" | "cache_read_tokens" | "cache_write_tokens" | "api_call_count">;
 
 const count = (value: unknown): number | null =>
   typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
@@ -119,6 +132,10 @@ const count = (value: unknown): number | null =>
  * lower bound when 1-hour writes occur. Unavailable, never $0, when the model is
  * missing or unknown, input or output counts are missing, a cache counter is invalid,
  * or the row carries no tokens at all.
+ *
+ * A row that rolls up several model calls (Grok CLI records tokens per turn) decides the
+ * long-prompt tier on the average prompt per call. The tier applies per call, so this
+ * under-counts when only a few of the calls were long.
  */
 export function shadowCostForFact(fact: TokenFact): ShadowCost {
   if (typeof fact.model !== "string" || !fact.model.trim()) return { status: "unavailable", reason: "missing_model" };
@@ -133,7 +150,8 @@ export function shadowCostForFact(fact: TokenFact): ShadowCost {
   if (read === null || write === null) return { status: "unavailable", reason: "missing_tokens" };
   // Stored counters default to zero, so an all-zero row is a row without usage data.
   if (input + output + read + write === 0) return { status: "unavailable", reason: "missing_tokens" };
-  const prompt = input + read + write;
+  const calls = typeof fact.api_call_count === "number" && Number.isFinite(fact.api_call_count) && fact.api_call_count > 1 ? fact.api_call_count : 1;
+  const prompt = (input + read + write) / calls;
   const tier = rate.prompt_tier;
   const long = !!tier && (tier.inclusive ? prompt >= tier.threshold_tokens : prompt > tier.threshold_tokens);
   const r = long ? tier!.rates : rate.rates;

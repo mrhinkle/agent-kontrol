@@ -4,6 +4,7 @@ export const USAGE_SOURCES = [
   "subscription_fee",
   "quota_snapshot",
   "claude_code",
+  "grok_cli",
 ] as const;
 
 export type UsageSource = (typeof USAGE_SOURCES)[number];
@@ -163,7 +164,18 @@ export interface GrokUsageSummary {
   fee_records: number;
   openrouter_cost_usd: number | null;
   openrouter_coverage: ProviderCostSummary["coverage"];
-  local_usage_status: "unavailable";
-  /** Unavailable until a Grok token feed exists; rates are already in the table. */
+  /** From the newest grok-cli coverage snapshot per machine: unavailable when none was received. */
+  local_usage_status: "complete" | "partial" | "unavailable";
+  /** Grok CLI turn-and-model rows in the window. One row covers `model_calls` calls. */
+  turns: number;
+  model_calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  reasoning_tokens: number;
+  /** Grok CLI's own figure (costUsdTicks) for the rows the estimate covers (API-billed rows left out). A cross-check, never a charge. */
+  reported_estimate_usd: number | null;
+  machines: { account_id: string; collected_at: string; status: "complete" | "partial" | "unverified"; since: string | null; until: string | null }[];
+  /** API-equivalent value of the observed Grok CLI tokens. An estimate, never a charge. */
   shadow: ShadowCostSummary;
 }

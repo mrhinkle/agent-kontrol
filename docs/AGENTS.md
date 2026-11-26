@@ -15,6 +15,7 @@ This document describes the adapters that connect coding agents to Agent Kontrol
 | hermes | Via MCP | Via MCP | Via MCP (`claim_task`) | Any OpenTelemetry exporter | With the usage collector |
 | usage-collector | No | No | No | No | Hermes usage |
 | claude-usage-collector | No | No | No | No | Local Claude Code usage |
+| grok-usage-collector | No | No | No | No | Local Grok CLI usage |
 | collect-provider-usage.ts | No | No | No | No | OpenRouter, Claude API, recorded Claude fees |
 | progress-collector | No (feeds the Progress board) | No | No | No | No |
 | reviewer (Claude Reviewer) | One receipt per run, disabled by default | No | No (consumes the `pr_review` queue) | No | Spend ledger per UTC day |
@@ -124,4 +125,4 @@ Carmack job. Follow the API consumer setup and existing owner deployment holds.
 
 ## Provider and Claude usage collectors
 
-`npx tsx scripts/collect-provider-usage.ts` collects OpenRouter management and Anthropic Console admin reports. `agents/claude-usage-collector/collector.py` separately collects allowlisted local Claude Code usage metadata; it does not change the lifecycle hook. Both are dry-run by default and publish only with an explicit flag. Credential provisioning and recurring activation are separate operator actions. See [Usage and Costs](USAGE.md) and the [Claude collector README](../agents/claude-usage-collector/README.md).
+`npx tsx scripts/collect-provider-usage.ts` collects OpenRouter management and Anthropic Console admin reports. `agents/claude-usage-collector/collector.py` separately collects allowlisted local Claude Code usage metadata; it does not change the lifecycle hook. Both are dry-run by default and publish only with an explicit flag. Credential provisioning and recurring activation are separate operator actions. `agents/grok-usage-collector/collector.py` does the same for Grok CLI session `usage.json` files. See [Usage and Costs](USAGE.md) and the [Claude collector README](../agents/claude-usage-collector/README.md) and the [Grok collector README](../agents/grok-usage-collector/README.md).
