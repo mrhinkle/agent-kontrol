@@ -2684,6 +2684,20 @@ export function openApiDocument(): Json {
           },
         }),
       },
+      "/api/sweep/cron": {
+        get: operation({
+          operationId: "runSweepScheduled",
+          tags: ["sweep"],
+          summary: "Run the absence sweeper once, for Vercel Cron.",
+          description:
+            "vercel.json calls it every 5 minutes, because Vercel Cron sends GET and GET /api/sweep is read-only status. Authenticate with Bearer CRON_SECRET (Vercel Cron), MC_TOKEN, or a dashboard session; an agent credential is refused. Runs exactly what POST /api/sweep runs and returns the same body. Overlapping runs are safe: each check takes a transaction advisory lock, so an event is still emitted once per condition. Without a database it answers ok true with demo true and runs nothing.",
+          security: cookieOrBearer,
+          responses: {
+            "200": jsonResponse("The run completed (read each check's state), or a demo no-op without a database.", { type: "object" }),
+            ...flatErrors,
+          },
+        }),
+      },
       "/api/sweep": {
         get: operation({
           operationId: "getSweepStatus",
