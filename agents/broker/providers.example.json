@@ -1,0 +1,30 @@
+{
+  "file": {
+    "default": "/var/lib/agent-kontrol/secrets.env"
+  },
+  "exec": {
+    "onepassword": {
+      "argv": ["op", "read", "op://{name}"],
+      "env": ["OP_SERVICE_ACCOUNT_TOKEN"],
+      "timeout_seconds": 10
+    },
+    "keychain": {
+      "argv": [
+        "security",
+        "find-generic-password",
+        "-s",
+        "<service>",
+        "-a",
+        "{name}",
+        "-w"
+      ],
+      "env": [],
+      "timeout_seconds": 10
+    },
+    "sops": {
+      "argv": ["sops", "-d", "--extract", "[\"{name}\"]", "<file>"],
+      "env": [],
+      "timeout_seconds": 10
+    }
+  }
+}
