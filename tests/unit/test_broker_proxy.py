@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import ssl
@@ -157,11 +158,17 @@ def _service(secret: str = "secretref://file/lanes/KEY", **overrides: object) ->
         "path_prefixes": ["/api/v1/"],
     }
     data.update(overrides)
+    # #194: unique per service name, so multi-service fixtures stay valid.
+    stem = re.sub(r"[^A-Z0-9]", "_", data["name"].upper()) if isinstance(data["name"], str) else "SVC"
+    data.setdefault("env_key", "AK_%s_KEY" % stem)
+    data.setdefault("env_base_url", "AK_%s_BASE_URL" % stem)
     return data
 
 
 def _config(providers: str, services: list | None = None, **overrides: object) -> dict:
     data = {
+        # #194: next to the providers file, inside the test's own temp dir.
+        "admin_socket": os.path.join(os.path.dirname(providers), "admin.sock"),
         "bind": "127.0.0.1",
         "port": 0,
         "providers": providers,
@@ -677,7 +684,7 @@ class ConfigTests(_GuardedCase):
     def test_unknown_missing_null_bool_and_duplicate(self) -> None:
         base = _config(self.providers)
         extra = dict(base)
-        extra["admin_socket"] = "/tmp/admin.sock"
+        extra["nope"] = "/tmp/admin.sock"
         self._refuse(extra, "invalid broker config")
         missing = dict(base)
         del missing["max_request_body_bytes"]

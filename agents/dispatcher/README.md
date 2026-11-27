@@ -240,6 +240,74 @@ environment, hook telemetry from dispatched Claude runs stops. A child
 running as the same OS user can still read `~/.claude/mission-control.env`
 and `~/.mission-control/env` on disk.
 
+## Secret broker (fail closed)
+
+With the secret broker (`agents/broker/`) enabled, a dispatched CLI gets an
+`akp_` placeholder and a loopback base URL for each granted service, not
+that service's key. The broker swaps in the real key when the CLI calls
+`http://127.0.0.1:<port>/<service>/...`.
+
+Two settings, both read from the dispatcher's environment and never passed
+to a CLI (they are `MC_` names):
+
+- `MC_BROKER_SOCKET`: the absolute path of the broker's `admin_socket`. The
+  broker refuses to start unless that socket's directory is a real directory
+  owned by the broker's user with no group or other write bit (for example
+  `~/.mission-control/broker`, mode `0700`), so never a shared directory such
+  as `/tmp`.
+  Surrounding whitespace is trimmed. Unset or blank turns the broker off,
+  and a CLI gets `build_child_env` only, exactly as without a broker. A
+  relative path is a configuration error and fails every task.
+- `MC_BROKER_SERVICES`: comma-separated broker service names to grant to
+  each task, in order. Entries are trimmed. An empty entry or a duplicate is
+  a configuration error and fails every task. Ignored when the broker is
+  off. Unset or blank with the broker on means no services: the dispatcher
+  still checks `health`, mints nothing, and launches with no overlay.
+
+Fail-closed rule. When `MC_BROKER_SOCKET` is set, any of these fails the
+task with a result beginning `secret broker unavailable, no worker started`,
+and no CLI starts: a missing socket, a refused connection, a 5-second
+timeout, a failed `health`, `ok:false` from `mint`, a malformed or partial
+grant (a missing service, an empty field, an extra or duplicate grant), or
+a configuration error above. Nothing falls back to real keys.
+
+Step order inside `run_task`:
+
+1. worktree lock
+2. broker `health`, then one `mint` for the task id `str(task["id"])`
+3. pointer fetch and inject
+4. running patch and ingest
+5. worker
+6. pointer cleanup
+7. reviewer (same grants as the worker; no second mint)
+8. result patch
+9. `revoke_task`, exactly once whenever a mint request was sent, even when an
+   earlier step raised or the mint response never arrived; then the lock is
+   released
+
+There are no retries. A failed revoke is logged to stderr by failure code
+and changes neither the task outcome nor what runs; the placeholders still
+expire at the broker's `placeholder_ttl_seconds`, and a broker restart
+invalidates them all. Each grant sets its `env_key` to the placeholder and
+its `env_base_url` to the loopback URL, overwriting any value already under
+those names. Every API call, ingest payload, printed line, exception text
+and task result has each placeholder and base URL replaced by
+`[broker-redacted]` before it leaves the dispatcher; so does the worker
+report embedded in the reviewer's prompt.
+
+Scope. The broker replaces only the variables its grants name. A platform's
+own CLI login keys, which pass by prefix (`ANTHROPIC_*` for Claude, and so
+on), and names listed in `MC_CHILD_ENV_ALLOW` are passed as before, and the
+dispatcher does not fail a task because they are present. Once a service is
+brokered, remove its real key from `MC_CHILD_ENV_ALLOW` and from the
+dispatcher's environment.
+
+Direct mode (`ak_skill_launch.py direct`) and fleet mode do not use the
+broker yet: they call `build_child_env` directly and never open the socket.
+
+To turn the broker off on a host: wait until no task is running, unset
+`MC_BROKER_SOCKET`, restart the dispatcher, then stop the broker.
+
 ## Dispatch-ready handoff
 
 `dispatch_ready_bridge.py` is the inert issue-to-task handoff. It does nothing
@@ -287,3 +355,5 @@ python3 -m unittest tests.unit.test_dispatch_ready_bridge -v
 
 `python3 -m unittest tests.unit.test_dispatcher_skills -v` (also part of
 `npm run test:unit:py`). Real temp git worktrees, a fake API, a fake CLI.
+`python3 -m unittest tests.unit.test_broker_dispatcher -v` covers the broker
+admin socket and the dispatcher's broker path.

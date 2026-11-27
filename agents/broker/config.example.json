@@ -1,4 +1,5 @@
 {
+  "admin_socket": "/abs/path/private-0700-dir/broker-admin.sock",
   "bind": "127.0.0.1",
   "port": 8765,
   "providers": "/abs/path/providers.json",
@@ -13,7 +14,9 @@
       "template": "Bearer {secret}",
       "secret": "secretref://file/default/OPENROUTER_API_KEY",
       "methods": ["GET", "POST"],
-      "path_prefixes": ["/api/v1/"]
+      "path_prefixes": ["/api/v1/"],
+      "env_key": "OPENROUTER_API_KEY",
+      "env_base_url": "OPENROUTER_BASE_URL"
     }
   ]
 }
