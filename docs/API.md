@@ -139,7 +139,7 @@ Body:
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
 | `agent_id` | string | yes | Agent id. |
-| `kind` | string | yes | `session_start`, `turn_start`, `waiting`, `notification`, `session_end`, `milestone`, `status`, `error`, or `heartbeat`. |
+| `kind` | string | yes | `session_start`, `turn_start`, `waiting`, `notification`, `session_end`, `milestone`, `status`, `error`, `heartbeat`, `broker_forwarded`, or `broker_refused`. The list documents known kinds; the route stores any kind that is not reserved. |
 | `platform` | string | no | `claude-code`, `cowork-cloud`, `chatgpt-work`, `codex`, `hermes`, or `other`. |
 | `machine` | string | no | Machine the agent runs on. |
 | `display_name` | string | no | Name to display for the agent. |
@@ -153,6 +153,26 @@ Body:
 Invalid JSON answers `400`.
 
 Each stored event records who sent it in `events.principal_kind` and `events.principal_id`, taken from the verified credential: `legacy`/`mc-token`, `agent`/the credential id, `oauth`/the client id (MCP), or `session`/`operator`. Fields with those names in the body are ignored. A caller allowed only because `MC_TOKEN` is unset in development stores null, and so does every event written before this column existed: those rows are unmeasured for the sweeper's consumer liveness. Nothing else about ordinary telemetry changes.
+
+#### Broker audit events
+
+The secret broker (`agents/broker/`) sends one event for each request it answers when its `audit` block is set. It authenticates with an agent credential that has only `status:write`, never `MC_TOKEN`. The body is `{ "agent_id": "broker-<short hostname>", "platform": "other", "kind": "<kind>", "detail": { ... } }`, with exactly those keys.
+
+- `broker_refused`: the broker refused the request itself. `status` is the 4xx it returned, or null when it closed the connection mid-upload without a status.
+- `broker_forwarded`: the request reached the upstream, including a broker `502` and a response the broker cut off because it held a secret.
+
+`detail` has exactly these keys:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `task_id` | string or null | The task the placeholder was minted for, read from the broker's placeholder store. Never taken from a header, body, URL, or query. Null when no valid placeholder was presented. |
+| `service` | string or null | The configured service the first path segment matched. Null for `unknown_service` and `bad_request`. |
+| `method` | string | The request method when it is one of the service's configured methods, otherwise `OTHER`. |
+| `path_prefix` | string or null | The configured prefix the normalized path matched. Never the full path or the query. Null when no prefix was matched. |
+| `status` | integer or null | The status the broker returned. For a forwarded request, the upstream status or `502`. |
+| `reason` | string or null | `bad_request`, `unknown_service`, `missing_placeholder`, `bad_placeholder`, `expired_placeholder`, `revoked_placeholder`, `placeholder_leak`, `method_not_allowed`, `path_not_allowed`, `body_too_large`, `missing_task_context`, `upstream_error`, or `secret_in_response`. Null for a forwarded request with a status below 500 that completed. A forwarded status of 500 or more is `upstream_error`. |
+
+Read them back with `GET /api/activity?kind=broker_forwarded` or `?kind=broker_refused`.
 
 #### Sweeper observations
 

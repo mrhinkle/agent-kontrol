@@ -137,7 +137,7 @@ python3 agents/broker/broker.py --config /var/lib/agent-kontrol/broker.json
 
 The config file is JSON. It must be a regular file, not a symlink, owned by the effective uid, mode `0600` or `0400`. Copy `config.example.json`, replace the operator substitutions, and `chmod 600` the copy.
 
-Every field is required.
+Every field is required except `audit`, which is described under [Audit events](#audit-events).
 
 - `bind` is exactly `127.0.0.1`. Any other address is refused before a socket is created.
 - `port` is an integer from 1 to 65535. `0` is rejected in the file. Tests pass an ephemeral port only through the in-memory server API.
@@ -157,6 +157,42 @@ Every field is required.
 If resolution fails, the process exits non-zero and names the service and the provider. It does not print the secret. Each request writes one JSON line to the logger `ak.broker` with the keys `service`, `method`, `prefix`, `status`, and `reason`. That line does not include the target, a header value, the body, the secret, or a placeholder.
 
 Stopping the process drops every placeholder, because they live only in memory. A later start resolves secrets again and will not accept placeholders minted by the previous process.
+
+### Audit events
+
+With an `audit` block, the broker posts one event to Agent Kontrol for each request it answers on its HTTP port (#192). Without the block it posts nothing.
+
+```json
+"audit": {
+  "url": "https://YOUR-DEPLOY.vercel.app",
+  "token": "secretref://file/default/AK_BROKER_AUDIT_TOKEN"
+}
+```
+
+- `url` is an `http://` or `https://` origin with no path, query, fragment, or userinfo. Events go to that origin plus exactly `/api/ingest`. Redirects are not followed.
+- `token` is a `secretref://` reference. It resolves at startup, before the listening socket exists. The value must start with `akc_`, the prefix of an Agent Kontrol agent credential. Any other value, including `MC_TOKEN`, stops startup with `audit token must be an agent credential with only status:write`. A literal token or a malformed URL stops startup with `invalid broker config: audit`. No environment variable is read for the token, and neither error prints any part of it.
+
+Issue the credential from **Settings** in Agent Kontrol:
+
+1. Under agent credentials, set **Label** to something like `broker-audit-<host>`.
+2. Under **Scopes**, select only `status:write`. That scope allows `POST /api/ingest` and nothing else the broker needs.
+3. Leave **Expires** empty, or set a date and plan to rotate.
+4. Create it and copy the token. It is shown once.
+5. Store it in the provider the reference names, for example the mode-600 file: `AK_BROKER_AUDIT_TOKEN=akc_...`.
+
+The broker does not check scopes. Check that the Settings row lists exactly `status:write`.
+
+Each event is:
+
+```json
+{"agent_id":"broker-<short hostname>","platform":"other","kind":"broker_forwarded","detail":{"task_id":"…","service":"openrouter","method":"POST","path_prefix":"/api/v1/","status":200,"reason":null}}
+```
+
+`kind` is `broker_refused` for a refusal the broker generates and `broker_forwarded` when the request reached the upstream. The `detail` fields are listed in [API.md](../../docs/API.md#broker-audit-events). `task_id` comes only from the placeholder store, never from the request. An event never holds a header value, a placeholder, a body, the full path, the query, a secret, or the audit token.
+
+Delivery never delays or changes a proxied response. One daemon thread drains a queue of 1,000 events. Each POST has one 5-second budget for connect, headers, and body, and is not retried. A full queue drops the event and counts `dropped_full`. A DNS failure, connection failure, timeout, redirect, non-2xx answer, or an answer that is not a JSON object drops the event and counts `delivery_failed`. While either counter is non-zero, the logger `ak.broker.audit` writes at most one line a minute, for example `{"audit":"degraded","dropped_full":3,"delivery_failed":0}`. Stopping the broker discards queued events.
+
+To turn auditing off, remove the `audit` block, restart the broker, and revoke the credential in Settings.
 
 ### launchd
 

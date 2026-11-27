@@ -25,6 +25,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import http.client
 
+import audit
 import providers
 import refs
 
@@ -40,6 +41,8 @@ _ROOT_KEYS = frozenset((
     "max_request_body_bytes",
     "services",
 ))
+# Optional root key (#192). Absent means no audit events at all.
+_AUDIT_KEY = "audit"
 _SERVICE_KEYS = frozenset((
     "name",
     "upstream",
@@ -95,6 +98,7 @@ _REASONS = frozenset((
     "upstream_error",
     "body_too_large",
     "secret_in_response",
+    "missing_task_context",
 ))
 _REQUEST_DROP = frozenset((
     "host",
@@ -368,7 +372,7 @@ def _check_service(service: object, seen: set[str], env_seen: set[str]) -> dict:
 
 def validate_config(data: object, port_zero_ok: bool = False) -> dict:
     """Validate a decoded broker config. Does not resolve secrets or bind."""
-    if not isinstance(data, dict) or set(data) != _ROOT_KEYS:
+    if not isinstance(data, dict) or set(data) not in (_ROOT_KEYS, _ROOT_KEYS | {_AUDIT_KEY}):
         _fail("invalid broker config")
     bind = data["bind"]
     if bind != "127.0.0.1":
@@ -400,7 +404,7 @@ def validate_config(data: object, port_zero_ok: bool = False) -> dict:
     env_seen: set[str] = set()
     checked = [_check_service(item, seen, env_seen) for item in services]
     admin_socket = _check_admin_socket(data["admin_socket"])
-    return {
+    checked_config = {
         "admin_socket": admin_socket,
         "bind": "127.0.0.1",
         "port": checked_port,
@@ -410,6 +414,9 @@ def validate_config(data: object, port_zero_ok: bool = False) -> dict:
         "max_request_body_bytes": max_body,
         "services": tuple(checked),
     }
+    if _AUDIT_KEY in data:
+        checked_config[_AUDIT_KEY] = audit.check_block(data[_AUDIT_KEY])
+    return checked_config
 
 
 def load_config(path: str) -> dict:
@@ -546,6 +553,17 @@ class PlaceholderStore:
             if entry["revoked"]:
                 return "revoked"
             return "ok"
+
+    def task_of(self, placeholder: object) -> str | None:
+        """The task id minted with ``placeholder``, read-only (#192). Call after ``check`` returned ``ok``."""
+        if type(placeholder) is not str:
+            return None
+        with self._lock:
+            entry = self._entries.get(placeholder)
+            if entry is None:
+                return None
+            task_id = entry.get("task_id")
+        return task_id if type(task_id) is str and task_id != "" else None
 
     def known_placeholders(self) -> tuple[str, ...]:
         """Every minted placeholder, including expired and revoked ones."""
@@ -984,7 +1002,25 @@ def _log_value(value: object, secret_values: tuple) -> str:
     return value
 
 
+# One outcome record per request on the HTTP port (#192). Each request runs on
+# its own server thread, so the record is thread-local. ``_emit`` fills the
+# result; ``_note`` adds the trusted values the broker itself established.
+_OUTCOME = threading.local()
+
+
+def _note(**values: object) -> None:
+    record = getattr(_OUTCOME, "record", None)
+    if record is not None:
+        record.update(values)
+
+
 def _emit(service: object, method: object, prefix: object, status: object, reason: object, secret_values: tuple) -> None:
+    record = getattr(_OUTCOME, "record", None)
+    if record is not None and not record.get("emitted"):
+        record["emitted"] = True
+        record["method"] = method
+        record["status"] = status
+        record["reason"] = reason
     safe_service = _log_value(service, secret_values)
     safe_method = _log_value(method, secret_values)
     if safe_method != "-" and _METHOD_RE.fullmatch(safe_method) is None:
@@ -1046,6 +1082,7 @@ class _State:
         self.secrets = secret_map
         self.upstream_factory = upstream_factory
         self.services = {service["name"]: service for service in config["services"]}
+        self.audit = None
 
     def __repr__(self) -> str:
         return "<broker state>"
@@ -1362,6 +1399,7 @@ def _serve_one(handler: BaseHTTPRequestHandler) -> None:
             _send_json(handler, 404, "unknown_service")
             return
         service_name = service["name"]
+        _note(service=service_name)
         outcome = _authorize(headers, service, state)
         if outcome != "ok":
             _emit(service_name, method, "-", outcome[0], outcome[1], secrets)
@@ -1380,6 +1418,7 @@ def _serve_one(handler: BaseHTTPRequestHandler) -> None:
             _send_json(handler, 403, "method_not_allowed")
             return
         prefix = _match_prefix(parsed.normalized, service["path_prefixes"])
+        _note(prefix=prefix)
         if not prefix:
             _emit(service_name, method, "-", 403, "path_not_allowed", secrets)
             logged = True
@@ -1442,6 +1481,11 @@ def _authorize(headers: http.client.HTTPMessage, service: dict, state: _State):
         return (401, "expired_placeholder")
     if kind == "revoked":
         return (401, "revoked_placeholder")
+    # The task id comes only from the store's record (#192 C5), never the request.
+    task_id = state.store.task_of(placeholder)
+    if task_id is None:
+        return (401, "missing_task_context")
+    _note(task_id=task_id)
     return "ok"
 
 
@@ -1641,7 +1685,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
     def handle_one_request(self) -> None:
         self.close_connection = True
-        _serve_one(self)
+        _OUTCOME.record = {}
+        try:
+            _serve_one(self)
+        finally:
+            record = _OUTCOME.record
+            _OUTCOME.record = None
+            _audit_outcome(getattr(self.server, "state", None), record)
 
     def handle_error(self, request: object, client_address: object) -> None:
         return
@@ -1663,6 +1713,27 @@ class BrokerHandler(BaseHTTPRequestHandler):
         _emit("-", self.command or "-", "-", 400, "bad_request", secrets)
         self._ak_logged = True
         _send_json(self, 400, "bad_request")
+
+
+def _audit_outcome(state: object, record: dict) -> None:
+    """The one audit call site (#192). Runs after the response is closed; never raises."""
+    auditor = getattr(state, "audit", None)
+    if auditor is None or not record.get("emitted"):
+        return
+    try:
+        service = record.get("service")
+        config = state.services.get(service) if type(service) is str else None
+        auditor.record(
+            record.get("task_id"),
+            service if config is not None else None,
+            record.get("method"),
+            config["methods"] if config is not None else (),
+            record.get("prefix"),
+            record.get("status"),
+            record.get("reason"),
+        )
+    except Exception:
+        return
 
 
 class _BoundServer(ThreadingHTTPServer):
@@ -1988,6 +2059,8 @@ class BrokerServer:
             _fail("invalid placeholder store")
         # Validation and resolution finish before the listening socket exists.
         checked = validate_config(config, port_zero_ok=True)
+        # The audit token resolves before any secret, socket, or delivery thread.
+        auditor = audit.from_config(checked["audit"], checked["providers"]) if "audit" in checked else None
         secret_map = _resolve_secrets(checked)
         store.configure(
             tuple(service["name"] for service in checked["services"]),
@@ -1995,6 +2068,7 @@ class BrokerServer:
         )
         factory = default_upstream_factory if upstream_factory is None else upstream_factory
         self._state = _State(checked, store, secret_map, factory)
+        self._state.audit = auditor
         self._httpd = _BoundServer((checked["bind"], checked["port"]), BrokerHandler)
         self._httpd.state = self._state
         self._serving = False
@@ -2013,6 +2087,8 @@ class BrokerServer:
     def serve_forever(self) -> None:
         httpd = self._httpd
         self._serving = True
+        if self._state.audit is not None:
+            self._state.audit.start()
         self._admin.start()
         try:
             httpd.serve_forever(poll_interval=0.1)
@@ -2030,6 +2106,9 @@ class BrokerServer:
                 httpd.shutdown()
             httpd.server_close()
         finally:
+            if self._state.audit is not None:
+                # Not drained: queued events are discarded (#192 AC4).
+                self._state.audit.close()
             self._admin.close()
 
     def __repr__(self) -> str:
