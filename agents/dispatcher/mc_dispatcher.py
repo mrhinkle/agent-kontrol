@@ -36,6 +36,11 @@ Config via environment (or ~/.claude/mission-control.env, read by main() only):
   MC_TASK_PROJECT        optional exact task lane on every claim (unset claims any project)
   MC_BROKER_SOCKET       optional absolute path of the secret broker's admin socket (#194)
   MC_BROKER_SERVICES     comma list of broker services minted for each task
+                         (with a GitHub origin remote the broker may also grant a
+                         short-lived repository token through git-credential-ak, #190)
+  MC_BROKER_GITHUB       unset, or exactly "required": a supported GitHub remote must get
+                         a GitHub grant or the task fails closed (set it on every host
+                         whose broker has a github block, #190 I4)
 
 An opt-in outbound SSE listener wakes the normal atomic claim path. While
 connected the fallback poll is max(MC_POLL_SECONDS, 60); when unavailable it
@@ -384,6 +389,15 @@ def run_cli(platform: str, prompt: str, cwd: Path, review: bool = False,
             # Returns only once the CLI's whole process group is stopped.
             env = child_env.build_child_env(platform)
             if env_overlay:
+                if "GIT_CONFIG_COUNT" in env_overlay:
+                    # The GitHub overlay replaces every inherited command-scope git config (#190 G11).
+                    for name in list(env):
+                        if name == "GIT_CONFIG_PARAMETERS":
+                            del env[name]
+                            continue
+                        match = _GIT_CONFIG_SLOT_RE.fullmatch(name)
+                        if match is not None and int(match.group(1)) >= 2:
+                            del env[name]
                 env.update(env_overlay)
             returncode, stdout, stderr = run_contained(cmd, cwd, TASK_TIMEOUT, env=env)
             finished = time.monotonic()
@@ -448,6 +462,22 @@ _BROKER_ENV_RE = re.compile(r"[A-Z_][A-Z0-9_]*")
 _BROKER_PLACEHOLDER_RE = re.compile(r"akp_[A-Za-z0-9_-]+")
 _BROKER_BASE_URL_RE = re.compile(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})/([a-z0-9-]{1,40})")
 _BROKER_GRANT_KEYS = frozenset(("service", "placeholder", "env_key", "env_base_url", "base_url"))
+# GitHub grant (#190 H10).
+_GITHUB_GRANT_KEYS = frozenset(("placeholder", "broker_url"))
+_GITHUB_PLACEHOLDER_RE = re.compile(r"akp_[A-Za-z0-9_-]{43}")
+_BROKER_ORIGIN_RE = re.compile(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})")
+_GIT_CONFIG_SLOT_RE = re.compile(r"GIT_CONFIG_(?:KEY|VALUE)_([0-9]+)")
+GITHUB_NO_GRANT = "[github] no grant: remote.origin.url is not a supported GitHub remote"
+GITHUB_HELPER = Path(__file__).resolve().parent.parent / "broker" / "git-credential-ak"
+_GITHUB_OWNER_RE = re.compile(r"[A-Za-z0-9-]{1,39}")
+_GITHUB_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,100}")
+_GITHUB_REMOTE_RES = (
+    re.compile(r"https://github\.com/([^/]+)/([^/]+)"),
+    re.compile(r"git@github\.com:([^/]+)/([^/]+)"),
+    re.compile(r"ssh://git@github\.com/([^/]+)/([^/]+)"),
+)
+# The helper path goes into git config unquoted, so only these characters are accepted.
+_SAFE_HELPER_PATH_RE = re.compile(r"/[A-Za-z0-9/._-]+")
 _BROKER_ERROR_CODES = frozenset(("malformed_json", "bad_request", "unknown_op", "unknown_service", "internal"))
 
 
@@ -475,6 +505,16 @@ def broker_settings(environ: Mapping[str, str] | None = None) -> tuple[str, list
             raise BrokerUnavailable("MC_BROKER_SERVICES has a duplicate entry")
         services.append(name)
     return path, services
+
+
+def broker_github_required(environ: Mapping[str, str] | None = None) -> bool:
+    """MC_BROKER_GITHUB: unset or exactly "required" (#190 I4). Raises BrokerUnavailable otherwise."""
+    env = os.environ if environ is None else environ
+    if "MC_BROKER_GITHUB" not in env:
+        return False
+    if env["MC_BROKER_GITHUB"] != "required":
+        raise BrokerUnavailable("MC_BROKER_GITHUB must be unset or exactly required")
+    return True
 
 
 def _broker_exchange(path: str, request: dict, on_connected=None) -> object:
@@ -530,11 +570,14 @@ def _broker_refusal(resp: object, op: str) -> BrokerUnavailable:
     return BrokerUnavailable(f"malformed {op} response")
 
 
-def _check_grants(resp: object, services: list[str]) -> list[dict]:
-    """Every grant present, in order, with every field a non-empty, well-formed string."""
+def _check_grants(resp: object, services: list[str], github_sent: bool = False) -> list[dict]:
+    """Every grant present, in order, with every field a non-empty, well-formed string.
+
+    A ``github`` member is allowed only when the request carried ``github_repo``.
+    """
     if not isinstance(resp, dict) or resp.get("ok") is not True:
         raise _broker_refusal(resp, "mint")
-    if set(resp) != {"ok", "grants"}:
+    if set(resp) != {"ok", "grants"} and not (github_sent and set(resp) == {"ok", "grants", "github"}):
         raise BrokerUnavailable("malformed mint response")
     grants = resp["grants"]
     if not isinstance(grants, list) or len(grants) != len(services):
@@ -562,6 +605,129 @@ def _check_grants(resp: object, services: list[str]) -> list[dict]:
     return grants
 
 
+def parse_github_remote(url: object) -> str | None:
+    """``<owner>/<name>`` as written for a supported GitHub remote, else None (#190 C8)."""
+    if not isinstance(url, str) or url == "" or not url.isascii():
+        return None
+    if any(ch.isspace() or ord(ch) < 33 or ord(ch) == 127 for ch in url) or any(ch in url for ch in "%?#\\"):
+        return None
+    for pattern in _GITHUB_REMOTE_RES:
+        match = pattern.fullmatch(url)
+        if match is None:
+            continue
+        owner, name = match.group(1), match.group(2)
+        if name.endswith(".git"):
+            name = name[:-4]
+        if (
+            _GITHUB_OWNER_RE.fullmatch(owner) is None
+            or _GITHUB_NAME_RE.fullmatch(name) is None
+            or name in (".", "..")
+        ):
+            return None
+        return f"{owner}/{name}"
+    return None
+
+
+def _git_lines(cwd: Path, *args: str) -> tuple[int, list[str]]:
+    out = git(cwd, *args)
+    raw = out.stdout if isinstance(out.stdout, str) else ""
+    text = raw[:-1] if raw.endswith("\n") else raw
+    # An empty configured value is one empty line, not "no value".
+    return out.returncode, ([] if raw == "" else text.split("\n"))
+
+
+def github_remote(cwd: Path) -> str | None:
+    """The task's GitHub repository from remote.origin.url, or None when unsupported (C8, D3, G6, H4).
+
+    Only remote.origin.url supplies the repository; push URLs are checked, never used.
+    """
+    try:
+        code, urls = _git_lines(cwd, "config", "--no-includes", "--get-all", "remote.origin.url")
+        if code != 0 or len(urls) != 1:
+            return None
+        repo = parse_github_remote(urls[0])
+        if repo is None:
+            return None
+        # A url.*.insteadOf rewrite (or an included definition) shows up as a mismatch.
+        code, resolved = _git_lines(cwd, "remote", "get-url", "origin")
+        if code != 0 or resolved != urls:
+            return None
+        code, pushurls = _git_lines(cwd, "config", "--no-includes", "--get-all", "remote.origin.pushurl")
+        if code not in (0, 1) or (code == 1 and pushurls):
+            return None
+        for pushurl in pushurls:
+            pushed = parse_github_remote(pushurl)
+            if pushed is None or pushed.lower() != repo.lower():
+                return None
+        code, effective = _git_lines(cwd, "remote", "get-url", "--push", "origin")
+        if code != 0 or not effective:
+            return None
+        for pushurl in effective:
+            pushed = parse_github_remote(pushurl)
+            if pushed is None or pushed.lower() != repo.lower():
+                return None
+        return repo
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+def _github_helper_path() -> str:
+    """The helper's absolute path, when it can be trusted. Raises BrokerUnavailable (D2, H15).
+
+    The exact path the overlay names must be a regular file (not a symlink),
+    mode exactly 0755, owned by this user or root, in a real directory owned by
+    this user or root with no group or other write bit.
+    """
+    path = str(GITHUB_HELPER)
+    if not os.path.isabs(path) or _SAFE_HELPER_PATH_RE.fullmatch(path) is None:
+        raise BrokerUnavailable("github helper unavailable")
+    trusted = (os.geteuid(), 0)
+    try:
+        info = os.lstat(path)
+        parent = os.lstat(os.path.dirname(path))
+    except OSError:
+        raise BrokerUnavailable("github helper unavailable") from None
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_IMODE(info.st_mode) != 0o755
+        or info.st_uid not in trusted
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid not in trusted
+        or stat.S_IMODE(parent.st_mode) & 0o022
+    ):
+        raise BrokerUnavailable("github helper unavailable")
+    return path
+
+
+def _check_github_grant(grant: object, placeholders: set[str]) -> dict:
+    if not isinstance(grant, dict) or set(grant) != _GITHUB_GRANT_KEYS:
+        raise BrokerUnavailable("malformed github grant")
+    placeholder, broker_url = grant["placeholder"], grant["broker_url"]
+    if not isinstance(placeholder, str) or not _GITHUB_PLACEHOLDER_RE.fullmatch(placeholder) or placeholder in placeholders:
+        raise BrokerUnavailable("malformed github grant")
+    match = _BROKER_ORIGIN_RE.fullmatch(broker_url) if isinstance(broker_url, str) else None
+    if match is None or int(match.group(1)) > 65535:
+        raise BrokerUnavailable("malformed github grant")
+    return grant
+
+
+def github_overlay(grant: dict, repo: str, helper: str) -> dict[str, str]:
+    """The exact E1 overlay: the broker helper is the only helper git consults for github.com."""
+    return {
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_VALUE_0": "",
+        "GIT_CONFIG_KEY_1": "credential.https://github.com.helper",
+        "GIT_CONFIG_VALUE_1": helper,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "",
+        "SSH_ASKPASS": "",
+        "AK_GITHUB_PLACEHOLDER": grant["placeholder"],
+        "AK_BROKER_URL": grant["broker_url"],
+        "AK_GITHUB_REPO": repo,
+    }
+
+
 class BrokerSession:
     """One task's grants. revoke() runs once, and only after a mint was sent."""
 
@@ -569,6 +735,8 @@ class BrokerSession:
         self.path = path
         self.services = services
         self.task_id = task_id
+        self.github_repo: str | None = None  # set from the C8 remote decision (#190)
+        self.github_required = False  # MC_BROKER_GITHUB=required (#190 I4)
         self.mint_sent = False
         self.revoked = False
         self.needles: list[str] = []  # base_urls first, then placeholders (C13)
@@ -580,22 +748,34 @@ class BrokerSession:
 
     def mint(self) -> dict[str, str]:
         """The overlay {env_key: placeholder, env_base_url: base_url}. Empty when no services are set."""
-        if not self.services:
+        if not self.services and self.github_repo is None:
             return {}
 
         def sent() -> None:
             # Set before the write: a partly written request still gets its revoke (C8).
             self.mint_sent = True
 
-        resp = _broker_exchange(
-            self.path, {"op": "mint", "task_id": self.task_id, "services": list(self.services)}, sent,
-        )
-        grants = _check_grants(resp, self.services)
+        request: dict = {"op": "mint", "task_id": self.task_id, "services": list(self.services)}
+        if self.github_repo is not None:
+            request["github_repo"] = self.github_repo
+        resp = _broker_exchange(self.path, request, sent)
+        grants = _check_grants(resp, self.services, self.github_repo is not None)
         overlay: dict[str, str] = {}
         for grant in grants:
             overlay[grant["env_key"]] = grant["placeholder"]
             overlay[grant["env_base_url"]] = grant["base_url"]
-        self.needles = _overlay_needles_from(grants)
+        needles = _overlay_needles_from(grants)
+        # No github member: the broker has no github block, the no-grant path (G1),
+        # unless this host requires a grant (I4), when it fails closed.
+        if self.github_repo is not None and self.github_required and not (isinstance(resp, dict) and "github" in resp):
+            raise BrokerUnavailable("github grant missing")
+        if isinstance(resp, dict) and "github" in resp and self.github_repo is not None:
+            grant = _check_github_grant(resp["github"], {g["placeholder"] for g in grants})
+            overlay.update(github_overlay(grant, self.github_repo, _github_helper_path()))
+            urls = [v for v in needles if _BROKER_BASE_URL_RE.fullmatch(v)] + [grant["broker_url"]]
+            rest = [v for v in needles if not _BROKER_BASE_URL_RE.fullmatch(v)] + [grant["placeholder"]]
+            needles = sorted(set(urls), key=len, reverse=True) + sorted(set(rest), key=len, reverse=True)
+        self.needles = needles
         return overlay
 
     def revoke(self) -> str | None:
@@ -620,9 +800,10 @@ def _overlay_needles_from(grants: list[dict]) -> list[str]:
 
 
 def _overlay_needles(overlay: Mapping[str, str]) -> list[str]:
+    # Only grant values are needles: the GitHub overlay's fixed git settings are not secrets (#190).
     values = [v for v in overlay.values() if isinstance(v, str) and v]
-    urls = [v for v in values if _BROKER_BASE_URL_RE.fullmatch(v)]
-    rest = [v for v in values if v not in urls]
+    urls = [v for v in values if _BROKER_BASE_URL_RE.fullmatch(v) or _BROKER_ORIGIN_RE.fullmatch(v)]
+    rest = [v for v in values if v not in urls and _BROKER_PLACEHOLDER_RE.fullmatch(v)]
     return sorted(set(urls), key=len, reverse=True) + sorted(set(rest), key=len, reverse=True)
 
 
@@ -855,7 +1036,10 @@ def run_task(task: dict, platform: str, sem: threading.Semaphore) -> None:
             settings = broker_settings()
             if settings is not None:
                 session = BrokerSession(settings[0], settings[1], str(tid))
+                session.github_required = broker_github_required()
                 session.health()
+                # The C8 remote decision, before the mint and before any overlay (#190 D7).
+                session.github_repo = github_remote(cwd)
         except BrokerUnavailable as e:
             failed(f"{BROKER_UNAVAILABLE}: {e}")
             return
@@ -875,8 +1059,9 @@ def run_task(task: dict, platform: str, sem: threading.Semaphore) -> None:
                     return
                 needles[:] = session.needles
             cli_env = {} if overlay is None else {"env_overlay": overlay}
+            suffix = GITHUB_NO_GRANT if session is not None and session.github_repo is None else ""
             _run_task_body(task, platform, tid, agent_id, project, runtime, cwd, cli_env,
-                           patch_task, failed, note, scrub)
+                           patch_task, failed, note, scrub, result_suffix=suffix)
         finally:
             # Runs once whenever a mint was sent, before the lock is released (C8).
             if session is not None:
@@ -897,7 +1082,7 @@ def run_task(task: dict, platform: str, sem: threading.Semaphore) -> None:
 
 
 def _run_task_body(task: dict, platform: str, tid: object, agent_id: str, project: str, runtime: str,
-                   cwd: Path, cli_env: dict, patch_task, failed, note, scrub) -> None:
+                   cwd: Path, cli_env: dict, patch_task, failed, note, scrub, *, result_suffix: str = "") -> None:
     """Steps 3-8 of run_task: pointers, running patch, worker, cleanup, reviewer, result patch."""
     try:
         block = fetch_pointers(project, runtime)
@@ -967,9 +1152,12 @@ def _run_task_body(task: dict, platform: str, tid: object, agent_id: str, projec
             ok, note_text = review_outcome(r_ok, r_out)
             result = f"{result}\n\n[{reviewer} review] {note_text}"
 
+    result = result or ("completed" if ok else "run failed with no output")
+    if result_suffix:
+        result = f"{result}\n\n{result_suffix}"
     body = {
         "status": "done" if ok else "failed",
-        "result": result or ("completed" if ok else "run failed with no output"),
+        "result": result,
         "agent_id": agent_id,
     }
     if cost is not None:
