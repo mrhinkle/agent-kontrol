@@ -1,0 +1,74 @@
+=== nft list tables ===
+table ip filter
+table ip6 filter
+table ip nat
+table ip6 nat
+=== routes ===
+default via 172.31.1.1 dev eth0 proto dhcp src 5.161.195.242 metric 100 
+172.31.1.1 dev eth0 proto dhcp scope link src 5.161.195.242 metric 100 
+185.12.64.1 via 172.31.1.1 dev eth0 proto dhcp src 5.161.195.242 metric 100 
+185.12.64.2 via 172.31.1.1 dev eth0 proto dhcp src 5.161.195.242 metric 100 
+2a01:4ff:f0:bedf::/64 dev eth0 proto kernel metric 256 pref medium
+fe80::/64 dev eth0 proto kernel metric 256 pref medium
+fe80::/64 dev tailscale0 proto kernel metric 256 pref medium
+default via fe80::1 dev eth0 proto static metric 1024 onlink pref medium
+=== rules ===
+0:	from all lookup local
+5210:	from all fwmark 0x80000/0xff0000 lookup main
+5230:	from all fwmark 0x80000/0xff0000 lookup default
+5250:	from all fwmark 0x80000/0xff0000 unreachable
+5270:	from all lookup 52
+32766:	from all lookup main
+32767:	from all lookup default
+0:	from all lookup local
+5210:	from all fwmark 0x80000/0xff0000 lookup main
+5230:	from all fwmark 0x80000/0xff0000 lookup default
+5250:	from all fwmark 0x80000/0xff0000 unreachable
+5270:	from all lookup 52
+32766:	from all lookup main
+=== resolv.conf ===
+nameserver 127.0.0.53
+options edns0 trust-ad
+search .
+=== resolvectl ===
+Global:
+Link 2 (eth0): 2a01:4ff:ff00::add:2 2a01:4ff:ff00::add:1 185.12.64.2
+        185.12.64.1
+Link 3 (tailscale0):
+Global:
+Link 2 (eth0):
+Link 3 (tailscale0):
+=== netfilter module names (nf*/nft*/xt*) ===
+nf_conntrack
+nf_defrag_ipv4
+nf_defrag_ipv6
+nf_log_syslog
+nfnetlink
+nf_reject_ipv4
+nf_reject_ipv6
+nf_tables
+nft_compat
+nft_limit
+xt_addrtype
+xt_comment
+xt_conntrack
+xt_hl
+xt_limit
+xt_LOG
+xt_recent
+xt_tcpudp
+=== iptables/ip6tables lines matching reject|owner|skuid (first 10, with line numbers) ===
+22::ufw-reject-forward - [0:0]
+23::ufw-reject-input - [0:0]
+24::ufw-reject-output - [0:0]
+43:-A INPUT -j ufw-reject-input
+49:-A FORWARD -j ufw-reject-forward
+55:-A OUTPUT -j ufw-reject-output
+103:-A ufw-user-limit -j REJECT --reject-with icmp-port-unreachable
+132::ufw6-reject-forward - [0:0]
+133::ufw6-reject-input - [0:0]
+134::ufw6-reject-output - [0:0]
+=== section header line numbers (stderr warning lines removed) ===
+2 113 263 656 662 681 683 693 708 714 723 735 801 814 824
+=== total lines (stderr warning lines removed) ===
+825

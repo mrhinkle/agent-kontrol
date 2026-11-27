@@ -14,14 +14,32 @@ Scope: `mc_dispatcher.run_cli` worker invocations. Direct mode in `agents/dispat
 - **CLI-native settings do not enforce an allowlist.** Claude Code's `sandbox.enabled` disabled itself on this host (no `bwrap`, no `socat`) and printed "Commands will run WITHOUT sandboxing": it failed open. It never governs hooks or the CLI's own API traffic. Codex `--sandbox workspace-write` does not govern MCP-server children; one reached `example.com`. Its own sandboxed shell path (`codex sandbox`) could not start on this host (`bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`). Grok `GROK_SANDBOX=workspace` refused to start without `bwrap`: it failed closed, so its network policy could not be observed.
 - **An `HTTPS_PROXY` CONNECT proxy alone is advisory.** The CLIs and inheriting children used it, and `example.com` got `blocked-by-proxy` (403, no upstream). The AC3 bypass reached `example.com` (HTTP 200) for every CLI where a child could be launched: `unexpectedly allowed`. Codex does not pass `HTTPS_PROXY` to MCP servers, so even an ordinary MCP child went direct.
 - **An nftables owner-match rule (`meta skuid 1003`) on its own** blocked the child and the bypass (timeouts, drop counters) for `claude` and `codex`, and covered IPv4 and IPv6. Descendant coverage was tested only for the recorded child and bypass chains under the lane UID (CLI, then `sh`/MCP server, then `curl`). UID-changing processes and arbitrary other descendants were not tested. But its matching model is IP-based. The DNS alias `www.github.com`, the IP literal and **domain fronting** were all allowed: `curl --connect-to example.com:443:<api.openai.com IP>:443 https://example.com/` returned HTTP 200 from `example.com`, because both sites share Cloudflare addresses.
-- **nftables lock-to-proxy plus the allowlisting proxy (supplementary)** blocked the child (`blocked-by-proxy`) and the bypass (`blocked`) for claude and codex. It blocked subdomain, alias, redirect, port, IP-literal and plain-HTTP. Its limits: domain fronting through an allowed CONNECT tunnel still reached `example.com` (HTTP 200), because the proxy does not check TLS SNI; DNS is not governed (queries for arbitrary names leave the host through `systemd-resolved`, under its own UID); proxy client-side IPv6 was not tested; grok child and bypass, codex shell-tool children, review mode, UID-changing processes, arbitrary descendants, loopback listeners other than the proxy, proxy-down, DNS-down and empty-allowlist behavior were not tested.
+- **nftables lock-to-proxy plus the allowlisting proxy (supplementary)** blocked the claude child (`blocked-by-proxy`) and the claude bypass (`blocked`). The codex MCP child received no proxy variables, so nftables dropped every request it made, including the allowed `github.com` control: all three probes ended in `curl: (28)` timeouts (`blocked`). That fails closed, and any MCP server that needs the network would break. The codex bypass was `blocked`. It blocked subdomain, alias, redirect, port, IP-literal and plain-HTTP. Its limits: domain fronting through an allowed CONNECT tunnel still reached `example.com` (HTTP 200), because the proxy does not check TLS SNI; DNS is not governed (queries for arbitrary names leave the host through `systemd-resolved`, under its own UID); proxy client-side IPv6 was not tested; grok child and bypass, codex shell-tool children, review mode, UID-changing processes, arbitrary descendants, loopback listeners other than the proxy, proxy-down, DNS-down and empty-allowlist behavior were not tested.
 - `grok` child and bypass rows are `not tested`. Without credentials Grok stops at its auth check (HTTP 400 from `api.x.ai`) before it starts hooks or MCP servers (HTTP 400 seen only in the unrestricted debug record R-grok-debug), and no disposable credential was supplied (C13).
 
 **Recommendation.**
 - **Linux: `not feasible/unknown` today.** The best candidate is to lock the lane UID to the proxy with nftables and have the proxy check the CONNECT host, the TLS SNI and the DNS path. The missing evidence is SNI/domain-fronting, DNS channel, credentialed grok and codex shell-tool child rows, and review-mode rows. Drafted follow-up: Appendix I.
 - **macOS: `not feasible/unknown`.** Nothing was tested on macOS, by owner decision. No per-user `pf` mechanism has been shown to distinguish the lane user (D3). Drafted follow-up: Appendix I.
 
-**Cleanup.** The user, its home directory, the temporary folder, the nft table and the proxy processes were all removed. Against the 19:03Z before-resume snapshot, the firewall, proxy, route, DNS, module and CLI-settings sections of the after snapshot are identical (`diff -u` empty), and the account files are byte-identical to the original 06:13Z pre-spike hashes. Against the original 06:13Z snapshot, the CLI-settings section is **not** identical: `fleet`'s `~/.codex/config.toml` hash changed (`95ba52f1…` to `b9e4eb77…`). That change is not from the spike and is covered by the named C16 exception X1 in Appendix E.
+**Cleanup.** The user, its home directory, the temporary folder, the nft table and the proxy processes were all removed.
+
+Proof that the original state was restored is **incomplete**. The full 06:13Z before-snapshot file was lost, and by the 19:03Z before-resume snapshot the spike had already changed host state. So the empty 19:03Z-to-19:11Z diff shows only that nothing changed during the resumed window, not that the original state was restored.
+
+- **Matched against 06:13Z.** These items were preserved from the 06:13Z tool output (Appendix E) and match the after snapshot exactly:
+  - account-file hashes and `/home`;
+  - the nft table list, routes, policy-routing rules, `resolv.conf` and `resolvectl`;
+  - netfilter module names;
+  - the first ten iptables reject lines, with their line numbers;
+  - the snapshot's section offsets and total line count.
+- **Unresolved against 06:13Z:**
+  - the full iptables, ip6tables and nft ruleset text;
+  - the full kernel-module list.
+- **Independent evidence for restoration:**
+  - nft shows only the four original tables;
+  - iptables and ip6tables contain no owner-match rules;
+  - the user, home, temporary directory, processes and the 47191 listener are gone;
+  - the account-file hashes match 06:13Z.
+- **CLI settings against 06:13Z:** not identical. `fleet`'s `~/.codex/config.toml` changed (`95ba52f1…` to `b9e4eb77…`). The change is not from the spike and is covered by the named C16 exception X1 in Appendix E.
 
 ## Appendix A. Definitions, host and conventions
 
@@ -48,7 +66,7 @@ Scope: `mc_dispatcher.run_cli` worker invocations. Direct mode in `agents/dispat
 
 **Credentials (C13).** Class: none. No disposable credential was supplied. Each cell injected an obvious placeholder string through the environment: `ANTHROPIC_API_KEY`, `CODEX_API_KEY`/`OPENAI_API_KEY` or `XAI_API_KEY`, each set to a `...PLACEHOLDER-not-a-key` value. The providers answered with auth errors: Anthropic "Invalid API key", OpenAI `401 Unauthorized`, and xAI `400` "Incorrect API key provided". These are recorded as themselves. No `fleet` credential was copied or used.
 
-**Prompt (D6).** Template `P1` is a one-sentence instruction asking for a one-word reply. SHA-256 of the exact bytes (no trailing newline): `ef7e7ff96d04cdcdb9a405d5319bdc1b52adabc168eea9179dfc1352aad79231`. Replay: substitute the P1 text for `<P1>` and check its hash. Mode: worker. Review mode (`--permission-mode default`, `-s read-only`, no extra args for grok) was not run, to keep spend down; every review-mode cell is `not tested`.
+**Prompt (D6).** Template `P1` is a one-sentence instruction asking for a one-word reply. SHA-256 of the exact bytes (no trailing newline): `ef7e7ff96d04cdcdb9a405d5319bdc1b52adabc168eea9179dfc1352aad79231`. At the coordinator's request (follow-up to #207), the exact text is published in [`egress-allowlist/prompt-P1.txt`](egress-allowlist/prompt-P1.txt), and its hash matches. It contains nothing sensitive, so D6's redacted replay template and the exact text are the same string; D6's purpose (no sensitive prompt content in the record) still holds. Replay: substitute it for `<P1>`. Mode: worker. Review mode (`--permission-mode default`, `-s read-only`, no extra args for grok) was not run, to keep spend down; every review-mode cell is `not tested`.
 
 **Effective argv (C6).** `MC_CLAUDE_ARGS`, `MC_CODEX_ARGS` and `MC_GROK_ARGS` were unset, so `run_cli` uses its defaults:
 - `claude -p <P1> --output-format json --permission-mode acceptEdits`
@@ -249,7 +267,22 @@ UID coverage, as tested: the recorded child and bypass chains (CLI, then `sh` or
 
 **Session interruption.** The original "before" snapshot was taken at 2026-11-27T06:13Z, before any change. The session then lost its network mid-run (around 06:27Z, during the claude OS cell) and its local scratch copy of that file was lost. When the session resumed, the coordinator checked the host: user `akegress191` and `/tmp/akegress191-spike` existed, there were no owner-match iptables or nft rules, and there were no spike processes.
 
-A fresh "before-resume" snapshot was then taken at 19:03Z. It was taken with the user and the temporary folder still present, because they were needed for the remaining cells. Its firewall, listener, route, DNS, module and settings sections are the authoritative baseline. The account sections were checked against the original 06:13Z values, which were read into the session before the loss:
+A fresh "before-resume" snapshot was then taken at 19:03Z. It was taken with the user and the temporary folder still present, because they were needed for the remaining cells. By then the spike had already changed host state (user, home, temporary folder, and earlier nft loads and proxy runs). So this snapshot is **not** a baseline that proves restoration. It only bounds changes made after 19:03Z.
+
+**What survives from 06:13Z.** The 06:13Z output was read in the session before the file was lost, in these runs:
+- the snapshot run at 06:13:51Z;
+- its 06:14:13Z repeat, used as a stability check;
+- the stderr-fixed run at 06:14Z.
+
+The following were transcribed from that output into [`egress-allowlist/cleanup-0613-excerpt.txt`](egress-allowlist/cleanup-0613-excerpt.txt). The same items extracted from the 19:11Z after snapshot are in [`egress-allowlist/cleanup-after-excerpt.txt`](egress-allowlist/cleanup-after-excerpt.txt).
+- the nft table list, routes, `ip rule` / `ip -6 rule`, `resolv.conf` and `resolvectl`;
+- the netfilter module names (`nf*`, `nft*`, `xt*`);
+- the first ten iptables/ip6tables lines matching `reject|owner|skuid`, with their line numbers;
+- every section header's line offset and the total line count, after the two stderr warning lines in the unfixed 06:13:51Z run are removed.
+
+The two files are byte-identical (SHA-256 `b1765ccc…cd6c`). The full iptables, ip6tables and nft ruleset text, and the full module list, were not read in full at 06:13Z. Their comparison against the original state is **unresolved**. Equal section lengths are consistent with unchanged rulesets but do not prove it.
+
+The account sections were checked against these 06:13Z values:
 - `/etc/passwd` `86b488c7…71f1`
 - `/etc/group` `be24add7…1575`
 - `/etc/shadow` `4e105664…490e`
@@ -257,8 +290,16 @@ A fresh "before-resume" snapshot was then taken at 19:03Z. It was taken with the
 - `/etc/subuid` = `/etc/subgid` `e3c1a1f1…3ecf2`
 - `/home` contained `fleet`, `reviewer`
 
-**After snapshot (19:11Z), compared with before-resume.**
-- Policy sections (everything except users, temporary paths and listeners): `diff -u` is **empty**.
+**After snapshot (19:11Z).**
+- Compared with the 19:03Z before-resume snapshot, the policy sections (everything except users, temporary paths and listeners) give an **empty** `diff -u`. That shows only that nothing changed between 19:03Z and 19:11Z.
+- Compared with 06:13Z, the transcribed excerpt matches exactly (above), and the full ruleset text is unresolved.
+- Independent evidence of cleanup (19:11Z and the final check):
+  - `nft list tables` shows only `ip filter`, `ip6 filter`, `ip nat` and `ip6 nat`, the same four tables as at 06:13Z;
+  - `iptables-save` and `ip6tables-save` contain no `owner` or `skuid` match (`grep -c` = 0);
+  - `id akegress191` reports no such user;
+  - `/home/akegress191` and `/tmp/akegress191*` are absent;
+  - no `akproxy`/`akegress` process is running;
+  - `ss -ltnH 'sport = :47191'` is empty.
 - Users section compared with the original 06:13Z values: **identical**. The account-file hashes are back to the pre-spike values, the `subuid`/`subgid` entries `useradd` added are gone, and `/home` holds `fleet` and `reviewer`.
 - Spike temporary paths: `none`.
 - Listeners: one line differs, `tcp 127.0.0.1:55409 postgres`. It belongs to a `fleet` lane's Postgres: it was present at 06:13Z, absent at 19:03Z and present at 19:11Z. The spike started no Postgres. The after listener set equals the original 06:13Z set.
@@ -285,13 +326,24 @@ The spike changed no iptables rule, ufw rule, route, resolver, sysctl, kernel mo
 
 ## Appendix F. Harness sources (for re-runs)
 
-SHA-256 of the files used in the 19:0xZ runs:
-- `akproxy.py` `dd4ba73e…8691`
-- `child.sh` `6767f974…15f4` (the concurrent version; the 06:2xZ runs used an earlier sequential version with the same probes)
-- `nft.sh` `d79f9276…5546`
-- `dims.sh` `1f05b474…cd89`
-- `front.py` `c98fbb31…4e45`
-- `cell.sh` `b5c5ca01…b1e`
+Complete sources are in [`egress-allowlist/`](egress-allowlist/), installed on the host under `/tmp/akegress191-spike/`.
+
+| File | SHA-256 | Role |
+|---|---|---|
+| [`cell.sh`](egress-allowlist/cell.sh) | `b5c5ca0108e487bf88d6a6eb81fc080d006ee7155292bbd07bd0540cf067bb1e` | one matrix cell as the lane user (contains P1 literally) |
+| [`nft.sh`](egress-allowlist/nft.sh) | `d79f9276cbe208eaa76b3df1740804a686e7e3671bc91faa73bf08d53e0e5546` | load, show or delete `table inet akegress191` (OS and combo variants) |
+| [`proxyctl.sh`](egress-allowlist/proxyctl.sh) | `739996171ed08fc55bb878ba24cc3720e4a6788de692b053d7c96b848890649b` | start or stop akproxy on `127.0.0.1:47191` |
+| [`dims.sh`](egress-allowlist/dims.sh) | `1f05b4744b9652eea7a856b6f81a736753e456c0bd0afc9e356ce8b2e659cd89` | Appendix D dimension commands |
+| [`snapshot.sh`](egress-allowlist/snapshot.sh) | `45a19279b332e1f9b516aacd494b2ce2d4253e0dbba6270cbf9efe0a1c4daa46` | canonical snapshot (19:03Z and 19:11Z runs) |
+| [`child.sh`](egress-allowlist/child.sh) | `6767f974553d993a892fc711d373e26b5448dc3fffb9c1be9d6fe0fb9a2f15f4` | child probe, concurrent version (19:0xZ runs) |
+| [`akproxy.py`](egress-allowlist/akproxy.py) | `dd4ba73ec35548d045c687a2f79e1d19eb944825ad235bd98964080a7ed48691` | allowlisting CONNECT proxy |
+| [`front.py`](egress-allowlist/front.py) | `c98fbb31ddddb71092bfbc2a0f71a0d55d16c1f38f437d45dda497fe28594e45` | fronting test through an allowed tunnel |
+| [`summarize.py`](egress-allowlist/summarize.py) | `4d9f97ebd9ca20f4b19b945890416c5fc1bc7594bb0c1ed04ab13badc1b6dd4d` | strace and output summarizer used by `cell.sh` |
+| [`prompt-P1.txt`](egress-allowlist/prompt-P1.txt) | `ef7e7ff96d04cdcdb9a405d5319bdc1b52adabc168eea9179dfc1352aad79231` | exact P1 bytes |
+
+Lost and not reproducible byte for byte:
+- **`snapshot.sh`, 06:13Z copy.** It was lost with the session's scratch folder. Its hash was never recorded. The 06:13:51Z and 06:14:13Z runs used a version without `2>/dev/null` on the two `nft` commands; the 06:14Z run added it. The file above was recreated at 19:03Z from the same commands with the fix applied, and both the 19:03Z and 19:11Z snapshots used it. With the two stderr warning lines removed, its section offsets and total line count match the 06:13Z output, which is consistent with the same commands. Byte identity cannot be shown without the original hash.
+- **`child.sh`, sequential version** used by the 06:2xZ cells (`claude-proxy-r1/r1s`, `claude-os-r1/r1s`, `codex-none-explore`, `codex-proxy-r1/r1s`). It ran the same three probes one after another instead of concurrently. It was overwritten on the host at 19:05Z and lost locally, and its hash was never recorded, so it cannot be reproduced exactly.
 
 The key parts follow.
 
@@ -425,6 +477,7 @@ Missing or failing evidence:
 5. review-mode argv: `not tested`.
 6. Proxy client-side IPv6: `not tested`.
 7. Credentialed runs: `not tested`.
+8. Cleanup against the original state: partly unresolved. The full 06:13Z ruleset and module text were lost (Appendix E).
 
 Blast radius if shipped as is: a lane can still exfiltrate to any site that shares a CDN edge with an allowed host, and through DNS queries.
 
