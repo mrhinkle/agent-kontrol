@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- The absence sweeper (#79) runs on the hosted deployment: `vercel.json` calls `GET /api/sweep/cron` every 5 minutes with `CRON_SECRET` (`MC_TOKEN` or a dashboard session also work). It does what `POST /api/sweep` does. No consumer is registered, so `consumer-silent` stays `not_configured`. See [Velocity](docs/VELOCITY.md).
 - The Langfuse page counts fleet wrapper runs (Grok lanes, Codex and spec reviews) from the events those wrappers already post, beside dispatcher runs. A run with no reported duration is shown as unavailable and kept out of the percentiles. See [Langfuse](docs/langfuse.md).
 - Scheduled provider billing on the deployment: `GET /api/usage/collect` collects OpenRouter, xAI and Claude API costs for the last 30 complete UTC days for each provider whose management key is set, and `vercel.json` runs it daily. Authenticates with `CRON_SECRET`, `MC_TOKEN` or a dashboard session. See [Usage](docs/USAGE.md).
 

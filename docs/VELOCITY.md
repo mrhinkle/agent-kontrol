@@ -281,7 +281,9 @@ Issue #79, Gibson doc 33 (draft, non-normative). A stuck PR, a silent consumer, 
 
 Shipped: `POST /api/sweep` (one run), `GET /api/sweep` (read-only status), `POST /api/sweep/consumers` (registrations), the three sweeper observation kinds on `POST /api/ingest`, the brief's Paused section, the manual runner `scripts/sweep-once.sh`, and an inert five-minute example in `docs/examples/absence-sweep.cron.example`, the queue and PR producer `scripts/sweep-producer.sh` (off by default; see [Producer](#producer)), and the scheduler observer `scripts/observe-scheduler.py` (off by default; see [Scheduler observer](#scheduler-observer)).
 
-Not performed: no `vercel.json` cron, no launchd job installed or bootstrapped, no Mini change, no collector scheduling, no producer config installed or enabled, no live GitHub collection, no consumer registration, and no live migration. The observer plist is a template only. The five-minute cadence and its operational acceptance are left for the owner. Until registrations and observations exist, the checks report `not_configured` or `unknown`, never `clear`.
+Scheduled since 2026-11-26 (owner decision): `vercel.json` runs `GET /api/sweep/cron` every 5 minutes with `CRON_SECRET`, so the hosted deployment sweeps without a workstation. No consumer is registered yet, so `consumer-silent` stays `not_configured` until one is.
+
+Not performed: no launchd job installed or bootstrapped, no Mini change, no collector scheduling, no producer config installed or enabled, no live GitHub collection, no consumer registration, and no live migration. The observer plist is a template only. The hosted five-minute cadence is the Vercel cron above; registering consumers is left for the owner. Until registrations and observations exist, the checks report `not_configured` or `unknown`, never `clear`.
 
 ### Conditions
 

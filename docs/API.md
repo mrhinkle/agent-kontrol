@@ -29,6 +29,7 @@ The `agent_credentials` table stores the label, the first 8 characters of the to
 | `POST /api/watch/beat`, `GET /api/watch/beats` | Verified `akc_` credential only. `watch:write` for the POST, `watch:read` for the GET. `MC_TOKEN`, the dashboard session, an OAuth access token, and a caller allowed only because the dashboard password is unset are `401` |
 | `POST /api/sweep`, `POST /api/sweep/consumers` | `Authorization: Bearer <MC_TOKEN>`, or the dashboard session cookie when `MC_DASHBOARD_PASSWORD` is set. An agent credential, an OAuth token, and a caller allowed only because the password is unset are refused (`403` `trusted_writer_required`, `403` `insufficient_scope`, or `401`) |
 | `GET /api/sweep` | Session cookie, `MC_TOKEN`, or an agent credential with `progress:read`. Read-only |
+| `GET /api/sweep/cron` | `Authorization: Bearer <CRON_SECRET>` (Vercel Cron), `MC_TOKEN`, or the dashboard session. An agent credential is refused |
 | `GET /api/sweep/queues` | Session cookie, `MC_TOKEN`, or an agent credential with `progress:read`. Read-only |
 | `GET /api/usage` | Session cookie, `MC_TOKEN`, or an agent credential with `usage:read`. `POST /api/usage/ingest` stays `MC_TOKEN` only |
 | Sweeper observations on `POST /api/ingest` (`kind` `sweep.scheduler_job`, `sweep.queue`, `sweep.pr_snapshot`) | `Authorization: Bearer <MC_TOKEN>` only. An agent credential with `status:write`, an OAuth token, and a dev-open caller are `403` `trusted_writer_required` and nothing is written |
@@ -174,6 +175,8 @@ Every field is validated before any write and unknown fields are `400` `validati
 ### Sweeper
 
 `POST /api/sweep` runs the absence sweeper once and returns `{ ok, checks, retention }`. The body is ignored; there is no caller clock. Each entry in `checks` has `check`, `state` (`firing`, `clear`, `held`, `unknown`, `not_configured`), `evaluated_at` (the database instant), `counts`, `emitted` (delivery ids written), `entities` (100 max), `complete`, `unvisited`, and `error`. A check that failed is `unknown` with an error and does not stop the others. The status is `200` whenever the run finished; read each check. `retention` reports `deleted`, `batches`, `complete`, and `error`.
+
+`GET /api/sweep/cron` runs the same sweep on a schedule: `vercel.json` calls it every 5 minutes, because Vercel Cron sends `GET` and `GET /api/sweep` is read-only status. It returns what `POST /api/sweep` returns. Overlapping runs are safe: each check takes a transaction advisory lock, so an event is still emitted once per condition. Without a database it answers `{ ok: true, demo: true }` and runs nothing.
 
 `POST /api/sweep/consumers` registers or updates one consumer: `id`, `agent_ids`, `reporters` (`[{ "kind": "agent", "id": "<credential id>" }]`), `queue` (`{ "type": "tasks", "platform": "codex" }` or `{ "type": "collector", "queue": "issues:owner/name" }`), optional `scheduler { source, job_id }`, `enabled`, `max_silence_hours` (default 3). There are no implicit registrations. `registered_at` is set once.
 
