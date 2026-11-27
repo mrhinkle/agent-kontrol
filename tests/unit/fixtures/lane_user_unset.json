@@ -1,0 +1,491 @@
+{
+  "rows": [
+    {
+      "argv": [
+        "claude",
+        "-p",
+        "fixture prompt 193",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "acceptEdits"
+      ],
+      "cwd": "/fixture/worktree",
+      "env": {
+        "ANTHROPIC_API_KEY": "fixture-anthropic-key-193",
+        "HOME": "/fixture/home/dispatcher",
+        "LANG": "C.UTF-8",
+        "LOGNAME": "dispatcher",
+        "MC_URL": "https://mc.fixture.invalid",
+        "PATH": "/fixture/bin:/usr/bin:/bin",
+        "SHELL": "/bin/zsh",
+        "USER": "dispatcher"
+      },
+      "mode": "worker",
+      "other_kwargs": [],
+      "platform": "claude-code",
+      "start_new_session": true,
+      "stderr_file": true,
+      "stdin_devnull": true,
+      "stdout_file": true,
+      "stop": {
+        "function": "stop_group",
+        "grace": 5.0,
+        "pid": 999999
+      },
+      "timeout": 3600
+    },
+    {
+      "argv": [
+        "claude",
+        "-p",
+        "fixture prompt 193",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "default"
+      ],
+      "cwd": "/fixture/worktree",
+      "env": {
+        "ANTHROPIC_API_KEY": "fixture-anthropic-key-193",
+        "HOME": "/fixture/home/dispatcher",
+        "LANG": "C.UTF-8",
+        "LOGNAME": "dispatcher",
+        "MC_URL": "https://mc.fixture.invalid",
+        "PATH": "/fixture/bin:/usr/bin:/bin",
+        "SHELL": "/bin/zsh",
+        "USER": "dispatcher"
+      },
+      "mode": "review",
+      "other_kwargs": [],
+      "platform": "claude-code",
+      "start_new_session": true,
+      "stderr_file": true,
+      "stdin_devnull": true,
+      "stdout_file": true,
+      "stop": {
+        "function": "stop_group",
+        "grace": 5.0,
+        "pid": 999999
+      },
+      "timeout": 3600
+    },
+    {
+      "argv": [
+        "claude",
+        "-p",
+        "fixture prompt 193",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "acceptEdits"
+      ],
+      "cwd": "/fixture/worktree",
+      "env": {
+        "AK_BROKER_URL": "http://127.0.0.1:8765",
+        "AK_GITHUB_PLACEHOLDER": "akp_ggggggggggggggggggggggggggggggggggggggggggg",
+        "AK_GITHUB_REPO": "fixture-owner/fixture-repo",
+        "ANTHROPIC_API_KEY": "fixture-anthropic-key-193",
+        "GIT_ASKPASS": "",
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_KEY_1": "credential.https://github.com.helper",
+        "GIT_CONFIG_VALUE_0": "",
+        "GIT_CONFIG_VALUE_1": "/fixture/agents/broker/git-credential-ak",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": "/fixture/home/dispatcher",
+        "LANG": "C.UTF-8",
+        "LOGNAME": "dispatcher",
+        "MC_URL": "https://mc.fixture.invalid",
+        "OPENROUTER_API_KEY": "akp_fixtureplaceholder193",
+        "OPENROUTER_BASE_URL": "http://127.0.0.1:8765/openrouter",
+        "PATH": "/fixture/bin:/usr/bin:/bin",
+        "SHELL": "/bin/zsh",
+        "SSH_ASKPASS": "",
+        "USER": "dispatcher"
+      },
+      "mode": "worker+overlay",
+      "other_kwargs": [],
+      "platform": "claude-code",
+      "start_new_session": true,
+      "stderr_file": true,
+      "stdin_devnull": true,
+      "stdout_file": true,
+      "stop": {
+        "function": "stop_group",
+        "grace": 5.0,
+        "pid": 999999
+      },
+      "timeout": 3600
+    },
+    {
+      "argv": [
+        "claude",
+        "-p",
+        "fixture prompt 193",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "default"
+      ],
+      "cwd": "/fixture/worktree",
+      "env": {
+        "AK_BROKER_URL": "http://127.0.0.1:8765",
+        "AK_GITHUB_PLACEHOLDER": "akp_ggggggggggggggggggggggggggggggggggggggggggg",
+        "AK_GITHUB_REPO": "fixture-owner/fixture-repo",
+        "ANTHROPIC_API_KEY": "fixture-anthropic-key-193",
+        "GIT_ASKPASS": "",
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_KEY_1": "credential.https://github.com.helper",
+        "GIT_CONFIG_VALUE_0": "",
+        "GIT_CONFIG_VALUE_1": "/fixture/agents/broker/git-credential-ak",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": "/fixture/home/dispatcher",
+        "LANG": "C.UTF-8",
+        "LOGNAME": "dispatcher",
+        "MC_URL": "https://mc.fixture.invalid",
+        "OPENROUTER_API_KEY": "akp_fixtureplaceholder193",
+        "OPENROUTER_BASE_URL": "http://127.0.0.1:8765/openrouter",
+        "PATH": "/fixture/bin:/usr/bin:/bin",
+        "SHELL": "/bin/zsh",
+        "SSH_ASKPASS": "",
+        "USER": "dispatcher"
+      },
+      "mode": "review+overlay",
+      "other_kwargs": [],
+      "platform": "claude-code",
+      "start_new_session": true,
+      "stderr_file": true,
+      "stdin_devnull": true,
+      "stdout_file": true,
+      "stop": {
+        "function": "stop_group",
+        "grace": 5.0,
+        "pid": 999999
+      },
+      "timeout": 3600
+    },
+    {
+      "argv": [
+        "codex",
+        "exec",
+        "--sandbox",
+        "workspace-write",
+        "--json",
+        "fixture prompt 193"
+      ],
+      "cwd": "/fixture/worktree",
+      "env": {
+        "HOME": "/fixture/home/dispatcher",
+        "LANG": "C.UTF-8",
+        "LOGNAME": "dispatcher",
+        "MC_URL": "https://mc.fixture.invalid",
+        "OPENAI_API_KEY": "fixture-openai-key-193",
+        "PATH": "/fixture/bin:/usr/bin:/bin",
+        "SHELL": "/bin/zsh",
+        "USER": "dispatcher"
+      },
+      "mode": "worker",
+      "other_kwargs": [],
+      "platform": "codex",
+      "start_new_session": true,
+      "stderr_file": true,
+      "stdin_devnull": true,
+      "stdout_file": true,
+      "stop": {
+        "function": "stop_group",
+        "grace": 5.0,
+        "pid": 999999
+      },
+      "timeout": 3600
+    },
+    {
+      "argv": [
+        "codex",
+        "exec",
+        "-s",
+        "read-only",
+        "--json",
+        "fixture prompt 193"
+      ],
+      "cwd": "/fixture/worktree",
+      "env": {
+        "HOME": "/fixture/home/dispatcher",
+        "LANG": "C.UTF-8",
+        "LOGNAME": "dispatcher",
+        "MC_URL": "https://mc.fixture.invalid",
+        "OPENAI_API_KEY": "fixture-openai-key-193",
+        "PATH": "/fixture/bin:/usr/bin:/bin",
+        "SHELL": "/bin/zsh",
+        "USER": "dispatcher"
+      },
+      "mode": "review",
+      "other_kwargs": [],
+      "platform": "codex",
+      "start_new_session": true,
+      "stderr_file": true,
+      "stdin_devnull": true,
+      "stdout_file": true,
+      "stop": {
+        "function": "stop_group",
+        "grace": 5.0,
+        "pid": 999999
+      },
+      "timeout": 3600
+    },
+    {
+      "argv": [
+        "codex",
+        "exec",
+        "--sandbox",
+        "workspace-write",
+        "--json",
+        "fixture prompt 193"
+      ],
+      "cwd": "/fixture/worktree",
+      "env": {
+        "AK_BROKER_URL": "http://127.0.0.1:8765",
+        "AK_GITHUB_PLACEHOLDER": "akp_ggggggggggggggggggggggggggggggggggggggggggg",
+        "AK_GITHUB_REPO": "fixture-owner/fixture-repo",
+        "GIT_ASKPASS": "",
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_KEY_1": "credential.https://github.com.helper",
+        "GIT_CONFIG_VALUE_0": "",
+        "GIT_CONFIG_VALUE_1": "/fixture/agents/broker/git-credential-ak",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": "/fixture/home/dispatcher",
+        "LANG": "C.UTF-8",
+        "LOGNAME": "dispatcher",
+        "MC_URL": "https://mc.fixture.invalid",
+        "OPENAI_API_KEY": "fixture-openai-key-193",
+        "OPENROUTER_API_KEY": "akp_fixtureplaceholder193",
+        "OPENROUTER_BASE_URL": "http://127.0.0.1:8765/openrouter",
+        "PATH": "/fixture/bin:/usr/bin:/bin",
+        "SHELL": "/bin/zsh",
+        "SSH_ASKPASS": "",
+        "USER": "dispatcher"
+      },
+      "mode": "worker+overlay",
+      "other_kwargs": [],
+      "platform": "codex",
+      "start_new_session": true,
+      "stderr_file": true,
+      "stdin_devnull": true,
+      "stdout_file": true,
+      "stop": {
+        "function": "stop_group",
+        "grace": 5.0,
+        "pid": 999999
+      },
+      "timeout": 3600
+    },
+    {
+      "argv": [
+        "codex",
+        "exec",
+        "-s",
+        "read-only",
+        "--json",
+        "fixture prompt 193"
+      ],
+      "cwd": "/fixture/worktree",
+      "env": {
+        "AK_BROKER_URL": "http://127.0.0.1:8765",
+        "AK_GITHUB_PLACEHOLDER": "akp_ggggggggggggggggggggggggggggggggggggggggggg",
+        "AK_GITHUB_REPO": "fixture-owner/fixture-repo",
+        "GIT_ASKPASS": "",
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_KEY_1": "credential.https://github.com.helper",
+        "GIT_CONFIG_VALUE_0": "",
+        "GIT_CONFIG_VALUE_1": "/fixture/agents/broker/git-credential-ak",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": "/fixture/home/dispatcher",
+        "LANG": "C.UTF-8",
+        "LOGNAME": "dispatcher",
+        "MC_URL": "https://mc.fixture.invalid",
+        "OPENAI_API_KEY": "fixture-openai-key-193",
+        "OPENROUTER_API_KEY": "akp_fixtureplaceholder193",
+        "OPENROUTER_BASE_URL": "http://127.0.0.1:8765/openrouter",
+        "PATH": "/fixture/bin:/usr/bin:/bin",
+        "SHELL": "/bin/zsh",
+        "SSH_ASKPASS": "",
+        "USER": "dispatcher"
+      },
+      "mode": "review+overlay",
+      "other_kwargs": [],
+      "platform": "codex",
+      "start_new_session": true,
+      "stderr_file": true,
+      "stdin_devnull": true,
+      "stdout_file": true,
+      "stop": {
+        "function": "stop_group",
+        "grace": 5.0,
+        "pid": 999999
+      },
+      "timeout": 3600
+    },
+    {
+      "argv": [
+        "grok",
+        "-p",
+        "fixture prompt 193",
+        "--output-format",
+        "json"
+      ],
+      "cwd": "/fixture/worktree",
+      "env": {
+        "HOME": "/fixture/home/dispatcher",
+        "LANG": "C.UTF-8",
+        "LOGNAME": "dispatcher",
+        "MC_URL": "https://mc.fixture.invalid",
+        "PATH": "/fixture/bin:/usr/bin:/bin",
+        "SHELL": "/bin/zsh",
+        "USER": "dispatcher",
+        "XAI_API_KEY": "fixture-xai-key-193"
+      },
+      "mode": "worker",
+      "other_kwargs": [],
+      "platform": "grok",
+      "start_new_session": true,
+      "stderr_file": true,
+      "stdin_devnull": true,
+      "stdout_file": true,
+      "stop": {
+        "function": "stop_group",
+        "grace": 5.0,
+        "pid": 999999
+      },
+      "timeout": 3600
+    },
+    {
+      "argv": [
+        "grok",
+        "-p",
+        "fixture prompt 193",
+        "--output-format",
+        "json"
+      ],
+      "cwd": "/fixture/worktree",
+      "env": {
+        "HOME": "/fixture/home/dispatcher",
+        "LANG": "C.UTF-8",
+        "LOGNAME": "dispatcher",
+        "MC_URL": "https://mc.fixture.invalid",
+        "PATH": "/fixture/bin:/usr/bin:/bin",
+        "SHELL": "/bin/zsh",
+        "USER": "dispatcher",
+        "XAI_API_KEY": "fixture-xai-key-193"
+      },
+      "mode": "review",
+      "other_kwargs": [],
+      "platform": "grok",
+      "start_new_session": true,
+      "stderr_file": true,
+      "stdin_devnull": true,
+      "stdout_file": true,
+      "stop": {
+        "function": "stop_group",
+        "grace": 5.0,
+        "pid": 999999
+      },
+      "timeout": 3600
+    },
+    {
+      "argv": [
+        "grok",
+        "-p",
+        "fixture prompt 193",
+        "--output-format",
+        "json"
+      ],
+      "cwd": "/fixture/worktree",
+      "env": {
+        "AK_BROKER_URL": "http://127.0.0.1:8765",
+        "AK_GITHUB_PLACEHOLDER": "akp_ggggggggggggggggggggggggggggggggggggggggggg",
+        "AK_GITHUB_REPO": "fixture-owner/fixture-repo",
+        "GIT_ASKPASS": "",
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_KEY_1": "credential.https://github.com.helper",
+        "GIT_CONFIG_VALUE_0": "",
+        "GIT_CONFIG_VALUE_1": "/fixture/agents/broker/git-credential-ak",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": "/fixture/home/dispatcher",
+        "LANG": "C.UTF-8",
+        "LOGNAME": "dispatcher",
+        "MC_URL": "https://mc.fixture.invalid",
+        "OPENROUTER_API_KEY": "akp_fixtureplaceholder193",
+        "OPENROUTER_BASE_URL": "http://127.0.0.1:8765/openrouter",
+        "PATH": "/fixture/bin:/usr/bin:/bin",
+        "SHELL": "/bin/zsh",
+        "SSH_ASKPASS": "",
+        "USER": "dispatcher",
+        "XAI_API_KEY": "fixture-xai-key-193"
+      },
+      "mode": "worker+overlay",
+      "other_kwargs": [],
+      "platform": "grok",
+      "start_new_session": true,
+      "stderr_file": true,
+      "stdin_devnull": true,
+      "stdout_file": true,
+      "stop": {
+        "function": "stop_group",
+        "grace": 5.0,
+        "pid": 999999
+      },
+      "timeout": 3600
+    },
+    {
+      "argv": [
+        "grok",
+        "-p",
+        "fixture prompt 193",
+        "--output-format",
+        "json"
+      ],
+      "cwd": "/fixture/worktree",
+      "env": {
+        "AK_BROKER_URL": "http://127.0.0.1:8765",
+        "AK_GITHUB_PLACEHOLDER": "akp_ggggggggggggggggggggggggggggggggggggggggggg",
+        "AK_GITHUB_REPO": "fixture-owner/fixture-repo",
+        "GIT_ASKPASS": "",
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_KEY_1": "credential.https://github.com.helper",
+        "GIT_CONFIG_VALUE_0": "",
+        "GIT_CONFIG_VALUE_1": "/fixture/agents/broker/git-credential-ak",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": "/fixture/home/dispatcher",
+        "LANG": "C.UTF-8",
+        "LOGNAME": "dispatcher",
+        "MC_URL": "https://mc.fixture.invalid",
+        "OPENROUTER_API_KEY": "akp_fixtureplaceholder193",
+        "OPENROUTER_BASE_URL": "http://127.0.0.1:8765/openrouter",
+        "PATH": "/fixture/bin:/usr/bin:/bin",
+        "SHELL": "/bin/zsh",
+        "SSH_ASKPASS": "",
+        "USER": "dispatcher",
+        "XAI_API_KEY": "fixture-xai-key-193"
+      },
+      "mode": "review+overlay",
+      "other_kwargs": [],
+      "platform": "grok",
+      "start_new_session": true,
+      "stderr_file": true,
+      "stdin_devnull": true,
+      "stdout_file": true,
+      "stop": {
+        "function": "stop_group",
+        "grace": 5.0,
+        "pid": 999999
+      },
+      "timeout": 3600
+    }
+  ],
+  "source": "main 974dc9d, MC_LANE_USER unset"
+}

@@ -364,6 +364,189 @@ task. `gh` is not covered, SSH pushes keep using the host's SSH keys, and a
 worker that deliberately overrides `credential.helper` itself is not stopped
 (#193 covers OS-user separation).
 
+## Lane user (Linux, #193)
+
+Without a second OS user the broker is hygiene, not a wall: a CLI running as
+the dispatcher's user can read the dispatcher's env file (which holds
+`MC_TOKEN`), the broker's config and provider files, and the broker's
+memory, and can connect to its admin socket. With `MC_LANE_USER` set, every
+dispatched CLI (worker and reviewer, `claude`, `codex` and `grok`) runs as
+that unprivileged user instead:
+
+```
+sudo -n -u <lane> --preserve-env=<child env names, sorted> -- <absolute CLI path> <args…>
+```
+
+The argv carries names only, never a value. The CLI's environment is the
+usual allowlisted child environment plus the broker overlay (`AK_GITHUB_*`,
+`AK_BROKER_URL`, `GIT_CONFIG_*`, `GIT_TERMINAL_PROMPT`, service placeholders),
+with `HOME`, `USER`, `LOGNAME` and `SHELL` set to the lane user's passwd
+values. `MC_TOKEN` and `MC_EVENT_TOKEN` are never in it; if either name ever
+reached the mapping the task would fail instead. The CLI path is the one
+`shutil.which` finds on the dispatcher's own `PATH`.
+
+The worktree lock, the skill pointers in `AGENTS.md`, the recovery record and
+the broker client stay with the dispatcher's user. `ak_skill_launch.py`
+direct and fleet modes are not changed and still run as the same user.
+
+### Fail closed
+
+`MC_LANE_USER` is read from the process environment after the env file
+(which only fills defaults, so an exported value wins). It is invalid when it
+is empty or whitespace, has leading or trailing whitespace (it is never
+trimmed), is not a plain user name, is set alongside a non-blank
+`MC_CLAUDE_ARGS`, `MC_CODEX_ARGS` or `MC_GROK_ARGS`, names no user, is UID 0, has the
+dispatcher's effective UID, or has an empty home or shell in passwd. After
+the worktree lock and before anything else (the recovery check, the broker,
+the pointer fetch, the `HEAD` read, the running patch, ingest and any CLI)
+the dispatcher validates it and runs:
+
+```
+sudo -n -u <lane> /usr/bin/test -w <worktree>
+```
+
+An invalid user, a failed preflight, a refused sudo, or a CLI that cannot be
+launched as the lane user fails the task with a result starting
+`lane user unavailable, no worker started`. Only the lock is released. There
+is no fallback to the dispatcher's user.
+
+### Containment across the user switch
+
+`sudo` is started in a new session, so the process group id is its pid, and
+with `!use_pty` sudo runs the CLI in that same group. The dispatcher cannot
+signal lane processes itself, so on every exit (normal, error or timeout) it
+runs `sudo -n -u <lane> /bin/kill -TERM -- -<pgid>`, then `-KILL` after
+`KILL_GRACE` if anything is left, and polls `/bin/kill -0 -- -<pgid>` until
+it exits non-zero (no lane-owned member left). The dispatcher waits for the
+wrapper without reaping it (`waitid` with `WNOWAIT` on Linux), even when the
+CLI exits normally, and reaps it only then, so the group id cannot be reused
+during the check. Two checks
+that do not trust sudo follow: the wrapper must exit within `KILL_GRACE` (it
+waits for the CLI, so a CLI that escaped the group keeps it alive), and once
+it is reaped the group must be empty. Any failure raises `ContainmentError`.
+
+### Setup (Linux)
+
+Run every step as root. Replace `ak` (dispatcher and secrets user), `aklane`
+(lane user) and `aklanes` (shared group) with your names.
+
+1. Create the lane user with its own home and a real shell, and the shared
+   group:
+
+   ```bash
+   groupadd aklanes
+   useradd --create-home --shell /bin/bash --groups aklanes aklane
+   usermod -aG aklanes ak
+   ```
+
+2. Install the sudoers rule. Substitute `<dispatcher>`, `<lane>` and the
+   three CLI paths from `command -v claude codex grok` on the host. This is
+   the exact stanza Mark approves before it goes on any host:
+
+   ```
+   Cmnd_Alias AK_LANE_CLI = <claude-path>, <codex-path>, <grok-path>
+   Cmnd_Alias AK_LANE_OPS = /usr/bin/test -w *, /bin/kill -TERM -- -[0-9]*, /bin/kill -KILL -- -[0-9]*, /bin/kill -0 -- -[0-9]*
+   Defaults!AK_LANE_CLI, AK_LANE_OPS !use_pty, env_reset
+   <dispatcher> ALL=(<lane>) NOPASSWD:SETENV: AK_LANE_CLI, AK_LANE_OPS
+   ```
+
+   Write it to a scratch file, check it, then install it with mode 0440:
+
+   ```bash
+   visudo -cf /root/ak-lane.sudoers
+   install -m 0440 -o root -g root /root/ak-lane.sudoers /etc/sudoers.d/ak-lane
+   visudo -cf /etc/sudoers.d/ak-lane
+   sudo -u ak sudo -n -l          # lists exactly AK_LANE_CLI and AK_LANE_OPS
+   ```
+
+   The rule names no shell and no `env`. `SETENV` is needed for
+   `--preserve-env`. The `kill` wildcards (`-[0-9]*` also matches `-1` and
+   extra operands) reach only processes running as the lane user, whose only
+   processes are lane tasks; that is the bound, so give the lane user nothing
+   else to run. `test -w *` is read-only. `!use_pty` keeps the CLI in sudo's
+   process group (sudo 1.9.14 and later turn `use_pty` on by default, which
+   would move the CLI out of reach). Install the vendor CLIs at system paths
+   that the lane user can read and execute and cannot write, such as
+   `/usr/local/bin`. A host `secure_path` replaces `PATH` for the CLI, so a
+   CLI that finds its interpreter on `PATH` (for example `node`) needs it
+   there.
+
+3. Shared group, setgid directories and `umask 002`. The lane user writes the
+   linked worktree, its per-worktree git admin directory
+   (`<main>/.git/worktrees/<name>`), and the files `git status`, `git commit`
+   and the #190 push touch: `index`, `index.lock`, `HEAD`, `ORIG_HEAD`,
+   `logs/`, and the shared `objects/` and `refs/` of the main checkout.
+
+   ```bash
+   chgrp -R aklanes <main-checkout> <MC_WORKDIR>/<worktree>
+   chmod -R g+rwX <main-checkout> <MC_WORKDIR>/<worktree>
+   find <main-checkout> <MC_WORKDIR>/<worktree> -type d -exec chmod g+s {} +
+   git -C <main-checkout> config core.sharedRepository group
+   ```
+
+   Run the dispatcher with `umask 002` (systemd `UMask=0002`) so the
+   `AGENTS.md` it writes and new git files stay group-writable. The worktree
+   lock (`ak-dispatch.lock`, mode 0600) stays the dispatcher's; the lane user
+   never needs it. Keep the dispatcher's own checkout (which holds
+   `agents/broker/git-credential-ak`) outside these shared directories: the
+   helper must be mode 0755 in a directory owned by the dispatcher or root
+   with no group or other write bit (#190), and every directory above it must
+   be searchable by the lane user so git can run it.
+
+4. The lane user's own identity and logins, in its own home:
+
+   ```bash
+   sudo -u aklane git config --global user.name  "<lane bot name>"
+   sudo -u aklane git config --global user.email "<lane bot email>"
+   sudo -iu aklane claude    # then codex login, grok login, as that user
+   ```
+
+   Vendor CLI logins are not moved into the broker (out of scope).
+
+5. Broker and dispatcher file ownership. The broker config, the provider
+   config, every `file` provider file and the dispatcher's env file are owned
+   by `ak`, mode 0600 (or 0400), in directories the lane user cannot search.
+   The admin socket's parent directory is owned by `ak`, mode 0700. The
+   broker's loopback port (`127.0.0.1:<port>`) stays reachable by the lane
+   user; that is how placeholders and the GitHub helper work.
+
+6. Check the boundary. As root:
+
+   ```bash
+   agents/dispatcher/lane-user-check.sh aklane /var/lib/agent-kontrol/broker.json \
+       /var/lib/agent-kontrol/providers.json /var/lib/agent-kontrol/run/admin.sock \
+       /home/ak/.claude/mission-control.env /var/lib/agent-kontrol/secrets/lanes.env
+   ```
+
+   It prints `DENIED`, `READABLE` or `INCONCLUSIVE` and the path, one line per
+   target, never any content, and exits 0 only if every line is `DENIED`. It
+   probes as the lane user with `sudo -u <lane> python3`, which the
+   dispatcher's own rule does not allow, so run it as root (as the secrets
+   user every line is `INCONCLUSIVE` unless a separate rule permits the
+   probe). Then set `MC_LANE_USER=aklane` for the dispatcher and restart it.
+
+Any `READABLE` or `INCONCLUSIVE` line, a `visudo` failure, or a lane process
+left after a forced timeout blocks enabling `MC_LANE_USER` on that host.
+
+### What does not work yet
+
+- macOS: no lane user support or setup recipe; Linux first (owner decision
+  D1).
+- `ak_skill_launch.py` direct and fleet modes still run as the dispatcher's
+  user.
+- `MC_CLAUDE_ARGS`, `MC_CODEX_ARGS` and `MC_GROK_ARGS` are not supported with
+  a lane user: they are environment values that would land in the sudo argv.
+  If any of the three is set and not blank, every task fails with
+  `lane user unavailable, no worker started` before sudo, the preflight or
+  any CLI runs. Without `MC_LANE_USER` they work as before.
+- Unit tests use a stub `sudo`; they prove how the commands are built, not
+  the boundary. The host checks in #193 do that.
+- A lane user can still reach anything its own permissions allow, including
+  the broker's loopback port and the network (egress rules are #191).
+
+To roll back: confirm no lane-user process is running, unset `MC_LANE_USER`
+and restart the dispatcher. The sudoers rule and the user can stay.
+
 ## Dispatch-ready handoff
 
 `dispatch_ready_bridge.py` is the inert issue-to-task handoff. It does nothing
@@ -413,3 +596,5 @@ python3 -m unittest tests.unit.test_dispatch_ready_bridge -v
 `npm run test:unit:py`). Real temp git worktrees, a fake API, a fake CLI.
 `python3 -m unittest tests.unit.test_broker_dispatcher -v` covers the broker
 admin socket and the dispatcher's broker path.
+`python3 -m unittest tests.unit.test_broker_lane_user -v` covers the lane user
+(stub `sudo`, stub `id`, fake CLIs) and `lane-user-check.sh`.

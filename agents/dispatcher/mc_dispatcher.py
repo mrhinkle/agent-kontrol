@@ -41,6 +41,9 @@ Config via environment (or ~/.claude/mission-control.env, read by main() only):
   MC_BROKER_GITHUB       unset, or exactly "required": a supported GitHub remote must get
                          a GitHub grant or the task fails closed (set it on every host
                          whose broker has a github block, #190 I4)
+  MC_LANE_USER           optional unprivileged OS user that runs every agent CLI, through
+                         sudo and the documented sudoers rule (#193, Linux only). Set and
+                         unusable, the task fails closed; it never falls back to this user
 
 An opt-in outbound SSE listener wakes the normal atomic claim path. While
 connected the fallback poll is max(MC_POLL_SECONDS, 60); when unavailable it
@@ -67,7 +70,9 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import pwd
 import re
+import select
 import shutil
 import signal
 import socket
@@ -319,14 +324,18 @@ def stop_group_id(pgid: int, reap, grace: float) -> bool:
     return False
 
 
-def run_contained(cmd: list[str], cwd: Path, timeout: float, *, env: dict[str, str]) -> tuple[int, str, str]:
+def run_contained(cmd: list[str], cwd: Path, timeout: float, *, env: dict[str, str],
+                  lane: LaneUser | None = None) -> tuple[int, str, str]:
     """Run cmd in a new session and stop its whole process group before returning.
 
     Background children left by the CLI are stopped on exit, error, timeout, or
     exception, so none of them outlives the worktree lock. Output goes to temp
     files rather than pipes, so a child holding stdout open does not stall the wait.
     env is the child's whole environment; the parent's environment is not inherited.
+    With lane, the CLI runs as that user through sudo and is stopped through sudo (#193).
     """
+    if lane is not None:
+        return _run_contained_lane(cmd, cwd, timeout, env=env, lane=lane)
     with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
         proc = subprocess.Popen(
             cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f,
@@ -352,14 +361,256 @@ def run_contained(cmd: list[str], cwd: Path, timeout: float, *, env: dict[str, s
         )
 
 
+# ---------------------------------------------------------------------------
+# Lane user (#193). With MC_LANE_USER set, every agent CLI runs as that
+# unprivileged user through `sudo -n -u <lane>` and the sudoers rule in the
+# README; the lock, pointer files, recovery record and broker client stay with
+# this user. An unusable lane user fails the task closed: there is no fallback.
+
+LANE_USER_UNAVAILABLE = "lane user unavailable, no worker started"
+LANE_TEST = "/usr/bin/test"  # the sudoers rule names these exact paths (C8)
+LANE_KILL = "/bin/kill"
+LANE_PREFLIGHT_TIMEOUT = 30.0
+LANE_OP_TIMEOUT = 10.0
+LANE_POLL = 0.1
+_LANE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9._-]{0,31}")
+_LANE_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_LANE_NEVER_PRESERVED = frozenset(("MC_TOKEN", "MC_EVENT_TOKEN"))
+# Per-machine CLI args are environment values that would land in the sudo argv (C5), so a
+# lane user refuses all three: a task's reviewer may be another platform than its worker.
+LANE_REFUSED_ARGS = ("MC_CLAUDE_ARGS", "MC_CODEX_ARGS", "MC_GROK_ARGS")
+
+
+class LaneUserUnavailable(Exception):
+    """The lane user is set and cannot be used. The message is a fixed reason, never an env value."""
+
+
+class LaneUser:
+    """A validated lane user: its name and the passwd values the CLI sees (C6)."""
+
+    def __init__(self, name: str, uid: int, home: str, shell: str) -> None:
+        self.name = name
+        self.uid = uid
+        self.home = home
+        self.shell = shell
+
+    def identity(self) -> dict[str, str]:
+        return {"HOME": self.home, "USER": self.name, "LOGNAME": self.name, "SHELL": self.shell}
+
+
+def lane_user(environ: Mapping[str, str] | None = None) -> LaneUser | None:
+    """The MC_LANE_USER user, None when unset. Raises LaneUserUnavailable when set and invalid (C6).
+
+    Read from the process environment, which load_env_file only fills with defaults,
+    so an exported value wins. The value is never trimmed.
+    """
+    env = os.environ if environ is None else environ
+    if "MC_LANE_USER" not in env:
+        return None
+    name = env["MC_LANE_USER"]
+    if name.strip() == "":
+        raise LaneUserUnavailable("MC_LANE_USER is empty")
+    if name != name.strip():
+        raise LaneUserUnavailable("MC_LANE_USER has leading or trailing whitespace")
+    if _LANE_NAME_RE.fullmatch(name) is None:
+        raise LaneUserUnavailable("MC_LANE_USER is not a plain user name")
+    for var in LANE_REFUSED_ARGS:
+        if env.get(var, "").strip():
+            raise LaneUserUnavailable(f"{var} is not supported with a lane user")
+    try:
+        entry = pwd.getpwnam(name)
+    except (KeyError, ValueError, TypeError, OSError):
+        raise LaneUserUnavailable("MC_LANE_USER names no user on this host") from None
+    if entry.pw_uid == 0:
+        raise LaneUserUnavailable("MC_LANE_USER is root")
+    if entry.pw_uid == os.geteuid():
+        raise LaneUserUnavailable("MC_LANE_USER is the dispatcher's own user")
+    if not entry.pw_dir or not os.path.isabs(entry.pw_dir):
+        raise LaneUserUnavailable("MC_LANE_USER has no home directory")
+    if not entry.pw_shell or not os.path.isabs(entry.pw_shell):
+        raise LaneUserUnavailable("MC_LANE_USER has no login shell")
+    return LaneUser(entry.pw_name, entry.pw_uid, entry.pw_dir, entry.pw_shell)
+
+
+def _lane_op(lane: LaneUser, *args: str, timeout: float = LANE_OP_TIMEOUT) -> int | None:
+    """`sudo -n -u <lane> <args>` for a sudoers-permitted op. Its exit code, or None when it could not run.
+
+    The sudo process gets PATH only, so it never holds this process's secrets.
+    """
+    try:
+        done = subprocess.run(
+            ["sudo", "-n", "-u", lane.name, *args],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env={"PATH": os.environ.get("PATH", os.defpath)}, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.returncode
+
+
+def lane_preflight(lane: LaneUser, cwd: Path) -> None:
+    """`sudo -n -u <lane> /usr/bin/test -w <cwd>`. Raises LaneUserUnavailable unless it exits 0."""
+    code = _lane_op(lane, LANE_TEST, "-w", str(cwd), timeout=LANE_PREFLIGHT_TIMEOUT)
+    if code is None:
+        raise LaneUserUnavailable("preflight could not run sudo")
+    if code != 0:
+        raise LaneUserUnavailable(f"preflight failed: the lane user cannot write the worktree (exit {code})")
+
+
+def lane_argv(lane: LaneUser, cmd: list[str], env: Mapping[str, str]) -> list[str]:
+    """The C5 launch argv: sudo, the sorted child env names, then the CLI by absolute path.
+
+    Names only: no environment value is ever placed in the argv.
+    """
+    names = sorted(env)
+    for name in names:
+        if name in _LANE_NEVER_PRESERVED:
+            raise LaneUserUnavailable(f"{name} may never reach a lane")
+        if _LANE_ENV_NAME_RE.fullmatch(name) is None:
+            raise LaneUserUnavailable("the child environment has a name sudo cannot preserve")
+    exe = shutil.which(cmd[0])
+    if exe is None or not os.path.isabs(exe):
+        raise LaneUserUnavailable(f"{cmd[0]} not found on the dispatcher's PATH")
+    return ["sudo", "-n", "-u", lane.name, "--preserve-env=" + ",".join(names), "--", exe, *cmd[1:]]
+
+
+def stop_lane_group(proc: subprocess.Popen, pgid: int, lane: LaneUser, grace: float) -> str | None:
+    """Stop a lane CLI's process group across the user switch (C9). None once it is confirmed gone.
+
+    SIGTERM, then SIGKILL, go to the group through `sudo -n -u <lane> /bin/kill`;
+    `kill -0` through the same rule is polled until it exits non-zero (no lane-owned
+    member is left). Only then is the sudo wrapper reaped, so the group id cannot be
+    reused during the check. Two checks follow that do not trust sudo: the wrapper
+    must exit (it waits for the CLI), and once it is reaped the group must be empty.
+    """
+    if pgid <= 1 or pgid == os.getpgrp():
+        raise ValueError(f"refusing to signal process group {pgid}")
+    target = f"-{pgid}"
+    gone = False
+    for sig in ("-TERM", "-KILL"):
+        _lane_op(lane, LANE_KILL, sig, "--", target)
+        deadline = time.monotonic() + grace
+        while True:
+            code = _lane_op(lane, LANE_KILL, "-0", "--", target)
+            if code is not None and code != 0:
+                gone = True
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(LANE_POLL)
+        if gone:
+            break
+    if not gone:
+        return "still had lane-user members after SIGKILL"
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        return "the sudo wrapper did not exit after its group was stopped"
+    # A member SIGKILL just ended can stay a zombie until init reaps it, so allow it the same grace.
+    deadline = time.monotonic() + grace
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return None
+        except PermissionError:
+            problem = "members this user cannot signal are still in the group"
+        except OSError:
+            return "the group could not be checked"
+        else:
+            problem = "the group still has members"
+        if time.monotonic() >= deadline:
+            return problem
+        time.sleep(LANE_POLL)
+
+
+def _can_wait_unreaped() -> bool:
+    return hasattr(os, "waitid") or hasattr(select, "kqueue")
+
+
+def _wait_exit_unreaped(pid: int, timeout: float) -> bool:
+    """True once child pid has exited, False on timeout. Never reaps it (C9).
+
+    The zombie keeps its pid, and so its group id, from being reused until
+    stop_lane_group has confirmed the group gone and reaps it. Linux has
+    waitid(WNOWAIT); macOS's Python 3.9 has no waitid, so kqueue NOTE_EXIT.
+    """
+    deadline = time.monotonic() + timeout
+    if hasattr(os, "waitid"):
+        delay = 0.01
+        while True:
+            info = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+            if info is not None and info.si_pid == pid:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, 0.25)
+    kq = select.kqueue()
+    try:
+        event = select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                              flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT, fflags=select.KQ_NOTE_EXIT)
+        try:
+            return bool(kq.control([event], 1, max(0.0, deadline - time.monotonic())))
+        except ProcessLookupError:
+            return True  # already a zombie: our unreaped child, so it has exited
+    finally:
+        kq.close()
+
+
+def _run_contained_lane(cmd: list[str], cwd: Path, timeout: float, *, env: dict[str, str],
+                        lane: LaneUser) -> tuple[int, str, str]:
+    """run_contained for a lane user. Raises LaneUserUnavailable when sudo cannot be started."""
+    argv = lane_argv(lane, cmd, env)
+    if not _can_wait_unreaped():
+        raise LaneUserUnavailable("this platform cannot wait for the sudo wrapper without reaping it")
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        try:
+            proc = subprocess.Popen(
+                argv, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f,
+                start_new_session=True, env=env,
+            )
+        except OSError:
+            raise LaneUserUnavailable("sudo could not start") from None
+        # start_new_session makes sudo a session leader, so the group id is its pid;
+        # with !use_pty sudo runs the lane CLI in that same group (C9).
+        pgid = proc.pid
+        timed_out = True
+        try:
+            # Wait without reaping, on every path: the wrapper's zombie pins the
+            # group id until stop_lane_group has confirmed the group gone.
+            timed_out = not _wait_exit_unreaped(proc.pid, timeout)
+        finally:
+            problem = stop_lane_group(proc, pgid, lane, KILL_GRACE)
+        if problem is not None:
+            raise ContainmentError(f"lane process group {pgid}: {problem}")
+        if timed_out:
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        returncode = proc.returncode  # reaped by stop_lane_group, after confirmation
+        out_f.seek(0)
+        err_f.seek(0)
+        return (
+            returncode,
+            out_f.read().decode("utf-8", errors="replace"),
+            err_f.read().decode("utf-8", errors="replace"),
+        )
+
+
 def run_cli(platform: str, prompt: str, cwd: Path, review: bool = False,
             task_id: int | None = None, *,
-            env_overlay: Mapping[str, str] | None = None) -> tuple[bool, str, float | None]:
+            env_overlay: Mapping[str, str] | None = None,
+            lane: LaneUser | None = None) -> tuple[bool, str, float | None]:
     """Run one headless agent turn. Returns (ok, output_text, cost_usd).
 
     env_overlay is written into a fresh copy of build_child_env(platform); no
     shared mapping and not os.environ is changed. Its values are redacted from
-    this function's own telemetry.
+    this function's own telemetry. With lane, HOME, USER, LOGNAME and SHELL are
+    the lane user's passwd values and the CLI runs as that user (#193).
     """
     extra = os.environ.get(f"MC_{platform.split('-')[0].upper()}_ARGS", "").split()
     if platform == "claude-code":
@@ -385,6 +636,10 @@ def run_cli(platform: str, prompt: str, cwd: Path, review: bool = False,
         if cmd is None:
             outcome, error_class = "unavailable", "unavailable"
             return False, f"no CLI runner for platform {platform}", None
+        if lane is not None and extra:
+            # Never reached from run_task (lane_user refuses all three); kept for direct callers.
+            outcome, error_class = "unavailable", "unavailable"
+            return False, f"{LANE_USER_UNAVAILABLE}: MC_{platform.split('-')[0].upper()}_ARGS is not supported with a lane user", None
         try:
             # Returns only once the CLI's whole process group is stopped.
             env = child_env.build_child_env(platform)
@@ -399,8 +654,15 @@ def run_cli(platform: str, prompt: str, cwd: Path, review: bool = False,
                         if match is not None and int(match.group(1)) >= 2:
                             del env[name]
                 env.update(env_overlay)
-            returncode, stdout, stderr = run_contained(cmd, cwd, TASK_TIMEOUT, env=env)
+            if lane is None:
+                returncode, stdout, stderr = run_contained(cmd, cwd, TASK_TIMEOUT, env=env)
+            else:
+                env.update(lane.identity())
+                returncode, stdout, stderr = run_contained(cmd, cwd, TASK_TIMEOUT, env=env, lane=lane)
             finished = time.monotonic()
+        except LaneUserUnavailable as e:
+            outcome, error_class = "unavailable", "unavailable"
+            return False, f"{LANE_USER_UNAVAILABLE}: {e}", None
         except subprocess.TimeoutExpired:
             outcome, error_class = "timeout", "timeout"
             return False, f"timed out after {TASK_TIMEOUT}s", None
@@ -1025,6 +1287,22 @@ def run_task(task: dict, platform: str, sem: threading.Semaphore) -> None:
             candidate = WorktreeLock(git_dir)
             candidate.acquire(cwd)
             lock = candidate
+        except DispatchRefused as e:
+            fail_task(tid, agent_id, str(e))
+            return
+        # Lane user (#193): after the lock, before the recovery check, the broker,
+        # pointers, HEAD, the running patch, ingest and any CLI (C7).
+        try:
+            lane = lane_user()
+            if lane is not None:
+                lane_preflight(lane, cwd)
+        except LaneUserUnavailable as e:
+            fail_task(tid, agent_id, f"{LANE_USER_UNAVAILABLE}: {e}")
+            return
+        except Exception:
+            fail_task(tid, agent_id, f"{LANE_USER_UNAVAILABLE}: lane user check error")
+            return
+        try:
             refuse_unresolved_recovery(git_dir)
         except DispatchRefused as e:
             fail_task(tid, agent_id, str(e))
@@ -1058,7 +1336,9 @@ def run_task(task: dict, platform: str, sem: threading.Semaphore) -> None:
                     failed(f"{BROKER_UNAVAILABLE}: broker client error")
                     return
                 needles[:] = session.needles
-            cli_env = {} if overlay is None else {"env_overlay": overlay}
+            cli_env: dict = {} if overlay is None else {"env_overlay": overlay}
+            if lane is not None:
+                cli_env["lane"] = lane
             suffix = GITHUB_NO_GRANT if session is not None and session.github_repo is None else ""
             _run_task_body(task, platform, tid, agent_id, project, runtime, cwd, cli_env,
                            patch_task, failed, note, scrub, result_suffix=suffix)
