@@ -31,6 +31,7 @@ import refs
 _LOG = logging.getLogger("ak.broker")
 
 _ROOT_KEYS = frozenset((
+    "admin_socket",
     "bind",
     "port",
     "providers",
@@ -47,6 +48,8 @@ _SERVICE_KEYS = frozenset((
     "secret",
     "methods",
     "path_prefixes",
+    "env_key",
+    "env_base_url",
 ))
 _TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+\Z")
 _METHOD_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Z]+\Z")
@@ -56,6 +59,17 @@ _ENCODED_SLASH_RE = re.compile(r"%2f", re.IGNORECASE)
 _ENCODED_BACKSLASH_RE = re.compile(r"%5c", re.IGNORECASE)
 _HEX_RE = re.compile(r"[0-9A-Fa-f]+\Z")
 _CL_RE = re.compile(r"[0-9]+\Z")
+_ENV_NAME_RE = re.compile(r"[A-Z_][A-Z0-9_]*\Z")
+
+# Admin socket (#194). One JSON object per line, newline included in the limit.
+_ADMIN_MAX_LINE = 65536
+_ADMIN_TIMEOUT = 5.0
+_ADMIN_STALE_PROBE = 1.0
+# sun_path is 104 bytes on macOS and 108 on Linux, including the NUL.
+_ADMIN_MAX_PATH = 103
+_ADMIN_ERRORS = frozenset(("malformed_json", "bad_request", "unknown_op", "unknown_service", "internal"))
+# A placeholder is "akp_" plus token_urlsafe(32), which is 43 characters.
+_PLACEHOLDER_LEN = 4 + 43
 
 _SMALL_BODY = 1024 * 1024
 _READ_CHUNK = 65536
@@ -94,6 +108,8 @@ _REQUEST_DROP = frozenset((
     "upgrade",
     # Framing is generated from the body mode, so the inbound length is not copied.
     "content-length",
+    # Replaced by Accept-Encoding: identity so the response scan can read the body (#194).
+    "accept-encoding",
 ))
 # Credential injection must not be able to replace framing or hop-by-hop fields.
 _OWNED_HEADERS = frozenset((
@@ -106,6 +122,8 @@ _OWNED_HEADERS = frozenset((
     "trailer",
     "upgrade",
     "proxy-connection",
+    # The broker always sends Accept-Encoding: identity (#194).
+    "accept-encoding",
 ))
 _RESPONSE_HOP = frozenset((
     "connection",
@@ -274,7 +292,31 @@ def _check_upstream(value: object) -> str:
     return value
 
 
-def _check_service(service: object, seen: set[str]) -> dict:
+def _check_env_name(value: object, field: str, env_seen: set[str]) -> str:
+    if (
+        type(value) is not str
+        or _ENV_NAME_RE.fullmatch(value) is None
+        or value.startswith("MC_")
+        or value in env_seen
+    ):
+        _fail("invalid broker config: %s" % field)
+    env_seen.add(value)
+    return value
+
+
+def _check_admin_socket(value: object) -> str:
+    if (
+        type(value) is not str
+        or not os.path.isabs(value)
+        or "\x00" in value
+        or not _fs_encodable(value)
+        or len(os.fsencode(value)) > _ADMIN_MAX_PATH
+    ):
+        _fail("invalid broker config: admin_socket")
+    return value
+
+
+def _check_service(service: object, seen: set[str], env_seen: set[str]) -> dict:
     if not isinstance(service, dict) or set(service) != _SERVICE_KEYS:
         _fail("invalid broker config: services")
     name = service["name"]
@@ -309,6 +351,8 @@ def _check_service(service: object, seen: set[str]) -> dict:
         or any(type(item) is not str or not item.startswith("/") or "\x00" in item for item in prefixes)
     ):
         _fail("invalid broker config: path_prefixes")
+    env_key = _check_env_name(service["env_key"], "env_key", env_seen)
+    env_base_url = _check_env_name(service["env_base_url"], "env_base_url", env_seen)
     return {
         "name": name,
         "upstream": upstream,
@@ -317,6 +361,8 @@ def _check_service(service: object, seen: set[str]) -> dict:
         "secret": secret,
         "methods": tuple(methods),
         "path_prefixes": tuple(prefixes),
+        "env_key": env_key,
+        "env_base_url": env_base_url,
     }
 
 
@@ -351,8 +397,11 @@ def validate_config(data: object, port_zero_ok: bool = False) -> dict:
     if not isinstance(services, (list, tuple)) or not services:
         _fail("invalid broker config: services")
     seen: set[str] = set()
-    checked = [_check_service(item, seen) for item in services]
+    env_seen: set[str] = set()
+    checked = [_check_service(item, seen, env_seen) for item in services]
+    admin_socket = _check_admin_socket(data["admin_socket"])
     return {
+        "admin_socket": admin_socket,
         "bind": "127.0.0.1",
         "port": checked_port,
         "providers": providers_path,
@@ -419,7 +468,8 @@ class PlaceholderStore:
         with self._lock:
             if not self._configured:
                 _fail("invalid placeholder store")
-            if task_id in self._tasks:
+            # A task id may be minted again once none of its grants is live (#194 A2).
+            if self._has_live_grant(task_id):
                 _fail("duplicate task id")
             for name in requested:
                 if name not in self._services:
@@ -437,9 +487,21 @@ class PlaceholderStore:
                 }
                 created.append(placeholder)
                 issued[name] = placeholder
-            self._by_task[task_id] = created
+            self._by_task.setdefault(task_id, []).extend(created)
             self._tasks.add(task_id)
             return issued
+
+    def _has_live_grant(self, task_id: str) -> bool:
+        # Called with the lock held. Live: neither revoked nor expired.
+        now = self._clock()
+        for placeholder in self._by_task.get(task_id, ()):
+            entry = self._entries.get(placeholder)
+            if entry is None or entry["revoked"]:
+                continue
+            if now >= entry["minted_at"] + self._ttl:
+                continue
+            return True
+        return False
 
     def _new_placeholder(self) -> str:
         # Called with the lock held. A collision only retries; the value is not logged.
@@ -1129,6 +1191,8 @@ def _outbound_headers(items: list, service: dict, secret: str, length: int | Non
             continue
         kept.append((name, value))
     kept.append(("Host", _authority(service["upstream"])))
+    # Upstream bodies must arrive uncompressed so the secret scan can read them.
+    kept.append(("Accept-Encoding", "identity"))
     kept.append((header_name, _fill(service["template"], secret)))
     if chunked:
         kept.append(("Transfer-Encoding", "chunked"))
@@ -1610,6 +1674,312 @@ class _BoundServer(ThreadingHTTPServer):
         return
 
 
+class _AdminBadRequest(Exception):
+    """A decoded admin request with a duplicate key. Maps to ``bad_request``."""
+
+
+def _admin_pairs(pairs: list) -> dict:
+    obj: dict = {}
+    for key, value in pairs:
+        if key in obj:
+            raise _AdminBadRequest()
+        obj[key] = value
+    return obj
+
+
+def _admin_constant(_token: str) -> None:
+    raise ValueError("constant")
+
+
+def _admin_error(code: str) -> dict:
+    return {"ok": False, "error": code if code in _ADMIN_ERRORS else "internal"}
+
+
+def _admin_line(payload: dict) -> bytes:
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("ascii") + b"\n"
+
+
+def _valid_task_id(value: object) -> bool:
+    return type(value) is str and value != ""
+
+
+def _admin_parent_ok(path: str) -> bool:
+    """The socket's directory: a real directory, ours, with no group or other write bit.
+
+    POSIX has no unlink-by-inode, so the check-then-unlink below is safe only
+    when no other user can rename entries in this directory.
+    """
+    try:
+        info = os.lstat(os.path.dirname(path))
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return False
+    if info.st_uid != os.geteuid():
+        return False
+    return stat.S_IMODE(info.st_mode) & 0o022 == 0
+
+
+def _prepare_admin_path(path: str) -> None:
+    """Refuse a symlink, a non-socket, or another user's socket. Remove only a dead socket we own."""
+    if not _admin_parent_ok(path):
+        _fail("admin_socket: parent directory must be a real directory owned by this user with no group or other write")
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError:
+        _fail("admin_socket: path cannot be inspected")
+    if stat.S_ISLNK(info.st_mode):
+        _fail("admin_socket: path is a symlink")
+    if not stat.S_ISSOCK(info.st_mode):
+        _fail("admin_socket: path exists and is not a socket")
+    if info.st_uid != os.geteuid():
+        _fail("admin_socket: socket is owned by another user")
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(_ADMIN_STALE_PROBE)
+        try:
+            probe.connect(path)
+        except OSError:
+            live = False
+        else:
+            live = True
+    finally:
+        probe.close()
+    if live:
+        _fail("admin_socket: another process is serving this socket")
+    try:
+        again = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if (again.st_dev, again.st_ino) != (info.st_dev, info.st_ino) or not stat.S_ISSOCK(again.st_mode):
+        _fail("admin_socket: path changed during startup")
+    os.unlink(path)
+
+
+class _AdminServer:
+    """Unix socket for the dispatcher: health, mint and revoke_task (#194).
+
+    Responses carry placeholders only to the socket's owner. Requests are never
+    echoed and nothing here is logged.
+    """
+
+    def __init__(self, path: str, state: _State, port_fn: object) -> None:
+        self.path = path
+        self._state = state
+        self._port_fn = port_fn
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._conns: set = set()
+        self._conns_lock = threading.Lock()
+        _prepare_admin_path(path)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        old_mask = os.umask(0o177)
+        try:
+            try:
+                listener.bind(path)
+            except OSError:
+                listener.close()
+                _fail("admin_socket: bind failed")
+        finally:
+            os.umask(old_mask)
+        try:
+            os.chmod(path, 0o600)
+            info = os.lstat(path)
+            if (
+                not stat.S_ISSOCK(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                _fail("admin_socket: unexpected mode or owner")
+            self._ident = (info.st_dev, info.st_ino)
+            listener.listen(16)
+            listener.settimeout(0.1)
+        except BaseException:
+            listener.close()
+            self._unlink_any()
+            raise
+        self._listener = listener
+
+    def _unlink_any(self) -> None:
+        try:
+            os.unlink(self.path)
+        except OSError:
+            return
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._accept_loop, name="ak-broker-admin", daemon=True)
+        self._thread.start()
+
+    def _accept_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                conn, _addr = self._listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._stop.is_set():
+                    return
+                time.sleep(0.05)
+                continue
+            with self._conns_lock:
+                self._conns.add(conn)
+            worker = threading.Thread(target=self._serve_conn, args=(conn,), daemon=True)
+            worker.start()
+
+    def _serve_conn(self, conn: socket.socket) -> None:
+        try:
+            buf = b""
+            while not self._stop.is_set():
+                deadline = time.monotonic() + _ADMIN_TIMEOUT
+                line = None
+                while line is None:
+                    newline = buf.find(b"\n")
+                    if newline >= 0:
+                        if newline + 1 > _ADMIN_MAX_LINE:
+                            self._send(conn, _admin_error("bad_request"))
+                            return
+                        line, buf = buf[:newline], buf[newline + 1:]
+                        break
+                    if len(buf) >= _ADMIN_MAX_LINE:
+                        self._send(conn, _admin_error("bad_request"))
+                        return
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    conn.settimeout(remaining)
+                    try:
+                        block = conn.recv(_READ_CHUNK)
+                    except (socket.timeout, OSError):
+                        return
+                    if not block:
+                        return
+                    buf += block
+                try:
+                    response, close = self._handle(line)
+                except Exception:
+                    response, close = _admin_error("internal"), False
+                if not self._send(conn, response) or close:
+                    return
+        finally:
+            with self._conns_lock:
+                self._conns.discard(conn)
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def _send(self, conn: socket.socket, payload: dict) -> bool:
+        data = _admin_line(payload)
+        if len(data) > _ADMIN_MAX_LINE:
+            data = _admin_line(_admin_error("internal"))
+        try:
+            conn.settimeout(_ADMIN_TIMEOUT)
+            conn.sendall(data)
+        except OSError:
+            return False
+        return True
+
+    def _handle(self, raw: bytes) -> tuple:
+        """Return ``(response, close_connection)``."""
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return _admin_error("bad_request"), True
+        try:
+            request = json.loads(text, object_pairs_hook=_admin_pairs, parse_constant=_admin_constant)
+        except _AdminBadRequest:
+            return _admin_error("bad_request"), False
+        except (ValueError, RecursionError):
+            return _admin_error("malformed_json"), False
+        if not isinstance(request, dict):
+            return _admin_error("bad_request"), False
+        op = request.get("op")
+        if type(op) is not str:
+            return _admin_error("bad_request"), False
+        if op == "health":
+            if set(request) != {"op"}:
+                return _admin_error("bad_request"), False
+            return {"ok": True}, False
+        if op == "mint":
+            return self._mint(request), False
+        if op == "revoke_task":
+            if set(request) != {"op", "task_id"} or not _valid_task_id(request["task_id"]):
+                return _admin_error("bad_request"), False
+            self._state.store.revoke_task(request["task_id"])
+            return {"ok": True}, False
+        return _admin_error("unknown_op"), False
+
+    def _grant(self, name: str, placeholder: str, port: int) -> dict:
+        service = self._state.services[name]
+        return {
+            "service": name,
+            "placeholder": placeholder,
+            "env_key": service["env_key"],
+            "env_base_url": service["env_base_url"],
+            "base_url": "http://127.0.0.1:%d/%s" % (port, name),
+        }
+
+    def _mint(self, request: dict) -> dict:
+        if set(request) != {"op", "task_id", "services"}:
+            return _admin_error("bad_request")
+        task_id = request["task_id"]
+        services = request["services"]
+        if not _valid_task_id(task_id) or type(services) is not list or not services:
+            return _admin_error("bad_request")
+        names: list[str] = []
+        for name in services:
+            if type(name) is not str or name == "" or name in names:
+                return _admin_error("bad_request")
+            names.append(name)
+        # The whole list is checked before anything is created (C7).
+        for name in names:
+            if name not in self._state.services:
+                return _admin_error("unknown_service")
+        port = int(self._port_fn())
+        sizing = {"ok": True, "grants": [self._grant(name, "x" * _PLACEHOLDER_LEN, port) for name in names]}
+        if len(_admin_line(sizing)) > _ADMIN_MAX_LINE:
+            return _admin_error("bad_request")
+        try:
+            issued = self._state.store.mint(task_id, names)
+        except ValueError as exc:
+            if str(exc) == "duplicate task id":
+                return _admin_error("bad_request")
+            return _admin_error("internal")
+        return {"ok": True, "grants": [self._grant(name, issued[name], port) for name in names]}
+
+    def close(self) -> None:
+        self._stop.set()
+        try:
+            self._listener.close()
+        except OSError:
+            pass
+        thread = self._thread
+        if thread is not None:
+            thread.join(2)
+        with self._conns_lock:
+            conns = list(self._conns)
+        for conn in conns:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        # Remove the socket file only when it is still the one this server bound,
+        # and only while no other user can swap entries in its directory.
+        if not _admin_parent_ok(self.path):
+            _LOG.warning("%s", json.dumps({"admin_socket": "left in place", "reason": "parent_not_private"}))
+            return
+        try:
+            info = os.lstat(self.path)
+        except OSError:
+            return
+        if stat.S_ISSOCK(info.st_mode) and (info.st_dev, info.st_ino) == self._ident:
+            self._unlink_any()
+
+
 class BrokerServer:
     """Validate, resolve secrets, then bind ``127.0.0.1`` only."""
 
@@ -1628,6 +1998,13 @@ class BrokerServer:
         self._httpd = _BoundServer((checked["bind"], checked["port"]), BrokerHandler)
         self._httpd.state = self._state
         self._serving = False
+        port = int(self._httpd.server_address[1])
+        try:
+            self._admin = _AdminServer(checked["admin_socket"], self._state, lambda: port)
+        except BaseException:
+            self._httpd.server_close()
+            self._httpd = None
+            raise
 
     @property
     def bound_port(self) -> int:
@@ -1636,6 +2013,7 @@ class BrokerServer:
     def serve_forever(self) -> None:
         httpd = self._httpd
         self._serving = True
+        self._admin.start()
         try:
             httpd.serve_forever(poll_interval=0.1)
         finally:
@@ -1646,10 +2024,13 @@ class BrokerServer:
         if httpd is None:
             return
         self._httpd = None
-        # shutdown() waits for serve_forever. Skip that wait when it never started.
-        if self._serving:
-            httpd.shutdown()
-        httpd.server_close()
+        try:
+            # shutdown() waits for serve_forever. Skip that wait when it never started.
+            if self._serving:
+                httpd.shutdown()
+            httpd.server_close()
+        finally:
+            self._admin.close()
 
     def __repr__(self) -> str:
         return "<broker 127.0.0.1:%s>" % self.bound_port

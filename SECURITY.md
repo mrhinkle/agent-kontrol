@@ -30,6 +30,7 @@ Where each credential goes:
 - `MC_CHILD_ENV_ALLOW` is a comma-separated list of extra names to copy. Whitespace around entries is ignored. An entry may be an exact name or a prefix ending in one `*`: `FLEET_*` passes `FLEET_DISPATCH_TOKEN` and does not pass `FLEET`. A bare `*` or a `*` anywhere but the end is ignored. A name on the never-pass list is still omitted when the allow list matches it.
 - `main_worker_exec` is deny-only. Before it execs the worker it removes the never-pass names above and leaves the wrapper's other variables, including ones this repository does not know. The fleet-mode controller is unchanged and still receives the dispatcher's environment.
 - A child running as the same OS user can still read `~/.claude/mission-control.env` and `~/.mission-control/env` on disk.
+- With the secret broker enabled (`MC_BROKER_SOCKET`, see `agents/dispatcher/README.md`), a CLI dispatched by `mc_dispatcher.py` receives, for each service in `MC_BROKER_SERVICES`, an `akp_` placeholder and a loopback URL (`http://127.0.0.1:<port>/<service>`), not that service's key. The broker holds the key and revokes the task's placeholders when the task ends. A configured broker that cannot be reached fails the task before any CLI starts; nothing falls back to real keys. The platform's own login keys and names in `MC_CHILD_ENV_ALLOW` still pass as described above, so remove a brokered service's real key from both. Direct mode does not use the broker yet.
 
 ## Controls
 

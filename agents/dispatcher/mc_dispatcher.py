@@ -34,6 +34,8 @@ Config via environment (or ~/.claude/mission-control.env, read by main() only):
   MC_EVENT_CONSUMER      optional, explicitly registered event consumer id
   MC_EVENT_TOKEN         optional events:read akc_ credential (never MC_TOKEN)
   MC_TASK_PROJECT        optional exact task lane on every claim (unset claims any project)
+  MC_BROKER_SOCKET       optional absolute path of the secret broker's admin socket (#194)
+  MC_BROKER_SERVICES     comma list of broker services minted for each task
 
 An opt-in outbound SSE listener wakes the normal atomic claim path. While
 connected the fallback poll is max(MC_POLL_SECONDS, 60); when unavailable it
@@ -72,6 +74,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -345,8 +348,14 @@ def run_contained(cmd: list[str], cwd: Path, timeout: float, *, env: dict[str, s
 
 
 def run_cli(platform: str, prompt: str, cwd: Path, review: bool = False,
-            task_id: int | None = None) -> tuple[bool, str, float | None]:
-    """Run one headless agent turn. Returns (ok, output_text, cost_usd)."""
+            task_id: int | None = None, *,
+            env_overlay: Mapping[str, str] | None = None) -> tuple[bool, str, float | None]:
+    """Run one headless agent turn. Returns (ok, output_text, cost_usd).
+
+    env_overlay is written into a fresh copy of build_child_env(platform); no
+    shared mapping and not os.environ is changed. Its values are redacted from
+    this function's own telemetry.
+    """
     extra = os.environ.get(f"MC_{platform.split('-')[0].upper()}_ARGS", "").split()
     if platform == "claude-code":
         cmd = ["claude", "-p", prompt, "--output-format", "json"]
@@ -373,9 +382,10 @@ def run_cli(platform: str, prompt: str, cwd: Path, review: bool = False,
             return False, f"no CLI runner for platform {platform}", None
         try:
             # Returns only once the CLI's whole process group is stopped.
-            returncode, stdout, stderr = run_contained(
-                cmd, cwd, TASK_TIMEOUT, env=child_env.build_child_env(platform),
-            )
+            env = child_env.build_child_env(platform)
+            if env_overlay:
+                env.update(env_overlay)
+            returncode, stdout, stderr = run_contained(cmd, cwd, TASK_TIMEOUT, env=env)
             finished = time.monotonic()
         except subprocess.TimeoutExpired:
             outcome, error_class = "timeout", "timeout"
@@ -418,9 +428,220 @@ def run_cli(platform: str, prompt: str, cwd: Path, review: bool = False,
                 outcome=outcome, error_class=error_class, parsed=parsed,
                 cumulative=resumes_session(extra if not review else [], platform), task_id=task_id,
             )
+            if env_overlay:
+                detail = redact_broker(detail, _overlay_needles(env_overlay))
             ingest("run_complete", "Agent run complete", f"{platform}-{HOSTNAME}", platform, detail, quiet=True)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Secret broker (#194). The broker mints per-task placeholders; the CLI never
+# receives the real key for a granted service. Fail closed: a configured
+# broker that cannot be used stops the task before any worker starts.
+
+BROKER_UNAVAILABLE = "secret broker unavailable, no worker started"
+BROKER_REDACTED = "[broker-redacted]"
+BROKER_TIMEOUT = 5.0
+BROKER_MAX_LINE = 65536
+_BROKER_ENV_RE = re.compile(r"[A-Z_][A-Z0-9_]*")
+_BROKER_PLACEHOLDER_RE = re.compile(r"akp_[A-Za-z0-9_-]+")
+_BROKER_BASE_URL_RE = re.compile(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})/([a-z0-9-]{1,40})")
+_BROKER_GRANT_KEYS = frozenset(("service", "placeholder", "env_key", "env_base_url", "base_url"))
+_BROKER_ERROR_CODES = frozenset(("malformed_json", "bad_request", "unknown_op", "unknown_service", "internal"))
+
+
+class BrokerUnavailable(Exception):
+    """The broker path is enabled and cannot be used. The message is a fixed code, never a grant."""
+
+
+def broker_settings(environ: Mapping[str, str] | None = None) -> tuple[str, list[str]] | None:
+    """(socket path, services) when MC_BROKER_SOCKET is set, else None. Raises BrokerUnavailable."""
+    env = os.environ if environ is None else environ
+    path = env.get("MC_BROKER_SOCKET", "").strip()
+    if not path:
+        return None
+    if not os.path.isabs(path):
+        raise BrokerUnavailable("MC_BROKER_SOCKET must be an absolute path")
+    raw = env.get("MC_BROKER_SERVICES", "")
+    if not raw.strip():
+        return path, []
+    services: list[str] = []
+    for part in raw.split(","):
+        name = part.strip()
+        if not name:
+            raise BrokerUnavailable("MC_BROKER_SERVICES has an empty entry")
+        if name in services:
+            raise BrokerUnavailable("MC_BROKER_SERVICES has a duplicate entry")
+        services.append(name)
+    return path, services
+
+
+def _broker_exchange(path: str, request: dict, on_connected=None) -> object:
+    """One request line, one response line, over a fresh connection."""
+    line = json.dumps(request, separators=(",", ":")).encode("utf-8") + b"\n"
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    except OSError:
+        raise BrokerUnavailable("unreachable") from None
+    try:
+        sock.settimeout(BROKER_TIMEOUT)
+        try:
+            sock.connect(path)
+        except socket.timeout:
+            raise BrokerUnavailable("timeout") from None
+        except OSError:
+            raise BrokerUnavailable("unreachable") from None
+        if on_connected is not None:
+            on_connected()
+        deadline = time.monotonic() + BROKER_TIMEOUT
+        buf = b""
+        try:
+            sock.sendall(line)
+            while b"\n" not in buf:
+                if len(buf) >= BROKER_MAX_LINE:
+                    raise BrokerUnavailable("oversized response")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BrokerUnavailable("timeout")
+                sock.settimeout(remaining)
+                block = sock.recv(65536)
+                if not block:
+                    raise BrokerUnavailable("connection closed")
+                buf += block
+        except socket.timeout:
+            raise BrokerUnavailable("timeout") from None
+        except OSError:
+            raise BrokerUnavailable("unreachable") from None
+    finally:
+        sock.close()
+    raw = buf.split(b"\n", 1)[0]
+    if len(raw) + 1 > BROKER_MAX_LINE:
+        raise BrokerUnavailable("oversized response")
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise BrokerUnavailable("malformed response") from None
+
+
+def _broker_refusal(resp: object, op: str) -> BrokerUnavailable:
+    if isinstance(resp, dict) and resp.get("ok") is False and resp.get("error") in _BROKER_ERROR_CODES:
+        return BrokerUnavailable(f"{op} refused ({resp['error']})")
+    return BrokerUnavailable(f"malformed {op} response")
+
+
+def _check_grants(resp: object, services: list[str]) -> list[dict]:
+    """Every grant present, in order, with every field a non-empty, well-formed string."""
+    if not isinstance(resp, dict) or resp.get("ok") is not True:
+        raise _broker_refusal(resp, "mint")
+    if set(resp) != {"ok", "grants"}:
+        raise BrokerUnavailable("malformed mint response")
+    grants = resp["grants"]
+    if not isinstance(grants, list) or len(grants) != len(services):
+        raise BrokerUnavailable("malformed grant")
+    env_names: set[str] = set()
+    placeholders: set[str] = set()
+    for grant, service in zip(grants, services):
+        if not isinstance(grant, dict) or set(grant) != _BROKER_GRANT_KEYS:
+            raise BrokerUnavailable("malformed grant")
+        if any(not isinstance(grant[k], str) or grant[k] == "" for k in _BROKER_GRANT_KEYS):
+            raise BrokerUnavailable("malformed grant")
+        if grant["service"] != service:
+            raise BrokerUnavailable("malformed grant")
+        if not _BROKER_PLACEHOLDER_RE.fullmatch(grant["placeholder"]) or grant["placeholder"] in placeholders:
+            raise BrokerUnavailable("malformed grant")
+        placeholders.add(grant["placeholder"])
+        match = _BROKER_BASE_URL_RE.fullmatch(grant["base_url"])
+        if match is None or match.group(2) != service or int(match.group(1)) > 65535:
+            raise BrokerUnavailable("malformed grant")
+        for key in ("env_key", "env_base_url"):
+            name = grant[key]
+            if not _BROKER_ENV_RE.fullmatch(name) or name.startswith("MC_") or name in env_names:
+                raise BrokerUnavailable("malformed grant")
+            env_names.add(name)
+    return grants
+
+
+class BrokerSession:
+    """One task's grants. revoke() runs once, and only after a mint was sent."""
+
+    def __init__(self, path: str, services: list[str], task_id: str) -> None:
+        self.path = path
+        self.services = services
+        self.task_id = task_id
+        self.mint_sent = False
+        self.revoked = False
+        self.needles: list[str] = []  # base_urls first, then placeholders (C13)
+
+    def health(self) -> None:
+        resp = _broker_exchange(self.path, {"op": "health"})
+        if resp != {"ok": True} or not isinstance(resp.get("ok"), bool):
+            raise _broker_refusal(resp, "health")
+
+    def mint(self) -> dict[str, str]:
+        """The overlay {env_key: placeholder, env_base_url: base_url}. Empty when no services are set."""
+        if not self.services:
+            return {}
+
+        def sent() -> None:
+            # Set before the write: a partly written request still gets its revoke (C8).
+            self.mint_sent = True
+
+        resp = _broker_exchange(
+            self.path, {"op": "mint", "task_id": self.task_id, "services": list(self.services)}, sent,
+        )
+        grants = _check_grants(resp, self.services)
+        overlay: dict[str, str] = {}
+        for grant in grants:
+            overlay[grant["env_key"]] = grant["placeholder"]
+            overlay[grant["env_base_url"]] = grant["base_url"]
+        self.needles = _overlay_needles_from(grants)
+        return overlay
+
+    def revoke(self) -> str | None:
+        """None on success, else a fixed failure code. Never raises."""
+        if self.revoked or not self.mint_sent:
+            return None
+        self.revoked = True
+        try:
+            resp = _broker_exchange(self.path, {"op": "revoke_task", "task_id": self.task_id})
+        except BrokerUnavailable as e:
+            return str(e)
+        except Exception:
+            return "revoke error"
+        if resp != {"ok": True} or not isinstance(resp.get("ok"), bool):
+            return str(_broker_refusal(resp, "revoke_task"))
+        return None
+
+
+def _overlay_needles_from(grants: list[dict]) -> list[str]:
+    urls = [g["base_url"] for g in grants]
+    return sorted(set(urls), key=len, reverse=True) + sorted({g["placeholder"] for g in grants}, key=len, reverse=True)
+
+
+def _overlay_needles(overlay: Mapping[str, str]) -> list[str]:
+    values = [v for v in overlay.values() if isinstance(v, str) and v]
+    urls = [v for v in values if _BROKER_BASE_URL_RE.fullmatch(v)]
+    rest = [v for v in values if v not in urls]
+    return sorted(set(urls), key=len, reverse=True) + sorted(set(rest), key=len, reverse=True)
+
+
+def redact_broker(value: object, needles: list[str]) -> object:
+    """Replace every needle in every string, recursively. base_urls are listed first (C13)."""
+    if not needles:
+        return value
+    if isinstance(value, str):
+        for needle in needles:
+            if needle:
+                value = value.replace(needle, BROKER_REDACTED)
+        return value
+    if isinstance(value, dict):
+        return {redact_broker(k, needles): redact_broker(v, needles) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_broker(v, needles) for v in value]
+    if isinstance(value, tuple):
+        return tuple(redact_broker(v, needles) for v in value)
+    return value
 
 
 def extract_result(output: str) -> str:
@@ -587,6 +808,20 @@ def run_task(task: dict, platform: str, sem: threading.Semaphore) -> None:
     agent_id = f"{platform}-{HOSTNAME}"
     tid = task["id"]
     lock: WorktreeLock | None = None
+    needles: list[str] = []  # filled by a successful mint; everything sent out is redacted with it
+
+    def scrub(value: object) -> object:
+        return redact_broker(value, needles)
+
+    def patch_task(body: dict) -> dict:
+        return api(f"/api/tasks/{tid}", scrub(body), "PATCH")
+
+    def failed(reason: str) -> None:
+        patch_task({"status": "failed", "agent_id": agent_id, "result": reason})
+
+    def note(kind: str, title: str, detail: dict | None = None) -> None:
+        ingest(kind, scrub(title), agent_id, platform, scrub(detail))
+
     try:
         # Invalid v2 and legacy v1 are not worker instructions. Refuse before
         # the lock, the running status, the work-event ingest, and the child.
@@ -613,87 +848,44 @@ def run_task(task: dict, platform: str, sem: threading.Semaphore) -> None:
         except DispatchRefused as e:
             fail_task(tid, agent_id, str(e))
             return
-        try:
-            block = fetch_pointers(project, runtime)
-        except Exception as e:
-            fail_task(tid, agent_id, f"skill pointers unavailable, no worker started: {e}")
-            return
-        # Read before injection: once the block is written, the next statement must be the cleanup try.
-        try:
-            head = git(cwd, "rev-parse", "--verify", "-q", "HEAD")
-        except (subprocess.SubprocessError, OSError) as e:
-            fail_task(tid, agent_id, f"could not read HEAD, no worker started: {e}")
-            return
-        base_head = head.stdout.strip() if head.returncode == 0 else None
-        try:
-            injection = ak_pointers.inject(cwd, block)
-        except (ak_pointers.PointerFileError, OSError) as e:
-            fail_task(tid, agent_id, f"could not write skill pointers, no worker started: {e}")
-            return
 
-        cleanup_error: str | None = None
+        # Secret broker: health, then mint, after the lock and before anything else (#194).
+        session: BrokerSession | None = None
         try:
-            api(f"/api/tasks/{tid}", {"status": "running", "agent_id": agent_id}, "PATCH")
-            ingest("status", f"Running task #{tid}: {task['title']}", agent_id, platform, {"task_id": tid})
-            ok, output, cost = run_cli(
-                platform, build_prompt(task, injection.changed and block != ""), cwd, task_id=tid
-            )
+            settings = broker_settings()
+            if settings is not None:
+                session = BrokerSession(settings[0], settings[1], str(tid))
+                session.health()
+        except BrokerUnavailable as e:
+            failed(f"{BROKER_UNAVAILABLE}: {e}")
+            return
+        except Exception:
+            failed(f"{BROKER_UNAVAILABLE}: broker client error")
+            return
+        try:
+            overlay: dict[str, str] | None = None
+            if session is not None:
+                try:
+                    overlay = session.mint()
+                except BrokerUnavailable as e:
+                    failed(f"{BROKER_UNAVAILABLE}: {e}")
+                    return
+                except Exception:
+                    failed(f"{BROKER_UNAVAILABLE}: broker client error")
+                    return
+                needles[:] = session.needles
+            cli_env = {} if overlay is None else {"env_overlay": overlay}
+            _run_task_body(task, platform, tid, agent_id, project, runtime, cwd, cli_env,
+                           patch_task, failed, note, scrub)
         finally:
-            try:
-                ak_pointers.cleanup(injection)
-            except (ak_pointers.PointerFileError, OSError) as e:
-                cleanup_error = str(e)
-        result = extract_result(output)
-
-        if cleanup_error:
-            ok = False
-            result = (
-                f"{result}\n\n[dispatch] AGENTS.md cleanup failed: {cleanup_error}. "
-                "Remove the ak-skills block by hand before committing; review was skipped."
-            )
-        elif injection.changed and block:
-            leaked = committed_metadata(cwd, base_head, block)
-            if leaked:
-                ok = False
-                result = (
-                    f"{result}\n\n[dispatch] the skill-pointer block is {leaked}. It is dispatch "
-                    "metadata: unstage or amend it out before this work lands; review was skipped."
-                )
-
-        reviewer = task.get("reviewer_platform")
-        # A configured reviewer is required: unknown, missing, failed, or verdict-less fails the task.
-        if ok and reviewer:
-            cli = CLI_FOR_PLATFORM.get(reviewer) if isinstance(reviewer, str) else None
-            if cli is None:
-                ok = False
-                result = f"{result}\n\n[review] unknown reviewer platform {reviewer!r}, task not approved"
-            elif not shutil.which(cli):
-                ok = False
-                result = f"{result}\n\n[{reviewer} review] {cli} not found on PATH, task not approved"
-            else:
-                api(f"/api/tasks/{tid}", {"status": "review", "agent_id": agent_id}, "PATCH")
-                ingest("status", f"Task #{tid} in review by {reviewer}", agent_id, platform, {"task_id": tid})
-                r_ok, r_out, r_cost = run_cli(
-                    reviewer, build_review_prompt(task, output), cwd, review=True, task_id=tid
-                )
-                if r_cost:
-                    cost = (cost or 0) + r_cost
-                ok, note = review_outcome(r_ok, r_out)
-                result = f"{result}\n\n[{reviewer} review] {note}"
-
-        body = {
-            "status": "done" if ok else "failed",
-            "result": result or ("completed" if ok else "run failed with no output"),
-            "agent_id": agent_id,
-        }
-        if cost is not None:
-            body["cost_usd"] = round(float(cost), 4)
-        api(f"/api/tasks/{tid}", body, "PATCH")
+            # Runs once whenever a mint was sent, before the lock is released (C8).
+            if session is not None:
+                code = session.revoke()
+                if code:
+                    print(scrub(f"[mc] broker revoke_task failed for task #{tid}: {code}"), file=sys.stderr)
     except Exception as e:
         try:
-            api(f"/api/tasks/{tid}", {
-                "status": "failed", "result": f"dispatcher error: {e}", "agent_id": agent_id,
-            }, "PATCH")
+            patch_task({"status": "failed", "result": f"dispatcher error: {e}", "agent_id": agent_id})
         except Exception:
             pass
     finally:
@@ -702,6 +894,87 @@ def run_task(task: dict, platform: str, sem: threading.Semaphore) -> None:
                 lock.release()
         finally:
             sem.release()
+
+
+def _run_task_body(task: dict, platform: str, tid: object, agent_id: str, project: str, runtime: str,
+                   cwd: Path, cli_env: dict, patch_task, failed, note, scrub) -> None:
+    """Steps 3-8 of run_task: pointers, running patch, worker, cleanup, reviewer, result patch."""
+    try:
+        block = fetch_pointers(project, runtime)
+    except Exception as e:
+        failed(f"skill pointers unavailable, no worker started: {e}")
+        return
+    # Read before injection: once the block is written, the next statement must be the cleanup try.
+    try:
+        head = git(cwd, "rev-parse", "--verify", "-q", "HEAD")
+    except (subprocess.SubprocessError, OSError) as e:
+        failed(f"could not read HEAD, no worker started: {e}")
+        return
+    base_head = head.stdout.strip() if head.returncode == 0 else None
+    try:
+        injection = ak_pointers.inject(cwd, block)
+    except (ak_pointers.PointerFileError, OSError) as e:
+        failed(f"could not write skill pointers, no worker started: {e}")
+        return
+
+    cleanup_error: str | None = None
+    try:
+        patch_task({"status": "running", "agent_id": agent_id})
+        note("status", f"Running task #{tid}: {task['title']}", {"task_id": tid})
+        ok, output, cost = run_cli(
+            platform, build_prompt(task, injection.changed and block != ""), cwd, task_id=tid, **cli_env
+        )
+    finally:
+        try:
+            ak_pointers.cleanup(injection)
+        except (ak_pointers.PointerFileError, OSError) as e:
+            cleanup_error = str(e)
+    result = extract_result(output)
+
+    if cleanup_error:
+        ok = False
+        result = (
+            f"{result}\n\n[dispatch] AGENTS.md cleanup failed: {cleanup_error}. "
+            "Remove the ak-skills block by hand before committing; review was skipped."
+        )
+    elif injection.changed and block:
+        leaked = committed_metadata(cwd, base_head, block)
+        if leaked:
+            ok = False
+            result = (
+                f"{result}\n\n[dispatch] the skill-pointer block is {leaked}. It is dispatch "
+                "metadata: unstage or amend it out before this work lands; review was skipped."
+            )
+
+    reviewer = task.get("reviewer_platform")
+    # A configured reviewer is required: unknown, missing, failed, or verdict-less fails the task.
+    if ok and reviewer:
+        cli = CLI_FOR_PLATFORM.get(reviewer) if isinstance(reviewer, str) else None
+        if cli is None:
+            ok = False
+            result = f"{result}\n\n[review] unknown reviewer platform {reviewer!r}, task not approved"
+        elif not shutil.which(cli):
+            ok = False
+            result = f"{result}\n\n[{reviewer} review] {cli} not found on PATH, task not approved"
+        else:
+            patch_task({"status": "review", "agent_id": agent_id})
+            note("status", f"Task #{tid} in review by {reviewer}", {"task_id": tid})
+            r_ok, r_out, r_cost = run_cli(
+                reviewer, build_review_prompt(task, scrub(output)), cwd, review=True, task_id=tid, **cli_env
+            )
+            if r_cost:
+                cost = (cost or 0) + r_cost
+            ok, note_text = review_outcome(r_ok, r_out)
+            result = f"{result}\n\n[{reviewer} review] {note_text}"
+
+    body = {
+        "status": "done" if ok else "failed",
+        "result": result or ("completed" if ok else "run failed with no output"),
+        "agent_id": agent_id,
+    }
+    if cost is not None:
+        body["cost_usd"] = round(float(cost), 4)
+    patch_task(body)
 
 
 class DispatchWake:
