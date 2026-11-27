@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import http.client
 
 import audit
+import github
 import providers
 import refs
 
@@ -43,6 +44,12 @@ _ROOT_KEYS = frozenset((
 ))
 # Optional root key (#192). Absent means no audit events at all.
 _AUDIT_KEY = "audit"
+# Optional root key (#190). Absent means no GitHub tokens; the name is reserved.
+_GITHUB_KEY = "github"
+GITHUB_SERVICE = "github"
+GITHUB_PATH = "/_github/token"
+_GITHUB_MAX_BODY = 4096
+_GITHUB_BODY_TIMEOUT = 10.0
 _SERVICE_KEYS = frozenset((
     "name",
     "upstream",
@@ -99,6 +106,10 @@ _REASONS = frozenset((
     "body_too_large",
     "secret_in_response",
     "missing_task_context",
+    "github_not_configured",
+    "github_no_repo",
+    "github_repo_mismatch",
+    "github_unavailable",
 ))
 _REQUEST_DROP = frozenset((
     "host",
@@ -324,7 +335,7 @@ def _check_service(service: object, seen: set[str], env_seen: set[str]) -> dict:
     if not isinstance(service, dict) or set(service) != _SERVICE_KEYS:
         _fail("invalid broker config: services")
     name = service["name"]
-    if type(name) is not str or _NAME_RE.fullmatch(name) is None or name in seen:
+    if type(name) is not str or _NAME_RE.fullmatch(name) is None or name in seen or name == GITHUB_SERVICE:
         _fail("invalid broker config: name")
     seen.add(name)
     upstream = _check_upstream(service["upstream"])
@@ -372,7 +383,7 @@ def _check_service(service: object, seen: set[str], env_seen: set[str]) -> dict:
 
 def validate_config(data: object, port_zero_ok: bool = False) -> dict:
     """Validate a decoded broker config. Does not resolve secrets or bind."""
-    if not isinstance(data, dict) or set(data) not in (_ROOT_KEYS, _ROOT_KEYS | {_AUDIT_KEY}):
+    if not isinstance(data, dict) or not _ROOT_KEYS <= set(data) or not set(data) <= _ROOT_KEYS | {_AUDIT_KEY, _GITHUB_KEY}:
         _fail("invalid broker config")
     bind = data["bind"]
     if bind != "127.0.0.1":
@@ -416,6 +427,8 @@ def validate_config(data: object, port_zero_ok: bool = False) -> dict:
     }
     if _AUDIT_KEY in data:
         checked_config[_AUDIT_KEY] = audit.check_block(data[_AUDIT_KEY])
+    if _GITHUB_KEY in data:
+        checked_config[_GITHUB_KEY] = github.check_block(data[_GITHUB_KEY])
     return checked_config
 
 
@@ -461,17 +474,25 @@ class PlaceholderStore:
             self._ttl = ttl_seconds
             self._configured = True
 
-    def mint(self, task_id: object, services: object) -> dict[str, str]:
-        """Return ``{service: placeholder}``. Placeholders are ``akp_`` plus 32 url-safe bytes."""
+    def mint(self, task_id: object, services: object, github_repo: object = None) -> dict[str, str]:
+        """Return ``{service: placeholder}``. Placeholders are ``akp_`` plus 32 url-safe bytes.
+
+        ``github_repo`` (#190) adds a ``github`` entry that records the repository.
+        ``services`` may be empty only when it is given.
+        """
         if type(task_id) is not str or task_id == "":
             _fail("invalid task id")
-        if not isinstance(services, (list, tuple)) or not services:
+        if github_repo is not None and not github.valid_repo(github_repo):
+            _fail("invalid github repo")
+        if not isinstance(services, (list, tuple)) or (not services and github_repo is None):
             _fail("invalid service name")
         requested = []
         for name in services:
-            if type(name) is not str or name == "" or name in requested:
+            if type(name) is not str or name == "" or name in requested or name == GITHUB_SERVICE:
                 _fail("invalid service name")
             requested.append(name)
+        if github_repo is not None:
+            requested.append(GITHUB_SERVICE)
         with self._lock:
             if not self._configured:
                 _fail("invalid placeholder store")
@@ -491,6 +512,7 @@ class PlaceholderStore:
                     "task_id": task_id,
                     "minted_at": minted_at,
                     "revoked": False,
+                    "repo": github_repo if name == GITHUB_SERVICE else None,
                 }
                 created.append(placeholder)
                 issued[name] = placeholder
@@ -553,6 +575,23 @@ class PlaceholderStore:
             if entry["revoked"]:
                 return "revoked"
             return "ok"
+
+    def service_of(self, placeholder: object) -> str | None:
+        """The service a placeholder was minted for, or None when unknown (#190)."""
+        if type(placeholder) is not str:
+            return None
+        with self._lock:
+            entry = self._entries.get(placeholder)
+            return None if entry is None else entry["service"]
+
+    def repo_of(self, placeholder: object) -> str | None:
+        """The repository recorded on a ``github`` entry, or None (#190)."""
+        if type(placeholder) is not str:
+            return None
+        with self._lock:
+            entry = self._entries.get(placeholder)
+            repo = None if entry is None else entry.get("repo")
+        return repo if type(repo) is str and repo != "" else None
 
     def task_of(self, placeholder: object) -> str | None:
         """The task id minted with ``placeholder``, read-only (#192). Call after ``check`` returned ``ok``."""
@@ -1083,6 +1122,8 @@ class _State:
         self.upstream_factory = upstream_factory
         self.services = {service["name"]: service for service in config["services"]}
         self.audit = None
+        # The GitHub token service (#190), or None when no ``github`` block is configured.
+        self.github = None
 
     def __repr__(self) -> str:
         return "<broker state>"
@@ -1384,6 +1425,10 @@ def _serve_one(handler: BaseHTTPRequestHandler) -> None:
         handler.protocol_version = version
         service_name = "-"
         prefix = "-"
+        if target.startswith("/_github"):
+            _serve_github(handler, state, method, target, headers, secrets)
+            logged = True
+            return
         try:
             mode, length = _body_mode(headers, state.config["max_request_body_bytes"])
             parsed = _parse_target(target)
@@ -1450,6 +1495,143 @@ def _serve_one(handler: BaseHTTPRequestHandler) -> None:
             _send_json(handler, 502, "upstream_error")
     finally:
         handler.close_connection = True
+
+
+def _github_body(handler: BaseHTTPRequestHandler, headers: http.client.HTTPMessage) -> bytes | None:
+    """The request body when it is Content-Length framed and small, else None. Read only after authentication (I6)."""
+    if _values(headers, "Transfer-Encoding"):
+        return None
+    lengths = _values(headers, "Content-Length")
+    if len(lengths) != 1 or _CL_RE.fullmatch(lengths[0].strip()) is None:
+        return None
+    length = _decimal_length(lengths[0].strip(), 6)
+    if length is None or length > _GITHUB_MAX_BODY:
+        return None
+    try:
+        # An authenticated client still cannot hold the handler thread forever.
+        handler.connection.settimeout(_GITHUB_BODY_TIMEOUT)
+        return _read_exact(handler.rfile, length)
+    except (_BadRequest, OSError, ValueError):
+        return None
+
+
+def _github_authenticate(headers: http.client.HTTPMessage, state: _State):
+    """``(placeholder, task_id)`` or ``(status, code)`` (D4: before any config or repository check)."""
+    values = _values(headers, "Authorization")
+    if len(values) != 1:
+        return (401, "missing_placeholder")
+    placeholder = _extract_placeholder("Bearer {secret}", values[0])
+    if not placeholder:
+        return (401, "bad_placeholder")
+    service = state.store.service_of(placeholder)
+    if service is None:
+        return (401, "bad_placeholder")
+    # Only a ``github`` placeholder opens this endpoint when the block is configured (F2).
+    if state.github is not None and service != GITHUB_SERVICE:
+        return (401, "bad_placeholder")
+    kind = state.store.check(placeholder, service)
+    if kind in ("missing", "wrong_service"):
+        return (401, "bad_placeholder")
+    if kind == "expired":
+        return (401, "expired_placeholder")
+    if kind == "revoked":
+        return (401, "revoked_placeholder")
+    task_id = state.store.task_of(placeholder)
+    if task_id is None:
+        return (401, "missing_task_context")
+    _note(task_id=task_id)
+    return placeholder, task_id
+
+
+def _github_repository(headers: http.client.HTTPMessage, body: bytes | None) -> str | None:
+    """The body's repository when Content-Type and body are exactly right (C9, G5)."""
+    types = _values(headers, "Content-Type")
+    if len(types) != 1:
+        return None
+    media = types[0].split(";", 1)
+    if media[0].strip().lower() != "application/json":
+        return None
+    if len(media) == 2 and media[1].strip().lower().replace(" ", "") not in ("charset=utf-8",):
+        return None
+    if body is None:
+        return None
+    try:
+        data = github.strict_json(body)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or set(data) != {"repository"}:
+        return None
+    repo = data["repository"]
+    return repo if github.valid_repo(repo) else None
+
+
+def _send_token(handler: BaseHTTPRequestHandler, token: str, expires_at: str) -> None:
+    body = json.dumps({"token": token, "expires_at": expires_at}, separators=(",", ":")).encode("ascii")
+    try:
+        handler.send_response_only(200)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Connection", "close")
+        handler.end_headers()
+        handler.wfile.write(body)
+        handler.wfile.flush()
+    except (OSError, ValueError):
+        pass
+    _close_writer(handler)
+
+
+def _serve_github(handler: BaseHTTPRequestHandler, state: _State, method: str, target: str,
+                  headers: http.client.HTTPMessage, secrets: tuple) -> None:
+    """``POST /_github/token`` (#190).
+
+    Order (H11, I6): target and method, then the placeholder, and only then
+    are body bytes read; then Content-Type and body, config, repository.
+    """
+    _note(service=GITHUB_SERVICE, prefix=GITHUB_PATH)
+
+    def refuse(status: int, code: str) -> None:
+        _emit(GITHUB_SERVICE, method, GITHUB_PATH, status, code, secrets)
+        _send_json(handler, status, code)
+
+    if target != GITHUB_PATH or method != "POST":
+        refuse(400, "bad_request")
+        return
+    outcome = _github_authenticate(headers, state)
+    if type(outcome[0]) is int:
+        refuse(outcome[0], outcome[1])
+        return
+    placeholder, task_id = outcome
+    body = _github_body(handler, headers)
+    requested = _github_repository(headers, body)
+    if requested is None:
+        refuse(400, "bad_request")
+        return
+    service = state.github
+    if service is None:
+        refuse(403, "github_not_configured")
+        return
+    granted = state.store.repo_of(placeholder)
+    if granted is None:
+        refuse(403, "github_no_repo")
+        return
+    if requested.lower() != granted.lower():
+        refuse(403, "github_repo_mismatch")
+        return
+
+    def send(token: str, expires_at: str) -> None:
+        # Runs under the task lock (I5): the response is written before a revoke can proceed.
+        _emit(GITHUB_SERVICE, method, GITHUB_PATH, 200, "-", secrets)
+        _send_token(handler, token, expires_at)
+
+    try:
+        service.serve(task_id, granted, lambda: state.store.check(placeholder, GITHUB_SERVICE) == "ok", send)
+    except github.TokenRevoked:
+        kind = state.store.check(placeholder, GITHUB_SERVICE)
+        refuse(401, "expired_placeholder" if kind == "expired" else "revoked_placeholder")
+    except Exception:  # noqa: BLE001 - any failure is github_unavailable and clears the cache
+        service.forget(task_id)
+        refuse(502, "github_unavailable")
 
 
 def _upstream_failure_after_head(handler: BaseHTTPRequestHandler, service_name: str, prefix: str, secrets: tuple, logged: bool) -> None:
@@ -1722,7 +1904,11 @@ def _audit_outcome(state: object, record: dict) -> None:
         return
     try:
         service = record.get("service")
-        config = state.services.get(service) if type(service) is str else None
+        if service == GITHUB_SERVICE:
+            # The token endpoint is the pseudo-service ``github`` (#190 F1).
+            config = {"methods": ("POST",)}
+        else:
+            config = state.services.get(service) if type(service) is str else None
         auditor.record(
             record.get("task_id"),
             service if config is not None else None,
@@ -1981,6 +2167,12 @@ class _AdminServer:
             if set(request) != {"op", "task_id"} or not _valid_task_id(request["task_id"]):
                 return _admin_error("bad_request"), False
             self._state.store.revoke_task(request["task_id"])
+            # The task's GitHub token is revoked by the same op (C7). Failures are logged, never raised.
+            if self._state.github is not None:
+                try:
+                    self._state.github.revoke_task(request["task_id"])
+                except Exception:  # noqa: BLE001
+                    _LOG.warning("%s", json.dumps({"github": "github_revoke_failed"}, separators=(",", ":")))
             return {"ok": True}, False
         return _admin_error("unknown_op"), False
 
@@ -1995,32 +2187,50 @@ class _AdminServer:
         }
 
     def _mint(self, request: dict) -> dict:
-        if set(request) != {"op", "task_id", "services"}:
+        keys = set(request)
+        if keys != {"op", "task_id", "services"} and keys != {"op", "task_id", "services", "github_repo"}:
             return _admin_error("bad_request")
         task_id = request["task_id"]
         services = request["services"]
-        if not _valid_task_id(task_id) or type(services) is not list or not services:
+        github_repo = request.get("github_repo")
+        if "github_repo" in request and not github.valid_repo(github_repo):
+            return _admin_error("bad_request")
+        if not _valid_task_id(task_id) or type(services) is not list or (not services and github_repo is None):
             return _admin_error("bad_request")
         names: list[str] = []
         for name in services:
-            if type(name) is not str or name == "" or name in names:
+            if type(name) is not str or name == "" or name in names or name == GITHUB_SERVICE:
                 return _admin_error("bad_request")
             names.append(name)
+        # Without a github block the repository is ignored and nothing is minted for it (G1).
+        if self._state.github is None:
+            github_repo = None
+            if not names:
+                return {"ok": True, "grants": []}
         # The whole list is checked before anything is created (C7).
         for name in names:
             if name not in self._state.services:
                 return _admin_error("unknown_service")
         port = int(self._port_fn())
         sizing = {"ok": True, "grants": [self._grant(name, "x" * _PLACEHOLDER_LEN, port) for name in names]}
+        if github_repo is not None:
+            sizing["github"] = self._github_grant("x" * _PLACEHOLDER_LEN, port)
         if len(_admin_line(sizing)) > _ADMIN_MAX_LINE:
             return _admin_error("bad_request")
         try:
-            issued = self._state.store.mint(task_id, names)
+            issued = self._state.store.mint(task_id, names, github_repo)
         except ValueError as exc:
             if str(exc) == "duplicate task id":
                 return _admin_error("bad_request")
             return _admin_error("internal")
-        return {"ok": True, "grants": [self._grant(name, issued[name], port) for name in names]}
+        response = {"ok": True, "grants": [self._grant(name, issued[name], port) for name in names]}
+        if github_repo is not None:
+            response["github"] = self._github_grant(issued[GITHUB_SERVICE], port)
+        return response
+
+    @staticmethod
+    def _github_grant(placeholder: str, port: int) -> dict:
+        return {"placeholder": placeholder, "broker_url": "http://127.0.0.1:%d" % port}
 
     def close(self) -> None:
         self._stop.set()
@@ -2051,10 +2261,31 @@ class _AdminServer:
             self._unlink_any()
 
 
+def _github_service(checked: dict, client_factory: object, clock: object, openssl: str):
+    block = checked.get(_GITHUB_KEY)
+    if block is None:
+        return None
+    try:
+        ref = refs.parse_reference(block["private_key"])
+    except ValueError:
+        _fail("invalid broker config: github")
+    try:
+        value = providers.resolve(ref, {}, environ=None, config_path=checked["providers"])
+    except ValueError as exc:
+        _fail("github: provider %s: %s" % (ref[0], exc))
+    key_pem = github.normalize_key(value)
+    factory = github.default_client_factory if client_factory is None else client_factory
+    client = factory(block["api"], checked["upstream_timeout_seconds"])
+    return github.TokenService(block, key_pem, client, time.time if clock is None else clock, openssl)
+
+
 class BrokerServer:
     """Validate, resolve secrets, then bind ``127.0.0.1`` only."""
 
-    def __init__(self, config: object, store: PlaceholderStore, upstream_factory: object = None) -> None:
+    def __init__(self, config: object, store: PlaceholderStore, upstream_factory: object = None,
+                 github_client_factory: object = None, github_clock: object = None,
+                 github_openssl: str = "openssl") -> None:
+        """``github_client_factory`` and ``github_clock`` are test seams (C11); config cannot reach them."""
         if not isinstance(store, PlaceholderStore):
             _fail("invalid placeholder store")
         # Validation and resolution finish before the listening socket exists.
@@ -2062,13 +2293,16 @@ class BrokerServer:
         # The audit token resolves before any secret, socket, or delivery thread.
         auditor = audit.from_config(checked["audit"], checked["providers"]) if "audit" in checked else None
         secret_map = _resolve_secrets(checked)
-        store.configure(
-            tuple(service["name"] for service in checked["services"]),
-            checked["placeholder_ttl_seconds"],
-        )
+        # The App key resolves before either socket binds and stays out of the service map (G10).
+        token_service = _github_service(checked, github_client_factory, github_clock, github_openssl)
+        known = tuple(service["name"] for service in checked["services"])
+        if token_service is not None:
+            known = known + (GITHUB_SERVICE,)
+        store.configure(known, checked["placeholder_ttl_seconds"])
         factory = default_upstream_factory if upstream_factory is None else upstream_factory
         self._state = _State(checked, store, secret_map, factory)
         self._state.audit = auditor
+        self._state.github = token_service
         self._httpd = _BoundServer((checked["bind"], checked["port"]), BrokerHandler)
         self._httpd.state = self._state
         self._serving = False

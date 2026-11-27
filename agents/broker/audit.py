@@ -52,6 +52,11 @@ REFUSAL_REASONS = frozenset((
     "path_not_allowed",
     "body_too_large",
     "missing_task_context",
+    # The GitHub token endpoint (#190 F1). Status per D4.
+    "github_not_configured",
+    "github_no_repo",
+    "github_repo_mismatch",
+    "github_unavailable",
 ))
 # The request reached the upstream. ``kind`` is broker_forwarded.
 FORWARD_REASONS = frozenset(("upstream_error", "secret_in_response"))

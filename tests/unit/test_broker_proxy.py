@@ -2276,8 +2276,12 @@ class ProxyTests(_GuardedCase):
         allowed = {
             "__future__", "json", "logging", "os", "re", "secrets", "socket", "ssl",
             "stat", "sys", "threading", "time", "urllib", "http", "providers", "refs",
-            "audit",
+            "audit", "github",
         }
+        # The GitHub client (#190 G3) keeps the same verification policy.
+        github_text = (BROKER / "github.py").read_text()
+        for banned in ("CERT_NONE", "CERT_OPTIONAL", "_create_unverified_context", "check_hostname = False", "check_hostname=False"):
+            self.assertNotIn(banned, github_text)
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:

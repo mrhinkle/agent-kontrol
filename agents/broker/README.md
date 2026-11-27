@@ -137,7 +137,7 @@ python3 agents/broker/broker.py --config /var/lib/agent-kontrol/broker.json
 
 The config file is JSON. It must be a regular file, not a symlink, owned by the effective uid, mode `0600` or `0400`. Copy `config.example.json`, replace the operator substitutions, and `chmod 600` the copy.
 
-Every field is required except `audit`, which is described under [Audit events](#audit-events).
+Every field is required except `audit`, which is described under [Audit events](#audit-events), and `github`, described under [GitHub tokens](#github-tokens).
 
 - `bind` is exactly `127.0.0.1`. Any other address is refused before a socket is created.
 - `port` is an integer from 1 to 65535. `0` is rejected in the file. Tests pass an ephemeral port only through the in-memory server API.
@@ -146,7 +146,7 @@ Every field is required except `audit`, which is described under [Audit events](
 - `upstream_timeout_seconds` is a positive integer. It bounds the upstream connection, including the TLS handshake.
 - `max_request_body_bytes` is a positive integer. A request with a known length over the limit is refused with `413` before any upstream connection. A chunked body that crosses the limit while it is already streaming aborts both connections.
 - `services` is a non-empty list. Each service object has exactly these fields:
-  - `name`: 1–40 characters from `[a-z0-9-]`, unique among services.
+  - `name`: 1–40 characters from `[a-z0-9-]`, unique among services. `github` is reserved and refused.
   - `upstream`: an `https://` origin with no path, query, fragment, or userinfo. TLS verification stays on. Redirects are not followed.
   - `header`: the header the upstream uses for its credential. The name is matched without case sensitivity.
   - `template`: the header value, containing the text `{secret}` once. The usual form is `Bearer {secret}`.
@@ -193,6 +193,48 @@ Each event is:
 Delivery never delays or changes a proxied response. One daemon thread drains a queue of 1,000 events. Each POST has one 5-second budget for connect, headers, and body, and is not retried. A full queue drops the event and counts `dropped_full`. A DNS failure, connection failure, timeout, redirect, non-2xx answer, or an answer that is not a JSON object drops the event and counts `delivery_failed`. While either counter is non-zero, the logger `ak.broker.audit` writes at most one line a minute, for example `{"audit":"degraded","dropped_full":3,"delivery_failed":0}`. Stopping the broker discards queued events.
 
 To turn auditing off, remove the `audit` block, restart the broker, and revoke the credential in Settings.
+
+### GitHub tokens
+
+`git` and `gh` take no clean base-URL override, so the placeholder proxy cannot cover GitHub (#190). With a `github` block, the GitHub App's private key stays in the broker, and a lane gets an installation token scoped to its task's one repository, limited to the configured permissions, that expires within an hour. The lane does hold that token: a leaked token exposes one repository for at most an hour.
+
+```json
+"github": {
+  "app_id": 123456,
+  "private_key": "secretref://exec/keychain/AK_GITHUB_APP_KEY",
+  "permissions": {"contents": "write", "pull_requests": "write"},
+  "api": "https://api.github.com"
+}
+```
+
+- `app_id` is a positive integer (not a boolean).
+- `private_key` is a `secretref://` reference to the App's PEM private key. It resolves at startup, before either socket exists, and is kept apart from the service secrets. A literal key is refused. A single-line value may write the PEM's line breaks as `\n`, which is how a mode-600 env file holds it.
+- `permissions` is a non-empty object of permission names (`[a-z_]+`) to `read` or `write`. The minimum for pushing a branch and opening a pull request is `{"contents": "write", "pull_requests": "write"}`. Every token gets exactly this set; per-task permissions are not supported.
+- `api` is optional and defaults to `https://api.github.com`. It is an `https` origin with no path, query, fragment, or userinfo. TLS verification stays on and redirects are not followed.
+
+A malformed block stops startup, before any socket is created.
+
+**Signing.** The broker signs an RS256 JWT (`iss` = `app_id`, `iat` = now − 60 s, `exp` = now + 540 s) with `openssl dgst -sha256 -sign /dev/fd/<n>`. The PEM reaches `openssl` only through an inherited pipe: never argv, the environment, a log, or a file path on disk. `openssl` must be on the broker's `PATH`; if it is missing or fails, no token is issued (`github_unavailable`).
+
+**Minting.** For a task granted a repository, the broker calls `GET /repos/{owner}/{repo}/installation` and then `POST /app/installations/{id}/access_tokens` with exactly `{"repositories":[name],"permissions":{…}}`. Each call runs under one `upstream_timeout_seconds` deadline covering name resolution, every address, connect, TLS, send, headers and body. Proxy variables are not consulted. The token is cached per task (never shared between tasks); concurrent requests share one mint, and a request at or after `expires_at − 300 s` mints a new one. A timeout, redirect, non-2xx answer, malformed JSON, missing token, unparseable `expires_at`, or a lifetime over 3,600 seconds returns `github_unavailable` and clears that task's cache.
+
+**Endpoint.** `POST /_github/token` on the loopback port, with `Authorization: Bearer <github placeholder>`, `Content-Type: application/json` and exactly `{"repository":"<owner>/<name>"}`. Success is `200` and exactly `{"token":"…","expires_at":"<RFC 3339>"}`. The request target must be exactly `/_github/token`; a query, fragment, or any other path is `400 bad_request`. Checks run in this order: target and method, then the placeholder, and only then is any body byte read (a body has 10 seconds to arrive); then the body, configuration and repository. Refusals are `{"error":"<code>"}`: the placeholder codes (`401`), `bad_request` (`400`), `github_not_configured`, `github_no_repo` and `github_repo_mismatch` (`403`), and `github_unavailable` (`502`). Only the task's `github` placeholder opens the endpoint; a service placeholder is `401 bad_placeholder`. Each answer writes one `ak.broker` line and, with an `audit` block, one audit event (service `github`, path prefix `/_github/token`).
+
+**Admin socket.** `mint` takes an optional `github_repo: "<owner>/<name>"`; `services` may be empty only when it is present, and may never contain `github`. With the block, the response gains `"github": {"placeholder": "akp_…", "broker_url": "http://127.0.0.1:<port>"}`. Without the block the repository is ignored, and `services: []` returns exactly `{"ok":true,"grants":[]}`. `revoke_task` also clears the task's cached token and sends `DELETE /installation/token` with it; a failed DELETE is logged as `{"github":"github_revoke_failed"}` and the revoke still succeeds. A token request holds its task's lock from choosing the token until the response is written, and `revoke_task` takes the same lock after revoking the placeholder, so a request not yet answered gets `401 revoked_placeholder` and no token, even when the DELETE fails.
+
+**Dispatcher setting.** On every host whose broker has a `github` block, set `MC_BROKER_GITHUB=required` for the dispatcher. A supported remote then fails closed when the mint answer has no valid `github` grant (a stale or misconfigured broker), instead of starting the lane with no grant.
+
+**How a lane pushes.** The dispatcher sets `git-credential-ak` (this directory, mode `0755`) as the only credential helper for `https://github.com`, through the child's environment only (see the dispatcher README). An HTTPS `git push`, `fetch` or `clone` of the task's repository asks the helper, which posts `AK_GITHUB_REPO` to the endpoint and answers git with `username=x-access-token` and the token. Any doubt (malformed input, a refusal, a bad response, an unreachable broker) means a non-zero exit and no credential; other hosts, other protocols, `store` and `erase` print nothing.
+
+**Limits.**
+
+- `gh` is not covered; it still uses whatever login the host has.
+- SSH remotes get the grant, but SSH transport never calls a credential helper, so SSH pushes keep using the host's SSH keys.
+- The token lives up to an hour and the lane holds it. Revoking the task deletes it early.
+- The helper is the only one git's configuration supplies; a worker that deliberately runs `git -c credential.helper=…` or reads a credential store file is not stopped. Running lanes as a separate OS user is #193.
+- GitHub Enterprise is supported only through `api`.
+
+To turn it off: stop new claims, `revoke_task` each in-flight task, remove the block, and restart the broker and then the dispatcher. Every token that could have been issued has expired one hour later.
 
 ### launchd
 

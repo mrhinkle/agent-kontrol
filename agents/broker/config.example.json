@@ -3,6 +3,12 @@
     "url": "https://YOUR-DEPLOY.vercel.app",
     "token": "secretref://file/default/AK_BROKER_AUDIT_TOKEN"
   },
+  "github": {
+    "app_id": 123456,
+    "private_key": "secretref://exec/keychain/AK_GITHUB_APP_KEY",
+    "permissions": {"contents": "write", "pull_requests": "write"},
+    "api": "https://api.github.com"
+  },
   "admin_socket": "/abs/path/private-0700-dir/broker-admin.sock",
   "bind": "127.0.0.1",
   "port": 8765,

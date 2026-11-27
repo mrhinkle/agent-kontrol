@@ -308,6 +308,62 @@ broker yet: they call `build_child_env` directly and never open the socket.
 To turn the broker off on a host: wait until no task is running, unset
 `MC_BROKER_SOCKET`, restart the dispatcher, then stop the broker.
 
+### GitHub tokens (#190)
+
+With the broker on, the dispatcher reads the worktree's origin remote after
+`health` and before `mint`. `remote.origin.url` (read with `git config
+--no-includes --get-all`) must be exactly one of
+`https://github.com/<owner>/<name>`, `git@github.com:<owner>/<name>` or
+`ssh://git@github.com/<owner>/<name>`, with at most one trailing `.git`
+removed. Userinfo, a port, a query, a fragment, percent-encoding,
+whitespace, empty or extra segments, an owner outside `[A-Za-z0-9-]{1,39}`
+or a name outside `[A-Za-z0-9._-]{1,100}` (or `.`/`..`) is unsupported. So
+are zero or several values, a lookup that fails, a value that `git remote
+get-url origin` rewrites (`url.*.insteadOf`), and any `remote.origin.pushurl`
+or effective push URL that does not parse the same way and name the same
+repository (compared case-insensitively). Push URLs are only checked; the
+repository always comes from `remote.origin.url`, as written.
+
+- **Supported remote.** `mint` carries `github_repo`. When the broker answers
+  with a `github` grant, the worker and the reviewer get exactly this overlay
+  on top of `build_child_env`, through `run_cli(..., env_overlay=…)`:
+  `GIT_CONFIG_COUNT=2`, `GIT_CONFIG_KEY_0=credential.helper` with an empty
+  `GIT_CONFIG_VALUE_0`, `GIT_CONFIG_KEY_1=credential.https://github.com.helper`
+  with `GIT_CONFIG_VALUE_1` the absolute path of `agents/broker/git-credential-ak`,
+  `GIT_TERMINAL_PROMPT=0`, empty `GIT_ASKPASS` and `SSH_ASKPASS`, and
+  `AK_GITHUB_PLACEHOLDER`, `AK_BROKER_URL`, `AK_GITHUB_REPO`. The empty
+  `credential.helper` clears every helper read before it, so the host's
+  system, global, local and worktree helpers (a keychain helper included) are
+  replaced for the child, and a helper failure can never fall back to a
+  prompt or an askpass program. Before applying it, `run_cli` drops any
+  inherited `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`
+  for `n >= 2`. `GIT_CONFIG_NOSYSTEM` and `GIT_CONFIG_GLOBAL` are not touched,
+  so `user.name`, `user.email` and signing settings still apply.
+- **No git config is ever written.** The overlay is environment-only and
+  task-scoped: linked worktrees share the main repository's config, so a
+  written helper would outlive the task and leak to other lanes.
+- **Unsupported remote.** No `github_repo` is sent, no `GIT_CONFIG_*` or
+  `AK_*` variable is set, and the task result ends with exactly
+  `[github] no grant: remote.origin.url is not a supported GitHub remote`.
+- **Broker without a `github` block.** The mint answer has no `github` member;
+  the worker and reviewer environments and the result are as without #190.
+- **`MC_BROKER_GITHUB`.** Unset, or exactly `required`; any other value fails
+  every task with `secret broker unavailable, no worker started`. Set
+  `required` on every host whose broker has a `github` block: a supported
+  remote whose mint answer lacks a valid `github` grant then fails the task
+  before any worker or reviewer starts, so a stale or misconfigured broker
+  can never send a lane out on the host's own GitHub credentials.
+- **Fail closed.** A malformed `github` grant, or a helper that is missing,
+  not executable, or at a path with characters outside `[A-Za-z0-9/._-]`, fails
+  the task with `secret broker unavailable, no worker started`, and the task's
+  `revoke_task` runs as usual. The GitHub placeholder and broker URL are
+  redacted from every sink like the other grants.
+
+The token is revoked by the same single `revoke_task` at the end of the
+task. `gh` is not covered, SSH pushes keep using the host's SSH keys, and a
+worker that deliberately overrides `credential.helper` itself is not stopped
+(#193 covers OS-user separation).
+
 ## Dispatch-ready handoff
 
 `dispatch_ready_bridge.py` is the inert issue-to-task handoff. It does nothing
