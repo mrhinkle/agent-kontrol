@@ -39,6 +39,8 @@ export const INGEST_KINDS = [
   "status",
   "error",
   "heartbeat",
+  "broker_forwarded",
+  "broker_refused",
 ] as const;
 
 export interface ReportInput {

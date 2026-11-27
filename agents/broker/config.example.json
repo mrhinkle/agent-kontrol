@@ -1,4 +1,8 @@
 {
+  "audit": {
+    "url": "https://YOUR-DEPLOY.vercel.app",
+    "token": "secretref://file/default/AK_BROKER_AUDIT_TOKEN"
+  },
   "admin_socket": "/abs/path/private-0700-dir/broker-admin.sock",
   "bind": "127.0.0.1",
   "port": 8765,

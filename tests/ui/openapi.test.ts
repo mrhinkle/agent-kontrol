@@ -309,6 +309,10 @@ describe("OpenAPI document", () => {
     assert.deepEqual(Object.keys(report.properties ?? {}).sort(), reportFields.map((field) => field.name).sort());
     assert.deepEqual(report.required, reportFields.filter((field) => !field.optional).map((field) => field.name));
     assert.deepEqual((report.properties?.kind as { enum: string[] }).enum, [...INGEST_KINDS]);
+    assert.deepEqual(
+      ["broker_forwarded", "broker_refused"].filter((kind) => (report.properties?.kind as { enum: string[] }).enum.includes(kind)),
+      ["broker_forwarded", "broker_refused"],
+    );
 
     const fact = schemaOf(doc, "UsageFact");
     const factFields = interfaceFields(fs.readFileSync("src/lib/usage-types.ts", "utf8"), "UsageFact");

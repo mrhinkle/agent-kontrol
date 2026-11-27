@@ -2276,6 +2276,7 @@ class ProxyTests(_GuardedCase):
         allowed = {
             "__future__", "json", "logging", "os", "re", "secrets", "socket", "ssl",
             "stat", "sys", "threading", "time", "urllib", "http", "providers", "refs",
+            "audit",
         }
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
