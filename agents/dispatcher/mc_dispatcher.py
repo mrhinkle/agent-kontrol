@@ -2589,14 +2589,29 @@ class BridgeDispatcher:
         self.signals = BridgeSignalPort(self.children, table)
         self.halted: BridgeHalt | None = None
         self.held: dict | None = None
+        self.task_id: int | None = None
+        self.boundary = lambda name: None  # test hook at each named boundary
         # Signal latch (PR #215): a plain flag plus a non-blocking self-pipe. The
         # handler never takes a lock; the main loop sleeps in select() on the pipe.
         self.signalled = False
         self.wake_r, self.wake_w = os.pipe()
-        for fd in (self.wake_r, self.wake_w):
-            os.set_blocking(fd, False)
-        self.task_id: int | None = None
-        self.boundary = lambda name: None  # test hook at each named boundary
+        try:
+            for fd in (self.wake_r, self.wake_w):
+                os.set_blocking(fd, False)
+        except OSError:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Close the wake pipe. The ledger fd belongs to bridge_main."""
+        for name in ("wake_r", "wake_w"):
+            fd = getattr(self, name, None)
+            if fd is not None:
+                setattr(self, name, None)
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     # -- stop predicate (C12, D13) --------------------------------------------
 
@@ -3058,7 +3073,7 @@ def bridge_signal_handler(bridge: BridgeDispatcher):
         bridge.signalled = True
         try:
             os.write(bridge.wake_w, b"x")
-        except OSError:
+        except (OSError, TypeError):
             pass  # the pipe is full: a wake is already pending
 
     return latch
@@ -3066,6 +3081,13 @@ def bridge_signal_handler(bridge: BridgeDispatcher):
 
 def _bridge_run(parsed: dict, dir_fd: int, platforms: list[str]) -> int:
     bridge = BridgeDispatcher(parsed, dir_fd)
+    try:
+        return _bridge_loop(bridge, parsed, platforms)
+    finally:
+        bridge.close()
+
+
+def _bridge_loop(bridge: BridgeDispatcher, parsed: dict, platforms: list[str]) -> int:
     if bridge.journal.exists():
         # D6: unresolved recovery from an earlier run. Leave it exactly as it is.
         print(bridge_halt_line(BridgeHalt("stop_journal_present", "startup")), file=sys.stderr)

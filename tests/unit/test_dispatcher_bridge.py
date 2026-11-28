@@ -432,6 +432,7 @@ class BridgeHarness(unittest.TestCase):
             held = self._bridge.held or {}
             if held.get("lock") is not None:
                 held["lock"].release()
+            self._bridge.close()
             os.close(self._bridge.dir_fd)
         self.tmp.cleanup()
 
@@ -1006,6 +1007,42 @@ class CodeRabbit215Second(BridgeHarness):
         bridge.stop_event.set.assert_not_called()
         for _ in range(100000):  # a full pipe must not block or raise in the handler
             md.bridge_signal_handler(bridge)(signal.SIGTERM, None)
+
+
+class CodeRabbit215Third(BridgeHarness):
+    """Third CodeRabbit pass on PR #215 at 35287c5."""
+
+    def test_out_of_range_task_id_halts_at_selection(self):
+        # Finding 1: a hand-edited id above the safe-integer bound halts before any lock or grant.
+        self.write_rows([handoff_row(task_id=drb.MAX_TASK_ID + 1)])
+        with mock.patch.object(md.WorktreeLock, "acquire", side_effect=AssertionError("locked")), \
+                mock.patch.object(md.ak_pointers, "inject", side_effect=AssertionError("injected")):
+            self.assertEqual(self.poll(), "halt")
+        self.assert_halt("missing_task_id", phase="select")
+        self.assertEqual(self.claims(), [])
+        self.assertIsNone(self.agents_md())
+
+    def test_wake_pipe_closed(self):
+        # Finding 2: a dispatcher's lifetime leaves the open fd count unchanged.
+        def open_fds():
+            return len(os.listdir("/dev/fd"))
+
+        parsed = drb.parse_bridge_config(self.config)
+        fd = os.open(str(self.ledger), os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        before = open_fds()
+        for _ in range(20):
+            md.BridgeDispatcher(parsed, fd).close()
+        self.assertEqual(open_fds(), before)
+        with mock.patch.object(md.os, "set_blocking", side_effect=OSError("nope")):
+            with self.assertRaises(OSError):
+                md.BridgeDispatcher(parsed, fd)
+        self.assertEqual(open_fds(), before)
+        # A signal after close neither raises nor blocks.
+        bridge = md.BridgeDispatcher(parsed, fd)
+        bridge.close()
+        md.bridge_signal_handler(bridge)(signal.SIGTERM, None)
+        self.assertTrue(bridge.signalled)
 
 
 class BridgeStopTests(BridgeHarness):

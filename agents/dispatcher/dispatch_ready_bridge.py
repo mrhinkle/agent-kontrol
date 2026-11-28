@@ -1235,7 +1235,8 @@ def _validate_handoff(authority: str, row, *, keep_missing_task_id: bool = False
     if attempt is not None and _parse_time(attempt) is None:
         return "ledger_unreadable"
     task_id = row["task_id"]
-    bad_id = task_id is None or type(task_id) is not int or isinstance(task_id, bool) or task_id < 1
+    bad_id = (task_id is None or type(task_id) is not int or isinstance(task_id, bool)
+              or not 1 <= task_id <= MAX_TASK_ID)
     if keep_missing_task_id and row["state"] == "acknowledged" and bad_id:
         # Read-only dispatcher view (#212 H10): keep the row so the dispatcher
         # can halt it as missing_task_id. Never saved in this form.
