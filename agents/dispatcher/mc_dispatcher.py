@@ -1872,6 +1872,7 @@ BRIDGE_CODES = (
 )
 BRIDGE_PLATFORMS = ("claude-code", "codex", "grok")
 BRIDGE_JOURNAL = "dispatcher-stop.json"
+BRIDGE_LOCK = "dispatcher.lock"  # one bridge dispatcher per ledger, held for the process lifetime
 BRIDGE_DONE = "dispatcher-done.json"  # tasks this dispatcher finished; their rows are not candidates (I1)
 BRIDGE_DONE_MAX_BYTES = 16 * 1024 * 1024
 BRIDGE_CONFIG_MAX_BYTES = 1_048_576
@@ -1989,7 +1990,7 @@ def bridge_read_config(environ: Mapping[str, str]) -> tuple[dict, int]:
     if not path or "\0" in path or not os.path.isabs(path):
         raise BridgeHalt("invalid_config", "startup")
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     except OSError:
         raise BridgeHalt("invalid_config", "startup") from None
     try:
@@ -2024,6 +2025,27 @@ def bridge_read_config(environ: Mapping[str, str]) -> tuple[dict, int]:
         os.close(dir_fd)
         raise BridgeHalt("invalid_config", "startup")
     return parsed, dir_fd
+
+
+def bridge_lock_ledger(dir_fd: int) -> int:
+    """An exclusive, non-blocking flock on <ledger_dir>/dispatcher.lock. Raises invalid_config if held.
+
+    Taken before the journal is even looked at and held until exit, so a second
+    bridge dispatcher on the same ledger touches nothing.
+    """
+    try:
+        fd = os.open(BRIDGE_LOCK, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), 0o600,
+                     dir_fd=dir_fd)
+    except OSError:
+        raise BridgeHalt("invalid_config", "startup") from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise BridgeHalt("invalid_config", "startup") from None
+    return fd
 
 
 def bridge_validate_lanes(parsed: dict, workdir: Path) -> None:
@@ -2118,7 +2140,8 @@ class BridgeDoneRecord:
 
     def load(self) -> list[dict]:
         try:
-            fd = os.open(BRIDGE_DONE, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=self.dir_fd)
+            fd = os.open(BRIDGE_DONE, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+                         dir_fd=self.dir_fd)
         except FileNotFoundError:
             return []
         except OSError:
@@ -2170,8 +2193,16 @@ class BridgeDoneRecord:
         os.fsync(self.dir_fd)
 
 
+class BridgeTableIncomplete(OSError):
+    """A process vanished while the table was read: the listing cannot prove a group empty."""
+
+
 def bridge_process_table() -> dict[int, tuple[int, int, bool]]:
-    """{pid: (ppid, pgid, zombie)} for every process. Raises when it cannot be read whole."""
+    """{pid: (ppid, pgid, zombie)} for every process. Raises when it cannot be read whole.
+
+    On Linux a /proc entry that vanishes between the directory listing and its
+    stat read raises BridgeTableIncomplete: its group is unknown.
+    """
     table: dict[int, tuple[int, int, bool]] = {}
     proc_root = Path("/proc")
     if (proc_root / "self" / "stat").exists():
@@ -2182,7 +2213,7 @@ def bridge_process_table() -> dict[int, tuple[int, int, bool]]:
                 with open(f"/proc/{entry}/stat", "rb") as f:
                     raw = f.read().decode("ascii", "replace")
             except (FileNotFoundError, ProcessLookupError):
-                continue  # exited between listdir and open
+                raise BridgeTableIncomplete("a process exited while the table was read") from None
             fields = raw[raw.rindex(")") + 2:].split()
             table[int(entry)] = (int(fields[1]), int(fields[2]), fields[0] in ("Z", "X"))
         return table
@@ -2260,20 +2291,40 @@ class BridgeObserver:
         child = self.children.get(identity.pid)
         if child is None or child.proc.returncode is not None:
             return stopctl.Observation("unverifiable")
-        rows = self.table()
+        rows = self._listing()
         leader = rows.get(identity.pid)
         if leader is None:
             return stopctl.Observation("unverifiable")
         ppid, pgid, zombie = leader
-        live = any(pg == identity.pgid and not z for pid, (_pp, pg, z) in rows.items()
-                   if not (pid == identity.pid and zombie))
+        live = self._live(rows, identity, zombie)
         if zombie and not live:
+            # One listing can miss a member forked during the read. Empty needs a
+            # second complete listing that agrees, with the leader still unreaped.
+            again = self._listing()
+            second = again.get(identity.pid)
+            if (second is None or not second[2] or self._live(again, identity, True)
+                    or child.proc.returncode is not None):
+                return stopctl.Observation("unverifiable")
             # An unreaped zombie cannot change parent or group: echo what it was born with.
             return stopctl.Observation("absent", pid=identity.pid, pgid=identity.pgid, role=child.role,
                                        phase=child.phase, birth=child.birth, ancestry=(os.getpid(),),
                                        group_status="empty")
         return stopctl.Observation("present", pid=identity.pid, pgid=pgid, role=child.role, phase=child.phase,
                                    birth=child.birth, ancestry=(ppid,), group_status="occupied")
+
+    def _listing(self) -> dict[int, tuple[int, int, bool]]:
+        """A complete table. Retries a few times while processes elsewhere churn; then raises."""
+        for _attempt in range(5):
+            try:
+                return self.table()
+            except BridgeTableIncomplete:
+                continue
+        raise BridgeTableIncomplete("process table kept changing")
+
+    @staticmethod
+    def _live(rows: dict, identity: stopctl.OwnedIdentity, leader_zombie: bool) -> bool:
+        return any(pg == identity.pgid and not z for pid, (_pp, pg, z) in rows.items()
+                   if not (pid == identity.pid and leader_zombie))
 
 
 class BridgeSignalPort:
@@ -2295,11 +2346,15 @@ class BridgeSignalPort:
         self.sent: list[tuple[int, int, bool]] = []  # (pgid, sig, through lane)
 
     def _group_live(self, pgid: int) -> bool | None:
-        try:
-            rows = self.table()
-        except Exception:
-            return None
-        return any(pg == pgid and not z for _pp, pg, z in rows.values())
+        for _attempt in range(5):
+            try:
+                rows = self.table()
+            except BridgeTableIncomplete:
+                continue
+            except Exception:
+                return None
+            return any(pg == pgid and not z for _pp, pg, z in rows.values())
+        return None
 
     def signal_group(self, pgid: int, sig: int) -> str:
         if type(pgid) is not int or pgid <= 1 or pgid == os.getpgrp() or pgid == os.getpid():
@@ -2427,6 +2482,11 @@ class BridgeRunner:
                 self._abandon(proc, write_fd, identity, registered=True)
                 raise BridgeHalt("claim_unknown", f"{role}_event", task_id=bridge.task_id) from None
             bridge.boundary(f"{role}_acked")
+            if bridge.stop_requested():
+                # Stop arrived during the work event: never release the payload.
+                self._abandon(proc, write_fd, identity, registered=True)
+                ctl.request_stop()
+                raise BridgeHalt("stop_requested", f"{role}_release", task_id=bridge.task_id)
             try:
                 _write_fd_all(write_fd, release)
             except OSError:
@@ -2661,7 +2721,19 @@ class BridgeDispatcher:
                 raise RuntimeError("work event not recorded")
 
         def patch_task(payload: dict) -> dict:
-            return self.net(lambda: api(f"/api/tasks/{tid}", scrub(payload), "PATCH"))
+            """A task PATCH that the server provably applied, or raises (CodeRabbit #215, 6 and 7).
+
+            Requires {ok: true, task: {id, status}} with the requested status and no
+            demo flag. A timed-out PATCH may still land later, so a caller that sees
+            an exception must not send another status for this task.
+            """
+            resp = self.net(lambda: api(f"/api/tasks/{tid}", scrub(payload), "PATCH"))
+            task = resp.get("task") if isinstance(resp, dict) else None
+            if (not isinstance(resp, dict) or resp.get("ok") is not True or resp.get("demo") is True
+                    or not isinstance(task, dict) or task.get("id") != tid
+                    or task.get("status") != payload["status"]):
+                raise RuntimeError("task update not recorded")
+            return resp
 
         try:
             prepared = self._prepare(platform, row, state, needles)
@@ -2827,10 +2899,9 @@ class BridgeDispatcher:
         injection = state["injection"]
 
         def worker_ack() -> None:
-            try:
-                patch_task({"status": "running", "agent_id": agent_id})
-            except Exception:
-                print(f"[mc] bridge: running status not recorded for task #{tid}", file=sys.stderr)
+            # Strict: a PATCH that failed or timed out may still land later and overwrite
+            # the terminal status, so the payload is held and the round halts instead.
+            patch_task({"status": "running", "agent_id": agent_id})
             note("status", f"Running task #{tid}: {task['title']}", {"task_id": tid})
 
         ok, output, cost = self._run_phase(
@@ -2856,10 +2927,7 @@ class BridgeDispatcher:
                 result = f"{result}\n\n[{reviewer} review] {cli} not found on PATH, task not approved"
             else:
                 def reviewer_ack() -> None:
-                    try:
-                        patch_task({"status": "review", "agent_id": agent_id})
-                    except Exception:
-                        print(f"[mc] bridge: review status not recorded for task #{tid}", file=sys.stderr)
+                    patch_task({"status": "review", "agent_id": agent_id})
                     note("status", f"Task #{tid} in review by {reviewer}", {"task_id": tid})
 
                 r_ok, r_out, r_cost = self._run_phase(
@@ -2948,6 +3016,18 @@ def bridge_main(platforms: list[str]) -> int:
     except BridgeHalt as h:
         print(bridge_halt_line(h), file=sys.stderr)
         return 2
+    try:
+        lock_fd = bridge_lock_ledger(dir_fd)
+    except BridgeHalt as h:
+        print(bridge_halt_line(h), file=sys.stderr)
+        return 2
+    try:
+        return _bridge_run(parsed, dir_fd, platforms)
+    finally:
+        os.close(lock_fd)  # only at exit: the lock spans the journal check and any recovery
+
+
+def _bridge_run(parsed: dict, dir_fd: int, platforms: list[str]) -> int:
     bridge = BridgeDispatcher(parsed, dir_fd)
     if bridge.journal.exists():
         # D6: unresolved recovery from an earlier run. Leave it exactly as it is.

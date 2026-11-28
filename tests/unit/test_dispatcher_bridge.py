@@ -135,6 +135,9 @@ class FakeServer:
                                  "empty": False, "block": BLOCK})
         if split.path == "/api/ingest":
             return FakeResponse({"ok": True})
+        if req.get_method() == "PATCH" and split.path.startswith("/api/tasks/"):
+            return FakeResponse({"ok": True, "task": {"id": int(split.path.rsplit("/", 1)[1]),
+                                                      "status": (body or {}).get("status")}})
         return FakeResponse({})
 
 
@@ -411,14 +414,19 @@ class BridgeHarness(unittest.TestCase):
         self._bridge = None
 
     def tearDown(self):
-        for name in ("worker.pid", "reviewer.pid", "leftover.pid"):
-            path = self.base / name
-            if path.exists():
-                try:
-                    os.kill(int(path.read_text()), signal.SIGKILL)
-                except (ProcessLookupError, ValueError):
-                    pass
         if self._bridge is not None:
+            # Only a child this dispatcher still holds unreaped is ours to stop: its zombie
+            # pins the group id. A reaped pid (or a pid file) may already name someone else.
+            for child in list(self._bridge.children._items.values()):
+                if child.proc.returncode is None:
+                    try:
+                        os.killpg(child.proc.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    child.proc.wait(timeout=10)
+            held = self._bridge.held or {}
+            if held.get("lock") is not None:
+                held["lock"].release()
             os.close(self._bridge.dir_fd)
         self.tmp.cleanup()
 
@@ -797,6 +805,131 @@ class BridgeStrictEvent(BridgeHarness):
                 self.assert_no_child()
                 self.assertEqual(self.bridge().signals.sent, [], "the gate is retired by EOF, not a signal")
                 self.assertIsNotNone(self.agents_md(), "no cleanup after a halt")
+
+
+class CodeRabbit215(BridgeHarness):
+    """Findings on PR #215 at fa37e9b."""
+
+    def test_lost_reply_after_commit_keeps_claim(self):
+        # Finding 9: the server commits the claim, then the reply is lost.
+        real = self.server.urlopen
+
+        def commit_then_lose(req, timeout=None):
+            if md.urllib.parse.urlsplit(req.full_url).path == "/api/tasks/claim":
+                real(req, timeout)  # commits: the task leaves the queue
+                raise md.urllib.error.URLError("reply lost")
+            return real(req, timeout)
+
+        with mock.patch.object(md.urllib.request, "urlopen", side_effect=commit_then_lose):
+            self.assertEqual(self.poll(), "halt")
+        self.assert_halt("claim_unknown", phase="claim")
+        self.assertEqual(self.server.claimed, [TID])
+        self.assertEqual(self.server.queue, [], "the committed claim stays claimed")
+        self.assert_no_child()
+        held = self._bridge.held
+        held["lock"].release()  # process exit
+        os.close(self._bridge.dir_fd)
+        self._bridge = None
+        self.assertEqual(self.poll(), "halt")
+        self.assertEqual(self.bridge().halted.code, "stop_journal_present")
+        self.assertEqual(len(self.claims()), 1, "a fresh dispatcher sent a second claim")
+
+    def test_stop_during_work_event_holds_payload(self):
+        # Finding 4.
+        bridge = self.bridge()
+        bridge.boundary = lambda name: bridge.stop_event.set() if name == "worker_acked" else None
+        self.assertEqual(self.poll(), "halt")
+        self.assert_halt("stop_requested", phase="worker_release")
+        self.assert_no_child()
+        self.assertEqual(bridge.signals.sent, [])
+
+    def test_phase_patch_failure_holds_payload(self):
+        # Finding 6: a running PATCH that failed or timed out may land late; never run, never finish.
+        for how in ("timeout", "http_500", "demo", "wrong_status"):
+            with self.subTest(failure=how):
+                if self._bridge is not None:
+                    self._bridge.held["lock"].release()
+                    if self._bridge.held.get("injection") is not None:
+                        ak_pointers.cleanup(self._bridge.held["injection"])
+                    os.close(self._bridge.dir_fd)
+                    self._bridge = None
+                    (self.ledger / md.BRIDGE_JOURNAL).unlink(missing_ok=True)
+                    self.server.queue = [server_task(TID, self.body)]
+                self.server.requests.clear()
+                real = self.server.urlopen
+
+                def urlopen(req, timeout=None, how=how):
+                    split = md.urllib.parse.urlsplit(req.full_url)
+                    if req.get_method() == "PATCH" and json.loads(req.data.decode())["status"] == "running":
+                        self.server.requests.append({"method": "PATCH", "path": split.path,
+                                                     "body": req.data.decode(), "headers": {}})
+                        if how == "timeout":
+                            time.sleep(2)
+                        if how == "http_500":
+                            raise md.urllib.error.HTTPError(req.full_url, 500, "boom", {}, None)
+                        if how == "demo":
+                            return FakeResponse({"ok": True, "demo": True})
+                        return FakeResponse({"ok": True, "task": {"id": TID, "status": "claimed"}})
+                    return real(req, timeout)
+
+                with mock.patch.object(md.urllib.request, "urlopen", side_effect=urlopen):
+                    self.assertEqual(self.poll(net_budget=0.5), "halt")
+                self.assert_halt("claim_unknown", phase="worker_event")
+                self.assert_no_child()
+                self.assertIsNone((self.ledger / md.BRIDGE_DONE).exists() or None)
+
+    def test_terminal_patch_not_recorded_halts(self):
+        # Finding 7.
+        for reply in ({"ok": True, "demo": True}, {"ok": False}, {}, {"ok": True, "task": {"id": TID, "status": "running"}}):
+            with self.subTest(reply=reply):
+                if self._bridge is not None:
+                    os.close(self._bridge.dir_fd)
+                    self._bridge = None
+                    (self.ledger / md.BRIDGE_JOURNAL).unlink(missing_ok=True)
+                    self.server.queue = [server_task(TID, self.body)]
+                self.server.requests.clear()
+                real = self.server.urlopen
+
+                def urlopen(req, timeout=None, reply=reply):
+                    if req.get_method() == "PATCH" and json.loads(req.data.decode())["status"] in ("done", "failed"):
+                        self.server.requests.append({"method": "PATCH", "path": "/api/tasks/101",
+                                                     "body": req.data.decode(), "headers": {}})
+                        return FakeResponse(reply)
+                    return real(req, timeout)
+
+                with mock.patch.object(md.urllib.request, "urlopen", side_effect=urlopen):
+                    self.assertEqual(self.poll(), "halt")
+                record = self.journal()
+                self.assertEqual(record["halt"]["code"], "claim_unknown")
+                self.assertEqual(record["halt"]["phase"], "result")
+                self.assertFalse((self.ledger / md.BRIDGE_DONE).exists(), "an unrecorded result was marked done")
+
+    def test_single_racy_listing_never_proves_empty(self):
+        # Finding 3: a member forked during the first listing appears only in the second.
+        children = md.BridgeChildren()
+        proc = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        self.addCleanup(proc.wait)
+        self.assertTrue(md._wait_exit_unreaped(proc.pid, 10))
+        birth = children.add(proc, "worker", None)
+        me = os.getpid()
+        empty = {proc.pid: (me, proc.pid, True)}
+        late = {proc.pid: (me, proc.pid, True), 999991: (proc.pid, proc.pid, False)}
+        listings = iter([empty, late])
+        observer = md.BridgeObserver(children, table=lambda: next(listings))
+        identity = stopctl.OwnedIdentity(pid=proc.pid, pgid=proc.pid, role="worker", phase="worker",
+                                         birth=birth, ancestry=(me,))
+        self.assertEqual(observer.observe(identity).status, "unverifiable")
+        # Two complete listings that agree prove it.
+        observer = md.BridgeObserver(children, table=lambda: empty)
+        seen = observer.observe(identity)
+        self.assertEqual((seen.status, seen.group_status), ("absent", "empty"))
+
+        def churn():
+            raise md.BridgeTableIncomplete("vanished")
+
+        observer = md.BridgeObserver(children, table=churn)
+        with self.assertRaises(md.BridgeTableIncomplete):
+            observer.observe(identity)
 
 
 class BridgeStopTests(BridgeHarness):
@@ -1211,6 +1344,42 @@ class BridgeCodeTests(unittest.TestCase):
                                  and item in list(ast.walk(f))]
                         self.assertEqual((name, owner[-1:]), ("BridgeSignalPort", ["signal_group"]),
                                          f"{called} called from {name}")
+
+
+class CodeRabbit215Startup(BridgeStartupTests):
+    def test_second_instance_refused(self):
+        # Finding 5: a second dispatcher on the same ledger exits invalid_config and touches nothing.
+        dir_fd = os.open(str(self.ledger), os.O_RDONLY)
+        self.addCleanup(os.close, dir_fd)
+        held = md.bridge_lock_ledger(dir_fd)
+        self.addCleanup(os.close, held)
+        (self.ledger / md.BRIDGE_JOURNAL).write_text("{}\n")
+        before = sorted((p.name, p.stat().st_mtime_ns) for p in self.ledger.iterdir())
+        code, err = self.start()
+        self.assertEqual(code, 2)
+        self.assertIn("code=invalid_config phase=startup", err)
+        self.assertNotIn("stop_journal_present", err, "the journal was looked at under another instance")
+        self.assertEqual(sorted((p.name, p.stat().st_mtime_ns) for p in self.ledger.iterdir()), before)
+
+    def test_fifo_config_does_not_hang(self):
+        # Findings 1 and 2: a FIFO is refused, not waited on.
+        fifo = self.base / "bridge.fifo"
+        os.mkfifo(fifo)
+        # Each read runs under a deadline, so a blocking open fails the test instead of hanging it.
+        def refused(fn):
+            try:
+                return md.bridge_bounded(fn, 3.0)
+            except md.BridgeHalt as h:
+                return h.code
+
+        self.assertEqual(refused(lambda: md.bridge_read_config({"MC_BRIDGE_CONFIG": str(fifo)})),
+                         "invalid_config")
+        dir_fd = os.open(str(self.ledger), os.O_RDONLY)
+        self.addCleanup(os.close, dir_fd)
+        os.mkfifo(self.ledger / "handoff.json")
+        self.assertEqual(refused(lambda: drb.load_handoff_rows(AUTHORITY, dir_fd=dir_fd)), "ledger_unreadable")
+        os.mkfifo(self.ledger / md.BRIDGE_DONE)
+        self.assertEqual(refused(lambda: md.BridgeDoneRecord(dir_fd).load()), "invalid_config")
 
 
 if __name__ == "__main__":

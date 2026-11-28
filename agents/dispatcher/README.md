@@ -708,6 +708,12 @@ Each poll, per platform:
    `<ledger_dir>/dispatcher-done.json` with an atomic, fsynced write, and only
    then `confirm_cleanup_durable()` clears `<ledger_dir>/dispatcher-stop.json`.
    A row whose task id is in `dispatcher-done.json` is never a candidate again.
+   Every task PATCH in bridge mode (`running`, `review`, and the result) counts
+   only when the reply is `{ok: true, task}` with the requested id and status
+   and no demo flag. A failed or timed-out `running`/`review` PATCH may still
+   land later, so it holds the payload and halts `claim_unknown` (phase
+   `worker_event`/`reviewer_event`); an unrecorded result halts
+   `claim_unknown` (phase `result`) and is not added to the done record.
    An unreadable or unparsable `dispatcher-done.json` halts `invalid_config`
    (it is never read as empty); a failed append keeps the journal and halts
    `claim_unknown` (phase `result`).
@@ -735,10 +741,21 @@ unreaped child until it is signalled (exit status 3). An existing
 `dispatcher-stop.json` at startup is `stop_journal_present`: no claim, and the
 file is left untouched.
 
-Rollback: stop new claims (create the `stop_file`), set `MC_BRIDGE_ENABLED=0`
-or unset it, restart on the last known good revision, keep `handoff.json`,
-`dispatcher-stop.json` and `dispatcher-done.json`, and reconcile every claimed task and every retained
-journal before removing anything.
+Rollback, in this order:
+
+1. Stop new claims: create the `stop_file`, then signal the bridge dispatcher.
+   Do not start the legacy (non-bridge) dispatcher yet.
+2. Confirm that every process group named in `dispatcher-stop.json` is gone.
+3. Reconcile the worktree (remove a left-over `ak-skills` block, check the
+   lock), the claimed task on the server, and every retained journal. Keep
+   `handoff.json`, `dispatcher-stop.json` and `dispatcher-done.json` until then.
+4. Only then set `MC_BRIDGE_ENABLED=0` or unset it, and restart on the last
+   known good revision. Legacy dispatch stays stopped until step 3 is done,
+   because it would otherwise claim work in a worktree that is not reconciled.
+
+Only one bridge dispatcher may use a ledger: each holds an exclusive lock on
+`<ledger_dir>/dispatcher.lock` from before the journal check until it exits,
+and a second one stops with `invalid_config` without touching anything.
 
 Limits: one host and one ledger. Two unfinished acknowledged rows for the
 same host and platform are `duplicate_candidate`. The skill pointers stay in `AGENTS.md`

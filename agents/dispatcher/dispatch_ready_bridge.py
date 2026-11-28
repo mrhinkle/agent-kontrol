@@ -1302,7 +1302,8 @@ def load_handoff_rows(authority: str, *, dir_fd: int) -> object:
     written under another authority. A missing file is an empty ledger.
     """
     try:
-        fd = os.open("handoff.json", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd)
+        # O_NONBLOCK: a FIFO planted at this name cannot hang the open; fstat refuses it below.
+        fd = os.open("handoff.json", os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd)
     except FileNotFoundError:
         return ()
     except OSError:
