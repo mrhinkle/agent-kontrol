@@ -24,6 +24,7 @@ if [ "$#" -eq 0 ]; then
   set -- test_ak_stop_control
 fi
 exec docker run --rm \
+  --pull=never \
   --network none \
   --pids-limit 128 \
   --cap-drop ALL \

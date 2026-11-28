@@ -609,13 +609,21 @@ the lock.
   `present` with the same role, phase, birth, ancestry, pid, and pgid. Pid 1
   or lower, the controller's own pid, and its own group are never signalled.
   `evaluate_target` never reports ownership and never authorizes anything.
-- Stop sends `SIGTERM`, waits through the injected grace and stop budget,
-  sends `SIGKILL` only while the identity still matches, and observes once
-  more after every attempted signal. Recovery is released only when that
+- Stop sends `SIGTERM`, waits through the injected grace (never past the
+  stop budget), and sends `SIGKILL` only while the identity still matches.
+  Containment can be confirmed only by an observation made after the last
+  signal and inside the stop budget. Recovery is released only when that
   observation echoes every registered field and reports the group empty, or
-  when the port reported the group absent and the final look agrees. A
-  timeout, an uncertain port result, a reused, foreign, or unverifiable
-  identity, or a failed journal write keeps recovery.
+  when the port reported the group absent and that observation agrees. Paths
+  that already keep recovery make no further observation: an uncertain port
+  result, a timeout, or an observer that answers after the budget. A reused,
+  foreign, or unverifiable identity, or a failed journal write, also keeps
+  recovery.
+- The journal port must leave its last record intact when `clear()` raises.
+  The controller cannot detect a `clear()` that deletes and then raises.
+- A reviewer launch ticket and a cleanup reservation never coexist, in either
+  order. A repeated stop after confirmed containment keeps that proof and
+  does not recreate a cleared journal.
 - Claims follow #173. `note_claimed(task_id, exact_claim=...)` has no default
   for `exact_claim`. Only `True`, for a claim sent with that `task_id`, sets
   `exact_task_match_proven` in the decision and the journal. A stop while the
@@ -634,6 +642,7 @@ is not PID 1 there.
 ```bash
 docker pull python:3.12-bookworm   # the runner refuses to pull
 sh tests/unit/run_ak_stop_control_virtual.sh
+docker pull python:3.9-slim
 AK_STOP_CONTROL_IMAGE=python:3.9-slim sh tests/unit/run_ak_stop_control_virtual.sh
 ```
 

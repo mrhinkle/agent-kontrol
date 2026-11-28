@@ -43,6 +43,13 @@ required. Only ``exact_claim=True``, meaning the claim was sent with that
 A miss has no transition here; the caller reports it as unknown, which fails
 closed.
 
+Journal port contract: ``persist(record)`` either stores the record durably
+and returns, or raises. ``clear()`` either removes the record and returns, or
+raises and leaves the last stored record intact. A ``clear`` that removes the
+record and then raises breaks this contract, and the controller cannot detect
+it. ``exact_task_match_proven`` is reported to the caller only after a write
+that recorded the exact claim succeeded.
+
 ``finish`` does not clear the injected journal. It only records that pointer
 cleanup and lock release are permitted. The caller performs both actions.
 ``confirm_cleanup_durable`` then requires an explicit confirmation that both
@@ -212,6 +219,7 @@ class StopController:
         self._claim_hold_only = False
         self._claim_id: int | None = None
         self._exact_claim = False
+        self._exact_claim_durable = False
         self._journal_failed = False
         self._claim_left_truthful = False
         self._ticket: str | None = None
@@ -328,6 +336,9 @@ class StopController:
                 return self._decision(start, allowed=False, code="review_requires_worker_exit")
             if self._ticket is not None or self._owned:
                 return self._decision(start, allowed=False, code="launch_in_progress")
+            if self._cleanup_state != "none":
+                # finish() already reserved cleanup. Launch and cleanup never overlap.
+                return self._decision(start, allowed=False, code="cleanup_reserved")
             self._ticket = role
             self._outcome = "launch_open"
             if not self._persist():
@@ -403,6 +414,9 @@ class StopController:
                 return self._decision(start, allowed=False, code="invalid_transition")
             if self._stop_requested():
                 return self._cancel_ack_for_stop(start)
+            if self._recovery_retained:
+                # A journal failure or an unconfirmed exit already holds recovery.
+                return self._decision(start, allowed=False, code="recovery_retained")
             self._ack = "confirmed"
             self._outcome = "ack_confirmed"
             if not self._persist():
@@ -441,6 +455,11 @@ class StopController:
     def request_stop(self) -> Decision:
         with self._hold():
             start = self._mark()
+            if self._cleanup_state == "cleared":
+                # The round is over and its journal is gone. Do not recreate it.
+                return self._decision(start, allowed=False, code=self._outcome)
+            if self._containment_already_proven():
+                return self._reuse_containment_proof(start)
             if self._claim_window and self._claim_id is None:
                 # The caller was already released. The external claim may have committed.
                 self._stopped = True
@@ -522,6 +541,35 @@ class StopController:
                 claim_left_truthful=self._claim_left_truthful,
             )
 
+    def _containment_already_proven(self) -> bool:
+        """True when a stop has nothing left to contain and the group is confirmed."""
+        return (
+            self._group_confirmed
+            and not self._recovery_retained
+            and not self._owned
+            and self._ticket is None
+            and not self._claim_window
+            and self._ack not in ("pending", "failed")
+        )
+
+    def _reuse_containment_proof(self, start: int) -> Decision:
+        """A stop after confirmed containment keeps that proof.
+
+        No ticket and no identity can appear after a stop, so a repeated stop
+        writes nothing. A first stop after a confirmed exit records the stop.
+        """
+        if self._claim_id is not None:
+            self._claim_left_truthful = True
+        if self._stopped:
+            return self._decision(start, allowed=False, code=self._outcome,
+                                  claim_left_truthful=self._claim_left_truthful)
+        self._stopped = True
+        self._outcome = "stopped_after_exit"
+        if not self._persist():
+            return self._journal_failure(start, claim_left_truthful=self._claim_left_truthful)
+        return self._decision(start, allowed=False, code="stopped_after_exit",
+                              claim_left_truthful=self._claim_left_truthful)
+
     def finish(self, *, phase_completed: bool) -> Decision:
         """Permit cleanup. The recovery journal stays until durable confirmation."""
         with self._hold():
@@ -537,6 +585,8 @@ class StopController:
                 )
             if self._recovery_retained or self._cleanup_state == "uncertain":
                 return self._decision(start, allowed=False, code="recovery_retained")
+            if self._ticket is not None:
+                return self._decision(start, allowed=False, code="launch_in_progress")
             if not self._cleanup_base():
                 return self._decision(start, allowed=False, code="recovery_retained")
             if self._cleanup_state == "pending":
@@ -559,7 +609,9 @@ class StopController:
         This method does not perform either action. The confirmation is written
         into the injected journal first. ``clear`` runs only after that write
         succeeds. Any other confirmation, or a failed write or clear, leaves
-        the journal in place and retains recovery.
+        the journal in place and retains recovery. "In place" relies on the
+        journal port contract: a ``clear`` that raises must not have removed
+        the record.
         """
         with self._hold():
             start = self._mark()
@@ -572,6 +624,8 @@ class StopController:
                 )
             if self._recovery_retained or self._cleanup_state in ("uncertain", "confirmed"):
                 return self._decision(start, allowed=False, code="recovery_retained")
+            if self._ticket is not None:
+                return self._decision(start, allowed=False, code="launch_in_progress")
             if self._cleanup_state != "pending" or not self._cleanup_base():
                 return self._reject_cleanup(start)
             if not _explicit_cleanup_confirmation(confirmation):
@@ -628,6 +682,9 @@ class StopController:
             self._hold_after_stop("timeout")
             return
         kind, seen, result = self._attempt(identity, SIGTERM)
+        if kind == "late":
+            self._hold_after_stop("timeout")
+            return
         if result is None and kind == "match":
             self._hold_after_stop("signal_refused")
             return
@@ -644,6 +701,9 @@ class StopController:
             self._hold_after_stop("timeout")
             return
         kind, seen, result = self._attempt(identity, SIGKILL)
+        if kind == "late":
+            self._hold_after_stop("timeout")
+            return
         if result is None:
             # This observation followed SIGTERM and is its final observation.
             self._finish_after_signal(identity, kind, seen, port_absent=False)
@@ -679,6 +739,10 @@ class StopController:
 
     def _final_observation(self, identity: OwnedIdentity, *, port_absent: bool) -> None:
         kind, seen = self._observe(identity)
+        if not self._time_left():
+            # A late answer cannot confirm containment.
+            self._hold_after_stop("timeout")
+            return
         self._finish_after_signal(identity, kind, seen, port_absent=port_absent)
 
     def _finish_after_signal(self, identity: OwnedIdentity, kind: str, seen: object, *, port_absent: bool) -> None:
@@ -735,6 +799,9 @@ class StopController:
         that is no longer a match does not authorize another signal.
         """
         kind, seen = self._observe(identity)
+        if not self._time_left():
+            # The observer returned after the stop budget. Its answer is stale.
+            return "late", seen, None
         if kind != "match" or not self._signal_allowed(identity):
             return kind, seen, None
         if identity.role not in self._owned or self._owned.get(identity.role) != identity:
@@ -852,10 +919,11 @@ class StopController:
         return now is not None and now < self._stop_deadline
 
     def _pause(self) -> bool:
-        if not self._time_left():
+        now = self._now()
+        if now is None or now >= self._stop_deadline:
             return False
         try:
-            self._wait(self._grace)
+            self._wait(min(self._grace, self._stop_deadline - now))
         except Exception:
             return False
         return self._time_left()
@@ -875,6 +943,8 @@ class StopController:
         except Exception:
             self._journal_failed = True
             return False
+        if self._claim_id is not None and self._exact_claim is True:
+            self._exact_claim_durable = True
         self._journal_open = True
         return True
 
@@ -920,7 +990,8 @@ class StopController:
                 for identity in self._owned.values()
             ],
             "task_marked_done": False,
-            "exact_task_match_proven": self._exact_match_proven(),
+            # This record itself carries the exact claim, so it may state it.
+            "exact_task_match_proven": self._claim_id is not None and self._exact_claim is True,
             "requeue": False,
             "lock_release_permitted": unlock,
             "pointer_cleanup_permitted": cleanup,
@@ -988,6 +1059,9 @@ class StopController:
 
     def _journal_failure(self, start: int, *, claim_left_truthful: bool = False) -> Decision:
         """A journal write failed. Do not permit claim, launch, review, or cleanup."""
+        if claim_left_truthful:
+            # Set before the fallback write so the record and the decision agree.
+            self._claim_left_truthful = True
         self._recovery_retained = True
         self._claim_hold_only = False
         self._group_confirmed = False
@@ -1042,7 +1116,8 @@ class StopController:
         )
 
     def _exact_match_proven(self) -> bool:
-        return self._claim_id is not None and self._exact_claim is True
+        # Reported only after a successful journal write recorded the exact claim.
+        return self._exact_claim_durable
 
     def _mark(self) -> int:
         return len(self._signals)

@@ -1948,6 +1948,7 @@ class StopControlTests(unittest.TestCase):
         ctl, fake, observer, _journal, _clock = self.controller()
         self.register_worker(ctl)
         stranger = worker(pid=101, pgid=101, birth="birth-stranger")
+        ctl._stop_deadline = float("inf")
         kind, _seen, result = ctl._attempt(stranger, stop.SIGTERM)
         self.assertEqual(kind, "match")
         self.assertIsNone(result)
@@ -2200,6 +2201,187 @@ class StopControlTests(unittest.TestCase):
                 self.assertTrue(path.is_file(), f"{path} is not mounted; the check would be vacuous")
                 self.assertNotIn("ak_stop_control", path.read_text(encoding="utf-8"))
                 self.assertNotIn("StopController", path.read_text(encoding="utf-8"))
+
+    # ---- #214 review (CodeRabbit) ----
+
+    def test_ack_refused_while_recovery_is_retained(self):
+        journal = Journal(fail=lambda record: record.get("outcome") == "still_running")
+        ctl, fake, _observer, _stored, _clock = self.controller(journal=journal)
+        self.claim(ctl)
+        self.assertEqual(ctl.begin_launch("worker").code, "launch_open")
+        self.assertEqual(ctl.register(worker()).code, "registered")
+        failed = ctl.confirm_phase_exit("worker")
+        self.assertEqual(failed.code, "journal_failed")
+        self.assertTrue(failed.recovery_retained)
+        decision = ctl.confirm_ack()
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.code, "recovery_retained")
+        self.assertTrue(decision.recovery_retained)
+        self.assertNotIn("confirmed", [record["ack"] for record in journal.records])
+        self.assert_signal_log(fake, [])
+
+    def test_repeated_stop_keeps_confirmed_containment(self):
+        ctl, fake, _observer, journal, _clock = self.controller()
+        fake.results = ["absent"]
+        self.register_worker(ctl)
+        first = ctl.request_stop()
+        self.assertEqual(first.code, "stopped_group_absent")
+        before = len(journal.records)
+        again = ctl.request_stop()
+        self.assertEqual(again.code, "stopped_group_absent")
+        self.assertFalse(again.recovery_retained)
+        self.assertTrue(again.group_confirmed)
+        self.assertEqual(len(journal.records), before)
+        self.assertEqual(ctl.finish(phase_completed=False).code, "cleanup_pending")
+        self.assertEqual(ctl.confirm_cleanup_durable(durable_cleanup()).code, "cleanup_confirmed")
+        self.assertEqual(journal.records, [])
+        late = ctl.request_stop()
+        self.assertFalse(late.allowed)
+        self.assertEqual(journal.records, [])
+        self.assertEqual(journal.clears, 1)
+        self.assert_signal_log(fake, [(100, stop.SIGTERM)])
+
+    def test_stop_after_confirmed_exit_reuses_the_proof(self):
+        ctl, fake, observer, journal, _clock = self.controller()
+        self.register_worker(ctl)
+        observer.script.append(absent_group)
+        self.assertEqual(ctl.confirm_phase_exit("worker").code, "stopped_group_absent")
+        decision = ctl.request_stop()
+        self.assertEqual(decision.code, "stopped_after_exit")
+        self.assertFalse(decision.recovery_retained)
+        self.assertTrue(decision.group_confirmed)
+        self.assertTrue(decision.claim_left_truthful)
+        self.assertEqual(journal.snapshot()["outcome"], "stopped_after_exit")
+        self.assertTrue(journal.snapshot()["stopped"])
+        self.assertEqual(ctl.begin_launch("reviewer").code, "launch_after_stop")
+        self.assertEqual(ctl.finish(phase_completed=True).code, "cleanup_pending")
+        self.assert_signal_log(fake, [])
+
+    def test_stop_after_a_cleared_journal_writes_nothing(self):
+        ctl, fake, observer, journal, _clock = self.controller()
+        self.register_worker(ctl)
+        observer.script.append(absent_group)
+        self.assertEqual(ctl.confirm_phase_exit("worker").code, "stopped_group_absent")
+        self.assertEqual(ctl.finish(phase_completed=True).code, "cleanup_pending")
+        self.assertEqual(ctl.confirm_cleanup_durable(durable_cleanup()).code, "phase_finished")
+        self.assertEqual(journal.records, [])
+        decision = ctl.request_stop()
+        self.assertFalse(decision.allowed)
+        self.assertEqual(journal.records, [])
+        self.assertEqual(journal.clears, 1)
+        self.assertEqual(ctl.phase, "finished")
+        self.assert_signal_log(fake, [])
+
+    def test_observer_answer_after_the_budget_does_not_signal(self):
+        ctl, fake, observer, journal, clock = self.controller(stop_budget=5)
+        self.register_worker(ctl)
+
+        def slow_match(identity):
+            clock.now += 6
+            return matching(identity)
+
+        observer.script.append(slow_match)
+        decision = ctl.request_stop()
+        self.assertEqual(decision.code, "timeout")
+        self.assertTrue(decision.recovery_retained)
+        self.assertEqual(decision.registered_pgids, (100,))
+        self.assertEqual(ctl.finish(phase_completed=True).code, "recovery_retained")
+        self.assertEqual(journal.clears, 0)
+        self.assert_signal_log(fake, [])
+
+    def test_late_final_observation_does_not_confirm_containment(self):
+        ctl, fake, observer, journal, clock = self.controller(stop_budget=5)
+        self.register_worker(ctl)
+        fake.results = ["absent"]
+
+        def slow_absent(identity):
+            clock.now += 6
+            return absent_group(identity)
+
+        observer.script.extend([matching, slow_absent])
+        decision = ctl.request_stop()
+        self.assertEqual(decision.code, "timeout")
+        self.assertTrue(decision.recovery_retained)
+        self.assertFalse(decision.group_confirmed)
+        self.assertEqual(ctl.finish(phase_completed=True).code, "recovery_retained")
+        self.assertEqual(journal.clears, 0)
+        self.assert_signal_log(fake, [(100, stop.SIGTERM)])
+
+    def test_wait_is_capped_at_the_remaining_budget(self):
+        ctl, fake, _observer, _journal, clock = self.controller(grace=10, stop_budget=5)
+        fake.results = ["delivered"]
+        self.register_worker(ctl)
+        start = clock.now
+        decision = ctl.request_stop()
+        self.assertEqual(decision.code, "timeout")
+        self.assertEqual(clock.now - start, 5)
+        self.assert_signal_log(fake, [(100, stop.SIGTERM)])
+
+    def _worker_exited(self):
+        ctl, fake, observer, journal, _clock = self.controller()
+        self.register_worker(ctl)
+        observer.script.append(absent_group)
+        self.assertEqual(ctl.confirm_phase_exit("worker").code, "stopped_group_absent")
+        return ctl, fake, journal
+
+    def test_open_reviewer_ticket_blocks_cleanup(self):
+        ctl, fake, journal = self._worker_exited()
+        self.assertEqual(ctl.begin_launch("reviewer").code, "launch_open")
+        finished = ctl.finish(phase_completed=True)
+        self.assertFalse(finished.allowed)
+        self.assertEqual(finished.code, "launch_in_progress")
+        self.assertFalse(finished.pointer_cleanup_permitted)
+        self.assertFalse(finished.lock_release_permitted)
+        confirmed = ctl.confirm_cleanup_durable(durable_cleanup())
+        self.assertFalse(confirmed.allowed)
+        self.assertEqual(confirmed.code, "launch_in_progress")
+        self.assertEqual(journal.clears, 0)
+        self.assertEqual(journal.snapshot()["cleanup_state"], "none")
+        self.assertEqual(ctl.register(reviewer()).code, "registered")
+        self.assert_signal_log(fake, [])
+
+    def test_cleanup_reservation_blocks_reviewer_launch(self):
+        ctl, fake, journal = self._worker_exited()
+        self.assertEqual(ctl.finish(phase_completed=False).code, "cleanup_pending")
+        launch = ctl.begin_launch("reviewer")
+        self.assertFalse(launch.allowed)
+        self.assertEqual(launch.code, "cleanup_reserved")
+        self.assertIsNone(journal.snapshot()["launch_ticket"])
+        self.assertEqual(ctl.confirm_cleanup_durable(durable_cleanup()).code, "cleanup_confirmed")
+        self.assertEqual(ctl.begin_launch("reviewer").code, "cleanup_reserved")
+        self.assert_signal_log(fake, [])
+
+    def test_failed_claim_record_states_the_claim_left_truthful(self):
+        journal = Journal(fail=lambda record: record.get("outcome") == "claimed")
+        ctl, fake, _observer, _stored, _clock = self.controller(journal=journal)
+        self.assertEqual(ctl.before_claim().code, "claim_permitted")
+        decision = ctl.note_claimed(TASK_ID, exact_claim=True)
+        self.assertEqual(decision.code, "journal_failed")
+        self.assertTrue(decision.claim_left_truthful)
+        fallback = journal.snapshot()
+        self.assertEqual(fallback["outcome"], "journal_failed")
+        self.assertEqual(fallback["claim"]["task_id"], TASK_ID)
+        self.assertIs(fallback["claim"]["left_truthful"], True)
+        self.assert_signal_log(fake, [])
+
+    def test_exact_claim_not_reported_without_a_durable_write(self):
+        journal = Journal(fail=lambda record: record.get("claim") is not None)
+        ctl, fake, _observer, _stored, _clock = self.controller(journal=journal)
+        self.assertEqual(ctl.before_claim().code, "claim_permitted")
+        decision = ctl.note_claimed(TASK_ID, exact_claim=True)
+        self.assertEqual(decision.code, "journal_failed")
+        self.assertFalse(decision.exact_task_match_proven)
+        self.assertIsNone(journal.snapshot()["claim"])
+        self.assertFalse(ctl.request_stop().exact_task_match_proven)
+
+        journal = Journal(fail=lambda record: record.get("outcome") == "claimed")
+        ctl, _fake, _observer, _stored, _clock = self.controller(journal=journal)
+        self.assertEqual(ctl.before_claim().code, "claim_permitted")
+        decision = ctl.note_claimed(TASK_ID, exact_claim=True)
+        self.assertEqual(decision.code, "journal_failed")
+        self.assertIs(journal.snapshot()["claim"]["exact_task_match_proven"], True)
+        self.assertTrue(decision.exact_task_match_proven)
+        self.assert_signal_log(fake, [])
 
 if __name__ == "__main__":
     unittest.main()
