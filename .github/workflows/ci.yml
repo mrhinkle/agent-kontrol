@@ -39,6 +39,13 @@ jobs:
         run: >-
           docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/w" -w /w python:3.9-slim
           sh -ec "python3.9 -m unittest discover -s tests/unit -p 'test_broker*.py' -v && python3.9 -m py_compile agents/broker/*.py"
+      - name: Stop control virtual tests in a private PID namespace (#211)
+        # From Google's Docker Hub mirror, for the rate-limit reason given on the postgres job. The runner
+        # itself refuses to pull, so the image is fetched and tagged here first.
+        run: |
+          docker pull mirror.gcr.io/library/python:3.12-bookworm
+          docker tag mirror.gcr.io/library/python:3.12-bookworm python:3.12-bookworm
+          sh tests/unit/run_ak_stop_control_virtual.sh
       - name: Lane user checker syntax (#193)
         run: bash -n agents/dispatcher/lane-user-check.sh
       - name: Lane user checker shellcheck (#193)

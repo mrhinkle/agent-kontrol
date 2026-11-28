@@ -590,6 +590,53 @@ is 1 through 3, and 3 is already P2.
 python3 -m unittest tests.unit.test_dispatch_ready_bridge -v
 ```
 
+## Stop control (source only, #211)
+
+`ak_stop_control.py` is the stop control for one dispatcher round: a pure
+state machine for claim, launch, acknowledgment, stop, and finish. It is
+source only. Nothing imports it, `mc_dispatcher.py`, `ak_skill_launch.py`,
+and `dispatch_ready_bridge.py` are unchanged, and no concrete signal port
+exists. Adding a real signal port, wiring it into the dispatcher, or
+activating it is Tier C and needs Mark's approval.
+
+The module starts no process, reads no environment or file, opens no claim
+route, and makes no signal syscall. The caller injects the stop predicate,
+the identity observer, the signal port, the journal, the clock, the wait, and
+the lock.
+
+- A stored pid or pgid is never ownership. The port is called only for a
+  registered identity that the observer has just shown, under the lock, to be
+  `present` with the same role, phase, birth, ancestry, pid, and pgid. Pid 1
+  or lower, the controller's own pid, and its own group are never signalled.
+  `evaluate_target` never reports ownership and never authorizes anything.
+- Stop sends `SIGTERM`, waits through the injected grace and stop budget,
+  sends `SIGKILL` only while the identity still matches, and observes once
+  more after every attempted signal. Recovery is released only when that
+  observation echoes every registered field and reports the group empty, or
+  when the port reported the group absent and the final look agrees. A
+  timeout, an uncertain port result, a reused, foreign, or unverifiable
+  identity, or a failed journal write keeps recovery.
+- Claims follow #173. `note_claimed(task_id, exact_claim=...)` has no default
+  for `exact_claim`. Only `True`, for a claim sent with that `task_id`, sets
+  `exact_task_match_proven` in the decision and the journal. A stop while the
+  claim reply is outstanding is `claim_unresolved` and refuses launch and
+  cleanup. A stop after registration and before acknowledgment is
+  `ack_after_stop` and authorizes no execution.
+- `finish` never clears the journal. `confirm_cleanup_durable` clears it only
+  after a `complete`/`complete`/`durable=True` confirmation has been persisted.
+
+`tsconfig.json` excludes `agents`, so `pnpm run typecheck` does not cover this
+module. The proof is the virtual runner. It runs the suite as PID 1 in a
+private PID namespace (`python:3.12-bookworm`, no network, no capabilities,
+read-only source). Ordinary `pnpm test` discovery skips the suite, because it
+is not PID 1 there.
+
+```bash
+docker pull python:3.12-bookworm   # the runner refuses to pull
+sh tests/unit/run_ak_stop_control_virtual.sh
+AK_STOP_CONTROL_IMAGE=python:3.9-slim sh tests/unit/run_ak_stop_control_virtual.sh
+```
+
 ## Tests
 
 `python3 -m unittest tests.unit.test_dispatcher_skills -v` (also part of
