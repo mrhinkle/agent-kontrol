@@ -1499,7 +1499,10 @@ class Run:
             out["retained"] = {"workspaces": [str(ws.root) for ws in self.workspaces]}
             out["ok"] = False
             self.incident = {"code": out["code"], "scenario": ctx.get("scenario"), "at": utc_now()}
-            return out  # keep processes, workspaces, proxies and the registry: stop-and-reconcile, no retry
+            # The sentinel is the runner's own control process, not evidence: reap it (M2) even here.
+            out["sentinels"] = [sen.cleanup() for sen in self.sentinels]
+            self.sentinels = []
+            return out  # keep dispatchers, workspaces, proxies and the registry: stop-and-reconcile, no retry
         for disp in self.dispatchers:
             out.setdefault("logs", []).append(publish_log(disp.log_path, disp.publish_path))
         for s in self.sentinels:
