@@ -2423,7 +2423,9 @@ class BridgeRunner:
             try:
                 self.on_ack()  # the authenticated work event, before the payload runs (C8)
             except Exception:
-                pass
+                # No recorded work event: the payload must not run. EOF retires the gate unexecuted.
+                self._abandon(proc, write_fd, identity, registered=True)
+                raise BridgeHalt("claim_unknown", f"{role}_event", task_id=bridge.task_id) from None
             bridge.boundary(f"{role}_acked")
             try:
                 _write_fd_all(write_fd, release)
@@ -2646,7 +2648,17 @@ class BridgeDispatcher:
             return redact_broker(value, needles)
 
         def note(kind: str, title: str, detail: dict | None = None) -> None:
-            self.net(lambda: ingest(kind, scrub(title), agent_id, platform, scrub(detail)))
+            """The authenticated work event, strict (C8): raises unless the server recorded it.
+
+            Same body as ingest(), under the bridge's one deadline. A transport
+            error, timeout, non-2xx, malformed reply, ok other than true, or a
+            demo deployment that dropped the event all raise.
+            """
+            event = {"agent_id": agent_id, "platform": platform, "machine": HOSTNAME,
+                     "kind": kind, "title": scrub(title), "detail": scrub(detail or {})}
+            resp = self.net(lambda: api("/api/ingest", event))
+            if not isinstance(resp, dict) or resp.get("ok") is not True or resp.get("demo") is True:
+                raise RuntimeError("work event not recorded")
 
         def patch_task(payload: dict) -> dict:
             return self.net(lambda: api(f"/api/tasks/{tid}", scrub(payload), "PATCH"))

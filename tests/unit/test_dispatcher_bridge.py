@@ -133,6 +133,8 @@ class FakeServer:
             q = md.urllib.parse.parse_qs(split.query)
             return FakeResponse({"demo": False, "lane": q["lane"][0], "runtime": q["runtime"][0],
                                  "empty": False, "block": BLOCK})
+        if split.path == "/api/ingest":
+            return FakeResponse({"ok": True})
         return FakeResponse({})
 
 
@@ -744,6 +746,57 @@ class BridgeDoneRecordTests(BridgeHarness):
         self.assertEqual(record["halt"]["phase"], "result")
         self.assertIsNone(self.done_record())
         self.assertEqual(len(self.result_patches()), 1, "exactly one result PATCH, no retry")
+
+
+class BridgeStrictEvent(BridgeHarness):
+    """Codex review on ebc03a1: a work event that is not recorded must hold the child."""
+
+    def failing_ingest(self, how):
+        real = self.server.urlopen
+
+        def urlopen(req, timeout=None):
+            split = md.urllib.parse.urlsplit(req.full_url)
+            if split.path == "/api/ingest" and json.loads(req.data.decode())["kind"] == "status":
+                self.server.requests.append({"method": "POST", "path": split.path,
+                                             "body": req.data.decode(), "headers": {}})
+                if how == "http_500":
+                    raise md.urllib.error.HTTPError(req.full_url, 500, "boom", {}, None)
+                if how == "transport":
+                    raise md.urllib.error.URLError("connection reset")
+                if how == "timeout":
+                    time.sleep(2)
+                    return FakeResponse({"ok": True})
+                if how == "malformed":
+                    resp = FakeResponse({})
+                    resp.data = b"<html>"
+                    return resp
+                return FakeResponse({"ok_false": {"ok": False}, "demo": {"ok": True, "demo": True},
+                                     "not_object": [1]}[how])
+            return real(req, timeout)
+
+        return urlopen
+
+    def test_failed_status_event_holds_child(self):
+        for how in ("http_500", "transport", "timeout", "malformed", "ok_false", "demo", "not_object"):
+            with self.subTest(failure=how):
+                if self._bridge is not None:
+                    held = self._bridge.held or {}
+                    if held.get("lock") is not None:
+                        held["lock"].release()
+                    if held.get("injection") is not None:
+                        ak_pointers.cleanup(held["injection"])
+                    os.close(self._bridge.dir_fd)
+                    self._bridge = None
+                    (self.ledger / md.BRIDGE_JOURNAL).unlink()
+                    self.server.queue = [server_task(TID, self.body)]
+                self.server.requests.clear()
+                with mock.patch.object(md.urllib.request, "urlopen", side_effect=self.failing_ingest(how)):
+                    self.assertEqual(self.poll(net_budget=0.5), "halt")
+                record = self.assert_halt("claim_unknown", phase="worker_event")
+                self.assertEqual(record["controller"]["claim"]["task_id"], TID)
+                self.assert_no_child()
+                self.assertEqual(self.bridge().signals.sent, [], "the gate is retired by EOF, not a signal")
+                self.assertIsNotNone(self.agents_md(), "no cleanup after a halt")
 
 
 class BridgeStopTests(BridgeHarness):

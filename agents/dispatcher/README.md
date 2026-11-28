@@ -693,7 +693,11 @@ Each poll, per platform:
 4. Each phase (worker, then reviewer when the row names one) runs through a
    gated child: `begin_launch`, spawn, `register`, `confirm_ack`, the
    authenticated `status` work event with `detail.task_id`, and only then is
-   the payload released. The registered identity is the process-group leader,
+   the payload released. The work event is strict: a transport error, timeout,
+   non-2xx, malformed reply, `ok` other than `true`, or a demo deployment that
+   dropped it keeps the payload unreleased; the gate exits on EOF, the
+   controller retires it, and the round halts `claim_unknown` (phase
+   `worker_event` or `reviewer_event`) with the journal kept. The registered identity is the process-group leader,
    or the `sudo` wrapper with `MC_LANE_USER`. The wait wakes on the stop
    predicate, `SIGTERM`/`SIGINT`, the task timeout and errors, and each of
    those goes to `request_stop()`. The leader is reaped only after the
