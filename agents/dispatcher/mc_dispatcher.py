@@ -44,6 +44,9 @@ Config via environment (or ~/.claude/mission-control.env, read by main() only):
   MC_LANE_USER           optional unprivileged OS user that runs every agent CLI, through
                          sudo and the documented sudoers rule (#193, Linux only). Set and
                          unusable, the task fails closed; it never falls back to this user
+  MC_BRIDGE_ENABLED      exactly "1" turns on bridge mode (#212); any other value or unset
+                         leaves the claim path above unchanged and reads no bridge file
+  MC_BRIDGE_CONFIG       absolute path of the bridge JSON config (read only in bridge mode)
 
 An opt-in outbound SSE listener wakes the normal atomic claim path. While
 connected the fallback poll is max(MC_POLL_SECONDS, 60); when unavailable it
@@ -89,7 +92,9 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import ak_pointers
+import ak_stop_control as stopctl
 import child_env
+import dispatch_ready_bridge as drb
 from dispatch_ready_bridge import bridge_frame_refusal, frame_untrusted_issue
 from run_telemetry import ParsedRun, build_detail, parse_cli_output, resumes_session
 
@@ -117,7 +122,14 @@ def configure() -> None:
     MC_TOKEN = os.environ.get("MC_TOKEN", "")
     WORKDIR = Path(os.environ.get("MC_WORKDIR", "~/Code")).expanduser()
     POLL = int(os.environ.get("MC_POLL_SECONDS", "20"))
-    MAX_CONCURRENT = int(os.environ.get("MC_MAX_CONCURRENT", "2"))
+    if os.environ.get("MC_BRIDGE_ENABLED") == "1":
+        # Bridge startup validates the raw value and halts with invalid_concurrency (#212 H12).
+        try:
+            MAX_CONCURRENT = int(os.environ.get("MC_MAX_CONCURRENT", "2"))
+        except ValueError:
+            MAX_CONCURRENT = 0
+    else:
+        MAX_CONCURRENT = int(os.environ.get("MC_MAX_CONCURRENT", "2"))
     TASK_TIMEOUT = int(os.environ.get("MC_TASK_TIMEOUT", "3600"))
 
 
@@ -604,14 +616,17 @@ def _run_contained_lane(cmd: list[str], cwd: Path, timeout: float, *, env: dict[
 def run_cli(platform: str, prompt: str, cwd: Path, review: bool = False,
             task_id: int | None = None, *,
             env_overlay: Mapping[str, str] | None = None,
-            lane: LaneUser | None = None) -> tuple[bool, str, float | None]:
+            lane: LaneUser | None = None,
+            contained=None) -> tuple[bool, str, float | None]:
     """Run one headless agent turn. Returns (ok, output_text, cost_usd).
 
     env_overlay is written into a fresh copy of build_child_env(platform); no
     shared mapping and not os.environ is changed. Its values are redacted from
     this function's own telemetry. With lane, HOME, USER, LOGNAME and SHELL are
     the lane user's passwd values and the CLI runs as that user (#193).
+    contained replaces run_contained; only bridge mode passes one (#212).
     """
+    runner = run_contained if contained is None else contained
     extra = os.environ.get(f"MC_{platform.split('-')[0].upper()}_ARGS", "").split()
     if platform == "claude-code":
         cmd = ["claude", "-p", prompt, "--output-format", "json"]
@@ -655,10 +670,10 @@ def run_cli(platform: str, prompt: str, cwd: Path, review: bool = False,
                             del env[name]
                 env.update(env_overlay)
             if lane is None:
-                returncode, stdout, stderr = run_contained(cmd, cwd, TASK_TIMEOUT, env=env)
+                returncode, stdout, stderr = runner(cmd, cwd, TASK_TIMEOUT, env=env)
             else:
                 env.update(lane.identity())
-                returncode, stdout, stderr = run_contained(cmd, cwd, TASK_TIMEOUT, env=env, lane=lane)
+                returncode, stdout, stderr = runner(cmd, cwd, TASK_TIMEOUT, env=env, lane=lane)
             finished = time.monotonic()
         except LaneUserUnavailable as e:
             outcome, error_class = "unavailable", "unavailable"
@@ -1642,8 +1657,20 @@ def configured_task_project() -> str | None:
     return value
 
 
-def task_claim_request(platform: str, stream: EventStreamWake | None) -> tuple[dict, dict | None, tuple[int, str, str] | None]:
+def task_claim_request(platform: str, stream: EventStreamWake | None, *, project: str | None = None,
+                       task_id: int | None = None) -> tuple[dict, dict | None, tuple[int, str, str] | None]:
+    """The claim body. With task_id (bridge mode, #212 D22) the exact claim; else the existing body.
+
+    The bridge form names the handoff's project and exact task_id, never reads
+    MC_TASK_PROJECT, and carries no event coverage. The two-argument form is unchanged.
+    """
     body = {"platform": platform, "machine": HOSTNAME, "agent_id": f"{platform}-{HOSTNAME}"}
+    if task_id is not None or project is not None:
+        if type(task_id) is not int or not 1 <= task_id <= stopctl.MAX_TASK_ID:
+            raise ValueError("bridge claim requires a positive safe-integer task_id")
+        if not isinstance(project, str) or LANE_RE.fullmatch(project) is None:
+            raise ValueError("bridge claim requires the handoff's exact project")
+        return {**body, "project": project, "task_id": task_id}, None, None
     project = configured_task_project()
     if project is not None:
         body["project"] = project
@@ -1825,6 +1852,1049 @@ class EventStreamWake:
             backoff = min(30.0, backoff * 2)
 
 
+# ---------------------------------------------------------------------------
+# Bridge mode (#212). Off unless MC_BRIDGE_ENABLED is exactly "1"; then main()
+# calls bridge_main() and nothing above this section's claim loop runs.
+#
+# One host, one ledger, one claim window: an `acknowledged` row in the bridge
+# ledger's handoff.json names a task id, and the dispatcher claims exactly that
+# id on that row's lane. Every stop, launch and cleanup decision goes through
+# ak_stop_control.StopController with the concrete ports below. The only code
+# in bridge mode that sends a signal is BridgeSignalPort.signal_group. Every
+# ambiguous state halts: no child, no done, no requeue, a durable record in
+# <ledger_dir>/dispatcher-stop.json and one bounded stderr line with the code.
+
+BRIDGE_CODES = (
+    "invalid_config", "invalid_concurrency", "ledger_unreadable", "stop_journal_present",
+    "missing_task_id", "conflicting_candidate", "duplicate_candidate", "claim_mismatch",
+    "exact_claim_miss", "claim_unknown", "journal_write_failed", "identity_unverifiable",
+    "stop_requested",
+)
+BRIDGE_PLATFORMS = ("claude-code", "codex", "grok")
+BRIDGE_JOURNAL = "dispatcher-stop.json"
+BRIDGE_CONFIG_MAX_BYTES = 1_048_576
+BRIDGE_NET_BUDGET = 30.0  # one deadline for each bridge network call, whatever the socket does
+BRIDGE_WAIT_SLICE = 0.2  # how often a running child's wait wakes to look at stop and timeout
+BRIDGE_STOP_BUDGET = 3 * KILL_GRACE
+_BRIDGE_ROLE_PHASE = {"worker": "worker", "reviewer": "review"}
+_BRIDGE_NODE_RE = re.compile(r"[A-Za-z0-9_]{1,200}")
+_BRIDGE_PHASE_RE = re.compile(r"[a-z_]{1,40}")
+# H5: internal StopController outcomes -> public codes. Anything else is identity_unverifiable.
+_BRIDGE_STOP_OUTCOMES = frozenset((
+    "stop_before_claim", "stopped_after_claim", "launch_after_stop", "ack_after_stop",
+    "stopped_group_absent", "stopped_after_exit", "stopped_before_launch",
+))
+_BRIDGE_CLAIM_OUTCOMES = frozenset(("claim_unresolved", "claim_unknown"))
+_BRIDGE_JOURNAL_OUTCOMES = frozenset(("journal_failed", "journal_clear_failed", "cleanup_unconfirmed"))
+
+# The gate (H1): a direct child that holds the payload until the controller has
+# registered it and confirmed the ack. It reads one release message from an
+# inherited pipe: b"1" plus the child environment as JSON. EOF or anything else
+# exits 125 without exec. exec keeps the pid, so the registered identity is the
+# process-group leader, which becomes the CLI, or the sudo wrapper with a lane user.
+_BRIDGE_GATE = r"""
+import json, os, sys
+fd = int(sys.argv[1])
+chunks = []
+while True:
+    try:
+        block = os.read(fd, 65536)
+    except OSError:
+        os._exit(125)
+    if not block:
+        break
+    chunks.append(block)
+os.close(fd)
+raw = b"".join(chunks)
+if raw[:1] != b"1":
+    os._exit(125)
+try:
+    env = json.loads(raw[1:].decode("utf-8"))
+    os.execvpe(sys.argv[2], sys.argv[2:], env)
+except Exception:
+    sys.stderr.write("agent CLI could not start\n")
+    os._exit(127)
+"""
+
+
+class BridgeHalt(Exception):
+    """An operator-visible halt. code is one of BRIDGE_CODES; nothing else is logged or stored."""
+
+    def __init__(self, code: str, phase: str, *, task_id: object = None, rows: tuple = ()) -> None:
+        if code not in BRIDGE_CODES:
+            code = "identity_unverifiable"
+        super().__init__(code)
+        self.code = code
+        self.phase = phase if isinstance(phase, str) and _BRIDGE_PHASE_RE.fullmatch(phase) else "unknown"
+        self.task_id = task_id if type(task_id) is int and 1 <= task_id <= stopctl.MAX_TASK_ID else None
+        self.rows = tuple(r for r in rows if isinstance(r, str) and _BRIDGE_NODE_RE.fullmatch(r))[:8]
+
+
+def bridge_public_code(internal: object) -> str:
+    """Map a StopController decision code to the public code (H5)."""
+    if internal in _BRIDGE_STOP_OUTCOMES:
+        return "stop_requested"
+    if internal in _BRIDGE_CLAIM_OUTCOMES:
+        return "claim_unknown"
+    if internal in _BRIDGE_JOURNAL_OUTCOMES:
+        return "journal_write_failed"
+    return "identity_unverifiable"
+
+
+def bridge_halt_record(halt: BridgeHalt) -> dict:
+    return {"code": halt.code, "phase": halt.phase, "machine": HOSTNAME,
+            "task_id": halt.task_id, "rows": list(halt.rows)}
+
+
+def bridge_halt_line(halt: BridgeHalt) -> str:
+    """The redacted stderr line: fixed words, a public code, and validated identifiers only."""
+    line = f"[mc] bridge halt code={halt.code} phase={halt.phase} machine={HOSTNAME}"
+    if halt.task_id is not None:
+        line += f" task_id={halt.task_id}"
+    if halt.rows:
+        line += " rows=" + ",".join(halt.rows)
+    return line
+
+
+def bridge_check_concurrency(environ: Mapping[str, str]) -> None:
+    """Bridge mode needs an effective MC_MAX_CONCURRENT of exactly 1. Unset is the default 2 (D1, H12)."""
+    raw = environ.get("MC_MAX_CONCURRENT", "2")
+    if re.fullmatch(r"[0-9]{1,6}", raw) is None or int(raw) != 1:
+        raise BridgeHalt("invalid_concurrency", "startup")
+
+
+def bridge_check_platforms(platforms: list[str]) -> None:
+    if not platforms or any(p not in BRIDGE_PLATFORMS for p in platforms):
+        raise BridgeHalt("invalid_config", "startup")
+
+
+def bridge_check_self() -> None:
+    """#211 refuses a controller whose own pid or group is 1 or below (a container's init group)."""
+    try:
+        stopctl.SelfIdentity(pid=os.getpid(), pgid=os.getpgrp())
+    except ValueError:
+        raise BridgeHalt("invalid_config", "startup") from None
+
+
+def bridge_read_config(environ: Mapping[str, str]) -> tuple[dict, int]:
+    """(validated config, ledger dir fd). Raises BridgeHalt(invalid_config) before any ledger exists (D12).
+
+    The ledger directory is opened once, without following a final symlink, and
+    must be a directory this user owns with no group or other access. Every
+    journal file is then reached through that descriptor, never by path again.
+    """
+    path = environ.get("MC_BRIDGE_CONFIG", "")
+    if not path or "\0" in path or not os.path.isabs(path):
+        raise BridgeHalt("invalid_config", "startup")
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        raise BridgeHalt("invalid_config", "startup") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > BRIDGE_CONFIG_MAX_BYTES:
+            raise BridgeHalt("invalid_config", "startup")
+        raw = os.read(fd, BRIDGE_CONFIG_MAX_BYTES + 1)
+    except OSError:
+        raise BridgeHalt("invalid_config", "startup") from None
+    finally:
+        os.close(fd)
+    if len(raw) > BRIDGE_CONFIG_MAX_BYTES:
+        raise BridgeHalt("invalid_config", "startup")
+    try:
+        config = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError, RecursionError):
+        raise BridgeHalt("invalid_config", "startup") from None
+    parsed = drb.parse_bridge_config(config)
+    if isinstance(parsed, str):
+        raise BridgeHalt("invalid_config", "startup")
+    try:
+        dir_fd = os.open(str(parsed["ledger_dir"]),
+                         os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        raise BridgeHalt("invalid_config", "startup") from None
+    try:
+        info = os.fstat(dir_fd)
+    except OSError:
+        os.close(dir_fd)
+        raise BridgeHalt("invalid_config", "startup") from None
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        os.close(dir_fd)
+        raise BridgeHalt("invalid_config", "startup")
+    return parsed, dir_fd
+
+
+def bridge_validate_lanes(parsed: dict, workdir: Path) -> None:
+    """D4 and D5, once a validated ledger exists: concrete platforms, and the same workdir."""
+    for repo in parsed["repos"]:
+        if repo["platform"] not in BRIDGE_PLATFORMS:
+            raise BridgeHalt("invalid_config", "startup")
+    try:
+        same = os.path.realpath(str(parsed["workdir"])) == os.path.realpath(str(workdir))
+    except (OSError, ValueError):
+        same = False
+    if not same:
+        raise BridgeHalt("invalid_config", "startup")
+
+
+class BridgeJournal:
+    """The durable stop-control journal port, <ledger_dir>/dispatcher-stop.json (C7).
+
+    persist() writes a temp file, fsyncs it, renames it over the journal and
+    fsyncs the directory, or raises. clear() unlinks it or raises with the
+    record intact. Every operation goes through the ledger directory fd.
+    The file holds the controller's last record and, after a halt, the halt.
+    """
+
+    def __init__(self, dir_fd: int) -> None:
+        self.dir_fd = dir_fd
+        self.controller: dict | None = None
+        self.halt: dict | None = None
+        self.writes = 0
+
+    def exists(self) -> bool:
+        try:
+            os.stat(BRIDGE_JOURNAL, dir_fd=self.dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True  # cannot tell: treat it as present, which refuses to claim
+        return True
+
+    def persist(self, record: dict) -> None:
+        self.controller = dict(record)
+        self._write()
+
+    def record_halt(self, halt: BridgeHalt) -> None:
+        self.halt = bridge_halt_record(halt)
+        self._write()
+
+    def clear(self) -> None:
+        os.unlink(BRIDGE_JOURNAL, dir_fd=self.dir_fd)
+        try:
+            os.fsync(self.dir_fd)
+        except OSError:
+            pass  # the record is gone; a replay after a crash only refuses the next start
+        self.controller = None
+        self.halt = None
+
+    def _write(self) -> None:
+        payload = {"version": 1, "unit": "ak-dispatcher-bridge", "machine": HOSTNAME,
+                   "controller": self.controller, "halt": self.halt}
+        raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        tmp = BRIDGE_JOURNAL + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600,
+                     dir_fd=self.dir_fd)
+        try:
+            os.fchmod(fd, 0o600)
+            view = memoryview(raw)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("incomplete journal write")
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, BRIDGE_JOURNAL, src_dir_fd=self.dir_fd, dst_dir_fd=self.dir_fd)
+        os.fsync(self.dir_fd)
+        self.writes += 1
+
+
+def bridge_process_table() -> dict[int, tuple[int, int, bool]]:
+    """{pid: (ppid, pgid, zombie)} for every process. Raises when it cannot be read whole."""
+    table: dict[int, tuple[int, int, bool]] = {}
+    proc_root = Path("/proc")
+    if (proc_root / "self" / "stat").exists():
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat", "rb") as f:
+                    raw = f.read().decode("ascii", "replace")
+            except (FileNotFoundError, ProcessLookupError):
+                continue  # exited between listdir and open
+            fields = raw[raw.rindex(")") + 2:].split()
+            table[int(entry)] = (int(fields[1]), int(fields[2]), fields[0] in ("Z", "X"))
+        return table
+    out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,stat="], stdin=subprocess.DEVNULL,
+                         capture_output=True, text=True, timeout=KILL_GRACE,
+                         env={"PATH": "/bin:/usr/bin"})
+    if out.returncode != 0:
+        raise OSError("process table unavailable")
+    for line in out.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            raise OSError("unexpected process table line")
+        table[int(parts[0])] = (int(parts[1]), int(parts[2]), parts[3].startswith("Z"))
+    return table
+
+
+class _BridgeChild:
+    def __init__(self, proc: subprocess.Popen, birth: str, role: str, lane: LaneUser | None) -> None:
+        self.proc = proc
+        self.birth = birth
+        self.role = role
+        self.phase = _BRIDGE_ROLE_PHASE[role]
+        self.lane = lane
+
+
+class BridgeChildren:
+    """Direct children this dispatcher created and has not reaped. Shared by the observer and the port.
+
+    A child stays here, unreaped, until the controller has confirmed its group
+    gone. Its zombie pins the pid, so the pid and group id cannot be reused
+    while the observer and the port look at them (#193).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._items: dict[int, _BridgeChild] = {}
+
+    def add(self, proc: subprocess.Popen, role: str, lane: LaneUser | None) -> str:
+        birth = f"{proc.pid}:{time.monotonic_ns()}:{os.urandom(8).hex()}"
+        with self._lock:
+            self._items[proc.pid] = _BridgeChild(proc, birth, role, lane)
+        return birth
+
+    def get(self, pid: object) -> _BridgeChild | None:
+        with self._lock:
+            return self._items.get(pid) if type(pid) is int else None
+
+    def reap(self, proc: subprocess.Popen) -> bool:
+        """Reap a child whose group the controller confirmed gone. False if it has not exited."""
+        try:
+            proc.wait(timeout=KILL_GRACE)
+        except subprocess.TimeoutExpired:
+            return False
+        with self._lock:
+            self._items.pop(proc.pid, None)
+        return True
+
+
+class BridgeObserver:
+    """The process observer port. It speaks only about registered, unreaped children.
+
+    The registered identity is the process group its unreaped leader pins.
+    present: the leader is our unreaped child with our pid as parent and its own
+    pid as group, and the group still has a live (non-zombie) member. absent:
+    the leader has exited (a zombie we have not reaped) and no live member is
+    left, reported with group_status "empty". A child we did not register, one
+    already reaped, or a process table that cannot be read is unverifiable.
+    """
+
+    def __init__(self, children: BridgeChildren, table=bridge_process_table) -> None:
+        self.children = children
+        self.table = table
+
+    def observe(self, identity: stopctl.OwnedIdentity) -> stopctl.Observation:
+        child = self.children.get(identity.pid)
+        if child is None or child.proc.returncode is not None:
+            return stopctl.Observation("unverifiable")
+        rows = self.table()
+        leader = rows.get(identity.pid)
+        if leader is None:
+            return stopctl.Observation("unverifiable")
+        ppid, pgid, zombie = leader
+        live = any(pg == identity.pgid and not z for pid, (_pp, pg, z) in rows.items()
+                   if not (pid == identity.pid and zombie))
+        if zombie and not live:
+            # An unreaped zombie cannot change parent or group: echo what it was born with.
+            return stopctl.Observation("absent", pid=identity.pid, pgid=identity.pgid, role=child.role,
+                                       phase=child.phase, birth=child.birth, ancestry=(os.getpid(),),
+                                       group_status="empty")
+        return stopctl.Observation("present", pid=identity.pid, pgid=pgid, role=child.role, phase=child.phase,
+                                   birth=child.birth, ancestry=(ppid,), group_status="occupied")
+
+
+class BridgeSignalPort:
+    """The only code in bridge mode that sends a signal (C6). Called by StopController only.
+
+    It signals a group only when that group's leader is a registered, unreaped
+    direct child whose pid is its group id, never pid 1 or below and never this
+    process's own group (#211 identity contract). With a lane user the group is
+    signalled through the #193 path, `sudo -n -u <lane> /bin/kill`, and the
+    dispatcher-owned sudo wrapper is signalled directly. Returns exactly
+    delivered, absent, or uncertain.
+    """
+
+    _SIGNALS = {stopctl.SIGTERM: (signal.SIGTERM, "-TERM"), stopctl.SIGKILL: (signal.SIGKILL, "-KILL")}
+
+    def __init__(self, children: BridgeChildren, table=bridge_process_table) -> None:
+        self.children = children
+        self.table = table
+        self.sent: list[tuple[int, int, bool]] = []  # (pgid, sig, through lane)
+
+    def _group_live(self, pgid: int) -> bool | None:
+        try:
+            rows = self.table()
+        except Exception:
+            return None
+        return any(pg == pgid and not z for _pp, pg, z in rows.values())
+
+    def signal_group(self, pgid: int, sig: int) -> str:
+        if type(pgid) is not int or pgid <= 1 or pgid == os.getpgrp() or pgid == os.getpid():
+            return "uncertain"
+        mapped = self._SIGNALS.get(sig)
+        child = self.children.get(pgid)
+        if mapped is None or child is None or child.proc.pid != pgid or child.proc.returncode is not None:
+            return "uncertain"
+        os_sig, kill_arg = mapped
+        lane_code = None
+        if child.lane is not None:
+            self.sent.append((pgid, sig, True))
+            lane_code = _lane_op(child.lane, LANE_KILL, kill_arg, "--", f"-{pgid}")
+        self.sent.append((pgid, sig, False))
+        try:
+            os.killpg(pgid, os_sig)
+            own = "delivered"
+        except ProcessLookupError:
+            own = "absent"
+        except OSError:
+            # macOS refuses to signal a group whose only member is a zombie: look before guessing.
+            live = self._group_live(pgid)
+            own = "absent" if live is False else "uncertain"
+        if own == "delivered" or lane_code == 0:
+            return "delivered"
+        if own == "absent" and (child.lane is None or lane_code is not None):
+            return "absent"
+        return "uncertain"
+
+
+def bridge_bounded(fn, budget: float = BRIDGE_NET_BUDGET):
+    """fn() with one overall deadline. A call that does not return in time raises TimeoutError.
+
+    The call keeps running on a daemon thread; its late result is discarded.
+    """
+    box: dict = {}
+
+    def run() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as e:  # carried to the caller
+            box["error"] = e
+
+    worker = threading.Thread(target=run, daemon=True, name="ak-bridge-net")
+    worker.start()
+    worker.join(budget)
+    if worker.is_alive():
+        raise TimeoutError("bridge network deadline")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+class BridgeRunner:
+    """A controller-aware run_contained for one phase (D7, H1, H2).
+
+    begin_launch -> gated spawn -> register -> confirm_ack -> work event ->
+    release -> wait (waking on stop, timeout, exception) -> confirm_phase_exit,
+    or request_stop on stop, timeout, exception or members left in the group.
+    The leader is reaped only after the controller confirmed its group gone.
+    No path here sends a signal; StopController does, through BridgeSignalPort.
+    """
+
+    def __init__(self, bridge: BridgeDispatcher, ctl: stopctl.StopController, role: str, on_ack) -> None:
+        self.bridge = bridge
+        self.ctl = ctl
+        self.role = role
+        self.on_ack = on_ack
+        self.phase_confirmed = False
+        self.forced = False  # members outlived the leader and were stopped through the controller
+
+    def __call__(self, cmd: list[str], cwd: Path, timeout: float, *, env: dict[str, str],
+                 lane: LaneUser | None = None) -> tuple[int, str, str]:
+        role, ctl, bridge = self.role, self.ctl, self.bridge
+        # Before begin_launch: a failure here starts no child (D10).
+        try:
+            if not _can_wait_unreaped():
+                raise LaneUserUnavailable("this platform cannot wait for a child without reaping it")
+            if lane is not None:
+                argv = lane_argv(lane, cmd, env)
+            else:
+                if shutil.which(cmd[0], path=env.get("PATH", os.defpath)) is None:
+                    raise FileNotFoundError(cmd[0])
+                argv = list(cmd)
+            release = b"1" + json.dumps(env).encode("utf-8")
+        except (LaneUserUnavailable, FileNotFoundError, ValueError, TypeError):
+            raise BridgeHalt("invalid_config", f"{role}_launch") from None
+        decision = ctl.begin_launch(role)
+        if not decision.allowed:
+            raise BridgeHalt(bridge_public_code(decision.code), f"{role}_launch")
+        read_fd, write_fd = os.pipe()
+        with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, "-I", "-c", _BRIDGE_GATE, str(read_fd), *argv],
+                    cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f,
+                    start_new_session=True, env={"PATH": "/usr/bin:/bin"}, pass_fds=(read_fd,),
+                )
+            except OSError:
+                os.close(read_fd)
+                os.close(write_fd)
+                # The open ticket is the only record that a child may exist: the
+                # controller closes it and keeps recovery.
+                ctl.request_stop()
+                raise BridgeHalt("identity_unverifiable", f"{role}_launch") from None
+            os.close(read_fd)
+            birth = bridge.children.add(proc, role, lane)
+            identity = stopctl.OwnedIdentity(pid=proc.pid, pgid=proc.pid, role=role,
+                                             phase=_BRIDGE_ROLE_PHASE[role], birth=birth,
+                                             ancestry=(os.getpid(),))
+            bridge.boundary(f"{role}_spawned")
+            decision = ctl.register(identity)
+            if not decision.allowed:
+                self._abandon(proc, write_fd, identity, registered=bool(decision.registered_pgids))
+                raise BridgeHalt(bridge_public_code(decision.code), f"{role}_register", task_id=bridge.task_id)
+            bridge.boundary(f"{role}_registered")
+            decision = ctl.confirm_ack()
+            if not decision.allowed:
+                self._abandon(proc, write_fd, identity, registered=True)
+                raise BridgeHalt(bridge_public_code(decision.code), f"{role}_ack", task_id=bridge.task_id)
+            try:
+                self.on_ack()  # the authenticated work event, before the payload runs (C8)
+            except Exception:
+                pass
+            bridge.boundary(f"{role}_acked")
+            try:
+                _write_fd_all(write_fd, release)
+            except OSError:
+                pass  # the gate is gone; the wait below sees its exit
+            finally:
+                os.close(write_fd)
+            reason = None
+            deadline = time.monotonic() + timeout
+            try:
+                while True:
+                    if bridge.stop_requested():
+                        reason = "stop"
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        reason = "timeout"
+                        break
+                    if _wait_exit_unreaped(proc.pid, min(BRIDGE_WAIT_SLICE, remaining)):
+                        break
+            except Exception:
+                reason = "error"
+            if reason is None:
+                decision = ctl.confirm_phase_exit(role)
+                if not decision.allowed and decision.code == "still_running":
+                    # The leader exited and left live members in its group: contain them.
+                    decision = ctl.request_stop()
+                    self.forced = True
+                if not decision.allowed and not decision.group_confirmed:
+                    raise BridgeHalt(bridge_public_code(decision.code), f"{role}_exit", task_id=bridge.task_id)
+            else:
+                decision = ctl.request_stop()
+                if not decision.group_confirmed:
+                    raise BridgeHalt(bridge_public_code(decision.code), f"{role}_stop", task_id=bridge.task_id)
+            if not bridge.children.reap(proc):
+                raise BridgeHalt("identity_unverifiable", f"{role}_reap", task_id=bridge.task_id)
+            self.phase_confirmed = True
+            if reason == "stop":
+                raise BridgeHalt("stop_requested", role, task_id=bridge.task_id)
+            if reason == "timeout":
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            if reason == "error":
+                raise OSError("execution error")
+            out_f.seek(0)
+            err_f.seek(0)
+            return (
+                proc.returncode,
+                out_f.read().decode("utf-8", errors="replace"),
+                err_f.read().decode("utf-8", errors="replace"),
+            )
+
+    def _abandon(self, proc: subprocess.Popen, write_fd: int, identity: stopctl.OwnedIdentity, *,
+                 registered: bool) -> None:
+        """Refused before release: EOF makes the gate exit 125 without exec. Never a signal."""
+        try:
+            os.close(write_fd)
+        except OSError:
+            pass
+        if not _wait_exit_unreaped(proc.pid, KILL_GRACE):
+            return  # left unreaped; recovery is retained by the controller
+        if registered:
+            decision = self.ctl.confirm_phase_exit(self.role)
+            if not decision.group_confirmed:
+                return
+        else:
+            try:
+                seen = self.bridge.observer.observe(identity)
+            except Exception:
+                return
+            if seen.status != "absent" or seen.group_status != "empty":
+                return
+        self.bridge.children.reap(proc)
+
+
+def _write_fd_all(fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short write")
+        view = view[written:]
+
+
+class BridgeDispatcher:
+    """One bridge-mode dispatcher: one host, one ledger, one claim window at a time."""
+
+    def __init__(self, parsed: dict, dir_fd: int, *, stop_event: threading.Event | None = None,
+                 grace: float = KILL_GRACE, stop_budget: float = BRIDGE_STOP_BUDGET,
+                 net_budget: float = BRIDGE_NET_BUDGET, table=bridge_process_table) -> None:
+        self.config = parsed
+        self.dir_fd = dir_fd
+        self.journal = BridgeJournal(dir_fd)
+        self.stop_event = stop_event if stop_event is not None else threading.Event()
+        self.grace = grace
+        self.stop_budget = stop_budget
+        self.net_budget = net_budget
+        self.children = BridgeChildren()
+        self.observer = BridgeObserver(self.children, table)
+        self.signals = BridgeSignalPort(self.children, table)
+        self.halted: BridgeHalt | None = None
+        self.held: dict | None = None
+        self.task_id: int | None = None
+        self.boundary = lambda name: None  # test hook at each named boundary
+
+    # -- stop predicate (C12, D13) --------------------------------------------
+
+    def stop_requested(self) -> bool:
+        if self.stop_event.is_set():
+            return True
+        stop_file = self.config.get("stop_file")
+        if stop_file is None:
+            return False
+        try:
+            os.stat(str(stop_file))
+        except FileNotFoundError:
+            return False
+        except Exception:
+            return True  # an error reading the stop file is a stop request
+        return True
+
+    def new_controller(self) -> stopctl.StopController:
+        return stopctl.StopController(
+            self_identity=stopctl.SelfIdentity(pid=os.getpid(), pgid=os.getpgrp()),
+            predicate=self.stop_requested, observer=self.observer, signals=self.signals,
+            journal=self.journal, clock=time, wait=time.sleep,
+            grace=self.grace, stop_budget=self.stop_budget,
+        )
+
+    def net(self, fn):
+        return bridge_bounded(fn, self.net_budget)
+
+    # -- candidate selection (C3, D3, H6, H7) ---------------------------------
+
+    def select(self, platform: str):
+        rows = drb.load_handoff_rows(self.config["authority"], dir_fd=self.dir_fd)
+        if isinstance(rows, str):
+            raise BridgeHalt(rows if rows in BRIDGE_CODES else "ledger_unreadable", "select")
+        matching = [r for r in rows if r.state == "acknowledged"
+                    and r.body.get("machine") == HOSTNAME and r.body.get("platform") == platform]
+        if not matching:
+            return None
+        if len(matching) > 1:
+            raise BridgeHalt("duplicate_candidate", "select", rows=tuple(r.node for r in matching))
+        row = matching[0]
+        if row.task_id is None:
+            raise BridgeHalt("missing_task_id", "select", rows=(row.node,))
+        body = row.body
+        entries = [e for e in self.config["repos"]
+                   if e["repo"] == row.repository and e["project"] == body.get("project")
+                   and e["platform"] == body.get("platform") and e["machine"] == body.get("machine")]
+        if (len(entries) != 1 or body.get("reviewer_platform") != entries[0]["reviewer_platform"]
+                or body.get("created_by") != drb.CREATED_BY):
+            raise BridgeHalt("conflicting_candidate", "select", task_id=row.task_id, rows=(row.node,))
+        return row, entries[0]
+
+    def claimed_task_ok(self, task: object, row, platform: str) -> bool:
+        """C4, D24, H6: the returned task is the requested id on the requested lane, frozen fields equal."""
+        if not isinstance(task, dict):
+            return False
+        task_id = task.get("id")
+        if type(task_id) is not int or task_id != row.task_id:
+            return False
+        if task.get("project") != row.body["project"] or task.get("platform") != platform:
+            return False
+        if not isinstance(task.get("machine"), str) or task.get("machine") != HOSTNAME:
+            return False
+        return drb.task_matches_handoff(task, row.body)
+
+    # -- one poll ---------------------------------------------------------------
+
+    def poll_once(self, platform: str) -> str:
+        """idle, done, stop, or halt. A halt is recorded before this returns."""
+        if self.halted is not None:
+            return "halt"
+        if self.stop_requested():
+            return "stop"
+        if self.journal.exists():
+            self.halt(BridgeHalt("stop_journal_present", "poll"), durable=False)
+            return "halt"
+        try:
+            picked = self.select(platform)
+        except BridgeHalt as h:
+            self.halt(h)
+            return "halt"
+        if picked is None:
+            return "idle"
+        return self.run_round(platform, *picked)
+
+    def halt(self, h: BridgeHalt, *, durable: bool = True) -> None:
+        self.halted = h
+        if durable:
+            try:
+                self.journal.record_halt(h)
+            except Exception:
+                print(bridge_halt_line(BridgeHalt("journal_write_failed", h.phase, task_id=h.task_id)),
+                      file=sys.stderr)
+        print(bridge_halt_line(h), file=sys.stderr)
+
+    def run_round(self, platform: str, row, entry: dict) -> str:
+        tid = row.task_id
+        self.task_id = tid
+        body = row.body
+        project = body["project"]
+        agent_id = f"{platform}-{HOSTNAME}"
+        reviewer = body.get("reviewer_platform")
+        state = {"lock": None, "session": None, "injection": None, "ctl": None, "claim_sent": False,
+                 "suffix": ""}
+        needles: list[str] = []
+
+        def scrub(value: object) -> object:
+            return redact_broker(value, needles)
+
+        def note(kind: str, title: str, detail: dict | None = None) -> None:
+            self.net(lambda: ingest(kind, scrub(title), agent_id, platform, scrub(detail)))
+
+        def patch_task(payload: dict) -> dict:
+            return self.net(lambda: api(f"/api/tasks/{tid}", scrub(payload), "PATCH"))
+
+        try:
+            prepared = self._prepare(platform, row, state, needles)
+            if prepared is None:
+                return "idle"
+            cwd, cli_env, block, base_head, runtime = prepared
+            self.boundary("prepared")
+            # -- claim (C4, C5, C19, D15) --
+            try:
+                ctl = self.new_controller()
+            except (TypeError, ValueError):
+                raise BridgeHalt("identity_unverifiable", "claim", task_id=tid) from None
+            state["ctl"] = ctl
+            decision = ctl.before_claim()
+            if not decision.allowed:
+                raise BridgeHalt(bridge_public_code(decision.code), "claim", task_id=tid, rows=(row.node,))
+            request, _headers, _observed = task_claim_request(platform, None, project=project, task_id=tid)
+            state["claim_sent"] = True  # from here the server may hold a claim for this id
+            self.boundary("claim_sent")
+            try:
+                resp = self.net(lambda: api("/api/tasks/claim", request))
+                readable = isinstance(resp, dict) and "task" in resp
+            except Exception:
+                resp, readable = None, False
+            if not readable:
+                ctl.note_claim_unknown()
+                raise BridgeHalt("claim_unknown", "claim", task_id=tid, rows=(row.node,))
+            task = resp["task"]
+            if task is None:
+                ctl.note_claim_unknown()
+                raise BridgeHalt("exact_claim_miss", "claim", task_id=tid, rows=(row.node,))
+            if not self.claimed_task_ok(task, row, platform):
+                ctl.note_claim_unknown()
+                raise BridgeHalt("claim_mismatch", "claim", task_id=tid, rows=(row.node,))
+            decision = ctl.note_claimed(tid, exact_claim=True)
+            if not decision.allowed:
+                raise BridgeHalt(bridge_public_code(decision.code), "post_claim", task_id=tid)
+            if not decision.exact_task_match_proven:
+                raise BridgeHalt("journal_write_failed", "post_claim", task_id=tid)
+            self.boundary("claimed")
+            return self._execute(platform, task, tid, agent_id, reviewer, cwd, cli_env, block, base_head,
+                                 ctl, state, scrub, note, patch_task)
+        except BridgeHalt as h:
+            return "halt" if self._on_halt(h, state) else "stop"
+        except Exception:
+            # An unexpected error is an ambiguous state: fail closed, keep everything held.
+            self._on_halt(BridgeHalt("identity_unverifiable", "internal", task_id=tid), state)
+            return "halt"
+        finally:
+            self.task_id = None
+
+    def _prepare(self, platform: str, row, state: dict, needles: list[str]):
+        """Everything that can be checked before the claim. None means: no claim this poll.
+
+        A lane that cannot run here halts as invalid_config. A busy lock, a
+        broker, pointer or git failure is retried on the next poll; nothing has
+        been claimed or launched, and every step taken here is undone.
+        """
+        tid = row.task_id
+        body = row.body
+        project = body["project"]
+        runtime = RUNTIME_FOR_PLATFORM.get(platform)
+        reviewer = body.get("reviewer_platform")
+        if bridge_frame_refusal({**body, "id": tid}) is not None:
+            raise BridgeHalt("ledger_unreadable", "prepare", task_id=tid, rows=(row.node,))
+        try:
+            if runtime is None or not isinstance(project, str) or not LANE_RE.fullmatch(project):
+                raise DispatchRefused("lane")
+            if shutil.which(CLI_FOR_PLATFORM[platform]) is None:
+                raise DispatchRefused("worker cli")
+            if reviewer is not None and shutil.which(CLI_FOR_PLATFORM.get(reviewer, "")) is None:
+                raise DispatchRefused("reviewer cli")
+            cwd = resolve_project(project, WORKDIR)
+            git_dir = linked_worktree_git_dir(cwd)
+            lane = lane_user()
+            if lane is not None:
+                lane_preflight(lane, cwd)
+        except (DispatchRefused, LaneUserUnavailable):
+            raise BridgeHalt("invalid_config", "prepare", task_id=tid, rows=(row.node,)) from None
+        why = "lock"
+        try:
+            lock = WorktreeLock(git_dir)
+            lock.acquire(cwd)
+            state["lock"] = lock
+            why = "recovery"
+            refuse_unresolved_recovery(git_dir)
+            why = "broker"
+            overlay = None
+            settings = broker_settings()
+            if settings is not None:
+                session = BrokerSession(settings[0], settings[1], str(tid))
+                session.github_required = broker_github_required()
+                session.health()
+                session.github_repo = github_remote(cwd)
+                state["session"] = session
+                overlay = session.mint()
+                needles[:] = session.needles
+                if session.github_repo is None:
+                    state["suffix"] = GITHUB_NO_GRANT
+            why = "pointers"
+            block = self.net(lambda: fetch_pointers(project, runtime))
+            why = "head"
+            head = git(cwd, "rev-parse", "--verify", "-q", "HEAD")
+            base_head = head.stdout.strip() if head.returncode == 0 else None
+            why = "inject"
+            state["injection"] = ak_pointers.inject(cwd, block)
+        except Exception:
+            self._undo_prepare(state)
+            print(f"[mc] bridge: no claim for task #{tid} this poll (preparation failed: {why})", file=sys.stderr)
+            return None
+        cli_env: dict = {} if overlay is None else {"env_overlay": overlay}
+        if lane is not None:
+            cli_env["lane"] = lane
+        return cwd, cli_env, block, base_head, runtime
+
+    def _undo_prepare(self, state: dict) -> None:
+        """Nothing was claimed: put the worktree back, revoke, then unlock."""
+        injection = state.pop("injection", None)
+        if injection is not None:
+            try:
+                ak_pointers.cleanup(injection)
+            except Exception:
+                pass
+        self._revoke(state)
+        lock = state.pop("lock", None)
+        if lock is not None:
+            lock.release()
+        state["injection"] = None
+        state["lock"] = None
+
+    def _revoke(self, state: dict) -> None:
+        session = state.get("session")
+        state["session"] = None
+        if session is not None:
+            code = session.revoke()
+            if code:
+                print(f"[mc] broker revoke_task failed for a bridge task: {code}", file=sys.stderr)
+
+    def _check_stop(self, ctl: stopctl.StopController, phase: str) -> None:
+        """The phase-exit and cleanup boundaries (C12): a true predicate goes to request_stop."""
+        self.boundary(phase)
+        if self.stop_requested():
+            decision = ctl.request_stop()
+            if decision.recovery_retained:
+                raise BridgeHalt(bridge_public_code(decision.code), phase, task_id=self.task_id)
+            raise BridgeHalt("stop_requested", phase, task_id=self.task_id)
+
+    def _run_phase(self, role: str, platform: str, prompt: str, cwd: Path, cli_env: dict, tid: int,
+                   ctl: stopctl.StopController, on_ack) -> tuple[bool, str, float | None]:
+        runner = BridgeRunner(self, ctl, role, on_ack)
+        ok, out, cost = run_cli(platform, prompt, cwd, review=(role == "reviewer"), task_id=tid,
+                                contained=runner, **cli_env)
+        if not runner.phase_confirmed:
+            # run_cli returned without a confirmed phase: nothing proves the group is gone.
+            raise BridgeHalt("identity_unverifiable", f"{role}_exit", task_id=tid)
+        if runner.forced:
+            ok = False
+            out = f"{out}\n\n[dispatch] processes outlived the {role} in its group; they were stopped"
+        return ok, out, cost
+
+    def _execute(self, platform, task, tid, agent_id, reviewer, cwd, cli_env, block, base_head,
+                 ctl, state, scrub, note, patch_task) -> str:
+        injection = state["injection"]
+
+        def worker_ack() -> None:
+            try:
+                patch_task({"status": "running", "agent_id": agent_id})
+            except Exception:
+                print(f"[mc] bridge: running status not recorded for task #{tid}", file=sys.stderr)
+            note("status", f"Running task #{tid}: {task['title']}", {"task_id": tid})
+
+        ok, output, cost = self._run_phase(
+            "worker", platform, build_prompt(task, injection.changed and block != ""), cwd, cli_env, tid,
+            ctl, worker_ack)
+        result = extract_result(output)
+        if injection.changed and block:
+            leaked = committed_metadata(cwd, base_head, block)
+            if leaked:
+                ok = False
+                result = (
+                    f"{result}\n\n[dispatch] the skill-pointer block is {leaked}. It is dispatch "
+                    "metadata: unstage or amend it out before this work lands; review was skipped."
+                )
+        self._check_stop(ctl, "phase_exit")
+        if ok and reviewer:
+            cli = CLI_FOR_PLATFORM.get(reviewer) if isinstance(reviewer, str) else None
+            if cli is None:
+                ok = False
+                result = f"{result}\n\n[review] unknown reviewer platform {reviewer!r}, task not approved"
+            elif not shutil.which(cli):
+                ok = False
+                result = f"{result}\n\n[{reviewer} review] {cli} not found on PATH, task not approved"
+            else:
+                def reviewer_ack() -> None:
+                    try:
+                        patch_task({"status": "review", "agent_id": agent_id})
+                    except Exception:
+                        print(f"[mc] bridge: review status not recorded for task #{tid}", file=sys.stderr)
+                    note("status", f"Task #{tid} in review by {reviewer}", {"task_id": tid})
+
+                r_ok, r_out, r_cost = self._run_phase(
+                    "reviewer", reviewer, build_review_prompt(task, scrub(output)), cwd, cli_env, tid,
+                    ctl, reviewer_ack)
+                if r_cost:
+                    cost = (cost or 0) + r_cost
+                ok, note_text = review_outcome(r_ok, r_out)
+                result = f"{result}\n\n[{reviewer} review] {note_text}"
+                self._check_stop(ctl, "phase_exit")
+        # -- finish, then cleanup and lock release, then the one result PATCH (C7, D9) --
+        self._check_stop(ctl, "cleanup")
+        decision = ctl.finish(phase_completed=True)
+        if not (decision.allowed and decision.pointer_cleanup_permitted and decision.lock_release_permitted):
+            raise BridgeHalt(bridge_public_code(decision.code), "cleanup", task_id=tid)
+        cleaned = self._cleanup(state)
+        if not cleaned:
+            ctl.confirm_cleanup_durable(stopctl.CleanupConfirmation("failed", "complete", True))
+            raise BridgeHalt("journal_write_failed", "cleanup", task_id=tid)
+        result = result or ("completed" if ok else "run failed with no output")
+        if state.get("suffix"):
+            result = f"{result}\n\n{state['suffix']}"
+        payload = {"status": "done" if ok else "failed", "result": result, "agent_id": agent_id}
+        if cost is not None:
+            payload["cost_usd"] = round(float(cost), 4)
+        try:
+            patch_task(payload)
+        except Exception:
+            raise BridgeHalt("claim_unknown", "result", task_id=tid) from None
+        decision = ctl.confirm_cleanup_durable(stopctl.CleanupConfirmation("complete", "complete", True))
+        if not decision.allowed:
+            raise BridgeHalt("journal_write_failed", "cleanup", task_id=tid)
+        return "done"
+
+    def _cleanup(self, state: dict) -> bool:
+        """Pointer cleanup, broker revoke, lock release. Only after finish() permitted both."""
+        ok = True
+        injection = state.get("injection")
+        state["injection"] = None
+        if injection is not None:
+            try:
+                ak_pointers.cleanup(injection)
+            except (ak_pointers.PointerFileError, OSError):
+                ok = False
+        self._revoke(state)
+        lock = state.get("lock")
+        state["lock"] = None
+        if lock is not None:
+            lock.release()
+        return ok
+
+    def _on_halt(self, h: BridgeHalt, state: dict) -> bool:
+        """Record the halt. False only for a stop that #211 fully reconciled before any claim was sent."""
+        ctl = state.get("ctl")
+        if h.code == "stop_requested" and ctl is not None:
+            decision = ctl.finish(phase_completed=False)
+            if decision.allowed and decision.pointer_cleanup_permitted and decision.lock_release_permitted:
+                cleaned = self._cleanup(state)
+                if cleaned and not state.get("claim_sent"):
+                    done = ctl.confirm_cleanup_durable(stopctl.CleanupConfirmation("complete", "complete", True))
+                    if done.allowed:
+                        # No claim left the host and the journal is cleared: a stop, not a failure.
+                        print(bridge_halt_line(h), file=sys.stderr)
+                        return False
+        if ctl is None:
+            self._undo_prepare(state)  # no claim window was opened
+        else:
+            self._revoke(state)  # revoking a grant is always safe; pointers and lock wait for #211
+        self.held = state  # the lock and pointers stay held until an operator reconciles
+        self.halt(h)
+        return True
+
+
+def bridge_main(platforms: list[str]) -> int:
+    """Bridge-mode main loop. Exit 0 on a signal, 2 on a startup halt, 3 after a halt."""
+    try:
+        bridge_check_concurrency(os.environ)
+        bridge_check_platforms(platforms)
+        bridge_check_self()
+        parsed, dir_fd = bridge_read_config(os.environ)
+    except BridgeHalt as h:
+        print(bridge_halt_line(h), file=sys.stderr)
+        return 2
+    bridge = BridgeDispatcher(parsed, dir_fd)
+    if bridge.journal.exists():
+        # D6: unresolved recovery from an earlier run. Leave it exactly as it is.
+        print(bridge_halt_line(BridgeHalt("stop_journal_present", "startup")), file=sys.stderr)
+        return 3
+    try:
+        bridge_validate_lanes(parsed, WORKDIR)
+    except BridgeHalt as h:
+        bridge.halt(h)
+        return 2
+
+    def latch(_signum, _frame) -> None:
+        bridge.stop_event.set()  # latch and wake only; never a signal to a child (D13)
+
+    signal.signal(signal.SIGTERM, latch)
+    signal.signal(signal.SIGINT, latch)
+    print(f"[mc] dispatcher on {HOSTNAME} serving: {', '.join(platforms)} (workdir {WORKDIR}, bridge mode)")
+    heartbeat_at = 0.0
+    outcome = "idle"
+    while not bridge.stop_event.is_set():
+        now = time.time()
+        if now - heartbeat_at > 300:
+            for p in platforms:
+                try:
+                    bridge.net(lambda p=p: ingest("heartbeat", "dispatcher online", f"{p}-{HOSTNAME}", p))
+                except Exception:
+                    pass
+            heartbeat_at = now
+        for platform in platforms:
+            outcome = bridge.poll_once(platform)
+            if outcome in ("halt", "stop"):
+                break
+        if outcome == "stop" and bridge.stop_event.is_set():
+            break
+        if bridge.halted is not None:
+            # Hold the halt (and any lock or unreaped child it keeps) until an operator stops us.
+            bridge.stop_event.wait()
+            return 3
+        bridge.stop_event.wait(POLL)
+    return 0
+
+
 def run_task_and_wake(task: dict, platform: str, sem: threading.Semaphore, wake: DispatchWake) -> None:
     try:
         run_task(task, platform, sem)
@@ -1842,6 +2912,9 @@ def main() -> None:
     if not platforms:
         print("No agent CLIs found (claude / codex / grok). Set MC_PLATFORMS or install one.", file=sys.stderr)
         sys.exit(1)
+    if os.environ.get("MC_BRIDGE_ENABLED") == "1":
+        # Bridge mode (#212). Only the exact value "1" gets here; nothing below runs.
+        sys.exit(bridge_main(platforms))
     try:
         configured_task_project()
     except ValueError as e:

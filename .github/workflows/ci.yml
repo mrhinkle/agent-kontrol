@@ -35,10 +35,17 @@ jobs:
         run: python3 -m unittest tests.unit.test_claude_reviewer -v
       - run: pnpm run test:mcp
       - run: pnpm run build
-      - name: Broker tests and syntax (Python 3.9)
+      - name: Bridge, dispatcher and broker tests and syntax (Python 3.9, #212)
+        # The full image, not -slim: the dispatcher tests build real git worktrees. From Google's
+        # Docker Hub mirror, for the rate-limit reason given on the postgres job.
         run: >-
-          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/w" -w /w python:3.9-slim
-          sh -ec "python3.9 -m unittest discover -s tests/unit -p 'test_broker*.py' -v && python3.9 -m py_compile agents/broker/*.py"
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/w" -w /w
+          mirror.gcr.io/library/python:3.9-bookworm
+          sh -ec "python3.9 -m unittest -v tests.unit.test_dispatcher_bridge tests.unit.test_dispatch_ready_bridge
+          tests.unit.test_ak_stop_control tests.unit.test_dispatcher_skills tests.unit.test_dispatcher_stream
+          tests.unit.test_broker_audit tests.unit.test_broker_dispatcher tests.unit.test_broker_github
+          tests.unit.test_broker_lane_user tests.unit.test_broker_providers tests.unit.test_broker_proxy
+          && python3.9 -m py_compile agents/dispatcher/*.py agents/broker/*.py"
       - name: Stop control virtual tests in a private PID namespace (#211)
         # From Google's Docker Hub mirror, for the rate-limit reason given on the postgres job. The runner
         # itself refuses to pull, so the image is fetched and tagged here first.
