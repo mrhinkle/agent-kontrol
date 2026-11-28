@@ -699,6 +699,10 @@ class Workspace:
                         "GIT_CONFIG_NOSYSTEM": "1", "LC_ALL": "C"}
 
     def create(self, mode: str) -> None:
+        # A marker left by an earlier run in the same REPORT_DIR must never be read as this child's.
+        for stale in [self.marker, *self.marker.parent.glob("started*.json")]:
+            if stale.exists():
+                stale.unlink()
         for d in (self.home, self.bin, self.go_dir, self.main):
             d.mkdir(mode=0o700)
         git(self.main, "init", "-q", "-b", "main", env=self.git_env)
@@ -944,7 +948,8 @@ class Run:
         snap = {"label": label, "t": utc_now(), "dispatcher_pid": disp.pid, "descendants": desc,
                 "descendant_starts": {str(p): table[p]["start"] for p in desc}, "cli_pid": cli,
                 "cli_pgid": marker["pgid"], "cli_group_members": group}
-        check(ctx, f"cli_in_dispatcher_tree_{label}", cli in desc and cli in group and marker["pgid"] == cli,
+        check(ctx, f"cli_in_dispatcher_tree_{label}", cli in desc and cli in group and marker["pgid"] == cli
+              and marker.get("ppid") == disp.pid,
               snapshot=snap)
         ctx.setdefault("tree_snapshots", []).append(snap)
         return snap
