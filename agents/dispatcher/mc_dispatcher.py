@@ -2539,6 +2539,10 @@ class BridgeDispatcher:
         except BridgeHalt as h:
             self.halt(h)
             return "halt"
+        except Exception:
+            # A ledger the selector cannot classify is unreadable: fail closed.
+            self.halt(BridgeHalt("ledger_unreadable", "select"))
+            return "halt"
         if picked is None:
             return "idle"
         return self.run_round(platform, *picked)

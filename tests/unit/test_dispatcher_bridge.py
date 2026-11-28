@@ -591,6 +591,12 @@ class BridgeClaimTests(BridgeHarness):
         self.assertEqual(self.poll(), "halt")
         self.assert_halt("conflicting_candidate")
 
+    def test_unexpected_selection_error_halts(self):
+        with mock.patch.object(md.BridgeDispatcher, "select", side_effect=KeyError("body")):
+            self.assertEqual(self.poll(), "halt")
+        self.assert_halt("ledger_unreadable", phase="select")
+        self.assertEqual(self.claims(), [])
+
     def test_malformed_ledger_halts(self):
         (self.ledger / "handoff.json").write_text("{not json")
         self.assertEqual(self.poll(), "halt")
