@@ -104,6 +104,33 @@ class Endpoints(unittest.TestCase):
                 runner.check_database_url(bad)
 
 
+class CloseReady(unittest.TestCase):
+    def passing(self):
+        return {"acceptance": {"AC1": True, "AC2": True, "AC3": True}, "all_scenarios_ran": True,
+                "scenarios": {n: {"result": "pass"} for n in runner.ALL_SCENARIOS}, "mutation": None,
+                "base": {"is_ancestor": True}, "final_cleanup": {"ok": True, "run_root_removed": True}}
+
+    def test_true_only_when_ac1_to_ac3_pass(self):
+        self.assertEqual(runner.close_ready_decision(self.passing())[0], True)
+        for key in ("AC1", "AC2", "AC3"):
+            report = self.passing()
+            report["acceptance"][key] = False
+            self.assertFalse(runner.close_ready_decision(report)[0], key)
+        for change in (lambda r: r.update(mutation="demo_true"), lambda r: r.update(failure={"code": "x"}),
+                       lambda r: r["final_cleanup"].update(ok=False), lambda r: r["scenarios"].pop("safe_stop"),
+                       lambda r: r["base"].update(is_ancestor=False)):
+            report = self.passing()
+            change(report)
+            self.assertFalse(runner.close_ready_decision(report)[0])
+
+    def test_guard_rejects_close_ready_beside_a_failed_ac(self):
+        report = self.passing()
+        report["close_ready"] = True
+        self.assertTrue(runner.close_ready_consistent(report))
+        report["acceptance"]["AC2"] = False
+        self.assertFalse(runner.close_ready_consistent(report))
+
+
 class Redaction(unittest.TestCase):
     def test_secrets_urls_and_keys(self):
         r = runner.Redactor()

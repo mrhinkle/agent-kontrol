@@ -8,13 +8,19 @@ changes no runtime code and stubs no route.
 
 Modes:
   (default)                      run the scenarios and write $REPORT_DIR/report.json
-  --snapshot LABEL               AC4: the five host snapshots, recorded, never fatal (L10, L17)
-  --stop-tree PIDFILE            AC4: stop and confirm the whole process tree of the Next server (L12)
-  --finalize-host                AC4: normalised snapshot diff, cleanup proof, close_ready (M7, M11)
+  --snapshot LABEL               optional host tooling: five host snapshots, recorded, never fatal
+  --stop-tree PIDFILE            optional host tooling: stop and confirm a setsid process tree
+  --finalize-host                optional host tooling: normalised snapshot diff and cleanup proof
+
+close_ready (owner decision on #213, 2026-11-28: AC4 dropped, CI is the proof) is true
+exactly when AC1, AC2 and AC3 pass with every scenario run, no fault injection, BASE_SHA an
+ancestor of HEAD, and every cleanup check passing. The CI bridge-e2e-report artifact is the
+evidence. The host modes are optional and nothing requires them.
 
 Inputs (environment): MC_URL, MC_TOKEN, DATABASE_URL, RUN_ID, REPORT_DIR, and
 optionally BASE_SHA and BRIDGE_E2E_SCENARIOS (a comma list, for local debugging;
 any subset leaves close_ready false).
+
 
 Safety:
   * MC_URL and DATABASE_URL must resolve only to 127.0.0.1 or ::1; DATABASE_URL may
@@ -83,8 +89,10 @@ SNAPSHOT_COMMANDS = (
     ("systemctl_user", ["systemctl", "--user", "list-units", "--all", "--no-legend"]),
 )
 # Fault injections for the mutation table (BRIDGE_E2E_MUTATION). Each one makes the system under
-# test misbehave in one way the runner claims to catch; the run must then fail. Unset in CI and AC4.
-MUTATIONS = ("extra_work_event", "demo_true", "claim_unfiltered", "mc_token_present", "escaped_grandchild",
+# test misbehave in one way the runner claims to catch; the run must then fail. Unset in CI.
+# close_ready_forced injects the extra work event AND makes the decision function claim
+# close_ready; the independent consistency guard must turn the run red.
+MUTATIONS = ("close_ready_forced", "extra_work_event", "demo_true", "claim_unfiltered", "mc_token_present", "escaped_grandchild",
              "second_post", "extra_bridge_task")
 MUTATION: str | None = None
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-connection", "proxy-authorization", "proxy-authenticate",
@@ -1100,7 +1108,7 @@ class Run:
         self.wait_status(bound["task_id"], "done")
         wait_for(lambda: bound["task_id"] in self.done_ids(ws), "dispatcher-done.json entry")
         wait_for(lambda: not (ws.ledger / "dispatcher-stop.json").exists(), "stop journal cleared")
-        if MUTATION == "extra_work_event":
+        if MUTATION in ("extra_work_event", "close_ready_forced"):
             self.api.call("POST", "/api/ingest", {"agent_id": f"{PLATFORM}-{self.machine}", "kind": "status",
                                                   "title": f"Running task #{bound['task_id']}: {bound['task_title']}",
                                                   "detail": {"task_id": bound["task_id"]}})
@@ -1423,8 +1431,43 @@ def acceptance(scenarios: dict) -> dict:
         "AC1": passed("normal"),
         "AC2": passed("safe_stop"),
         "AC3": passed("competing", "no_child_stop", "lost_reply", "two_in_sequence", "bad_input"),
-        "AC4": False,  # operator-only host gate (K11); set only by --finalize-host
     }
+
+
+def close_ready_decision(report: dict) -> tuple[bool, str]:
+    """True exactly when AC1-AC3 pass on a complete, unmutated, cleanly torn-down run."""
+    acc = report.get("acceptance") or {}
+    cleanup = report.get("final_cleanup") or {}
+    scenarios = report.get("scenarios") or {}
+    checks = {
+        "AC1": acc.get("AC1") is True,
+        "AC2": acc.get("AC2") is True,
+        "AC3": acc.get("AC3") is True,
+        "all_scenarios_ran": report.get("all_scenarios_ran") is True and set(scenarios) == set(ALL_SCENARIOS),
+        "every_scenario_pass": bool(scenarios) and all(v.get("result") == "pass" for v in scenarios.values()),
+        "no_fault_injection": report.get("mutation") is None,
+        "base_is_ancestor": (report.get("base") or {}).get("is_ancestor") is True,
+        "cleanup": cleanup.get("ok") is True and cleanup.get("run_root_removed") is True,
+        "no_runner_failure": "failure" not in report,
+    }
+    if MUTATION == "close_ready_forced":
+        return True, "FORCED by fault injection"
+    failed = [k for k, v in checks.items() if not v]
+    return (not failed), ("AC1-AC3 passed; CI artifact is the evidence" if not failed
+                          else "not close-ready: " + ",".join(failed))
+
+
+def close_ready_consistent(report: dict) -> bool:
+    """Independent guard: close_ready may never be true beside a failed AC, scenario, mutation or cleanup."""
+    if report.get("close_ready") is not True:
+        return True
+    acc = report.get("acceptance") or {}
+    scen = report.get("scenarios") or {}
+    return (all(acc.get(k) is True for k in ("AC1", "AC2", "AC3"))
+            and set(scen) == set(ALL_SCENARIOS) and all(v.get("result") == "pass" for v in scen.values())
+            and report.get("mutation") is None and "failure" not in report
+            and (report.get("final_cleanup") or {}).get("ok") is True
+            and (report.get("final_cleanup") or {}).get("run_root_removed") is True)
 
 
 def run_main() -> int:
@@ -1504,9 +1547,16 @@ def run_main() -> int:
                 code = 1
             report["api_calls"] = run.api.calls
         report["finished_at"] = utc_now()
-        report.setdefault("acceptance", acceptance(report["scenarios"]))
-        report["close_ready"] = False
-        report["close_ready_reason"] = "AC4 host evidence absent: only --finalize-host after a disposable host run can set it (L13)"
+        report["acceptance"] = acceptance(report["scenarios"])
+        report["close_ready"], report["close_ready_reason"] = close_ready_decision(report)
+        if not close_ready_consistent(report):
+            report["close_ready"] = False
+            report["close_ready_reason"] = "inconsistent: close_ready claimed beside a failed check"
+            report["result"] = "fail"
+            report["failure"] = {"code": "close_ready_inconsistent", "detail": {}}
+            code = 1
+        if code == 0 and report["close_ready"] is not True:
+            code = 1
         for log in report_dir.glob("scenarios/*/dispatcher.log"):
             try:
                 write_text(log, log.read_text(errors="replace"))
@@ -1525,7 +1575,7 @@ def main() -> int:
 
 
 # ---------------------------------------------------------------------------
-# AC4 host helpers (operator-only, K11). Defined below so the scenario runner reads top-down.
+# Optional host tooling (AC4 was dropped by the owner; nothing requires these modes).
 
 
 def _host_env() -> tuple[Path, str]:
@@ -1650,7 +1700,7 @@ def _normalise(text: str, name: str, tokens: list[str], pids: set[int]) -> tuple
 
 
 def host_finalize() -> int:
-    """M7, M11, K11: normalised before/after diff, run-owned resources gone, then close_ready."""
+    """Optional: normalised before/after diff and run-owned resources gone. Never changes close_ready."""
     import difflib
 
     report_dir, run_id = _host_env()
@@ -1720,18 +1770,13 @@ def host_finalize() -> int:
         "run_processes_gone": procs["ok"],
         "snapshot_diff_empty": diffs_empty,
     }
-    ac4 = all(checks.values())
-    report["ac4"] = {"checks": checks, "diff_classification": classification, "process_check": procs,
-                     "finalized_at": utc_now(), "hostname": socket.gethostname(),
-                     "user": pwd.getpwuid(os.getuid()).pw_name}
-    report.setdefault("acceptance", {})["AC4"] = ac4
-    acc = report["acceptance"]
-    report["close_ready"] = bool(ac4 and acc.get("AC1") and acc.get("AC2") and acc.get("AC3"))
-    report["close_ready_reason"] = "AC1-AC4 passed" if report["close_ready"] else \
-        "AC4 checks failed: " + ",".join(k for k, v in checks.items() if not v)
-    write_json(report_dir / "report.json", report)
-    print(f"bridge-e2e host finalize: close_ready={report['close_ready']} ({report['close_ready_reason']})")
-    return 0 if report["close_ready"] else 1
+    ok = all(checks.values())
+    host = {"ok": ok, "checks": checks, "diff_classification": classification, "process_check": procs,
+            "finalized_at": utc_now(), "hostname": socket.gethostname(),
+            "user": pwd.getpwuid(os.getuid()).pw_name}
+    write_json(report_dir / "host-check.json", host)
+    print(f"bridge-e2e host check: ok={ok} " + ",".join(k for k, v in checks.items() if not v))
+    return 0 if ok else 1
 
 
 def host_main(argv: list[str]) -> int:
