@@ -18,18 +18,21 @@
  * | name         | parameters ($n: name type)                        | row schema                                                                 | runner's count rule                     |
  * |--------------|---------------------------------------------------|----------------------------------------------------------------------------|-----------------------------------------|
  * | marker       | $1 agent_id text, $2 marker text                  | id text, kind text, agent_id text, marker text, principal_kind text|null, principal_id text|null | exactly 1                     |
- * | task         | $1 created_by text, $2 project text, $3 title text| id text, title, description, project, platform, machine text|null, priority int, status, created_by, reviewer_platform text|null | filtered by authority and node; exactly 1 bound task (0 for bad_input) |
+ * | task         | $1 created_by text, $2 project text               | id text, title, description, project, platform, machine text|null, priority int, status, created_by, reviewer_platform text|null | runner filters by decoded authority and node (not title), then exactly 1 (0 for bad_input) and asserts the title |
  * | create_event | $1 task_id text                                   | id text, kind text, title text, task_id text                               | exactly 1                               |
- * | work_event   | $1 task_id bigint (decimal text), $2 title text   | id text, kind, title, task_id jsonb number, principal_kind, principal_id, agent_id | exactly 1                   |
+ * | work_event   | $1 task_id bigint (decimal text), $2 title text   | id text, kind, title, task_id text, principal_kind text|null, principal_id text|null, agent_id | exactly 1, and every row legacy/mc-token |
  * | idempotency  | $1 idempotency_key text                           | scope text, idempotency_key text, completed bool, task_id text|null (the stored task's id) | exactly 1, task_id = bound id |
  * | status       | $1 task_id bigint (decimal text)                  | id text, status text, assigned_agent text|null, completed_at text|null     | exactly 1                               |
  *
- * The work_event predicate is the spec's exact one:
+ * The work_event query selects by the work-event signature only:
  *   kind = 'status' AND detail->'task_id' = to_jsonb($1::bigint)
  *   AND title = format('Running task #%s: %s', $1, $2)
- *   AND principal_kind = 'legacy' AND principal_id = 'mc-token'
+ * and returns principal_kind/principal_id unfiltered. The runner asserts the
+ * exact count AND that every row is principal_kind = 'legacy', principal_id =
+ * 'mc-token' (CodeRabbit #216), so an extra unauthenticated event with the same
+ * signature fails. task_id is returned as text so a large id is not rounded.
  * The claim receipt ("Claimed task #N: ...", string task_id) and the PATCH
- * rows never match it.
+ * rows never match the signature.
  */
 import pg from "pg";
 
@@ -45,10 +48,10 @@ const QUERIES = {
     shape: { id: "string", kind: "string", agent_id: "string", marker: "string", principal_kind: "string?", principal_id: "string?" },
   },
   task: {
-    params: [TEXT, TEXT, TEXT],
+    params: [TEXT, TEXT],
     sql:
       "select id::text as id, title, description, project, platform, machine, priority, status, created_by, reviewer_platform " +
-      "from tasks where created_by = $1 and project = $2 and title = $3 order by id",
+      "from tasks where created_by = $1 and project = $2 order by id",
     shape: {
       id: "string", title: "string", description: "string?", project: "string?", platform: "string",
       machine: "string?", priority: "number", status: "string", created_by: "string?", reviewer_platform: "string?",
@@ -64,11 +67,10 @@ const QUERIES = {
   work_event: {
     params: [BIGINT, TEXT],
     sql:
-      "select id::text as id, kind, title, detail->'task_id' as task_id, principal_kind, principal_id, agent_id " +
+      "select id::text as id, kind, title, detail->>'task_id' as task_id, principal_kind, principal_id, agent_id " +
       "from events where kind = 'status' and detail->'task_id' = to_jsonb($1::bigint) " +
-      "and title = format('Running task #%s: %s', $1::bigint, $2::text) " +
-      "and principal_kind = 'legacy' and principal_id = 'mc-token' order by id",
-    shape: { id: "string", kind: "string", title: "string", task_id: "number", principal_kind: "string", principal_id: "string", agent_id: "string?" },
+      "and title = format('Running task #%s: %s', $1::bigint, $2::text) order by id",
+    shape: { id: "string", kind: "string", title: "string", task_id: "string", principal_kind: "string?", principal_id: "string?", agent_id: "string?" },
   },
   idempotency: {
     params: [TEXT],
@@ -137,6 +139,7 @@ async function main() {
   }
   if (request === null || typeof request !== "object" || Array.isArray(request)) return fail("invalid_request");
   if (Object.keys(request).sort().join(",") !== "parameters,query") return fail("invalid_request");
+  if (typeof request.query !== "string") return fail("unknown_query");
   const spec = Object.prototype.hasOwnProperty.call(QUERIES, request.query) ? QUERIES[request.query] : null;
   if (!spec) return fail("unknown_query");
   if (!validParams(spec.params, request.parameters)) return fail("invalid_parameters");

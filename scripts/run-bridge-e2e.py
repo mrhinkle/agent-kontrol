@@ -9,7 +9,9 @@ changes no runtime code and stubs no route.
 Modes:
   (default)                      run the scenarios and write $REPORT_DIR/report.json
   --snapshot LABEL               optional host tooling: five host snapshots, recorded, never fatal
-  --stop-tree PIDFILE            optional host tooling: stop and confirm a setsid process tree
+  --record-pid PID PIDFILE       optional host tooling: record a session leader's identity at launch
+  --stop-tree PIDFILE            optional host tooling: stop a setsid tree whose launch identity still matches
+  --sanitize-file SRC DST        publish a redacted copy of SRC at DST (never the raw bytes)
   --finalize-host                optional host tooling: normalised snapshot diff and cleanup proof
 
 close_ready (owner decision on #213, 2026-11-28: AC4 dropped, CI is the proof) is true
@@ -92,7 +94,8 @@ SNAPSHOT_COMMANDS = (
 # test misbehave in one way the runner claims to catch; the run must then fail. Unset in CI.
 # close_ready_forced injects the extra work event AND makes the decision function claim
 # close_ready; the independent consistency guard must turn the run red.
-MUTATIONS = ("close_ready_forced", "extra_work_event", "demo_true", "claim_unfiltered", "mc_token_present", "escaped_grandchild",
+MUTATIONS = ("close_ready_forced", "dispatcher_spawn_fail", "escape_then_fail", "dispatcher_ignores_sigterm",
+             "extra_work_event", "demo_true", "claim_unfiltered", "mc_token_present", "escaped_grandchild",
              "second_post", "extra_bridge_task")
 MUTATION: str | None = None
 HOP_BY_HOP = {"connection", "keep-alive", "proxy-connection", "proxy-authorization", "proxy-authenticate",
@@ -182,6 +185,41 @@ def write_json(path: Path, payload) -> None:
 def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(REDACT.text(text), encoding="utf-8")
+
+
+def publish_log(raw: Path, dst: Path) -> dict:
+    """Publish a sanitized copy of a raw log that lives outside REPORT_DIR. The raw bytes are never copied.
+
+    If the raw log cannot be read or the sanitized copy cannot be written, a note says so and no log is published.
+    """
+    try:
+        text = raw.read_text(encoding="utf-8", errors="replace")
+        write_text(dst, text)
+        return {"published": True, "path": dst.name}
+    except OSError as e:
+        try:
+            if dst.exists():
+                dst.unlink()
+            write_text(dst.with_name(dst.name + ".unavailable.txt"),
+                       f"sanitized log not published: {type(e).__name__}\n")
+        except OSError:
+            pass
+        return {"published": False, "error": type(e).__name__}
+
+
+def work_event_violations(rows: list, expected: int) -> list[str]:
+    """Rows matched by the work-event signature (numeric task_id and exact title), with no principal filter.
+
+    The count must be exact, and every matching row must carry the server-populated legacy principal,
+    so an extra unauthenticated event with the same signature fails the run.
+    """
+    problems = []
+    if len(rows) != expected:
+        problems.append(f"count {len(rows)} != {expected}")
+    for row in rows:
+        if row.get("principal_kind") != "legacy" or row.get("principal_id") != "mc-token":
+            problems.append(f"event {row.get('id')} principal {row.get('principal_kind')}/{row.get('principal_id')}")
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -725,7 +763,7 @@ class Workspace:
         fake.write_text(FAKE_CLAUDE.format(python=sys.executable, marker=str(self.marker),
                                            go_dir=str(self.go_dir), mode=mode,
                                            force_token=MUTATION == "mc_token_present",
-                                           escape=MUTATION == "escaped_grandchild"))
+                                           escape=MUTATION in ("escaped_grandchild", "escape_then_fail")))
         fake.chmod(0o700)
 
     def config(self, machine: str) -> dict:
@@ -752,10 +790,18 @@ class Workspace:
 # The dispatcher subprocess
 
 
+_IGNORE_SIGTERM_WRAPPER = (
+    "import signal, subprocess, sys; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+    "sys.exit(subprocess.call(sys.argv[1:]))"
+)
+
+
 class Dispatcher:
-    def __init__(self, ws: Workspace, proxy_url: str, token: str, log_path: Path) -> None:
+    def __init__(self, ws: Workspace, proxy_url: str, token: str, publish_path: Path) -> None:
         self.ws = ws
-        self.log_path = log_path
+        # Raw output stays in the scenario root, outside REPORT_DIR (the public artifact).
+        self.log_path = ws.root / "dispatcher.raw.log"
+        self.publish_path = publish_path
         self.env = {
             "PATH": f"{ws.bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
             "HOME": str(ws.home),
@@ -779,25 +825,33 @@ class Dispatcher:
         self.sigterm_at: str | None = None
 
     def launch(self) -> None:
+        argv = [sys.executable, str(DISPATCHER_DIR / "mc_dispatcher.py")]
+        if MUTATION == "dispatcher_spawn_fail":
+            argv[0] = "/nonexistent/bridge-62/python3"
+        elif MUTATION == "dispatcher_ignores_sigterm":
+            argv = [sys.executable, "-I", "-c", _IGNORE_SIGTERM_WRAPPER, *argv]
         log = open(self.log_path, "wb")
         try:
-            self.proc = subprocess.Popen([sys.executable, str(DISPATCHER_DIR / "mc_dispatcher.py")], cwd=str(REPO),
-                                         env=self.env, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                         start_new_session=True)
+            self.proc = subprocess.Popen(argv, cwd=str(REPO), env=self.env, stdin=subprocess.DEVNULL, stdout=log,
+                                         stderr=log, start_new_session=True)
+        except OSError as e:
+            raise Failure("dispatcher_launch_failed", error=type(e).__name__) from None
         finally:
             log.close()
         self.started_at = utc_now()
         self.start = wait_for(lambda: start_identity(self.proc.pid), "dispatcher start identity", 10)
 
     @property
-    def pid(self) -> int:
-        return self.proc.pid
+    def pid(self) -> int | None:
+        return self.proc.pid if self.proc is not None else None
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
     def terminate(self) -> int:
         """SIGTERM only while unreaped (no pid reuse), then a bounded wait. Never SIGKILL (no remediation)."""
+        if self.proc is None:
+            return None
         if self.proc.poll() is None:
             self.sigterm_at = utc_now()
             self.proc.send_signal(signal.SIGTERM)
@@ -808,7 +862,7 @@ class Dispatcher:
         return self.exit_code
 
     def evidence(self) -> dict:
-        return {"pid": self.pid if self.proc else None, "start_identity": self.start, "started_at": self.started_at,
+        return {"pid": self.pid, "start_identity": self.start, "started_at": self.started_at,
                 "sigterm_at": self.sigterm_at, "exit_code": self.exit_code,
                 "env_names": sorted(self.env), "argv": ["python3", "agents/dispatcher/mc_dispatcher.py"]}
 
@@ -822,7 +876,14 @@ class Sentinel:
                                      start_new_session=True)
         self.pid = self.proc.pid
         self.pgid = self.pid
-        self.start = wait_for(lambda: start_identity(self.pid), "sentinel start identity", 10)
+        try:
+            self.start = wait_for(lambda: start_identity(self.pid), "sentinel start identity", 10)
+        except BaseException:
+            # Not yet registered with the run: reap our own sentinel before giving up.
+            if self.proc.poll() is None:
+                os.killpg(self.pgid, signal.SIGKILL)
+            self.proc.wait(timeout=10)
+            raise
 
     def alive_unchanged(self) -> bool:
         return self.proc.poll() is None and start_identity(self.pid) == self.start
@@ -858,6 +919,8 @@ class Run:
         self.fixture_two = json.loads((FIXTURE_DIR / "two-issues.json").read_text())
         self.run_root = Path(tempfile.mkdtemp(prefix=f"bridge-62-{self.run_id}-")).resolve()
         self.sentinels: list[Sentinel] = []
+        self.markers: list[dict] = []  # every fake-CLI marker read in the current scenario
+        self.incident: dict | None = None  # a run-owned process survived teardown: stop, keep evidence
         self.dispatchers: list[Dispatcher] = []
         self.workspaces: list[Workspace] = []
         self.proxies: list[RecorderProxy] = []
@@ -881,8 +944,9 @@ class Run:
         ctx.setdefault("bound", []).append(bound)
         return bound
 
-    def bridge_tasks(self, title: str, authority: str, node: str) -> list[dict]:
-        rows = self.db.query("task", [drb.CREATED_BY, PROJECT, title])
+    def bridge_tasks(self, authority: str, node: str) -> list[dict]:
+        """Every bridge task on the lane whose v2 description names this authority and node. Title not filtered."""
+        rows = self.db.query("task", [drb.CREATED_BY, PROJECT])
         mine = []
         for row in rows:
             decoded = drb.decode_issue_content(row["description"] or "")
@@ -892,7 +956,7 @@ class Run:
 
     def assert_task(self, ctx: dict, bound: dict, issue: dict, status: str) -> None:
         """L7 plus K14: the exact bound task, its create_task event and its idempotency row."""
-        mine = self.bridge_tasks(bound["task_title"], bound["authority"], bound["issue_node_id"])
+        mine = self.bridge_tasks(bound["authority"], bound["issue_node_id"])
         check(ctx, "exactly_one_bridge_task", len(mine) == 1, count=len(mine))
         task = mine[0]
         d = task["decoded"]
@@ -919,7 +983,14 @@ class Run:
               count=len(idem), rows=idem)
 
     def work_events(self, bound: dict) -> list[dict]:
+        """Rows with the work-event signature, whatever their principal."""
         return self.db.query("work_event", [str(bound["task_id"]), bound["task_title"]])
+
+    def assert_work_events(self, ctx: dict, name: str, bound: dict, expected: int) -> list[dict]:
+        rows = self.work_events(bound)
+        problems = work_event_violations(rows, expected)
+        check(ctx, name, not problems, problems=problems, rows=rows)
+        return rows
 
     def task_status(self, task_id: int) -> str:
         rows = self.db.query("status", [str(task_id)])
@@ -941,6 +1012,8 @@ class Run:
         data = wait_for(load, "fake CLI started.json")
         ok = (isinstance(data, dict) and type(data.get("pid")) is int and type(data.get("pgid")) is int
               and data.get("mc_token_present") is False and data.get("argv_ok") is True)
+        if isinstance(data, dict) and type(data.get("pid")) is int and type(data.get("pgid")) is int:
+            self.markers.append(data)  # cleanup checks it even when the marker is rejected
         if not ok:
             raise Failure("bad_started_marker", marker=data)
         return data
@@ -998,9 +1071,10 @@ class Run:
             if p.exists():
                 try:
                     out[name] = json.loads(p.read_text())
-                except ValueError:
+                    write_json(sdir / f"ledger-{name}", out[name])  # redacted copy, never the raw file
+                except (OSError, ValueError) as e:
                     out[name] = "<unparseable>"
-                shutil.copyfile(p, sdir / f"ledger-{name}")
+                    write_json(sdir / f"ledger-{name}", {"unparseable": True, "error": type(e).__name__})
             else:
                 out[name] = "absent"
         return out
@@ -1103,6 +1177,8 @@ class Run:
         disp = self.start_dispatcher(ctx, ws, proxy, sdir)
         marker = self.read_marker(ws)
         self.tree_evidence(ctx, disp, marker, "after_child_start")
+        if MUTATION == "escape_then_fail":
+            raise Failure("injected_early_failure")  # before final_gone: only cleanup can see the survivor
         wait_for(lambda: len(self.work_events(bound)) >= 1, "work event before release")
         (ws.go_dir / f"go-{marker['pid']}").write_text("go\n")
         self.wait_status(bound["task_id"], "done")
@@ -1115,8 +1191,7 @@ class Run:
         self.stop_dispatcher(ctx, disp, EXPECTED_EXIT[name])
         self.final_gone(ctx, disp, [marker])
         self.assert_task(ctx, bound, issue, "done")
-        wev = self.work_events(bound)
-        check(ctx, "exactly_one_work_event", len(wev) == 1, count=len(wev), rows=wev)
+        self.assert_work_events(ctx, "exactly_one_work_event", bound, 1)
         self.claim_checks(ctx, proxy, [bound["task_id"]])
         check(ctx, "phase_patches", self.patches(proxy, bound["task_id"]) == ["running", "done"],
               patches=self.patches(proxy, bound["task_id"]))
@@ -1149,17 +1224,19 @@ class Run:
         disp = self.start_dispatcher(ctx, ws, proxy, sdir)
         marker = self.read_marker(ws)
         self.tree_evidence(ctx, disp, marker, "after_child_start")
-        wev = wait_for(lambda: self.work_events(bound), "work event before stop")
-        check(ctx, "exactly_one_work_event_before_stop", len(wev) == 1, count=len(wev), rows=wev)
+        wait_for(lambda: self.work_events(bound), "work event before stop")
+        self.assert_work_events(ctx, "exactly_one_work_event_before_stop", bound, 1)
         check(ctx, "lock_held_while_cli_runs", flock_free(ws.worktree_lock()) is False)
         ws.stop_file.write_text("stop\n")
         ctx["stop_written_at"] = utc_now()
         order: list[dict] = []
 
         def settled():
+            # Lock first, then the group: a group still present after the lock was seen free is a real
+            # ordering defect; the reverse order could pair an old group sample with a new lock state.
+            lock = flock_free(ws.worktree_lock())
             table = process_table()
             group = sorted(p for p, row in table.items() if row["pgid"] == marker["pgid"])
-            lock = flock_free(ws.worktree_lock())
             order.append({"t": utc_now(), "group_live": bool(group), "lock_free": lock})
             if lock and group:
                 raise Failure("lock_released_before_group_gone", sample=order[-1])
@@ -1179,8 +1256,7 @@ class Run:
         ctx["sentinel_cleanup"] = sentinel.cleanup()
         check(ctx, "sentinel_cleanup", ctx["sentinel_cleanup"]["ok"], result=ctx["sentinel_cleanup"])
         self.assert_task(ctx, bound, issue, "running")
-        wev = self.work_events(bound)
-        check(ctx, "exactly_one_work_event", len(wev) == 1, count=len(wev))
+        self.assert_work_events(ctx, "exactly_one_work_event", bound, 1)
         self.claim_checks(ctx, proxy, [bound["task_id"]])
         check(ctx, "no_completion_patch", self.patches(proxy, bound["task_id"]) == ["running"],
               patches=self.patches(proxy, bound["task_id"]))
@@ -1204,7 +1280,12 @@ class Run:
         proxy = self.new_proxy()
         disp = self.start_dispatcher(ctx, ws, proxy, sdir)
         # The dispatcher's first act is its heartbeat; then each poll sees the stop and claims nothing.
-        wait_for(lambda: any(r["path"] == "/api/ingest" for r in proxy.snapshot()), "dispatcher heartbeat")
+        def heartbeat_ok(r: dict) -> bool:
+            return (r["method"] == "POST" and r["path"] == "/api/ingest" and isinstance(r["body"], dict)
+                    and r["body"].get("kind") == "heartbeat" and r["authorization"] == "preserved"
+                    and r.get("upstream_status") == 200 and r.get("demo_true") is False)
+
+        wait_for(lambda: any(heartbeat_ok(r) for r in proxy.snapshot()), "authenticated non-demo heartbeat")
         t0 = utc_now()
         time.sleep(3 * POLL_SECONDS + 1)
         ctx["observed_window"] = {"from": t0, "to": utc_now(), "poll_seconds": POLL_SECONDS}
@@ -1216,7 +1297,7 @@ class Run:
         check(ctx, "no_cli_started", not ws.marker.exists())
         check(ctx, "task_still_queued", self.task_status(bound["task_id"]) == "queued")
         check(ctx, "no_patch", self.patches(proxy, bound["task_id"]) == [])
-        check(ctx, "no_work_event", len(self.work_events(bound)) == 0)
+        self.assert_work_events(ctx, "no_work_event", bound, 0)
         ledger = self.ledger_files(ws, sdir)
         check(ctx, "no_stop_journal", ledger["dispatcher-stop.json"] == "absent")
         check(ctx, "sentinel_untouched", sentinel.alive_unchanged())
@@ -1298,7 +1379,7 @@ class Run:
         self.claim_checks(ctx, proxy, [b["task_id"] for b in bounds])
         for b in bounds:
             self.assert_task(ctx, b, issues[b["issue_node_id"]], "done")
-            check(ctx, f"exactly_one_work_event_{b['issue_node_id']}", len(self.work_events(b)) == 1)
+            self.assert_work_events(ctx, f"exactly_one_work_event_{b['issue_node_id']}", b, 1)
         check(ctx, "done_in_order", self.done_ids(ws) == [b["task_id"] for b in bounds], done=self.done_ids(ws))
         ledger = self.ledger_files(ws, sdir)
         check(ctx, "journal_cleared", ledger["dispatcher-stop.json"] == "absent")
@@ -1329,8 +1410,7 @@ class Run:
             tasks = TaskTransport(self.origin, self.token)
             issues = IssueTransport(sequence=sequence)
             result = drb.run_once(config, issues, tasks)
-            titles = sorted({i["title"] for snap in sequence for i in snap["issues"]})
-            found = [t for title in titles for t in self.bridge_tasks(title, ws.authority, issue["node_id"])]
+            found = self.bridge_tasks(ws.authority, issue["node_id"])
             handoff = ws.ledger / "handoff.json"
             rows = json.loads(handoff.read_text())["handoffs"] if handoff.exists() else {}
             idem = self.db.query("idempotency", [drb._idempotency_key(ws.authority, issue["node_id"])])
@@ -1358,6 +1438,7 @@ class Run:
 
     def run_scenario(self, name: str) -> dict:
         ctx: dict = {"scenario": name, "started_at": utc_now(), "assertions": []}
+        self.markers = []
         before = len(self.db.log)
         try:
             getattr(self, f"s_{name}")(ctx)
@@ -1379,17 +1460,48 @@ class Run:
         return ctx
 
     def cleanup_scenario(self, ctx: dict) -> dict:
+        """Stop what the scenario started and prove every recorded process gone, also on the failure path.
+
+        Survivors (a dispatcher that ignores SIGTERM, a descendant that outlived it) are an incident:
+        nothing is force-killed, the workspace and registry are kept as evidence, and the run stops.
+        """
+        if self.incident is not None:
+            return {"ok": False, "code": self.incident["code"], "retained": True, "note": "incident already open"}
         out: dict = {"dispatchers": [], "sentinels": [], "workspaces": [], "proxies": 0}
         ok = True
+        pids: dict[int, str | None] = {}
+        pgids: list[int] = []
+        survived = []
         for disp in self.dispatchers:
-            if disp.proc is not None and disp.proc.poll() is None:
-                try:
-                    disp.terminate()
-                except Failure:
-                    ok = False
+            if disp.proc is None:
+                out["dispatchers"].append({"pid": None, "launched": False})
+                continue
+            pids[disp.pid] = disp.start
+            if disp.alive():
+                table = process_table()
+                for p in descendants(table, disp.pid):
+                    pids.setdefault(p, table[p]["start"])
+            try:
+                disp.terminate()
+            except Failure:
+                survived.append(disp.pid)
             out["dispatchers"].append({"pid": disp.pid, "exit_code": disp.proc.returncode})
-            if disp.proc.returncode is None:
-                ok = False
+        for snap in ctx.get("tree_snapshots", []):
+            for p, start in snap.get("descendant_starts", {}).items():
+                pids.setdefault(int(p), start)
+        for m in self.markers:
+            pids.setdefault(m["pid"], None)
+            pgids.append(m["pgid"])
+        out["process_check"] = gone_check(pids, sorted(set(pgids))) if pids or pgids else {"ok": True, "checked_pids": []}
+        if survived or not out["process_check"]["ok"]:
+            out["code"] = "dispatcher_survived_teardown" if survived else "cleanup_survivor"
+            out["survived_dispatchers"] = survived
+            out["retained"] = {"workspaces": [str(ws.root) for ws in self.workspaces]}
+            out["ok"] = False
+            self.incident = {"code": out["code"], "scenario": ctx.get("scenario"), "at": utc_now()}
+            return out  # keep processes, workspaces, proxies and the registry: stop-and-reconcile, no retry
+        for disp in self.dispatchers:
+            out.setdefault("logs", []).append(publish_log(disp.log_path, disp.publish_path))
         for s in self.sentinels:
             res = s.cleanup()
             out["sentinels"].append(res)
@@ -1520,6 +1632,8 @@ def run_main() -> int:
         report["scenarios_requested"] = wanted
         for name in wanted:
             report["scenarios"][name] = run.run_scenario(name)
+            if run.incident is not None:
+                raise Failure(run.incident["code"], scenario=name, note="run stopped; evidence retained")
         report["acceptance"] = acceptance(report["scenarios"])
         all_pass = (all(s["result"] == "pass" for s in report["scenarios"].values())
                     and wanted == list(ALL_SCENARIOS) and MUTATION is None)
@@ -1540,7 +1654,9 @@ def run_main() -> int:
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         if run is not None:
             report["final_cleanup"] = run.cleanup_scenario({})
-            shutil.rmtree(run.run_root, ignore_errors=True)
+            report["run_root"] = str(run.run_root)
+            if run.incident is None:
+                shutil.rmtree(run.run_root, ignore_errors=True)
             report["final_cleanup"]["run_root_removed"] = not run.run_root.exists()
             if not (report["final_cleanup"]["ok"] and report["final_cleanup"]["run_root_removed"]):
                 report["result"] = "fail"
@@ -1557,11 +1673,6 @@ def run_main() -> int:
             code = 1
         if code == 0 and report["close_ready"] is not True:
             code = 1
-        for log in report_dir.glob("scenarios/*/dispatcher.log"):
-            try:
-                write_text(log, log.read_text(errors="replace"))
-            except OSError:
-                pass
         write_json(report_dir / "report.json", report)
         summary = ", ".join("%s=%s" % (k, v["result"]) for k, v in report["scenarios"].items())
         print(f"bridge-e2e: {report.get('result')} ({summary}) report={report_dir / 'report.json'}")
@@ -1646,13 +1757,20 @@ def host_stop_tree(pidfile: Path) -> int:
     report_dir, _run_id = _host_env()
     result: dict = {"pidfile": str(pidfile), "started_at": utc_now()}
     try:
-        pid = int(pidfile.read_text().split()[0])
-    except (OSError, ValueError, IndexError):
-        result.update(ok=False, reason="pid file unreadable")
+        record = json.loads(pidfile.read_text())
+        pid, pgid, start = int(record["pid"]), int(record["pgid"]), str(record["start"])
+    except (OSError, ValueError, KeyError, TypeError):
+        result.update(ok=False, reason="pid file unreadable; write it with --record-pid at launch")
         write_json(report_dir / "cleanup-next.json", result)
         return 1
     table = process_table()
-    pgid = table[pid]["pgid"] if pid in table else pid
+    leader = table.get(pid)
+    # Ownership is proven only against the launch-time record: same start identity and same group.
+    if leader is None or leader["start"] != start or leader["pgid"] != pgid:
+        result.update(ok=False, reason="cannot verify the launch-time identity; nothing signalled", pid=pid,
+                      pgid=pgid, observed=leader)
+        write_json(report_dir / "cleanup-next.json", result)
+        return 1
     if pgid <= 1 or pgid == os.getpgrp():
         result.update(ok=False, reason="refusing to signal this group", pid=pid, pgid=pgid)
         write_json(report_dir / "cleanup-next.json", result)
@@ -1779,7 +1897,28 @@ def host_finalize() -> int:
     return 0 if ok else 1
 
 
+def record_pid(pid: int, pidfile: Path) -> int:
+    """At launch: record the session leader's pid, group and start identity for --stop-tree."""
+    row = process_table().get(pid)
+    if row is None:
+        print("process not found", file=sys.stderr)
+        return 1
+    pidfile.write_text(json.dumps({"pid": pid, "pgid": row["pgid"], "start": row["start"]}) + "\n")
+    return 0
+
+
+def sanitize_file(src: Path, dst: Path) -> int:
+    for name, label in (("MC_TOKEN", "token"), ("MC_DASHBOARD_PASSWORD", "dashboard-password"),
+                        ("DATABASE_URL", "database-url")):
+        REDACT.add(os.environ.get(name), label)
+    return 0 if publish_log(src, dst)["published"] else 1
+
+
 def host_main(argv: list[str]) -> int:
+    if argv[0] == "--sanitize-file" and len(argv) == 3:
+        return sanitize_file(Path(argv[1]), Path(argv[2]))
+    if argv[0] == "--record-pid" and len(argv) == 3:
+        return record_pid(int(argv[1]), Path(argv[2]).resolve())
     if argv[0] == "--snapshot" and len(argv) == 2:
         return host_snapshot(argv[1])
     if argv[0] == "--stop-tree" and len(argv) == 2:

@@ -109,7 +109,14 @@ jobs:
           echo "::add-mask::$MC_TOKEN"; echo "::add-mask::$MC_DASHBOARD_PASSWORD"
           pnpm run build
           PORT=3999 NEXT_TELEMETRY_DISABLED=1 nohup pnpm start -H 127.0.0.1 >"$RUNNER_TEMP/next.log" 2>&1 &
-          ok=0; for _ in $(seq 1 60); do curl -fsS -H "Authorization: Bearer $MC_TOKEN" "http://127.0.0.1:3999/api/tasks?status=all" >/dev/null && { ok=1; break; }; sleep 2; done; [ "$ok" = 1 ] || exit 1
+          ok=0; for _ in $(seq 1 60); do curl -fsS -H "Authorization: Bearer $MC_TOKEN" "http://127.0.0.1:3999/api/tasks?status=all" >/dev/null && { ok=1; break; }; sleep 2; done
+          if [ "$ok" != 1 ]; then
+            # Keep the setup failure in the artifact: a record, and a sanitized copy of the Next log only.
+            mkdir -p "$REPORT_DIR"
+            printf '{"result": "fail", "failure": {"code": "next_not_ready"}, "close_ready": false}\n' >"$REPORT_DIR/report.json"
+            python3 scripts/run-bridge-e2e.py --sanitize-file "$RUNNER_TEMP/next.log" "$REPORT_DIR/next.log" || true
+            exit 1
+          fi
           MC_URL=http://127.0.0.1:3999 pnpm run test:bridge-e2e
           python3 -m py_compile scripts/run-bridge-e2e.py
       - uses: actions/upload-artifact@v4

@@ -8,7 +8,12 @@ from __future__ import annotations
 import http.client
 import importlib.util
 import json
+import os
+import signal
+import subprocess
 import sys
+import tempfile
+import time
 import unittest
 import urllib.parse
 from pathlib import Path
@@ -18,7 +23,9 @@ sys.path.insert(0, str(ROOT / "agents" / "dispatcher"))
 
 import dispatch_ready_bridge as drb  # noqa: E402
 
-_spec = importlib.util.spec_from_file_location("run_bridge_e2e", ROOT / "scripts" / "run-bridge-e2e.py")
+# BRIDGE_E2E_RUNNER lets the same tests run against an older runner to show a fixed bug RED.
+_spec = importlib.util.spec_from_file_location(
+    "run_bridge_e2e", os.environ.get("BRIDGE_E2E_RUNNER") or ROOT / "scripts" / "run-bridge-e2e.py")
 runner = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(runner)
 
@@ -129,6 +136,86 @@ class CloseReady(unittest.TestCase):
         self.assertTrue(runner.close_ready_consistent(report))
         report["acceptance"]["AC2"] = False
         self.assertFalse(runner.close_ready_consistent(report))
+
+
+class StubWorkspace:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.bin = root / "bin"
+        self.home = root / "home"
+        self.config_path = root / "bridge-config.json"
+
+
+class ReviewMajors(unittest.TestCase):
+    """CodeRabbit #216 Majors. Each test fails on the pre-fix runner (BRIDGE_E2E_RUNNER=<old file>)."""
+
+    def test_unauthenticated_work_event_with_the_same_signature_fails(self):
+        good = {"id": "1", "principal_kind": "legacy", "principal_id": "mc-token"}
+        bad = {"id": "2", "principal_kind": None, "principal_id": None}
+        self.assertEqual(runner.work_event_violations([good], 1), [])
+        self.assertNotEqual(runner.work_event_violations([good, bad], 1), [])
+        self.assertNotEqual(runner.work_event_violations([bad], 1), [])
+
+    def test_raw_dispatcher_log_is_outside_the_report_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "report" / "scenarios" / "normal"
+            disp = runner.Dispatcher(StubWorkspace(Path(tmp) / "ws"), "http://127.0.0.1:1", "tok",
+                                     report / "dispatcher.log")
+            self.assertNotIn(str(Path(tmp) / "report"), str(disp.log_path))
+
+    def test_publish_log_never_copies_raw_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            raw, dst = Path(tmp) / "raw.log", Path(tmp) / "out" / "dispatcher.log"
+            raw.write_text("Authorization: Bearer Zz9" + "Ab1" * 12 + "\n")
+            self.assertTrue(runner.publish_log(raw, dst)["published"])
+            self.assertNotIn("Ab1Ab1", dst.read_text())
+            missing = runner.publish_log(Path(tmp) / "absent.log", Path(tmp) / "out" / "gone.log")
+            self.assertFalse(missing["published"])
+            self.assertFalse((Path(tmp) / "out" / "gone.log").exists())
+
+    def test_cleanup_survives_a_dispatcher_that_never_started(self):
+        run = runner.Run.__new__(runner.Run)
+        with tempfile.TemporaryDirectory() as tmp:
+            disp = runner.Dispatcher(StubWorkspace(Path(tmp)), "http://127.0.0.1:1", "tok", Path(tmp) / "d.log")
+            run.dispatchers, run.sentinels, run.proxies, run.workspaces = [disp], [], [], []
+            run.markers, run.incident = [], None
+            out = run.cleanup_scenario({})
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["dispatchers"], [{"pid": None, "launched": False}])
+
+    def test_cleanup_finds_a_recorded_survivor_on_the_failure_path(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        try:
+            start = runner.start_identity(child.pid)
+            run = runner.Run.__new__(runner.Run)
+            run.dispatchers, run.sentinels, run.proxies, run.workspaces = [], [], [], []
+            run.markers, run.incident = [], None
+            ctx = {"tree_snapshots": [{"descendant_starts": {str(child.pid): start}}]}
+            out = run.cleanup_scenario(ctx)
+            self.assertFalse(out["ok"])
+            self.assertIn(child.pid, out["process_check"]["survivors"])
+        finally:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+
+    def test_stop_tree_refuses_a_pid_whose_launch_identity_does_not_match(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                pidfile = Path(tmp) / "next.pid"
+                pidfile.write_text(json.dumps({"pid": child.pid, "pgid": child.pid, "start": "not-this-process"}))
+                old = dict(os.environ)
+                os.environ.update(REPORT_DIR=tmp, RUN_ID="unit")
+                try:
+                    self.assertEqual(runner.host_stop_tree(pidfile), 1)
+                finally:
+                    os.environ.clear()
+                    os.environ.update(old)
+                time.sleep(0.2)
+                self.assertIsNone(child.poll(), "an unverified pid must never be signalled")
+        finally:
+            os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
 
 
 class Redaction(unittest.TestCase):
