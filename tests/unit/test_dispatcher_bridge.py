@@ -848,9 +848,11 @@ class CodeRabbit215(BridgeHarness):
         for how in ("timeout", "http_500", "demo", "wrong_status"):
             with self.subTest(failure=how):
                 if self._bridge is not None:
-                    self._bridge.held["lock"].release()
-                    if self._bridge.held.get("injection") is not None:
-                        ak_pointers.cleanup(self._bridge.held["injection"])
+                    held = self._bridge.held or {}
+                    if held.get("lock") is not None:
+                        held["lock"].release()
+                    if held.get("injection") is not None:
+                        ak_pointers.cleanup(held["injection"])
                     os.close(self._bridge.dir_fd)
                     self._bridge = None
                     (self.ledger / md.BRIDGE_JOURNAL).unlink(missing_ok=True)
