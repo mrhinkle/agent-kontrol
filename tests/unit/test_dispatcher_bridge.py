@@ -787,7 +787,7 @@ class BridgeStrictEvent(BridgeHarness):
                         ak_pointers.cleanup(held["injection"])
                     os.close(self._bridge.dir_fd)
                     self._bridge = None
-                    (self.ledger / md.BRIDGE_JOURNAL).unlink()
+                    (self.ledger / md.BRIDGE_JOURNAL).unlink(missing_ok=True)
                     self.server.queue = [server_task(TID, self.body)]
                 self.server.requests.clear()
                 with mock.patch.object(md.urllib.request, "urlopen", side_effect=self.failing_ingest(how)):
