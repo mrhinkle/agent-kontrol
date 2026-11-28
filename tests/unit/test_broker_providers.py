@@ -1695,13 +1695,16 @@ class ContractTests(unittest.TestCase):
         build = text.index("pnpm run build")
         self.assertLess(text.index('python-version: "3.12"'), build)
         after = text[build:]
-        self.assertIn("python:3.9-slim", after)
+        # #212 H8 replaced the broker-only discover step with an explicit module list.
+        # Every broker test module that discover found must still be named in it.
+        self.assertIn("mirror.gcr.io/library/python:3.9-bookworm", after)
         self.assertIn('--user "$(id -u):$(id -g)"', after)
-        self.assertIn(
-            "python3.9 -m unittest discover -s tests/unit -p 'test_broker*.py' -v",
-            after,
-        )
-        self.assertIn("python3.9 -m py_compile agents/broker/*.py", after)
+        step = after[after.index("python3.9 -m unittest -v"):]
+        step = step[:step.index("&& python3.9 -m py_compile")]
+        named = set(step.split())
+        for path in sorted((ROOT / "tests" / "unit").glob("test_broker*.py")):
+            self.assertIn(f"tests.unit.{path.stem}", named)
+        self.assertIn("python3.9 -m py_compile agents/dispatcher/*.py agents/broker/*.py", after)
         self.assertNotIn('python-version: "3.9"', text)
 
     def test_stdlib_only_and_no_package_init(self) -> None:

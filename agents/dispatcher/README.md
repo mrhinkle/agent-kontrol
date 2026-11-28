@@ -579,9 +579,9 @@ the row only when that halt is saved. If the halt save fails, a later call
 that still sees `posting` does not POST. The module reads no credentials and
 writes no GitHub labels.
 
-This does not start the lane. `mc_dispatcher.py` is unchanged, so it still
-claims whatever the existing loop claims and it has no bridge stop check.
-One ledger on one host is the whole scope. Cross-host processes with separate
+This module does not start the lane. The dispatcher does that only in bridge
+mode (below), which is off by default; with it off, the dispatcher still
+claims whatever the existing loop claims. One ledger on one host is the whole scope. Cross-host processes with separate
 journals are not coordinated and can still create a second task. An issue
 with no P0, P1, or P2 label sorts last and is not enqueued: create priority
 is 1 through 3, and 3 is already P2.
@@ -593,11 +593,10 @@ python3 -m unittest tests.unit.test_dispatch_ready_bridge -v
 ## Stop control (source only, #211)
 
 `ak_stop_control.py` is the stop control for one dispatcher round: a pure
-state machine for claim, launch, acknowledgment, stop, and finish. It is
-source only. Nothing imports it, `mc_dispatcher.py`, `ak_skill_launch.py`,
-and `dispatch_ready_bridge.py` are unchanged, and no concrete signal port
-exists. Adding a real signal port, wiring it into the dispatcher, or
-activating it is Tier C and needs Mark's approval.
+state machine for claim, launch, acknowledgment, stop, and finish. Only the
+dispatcher's bridge mode (#212, off by default) imports it, with the concrete
+ports described below; `ak_skill_launch.py` and `dispatch_ready_bridge.py` do
+not. Activating bridge mode on any host is Tier C and needs Mark's approval.
 
 The module starts no process, reads no environment or file, opens no claim
 route, and makes no signal syscall. The caller injects the stop predicate,
@@ -644,6 +643,132 @@ docker pull python:3.12-bookworm   # the runner refuses to pull
 sh tests/unit/run_ak_stop_control_virtual.sh
 docker pull python:3.9-slim
 AK_STOP_CONTROL_IMAGE=python:3.9-slim sh tests/unit/run_ak_stop_control_virtual.sh
+```
+
+## Bridge mode (#212, off by default)
+
+Bridge mode connects the handoff ledger, the exact-task claim (#173) and the
+stop control (#211). It is on only when `MC_BRIDGE_ENABLED` is exactly `1`.
+Unset, `0`, `true` or any other value runs the loop above unchanged: the same
+claim body, no `task_id`, and no bridge file is opened. A golden fixture
+captured on `main` before this change pins that
+(`tests/unit/fixtures/dispatcher_bridge_disabled_golden.json`). The config's
+own `enabled` field is validated and ignored; the environment value is the only
+switch. **Turning it on anywhere is a separate decision that stays with Mark.**
+
+Settings:
+
+- `MC_BRIDGE_CONFIG`: absolute path of the bridge JSON config, the same object
+  `dispatch_ready_bridge.run_once` takes (`authority`, `actor_id`,
+  `ledger_dir`, `workdir`, `repos`, optional `stop_file`). Every repo entry
+  needs a concrete platform (`claude-code`, `codex` or `grok`; `any` is
+  refused), and `workdir` must be the dispatcher's `MC_WORKDIR`.
+- `MC_MAX_CONCURRENT` must be exactly `1`. Unset means the default `2`, which
+  refuses to start (`invalid_concurrency`).
+- `ledger_dir` must be a directory this user owns with no group or other
+  access. It is opened once and every journal file is reached through that
+  descriptor.
+
+Each poll, per platform:
+
+1. A bridge candidate is an `acknowledged` row in `<ledger_dir>/handoff.json`
+   whose frozen body names this host (`HOSTNAME`) and this platform. No row:
+   idle, no claim. Two rows: `duplicate_candidate`. A row without a valid task
+   id: `missing_task_id`. A row that matches zero or several `repos[]`
+   entries (repository, project, platform, machine, reviewer, creator):
+   `conflicting_candidate`. A malformed ledger: `ledger_unreadable`.
+2. Before any claim the lane is checked (worktree, worker and reviewer CLIs,
+   lane user), the worktree lock is taken, the broker is minted, and the skill
+   pointers are written. A lane that cannot run halts as `invalid_config`; a
+   busy lock or a broker, pointer or git failure is undone and retried on the
+   next poll without a claim.
+3. `before_claim()`, then `POST /api/tasks/claim` with `platform`, `machine`,
+   `agent_id`, the row's `project` and its exact `task_id`. It never falls back
+   to an unfiltered claim or to `MC_TASK_PROJECT`. A returned task must have
+   the requested id, project, platform and machine (a null machine is a
+   mismatch) and every frozen field. `{task: null}` is `exact_claim_miss`; a
+   timeout, transport error or unreadable reply is `claim_unknown`; anything
+   else is `claim_mismatch`. Then `note_claimed(id, exact_claim=True)`, which
+   must report the exact match as durably proven.
+4. Each phase (worker, then reviewer when the row names one) runs through a
+   gated child: `begin_launch`, spawn, `register`, `confirm_ack`, the
+   authenticated `status` work event with `detail.task_id`, and only then is
+   the payload released. The work event is strict: a transport error, timeout,
+   non-2xx, malformed reply, `ok` other than `true`, or a demo deployment that
+   dropped it keeps the payload unreleased; the gate exits on EOF, the
+   controller retires it, and the round halts `claim_unknown` (phase
+   `worker_event` or `reviewer_event`) with the journal kept. The registered identity is the process-group leader,
+   or the `sudo` wrapper with `MC_LANE_USER`. The wait wakes on the stop
+   predicate, `SIGTERM`/`SIGINT`, the task timeout and errors, and each of
+   those goes to `request_stop()`. The leader is reaped only after the
+   controller has confirmed its group gone. Members left in the group after a
+   normal exit are stopped through the controller and fail the task.
+5. `finish()`, then pointer cleanup, broker revoke and lock release, then
+   exactly one result PATCH (`done` or `failed`), then the task is appended to
+   `<ledger_dir>/dispatcher-done.json` with an atomic, fsynced write, and only
+   then `confirm_cleanup_durable()` clears `<ledger_dir>/dispatcher-stop.json`.
+   A row whose task id is in `dispatcher-done.json` is never a candidate again.
+   Every task PATCH in bridge mode (`running`, `review`, and the result) counts
+   only when the reply is `{ok: true, task}` with the requested id and status
+   and no demo flag. A failed or timed-out `running`/`review` PATCH may still
+   land later, so it holds the payload and halts `claim_unknown` (phase
+   `worker_event`/`reviewer_event`); an unrecorded result halts
+   `claim_unknown` (phase `result`) and is not added to the done record.
+   An unreadable or unparsable `dispatcher-done.json` halts `invalid_config`
+   (it is never read as empty); a failed append keeps the journal and halts
+   `claim_unknown` (phase `result`).
+
+The only bridge-mode code that sends a signal is `BridgeSignalPort`, called by
+`StopController`. It signals only a registered, unreaped direct child's own
+group, and with a lane user it uses the #193 path (`sudo -n -u <lane>
+/bin/kill`). The process observer reads `/proc` on Linux and `ps` elsewhere.
+
+The stop predicate is the config's `stop_file` (an error reading it counts as a
+stop), `SIGTERM` or `SIGINT`. The signal handlers only latch the stop. A stop
+file pauses claiming; a signal ends the dispatcher. A stop before any claim was
+sent is reconciled and leaves no journal.
+
+A halt leaves `dispatcher-stop.json` with the controller's last record and a
+`halt` object, and prints one stderr line, `[mc] bridge halt code=<code>
+phase=<phase> machine=<host>` plus the task id and row id when known. The
+codes are `invalid_config`, `invalid_concurrency`, `ledger_unreadable`,
+`stop_journal_present`, `missing_task_id`, `conflicting_candidate`,
+`duplicate_candidate`, `claim_mismatch`, `exact_claim_miss`, `claim_unknown`,
+`journal_write_failed`, `identity_unverifiable` and `stop_requested`. A halt
+starts no child, sends neither `done` nor a requeue, and keeps the recovery
+record; the dispatcher then claims nothing and holds its lock and any
+unreaped child until it is signalled (exit status 3). An existing
+`dispatcher-stop.json` at startup is `stop_journal_present`: no claim, and the
+file is left untouched.
+
+Rollback, in this order:
+
+1. Stop new claims: create the `stop_file`, then signal the bridge dispatcher.
+   Do not start the legacy (non-bridge) dispatcher yet.
+2. Confirm the bridge dispatcher process has exited (it holds
+   `<ledger_dir>/dispatcher.lock` until then) before reading any recovery
+   state, then confirm that every process group named in
+   `dispatcher-stop.json` is gone.
+3. Reconcile the worktree (remove a left-over `ak-skills` block, check the
+   lock), the claimed task on the server, every claim or status write that
+   timed out (a timed-out `claim`, `running`, `review` or result PATCH may
+   have landed after the halt: read the task's current status on the server),
+   and every retained journal. Keep `handoff.json`, `dispatcher-stop.json` and
+   `dispatcher-done.json` until then.
+4. Only then set `MC_BRIDGE_ENABLED=0` or unset it, and restart on the last
+   known good revision. Legacy dispatch stays stopped until step 3 is done,
+   because it would otherwise claim work in a worktree that is not reconciled.
+
+Only one bridge dispatcher may use a ledger: each holds an exclusive lock on
+`<ledger_dir>/dispatcher.lock` from before the journal check until it exits,
+and a second one stops with `invalid_config` without touching anything.
+
+Limits: one host and one ledger. Two unfinished acknowledged rows for the
+same host and platform are `duplicate_candidate`. The skill pointers stay in `AGENTS.md`
+during review, because cleanup waits for `finish()`.
+
+```bash
+python3 -m unittest -v tests.unit.test_dispatcher_bridge
 ```
 
 ## Tests

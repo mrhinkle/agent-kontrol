@@ -2195,12 +2195,45 @@ class StopControlTests(unittest.TestCase):
     # ---- #211: no wiring (C14, H12) ----
 
     def test_dispatcher_entry_points_do_not_import_stop_control(self):
-        for name in ("mc_dispatcher.py", "ak_skill_launch.py", "dispatch_ready_bridge.py"):
+        # #212 D20: the bridge-enabled dispatcher path is wired through StopController.
+        # ak_skill_launch and the handoff module still are not.
+        for name in ("ak_skill_launch.py", "dispatch_ready_bridge.py"):
             with self.subTest(file=name):
                 path = DISPATCHER_DIR / name
                 self.assertTrue(path.is_file(), f"{path} is not mounted; the check would be vacuous")
                 self.assertNotIn("ak_stop_control", path.read_text(encoding="utf-8"))
                 self.assertNotIn("StopController", path.read_text(encoding="utf-8"))
+        path = DISPATCHER_DIR / "mc_dispatcher.py"
+        self.assertTrue(path.is_file(), f"{path} is not mounted; the check would be vacuous")
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        imports = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+        self.assertIn("ak_stop_control", imports)
+        defs = {node.name: node for node in tree.body if isinstance(node, (ast.ClassDef, ast.FunctionDef))}
+        self.assertIn("BridgeDispatcher", defs)
+        constructed = [
+            item for item in ast.walk(defs["BridgeDispatcher"])
+            if isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute) and item.func.attr == "StopController"
+        ]
+        self.assertEqual(len(constructed), 1, "the bridge path builds exactly one StopController per round")
+        ports = {kw.arg: kw.value for kw in constructed[0].keywords}
+        for port in ("observer", "signals", "journal", "predicate", "clock", "wait", "self_identity"):
+            self.assertIn(port, ports)
+        direct = {"killpg", "stop_group", "stop_group_id", "stop_lane_group", "_lane_op", "kill",
+                  "terminate", "send_signal"}
+        for name, node in defs.items():
+            if not (name.startswith("Bridge") or name.startswith("bridge_")):
+                continue
+            for method in ast.walk(node):
+                if not isinstance(method, ast.FunctionDef):
+                    continue
+                for item in ast.walk(method):
+                    if not isinstance(item, ast.Call):
+                        continue
+                    func = item.func
+                    called = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                    if called in direct:
+                        self.assertEqual((name, method.name), ("BridgeSignalPort", "signal_group"),
+                                         f"{called} outside the injected signal port")
 
     # ---- #214 review (CodeRabbit) ----
 

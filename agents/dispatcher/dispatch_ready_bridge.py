@@ -95,6 +95,7 @@ import re
 import stat
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -485,15 +486,16 @@ def _post(parsed, journal, record, tasks) -> dict:
             idempotency_key=key,
         )
     record["state"] = "acknowledged"
-    record["task_id"] = task["id"]
+    record["task_id"] = _canonical_task_id(task)  # an int, also when the server sent "101"
     record["bound_by"] = "post"
     record["halt_reason"] = None
     if not _save_journal(parsed["ledger_dir"], journal):
-        return _result("halted", posted=True, reason="ledger_unavailable", issue_node_id=node, idempotency_key=key, task_id=task["id"])
+        return _result("halted", posted=True, reason="ledger_unavailable", issue_node_id=node, idempotency_key=key,
+                       task_id=record["task_id"])
     return _result(
         "handed_off",
         posted=True,
-        task_id=task["id"],
+        task_id=record["task_id"],
         issue_node_id=node,
         idempotency_key=key,
     )
@@ -1116,14 +1118,30 @@ def _idempotency_key(authority: str, node: str) -> str:
     return f"drb1-{digest}"
 
 
+MAX_TASK_ID = 9007199254740991  # the claim route's safe-integer bound (#173)
+_TASK_ID_TEXT_RE = re.compile(r"[1-9][0-9]{0,15}")
+
+
+def canonical_task_id(value) -> int | None:
+    """A server task id as an int, or None (#212 CodeRabbit, PR #215).
+
+    ``tasks.id`` is a Postgres bigint and no int8 parser is registered, so the
+    real routes return it as a decimal string. Accept an int (not bool) or a
+    canonical decimal string (no sign, no leading zero, no space), within
+    1..MAX_TASK_ID. Anything else is not a task id.
+    """
+    if type(value) is int:
+        return value if 1 <= value <= MAX_TASK_ID else None
+    if isinstance(value, str) and _TASK_ID_TEXT_RE.fullmatch(value):
+        number = int(value)
+        return number if number <= MAX_TASK_ID else None
+    return None
+
+
 def _canonical_task_id(row):
     if not isinstance(row, Mapping):
         return None
-    task_id = row.get("id")
-    # bool subclasses int and compares equal to 1, so it is not a task id.
-    if type(task_id) is not int or isinstance(task_id, bool) or task_id < 1:
-        return None
-    return task_id
+    return canonical_task_id(row.get("id"))
 
 
 def _identity_matches(task, body: Mapping) -> bool:
@@ -1173,7 +1191,7 @@ def _load_journal(parsed):
     return checked, True
 
 
-def _validate_journal(data):
+def _validate_journal(data, *, keep_missing_task_id: bool = False):
     if not isinstance(data, Mapping) or data.get("version") != 1:
         return "ledger_unreadable"
     authority = data.get("authority")
@@ -1187,14 +1205,14 @@ def _validate_journal(data):
     for node, row in handoffs.items():
         if node != row.get("issue_node_id") if isinstance(row, Mapping) else True:
             return "ledger_unreadable"
-        parsed = _validate_handoff(authority, row)
+        parsed = _validate_handoff(authority, row, keep_missing_task_id=keep_missing_task_id)
         if isinstance(parsed, str):
             return parsed
         clean[node] = parsed
     return {"version": 1, "authority": authority, "actor_id": actor, "handoffs": clean}
 
 
-def _validate_handoff(authority: str, row):
+def _validate_handoff(authority: str, row, *, keep_missing_task_id: bool = False):
     if not isinstance(row, Mapping) or set(row) != HANDOFF_KEYS:
         return "ledger_unreadable"
     node = row["issue_node_id"]
@@ -1217,11 +1235,19 @@ def _validate_handoff(authority: str, row):
     if attempt is not None and _parse_time(attempt) is None:
         return "ledger_unreadable"
     task_id = row["task_id"]
-    if task_id is not None and (type(task_id) is not int or isinstance(task_id, bool) or task_id < 1):
+    bad_id = (task_id is None or type(task_id) is not int or isinstance(task_id, bool)
+              or not 1 <= task_id <= MAX_TASK_ID)
+    if keep_missing_task_id and row["state"] == "acknowledged" and bad_id:
+        # Read-only dispatcher view (#212 H10): keep the row so the dispatcher
+        # can halt it as missing_task_id. Never saved in this form.
+        task_id = None
+    elif task_id is not None and bad_id:
         return "ledger_unreadable"
     # "replay" remains readable so a row written by the old client still loads.
     # This module no longer writes that binding and does not POST it again.
-    if row["state"] == "acknowledged" and (task_id is None or row["bound_by"] not in ("post", "replay", "reconcile")):
+    if row["state"] == "acknowledged" and row["bound_by"] not in ("post", "replay", "reconcile"):
+        return "ledger_unreadable"
+    if row["state"] == "acknowledged" and task_id is None and not keep_missing_task_id:
         return "ledger_unreadable"
     if row["state"] == "halted" and not isinstance(row["halt_reason"], str):
         return "ledger_unreadable"
@@ -1231,6 +1257,7 @@ def _validate_handoff(authority: str, row):
         return "ledger_unreadable"
     copied = dict(row)
     copied["body"] = body
+    copied["task_id"] = task_id
     return copied
 
 
@@ -1250,6 +1277,99 @@ def _validate_body(body):
     if "reviewer_platform" in body and body["reviewer_platform"] not in REVIEWERS:
         return "ledger_unreadable"
     return dict(body)
+
+
+HANDOFF_MAX_BYTES = 16 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class HandoffRow:
+    """One handoff row as the dispatcher sees it (#212). Read-only.
+
+    ``task_id`` is None for an ``acknowledged`` row whose stored id is absent,
+    non-positive, or not an integer; the dispatcher halts that row as
+    ``missing_task_id``. ``body`` is the frozen task body, already validated.
+    """
+
+    node: str
+    state: str
+    repository: str
+    authority: str
+    task_id: object
+    body: dict
+
+
+def parse_bridge_config(config) -> object:
+    """The validated bridge configuration, or ``"invalid_config"``. Same rules as ``run_once``.
+
+    ``enabled`` is validated as a key and otherwise ignored here: the dispatcher's
+    only switch is ``MC_BRIDGE_ENABLED`` (#212 H4).
+    """
+    if not isinstance(config, Mapping) or _forbidden(config):
+        return "invalid_config"
+    return _parse_config(config)
+
+
+def load_handoff_rows(authority: str, *, dir_fd: int) -> object:
+    """Read ``handoff.json`` from the ledger directory open at ``dir_fd``. Never writes it.
+
+    Returns a tuple of :class:`HandoffRow`, ``"ledger_unreadable"`` for a
+    symlink, a non-regular file, an oversized file, malformed JSON, or an
+    invalid outer or row structure (``_validate_journal`` and
+    ``_validate_body``), or ``"conflicting_candidate"`` when the ledger was
+    written under another authority. A missing file is an empty ledger.
+    """
+    try:
+        # O_NONBLOCK: a FIFO planted at this name cannot hang the open; fstat refuses it below.
+        fd = os.open("handoff.json", os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd)
+    except FileNotFoundError:
+        return ()
+    except OSError:
+        return "ledger_unreadable"
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > HANDOFF_MAX_BYTES:
+            return "ledger_unreadable"
+        chunks = []
+        size = 0
+        while True:
+            block = os.read(fd, 65536)
+            if not block:
+                break
+            size += len(block)
+            if size > HANDOFF_MAX_BYTES:
+                return "ledger_unreadable"
+            chunks.append(block)
+    except OSError:
+        return "ledger_unreadable"
+    finally:
+        os.close(fd)
+    try:
+        data = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeError, ValueError, RecursionError):
+        return "ledger_unreadable"
+    checked = _validate_journal(data, keep_missing_task_id=True)
+    if isinstance(checked, str):
+        return checked
+    if checked["authority"] != authority:
+        return "conflicting_candidate"
+    rows = []
+    for node in sorted(checked["handoffs"]):
+        row = checked["handoffs"][node]
+        rows.append(HandoffRow(
+            node=node,
+            state=row["state"],
+            repository=row["repository"],
+            authority=row["authority"],
+            task_id=row["task_id"],
+            body=dict(row["body"]),
+        ))
+    return tuple(rows)
+
+
+def task_matches_handoff(task, body: Mapping) -> bool:
+    """True when a returned task carries the frozen handoff identity (#212 H6)."""
+    return _identity_matches(task, body)
 
 
 def _write_all(fd: int, payload: bytes) -> None:

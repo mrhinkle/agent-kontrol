@@ -1,0 +1,144 @@
+{
+  "agents_md_after": null,
+  "cli_runs": [
+    {
+      "argv": [
+        "-p",
+        "You are running as an autonomous worker dispatched by Agent Kontrol (task #41).\n\nTask: Golden task\n\nInstructions:\ndo the golden thing\n\nAGENTS.md in this worktree holds a temporary skill-pointer block between <!-- ak-skills:begin --> and <!-- ak-skills:end -->. It is dispatch metadata: read it, but do not edit, stage, or commit it. The dispatcher removes it when you finish.\n\nWork autonomously \u2014 do not wait for human input. When done, print a summary block:\nRESULT: <3-6 lines: what you did, what changed, anything left>",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "acceptEdits"
+      ],
+      "cwd": "<TMP>/work/proj",
+      "env": [
+        "HOME",
+        "MC_URL",
+        "PATH"
+      ]
+    },
+    {
+      "argv": [
+        "-p",
+        "You are a skeptical senior reviewer. Another AI agent just completed this task:\nTask: Golden task\ndo the golden thing\n\nWorker's report:\ndid it\nRESULT: golden ok\n\nReview the actual state of the working tree / recent changes in this project. Do NOT make changes. Verify the work is correct and complete. End with exactly one line: VERDICT: APPROVE or VERDICT: REQUEST_CHANGES \u2014 <one-line reason>",
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "default"
+      ],
+      "cwd": "<TMP>/work/proj",
+      "env": [
+        "HOME",
+        "MC_URL",
+        "PATH"
+      ]
+    }
+  ],
+  "requests": [
+    {
+      "body": "{\"agent_id\": \"claude-code-goldenhost\", \"platform\": \"claude-code\", \"machine\": \"goldenhost\", \"kind\": \"heartbeat\", \"title\": \"dispatcher online\", \"detail\": {}}",
+      "headers": {
+        "authorization": "Bearer golden-token",
+        "content-type": "application/json"
+      },
+      "method": "POST",
+      "path": "/api/ingest",
+      "timeout": 30
+    },
+    {
+      "body": "{\"platform\": \"claude-code\", \"machine\": \"goldenhost\", \"agent_id\": \"claude-code-goldenhost\"}",
+      "headers": {
+        "authorization": "Bearer golden-token",
+        "content-type": "application/json"
+      },
+      "method": "POST",
+      "path": "/api/tasks/claim",
+      "timeout": 30
+    },
+    {
+      "body": null,
+      "headers": {
+        "authorization": "Bearer golden-token",
+        "content-type": "application/json"
+      },
+      "method": "GET",
+      "path": "/api/skills/pointers?lane=proj&runtime=claude",
+      "timeout": 30
+    },
+    {
+      "body": "{\"status\": \"running\", \"agent_id\": \"claude-code-goldenhost\"}",
+      "headers": {
+        "authorization": "Bearer golden-token",
+        "content-type": "application/json"
+      },
+      "method": "PATCH",
+      "path": "/api/tasks/41",
+      "timeout": 30
+    },
+    {
+      "body": "{\"agent_id\": \"claude-code-goldenhost\", \"platform\": \"claude-code\", \"machine\": \"goldenhost\", \"kind\": \"status\", \"title\": \"Running task #41: Golden task\", \"detail\": {\"task_id\": 41}}",
+      "headers": {
+        "authorization": "Bearer golden-token",
+        "content-type": "application/json"
+      },
+      "method": "POST",
+      "path": "/api/ingest",
+      "timeout": 30
+    },
+    {
+      "body": "{\"agent_id\": \"claude-code-goldenhost\", \"platform\": \"claude-code\", \"machine\": \"goldenhost\", \"kind\": \"run_complete\", \"title\": \"Agent run complete\", \"detail\": {\"schema\": \"mc.run.v2\", \"run_id\": \"<run_id>\", \"role\": \"worker\", \"started_at\": \"<started_at>\", \"ended_at\": \"<ended_at>\", \"duration_ms\": \"<duration_ms>\", \"outcome\": \"completed\", \"error_class\": null, \"usage_scope\": \"unavailable\", \"usage_complete\": false, \"model_usage\": [], \"task_id\": 41}}",
+      "headers": {
+        "authorization": "Bearer golden-token",
+        "content-type": "application/json"
+      },
+      "method": "POST",
+      "path": "/api/ingest",
+      "timeout": 30
+    },
+    {
+      "body": "{\"status\": \"review\", \"agent_id\": \"claude-code-goldenhost\"}",
+      "headers": {
+        "authorization": "Bearer golden-token",
+        "content-type": "application/json"
+      },
+      "method": "PATCH",
+      "path": "/api/tasks/41",
+      "timeout": 30
+    },
+    {
+      "body": "{\"agent_id\": \"claude-code-goldenhost\", \"platform\": \"claude-code\", \"machine\": \"goldenhost\", \"kind\": \"status\", \"title\": \"Task #41 in review by claude-code\", \"detail\": {\"task_id\": 41}}",
+      "headers": {
+        "authorization": "Bearer golden-token",
+        "content-type": "application/json"
+      },
+      "method": "POST",
+      "path": "/api/ingest",
+      "timeout": 30
+    },
+    {
+      "body": "{\"agent_id\": \"claude-code-goldenhost\", \"platform\": \"claude-code\", \"machine\": \"goldenhost\", \"kind\": \"run_complete\", \"title\": \"Agent run complete\", \"detail\": {\"schema\": \"mc.run.v2\", \"run_id\": \"<run_id>\", \"role\": \"review\", \"started_at\": \"<started_at>\", \"ended_at\": \"<ended_at>\", \"duration_ms\": \"<duration_ms>\", \"outcome\": \"completed\", \"error_class\": null, \"usage_scope\": \"unavailable\", \"usage_complete\": false, \"model_usage\": [], \"task_id\": 41}}",
+      "headers": {
+        "authorization": "Bearer golden-token",
+        "content-type": "application/json"
+      },
+      "method": "POST",
+      "path": "/api/ingest",
+      "timeout": 30
+    },
+    {
+      "body": "{\"status\": \"done\", \"result\": \"golden ok\\n\\n[claude-code review] VERDICT: APPROVE\", \"agent_id\": \"claude-code-goldenhost\", \"cost_usd\": 0.5}",
+      "headers": {
+        "authorization": "Bearer golden-token",
+        "content-type": "application/json"
+      },
+      "method": "PATCH",
+      "path": "/api/tasks/41",
+      "timeout": 30
+    }
+  ],
+  "stderr": [],
+  "stdout": [
+    "[mc] dispatcher on goldenhost serving: claude-code (workdir <TMP>/work)",
+    "{\"kind\": \"claim-wake\", \"trigger\": \"reconcile\", \"fallback_claims\": 0, \"stream_connected\": false, \"coverage\": \"unknown\", \"coverage_reason\": \"reconcile\"}"
+  ]
+}
