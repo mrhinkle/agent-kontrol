@@ -25,6 +25,7 @@
     "test:sweep-producer": "npx tsx scripts/run-sweep-producer-tests.ts",
     "test:pg": "npx tsx scripts/run-pg-tests.ts",
     "test:mcp": "npx tsx scripts/run-mcp-client-tests.ts",
+    "test:bridge-e2e": "python3 scripts/run-bridge-e2e.py",
     "migrate": "node scripts/apply-schema.mjs"
   },
   "dependencies": {
