@@ -700,8 +700,13 @@ Each poll, per platform:
    controller has confirmed its group gone. Members left in the group after a
    normal exit are stopped through the controller and fail the task.
 5. `finish()`, then pointer cleanup, broker revoke and lock release, then
-   exactly one result PATCH (`done` or `failed`), then
-   `confirm_cleanup_durable()` clears `<ledger_dir>/dispatcher-stop.json`.
+   exactly one result PATCH (`done` or `failed`), then the task is appended to
+   `<ledger_dir>/dispatcher-done.json` with an atomic, fsynced write, and only
+   then `confirm_cleanup_durable()` clears `<ledger_dir>/dispatcher-stop.json`.
+   A row whose task id is in `dispatcher-done.json` is never a candidate again.
+   An unreadable or unparsable `dispatcher-done.json` halts `invalid_config`
+   (it is never read as empty); a failed append keeps the journal and halts
+   `claim_unknown` (phase `result`).
 
 The only bridge-mode code that sends a signal is `BridgeSignalPort`, called by
 `StopController`. It signals only a registered, unreaped direct child's own
@@ -727,14 +732,12 @@ unreaped child until it is signalled (exit status 3). An existing
 file is left untouched.
 
 Rollback: stop new claims (create the `stop_file`), set `MC_BRIDGE_ENABLED=0`
-or unset it, restart on the last known good revision, keep `handoff.json` and
-`dispatcher-stop.json`, and reconcile every claimed task and every retained
+or unset it, restart on the last known good revision, keep `handoff.json`,
+`dispatcher-stop.json` and `dispatcher-done.json`, and reconcile every claimed task and every retained
 journal before removing anything.
 
-Limits: one host and one ledger. A completed task's `acknowledged` row stays
-in `handoff.json`, so the next poll finds it again; its exact claim misses
-(`exact_claim_miss`), and a second acknowledged row for the same host and
-platform is `duplicate_candidate`. The skill pointers stay in `AGENTS.md`
+Limits: one host and one ledger. Two unfinished acknowledged rows for the
+same host and platform are `duplicate_candidate`. The skill pointers stay in `AGENTS.md`
 during review, because cleanup waits for `finish()`.
 
 ```bash

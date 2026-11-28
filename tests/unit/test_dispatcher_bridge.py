@@ -245,6 +245,7 @@ class GoldenDisabledTests(unittest.TestCase):
 
 import ast  # noqa: E402
 import signal  # noqa: E402
+import stat  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
 from datetime import datetime, timezone  # noqa: E402
@@ -680,6 +681,69 @@ class BridgeClaimTests(BridgeHarness):
         gate.set()
         self.assert_halt("claim_unknown", phase="claim")
         self.assert_no_child()
+
+
+class BridgeDoneRecordTests(BridgeHarness):
+    """Amendment I1: finished tasks are recorded and never offered again."""
+
+    def done_record(self):
+        path = self.ledger / md.BRIDGE_DONE
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def test_two_tasks_complete_in_sequence(self):
+        self.assertEqual(self.poll(), "done")
+        record = self.done_record()
+        self.assertEqual([(d["task_id"], d["issue"]) for d in record["done"]], [(TID, "I_7")])
+        self.assertEqual(stat.S_IMODE(os.stat(self.ledger / md.BRIDGE_DONE).st_mode), 0o600)
+        # A second handoff arrives; the first row stays acknowledged in handoff.json.
+        second = frozen_body(title="Second bridge task")
+        self.write_rows([handoff_row(body=self.body), handoff_row(node="I_8", task_id=TID + 1, body=second)])
+        self.server.queue.append(server_task(TID + 1, second))
+        self.server.requests.clear()
+        self.assertEqual(self.poll(), "done")
+        self.assertEqual([c["task_id"] for c in self.claims()], [TID + 1])
+        self.assertEqual(self.server.claimed, [TID, TID + 1])
+        self.assertEqual([d["task_id"] for d in self.done_record()["done"]], [TID, TID + 1])
+        # Both rows finished: the next poll is idle, not a miss or a duplicate.
+        self.server.requests.clear()
+        self.assertEqual(self.poll(), "idle")
+        self.assertEqual(self.claims(), [])
+        self.assertIsNone(self.journal())
+
+    def test_corrupt_done_record_halts(self):
+        cases = {
+            "not_json": "{bad",
+            "wrong_shape": json.dumps({"version": 1, "done": {}}),
+            "bad_id": json.dumps({"version": 1, "done": [{"task_id": "101", "issue": "I_7", "completed_at": "x"}]}),
+            "extra_key": json.dumps({"version": 1, "done": [], "more": 1}),
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                self.setUp_fresh()
+                (self.ledger / md.BRIDGE_DONE).write_text(text)
+                self.assertEqual(self.poll(), "halt")
+                self.assert_halt("invalid_config", phase="select")
+                self.assertEqual(self.claims(), [])
+                self.assert_no_child()
+
+    def setUp_fresh(self):
+        if self._bridge is not None:
+            os.close(self._bridge.dir_fd)
+            self._bridge = None
+        path = self.ledger / md.BRIDGE_JOURNAL
+        if path.exists():
+            path.unlink()
+        self.server.requests.clear()
+
+    def test_done_record_write_failure_keeps_journal(self):
+        with mock.patch.object(md.BridgeDoneRecord, "_write", side_effect=OSError("disk full")):
+            self.assertEqual(self.poll(), "halt")
+        record = self.journal()
+        self.assertIsNotNone(record, "the journal was cleared without a durable done record")
+        self.assertEqual(record["halt"]["code"], "claim_unknown")
+        self.assertEqual(record["halt"]["phase"], "result")
+        self.assertIsNone(self.done_record())
+        self.assertEqual(len(self.result_patches()), 1, "exactly one result PATCH, no retry")
 
 
 class BridgeStopTests(BridgeHarness):

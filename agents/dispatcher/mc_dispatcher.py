@@ -1872,6 +1872,8 @@ BRIDGE_CODES = (
 )
 BRIDGE_PLATFORMS = ("claude-code", "codex", "grok")
 BRIDGE_JOURNAL = "dispatcher-stop.json"
+BRIDGE_DONE = "dispatcher-done.json"  # tasks this dispatcher finished; their rows are not candidates (I1)
+BRIDGE_DONE_MAX_BYTES = 16 * 1024 * 1024
 BRIDGE_CONFIG_MAX_BYTES = 1_048_576
 BRIDGE_NET_BUDGET = 30.0  # one deadline for each bridge network call, whatever the socket does
 BRIDGE_WAIT_SLICE = 0.2  # how often a running child's wait wakes to look at stop and timeout
@@ -2099,6 +2101,73 @@ class BridgeJournal:
         os.replace(tmp, BRIDGE_JOURNAL, src_dir_fd=self.dir_fd, dst_dir_fd=self.dir_fd)
         os.fsync(self.dir_fd)
         self.writes += 1
+
+
+class BridgeDoneRecord:
+    """<ledger_dir>/dispatcher-done.json: the task ids this dispatcher completed (#212 I1).
+
+    {"version": 1, "done": [{"task_id": int, "issue": str, "completed_at": str}, ...]}.
+    A missing file is an empty record. A file that cannot be read or parsed is
+    never treated as empty: load() raises BridgeHalt(invalid_config). append()
+    writes the whole record atomically (temp file, fsync, rename, directory
+    fsync) through the ledger directory fd, or raises.
+    """
+
+    def __init__(self, dir_fd: int) -> None:
+        self.dir_fd = dir_fd
+
+    def load(self) -> list[dict]:
+        try:
+            fd = os.open(BRIDGE_DONE, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=self.dir_fd)
+        except FileNotFoundError:
+            return []
+        except OSError:
+            raise BridgeHalt("invalid_config", "select") from None
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > BRIDGE_DONE_MAX_BYTES:
+                raise BridgeHalt("invalid_config", "select")
+            raw = os.read(fd, BRIDGE_DONE_MAX_BYTES + 1)
+        except OSError:
+            raise BridgeHalt("invalid_config", "select") from None
+        finally:
+            os.close(fd)
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError, RecursionError):
+            raise BridgeHalt("invalid_config", "select") from None
+        if not isinstance(data, dict) or set(data) != {"version", "done"} or data["version"] != 1 \
+                or not isinstance(data["done"], list):
+            raise BridgeHalt("invalid_config", "select")
+        for item in data["done"]:
+            if (not isinstance(item, dict) or set(item) != {"task_id", "issue", "completed_at"}
+                    or type(item["task_id"]) is not int or not 1 <= item["task_id"] <= stopctl.MAX_TASK_ID
+                    or not isinstance(item["issue"], str) or not isinstance(item["completed_at"], str)):
+                raise BridgeHalt("invalid_config", "select")
+        return data["done"]
+
+    def task_ids(self) -> set[int]:
+        return {item["task_id"] for item in self.load()}
+
+    def append(self, task_id: int, issue: str) -> None:
+        done = self.load()
+        done.append({"task_id": task_id, "issue": issue,
+                     "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+        self._write({"version": 1, "done": done})
+
+    def _write(self, payload: dict) -> None:
+        raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        tmp = BRIDGE_DONE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600,
+                     dir_fd=self.dir_fd)
+        try:
+            os.fchmod(fd, 0o600)
+            _write_fd_all(fd, raw)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, BRIDGE_DONE, src_dir_fd=self.dir_fd, dst_dir_fd=self.dir_fd)
+        os.fsync(self.dir_fd)
 
 
 def bridge_process_table() -> dict[int, tuple[int, int, bool]]:
@@ -2447,6 +2516,8 @@ class BridgeDispatcher:
         self.config = parsed
         self.dir_fd = dir_fd
         self.journal = BridgeJournal(dir_fd)
+        self.done = BridgeDoneRecord(dir_fd)
+        self.issue: str | None = None
         self.stop_event = stop_event if stop_event is not None else threading.Event()
         self.grace = grace
         self.stop_budget = stop_budget
@@ -2492,8 +2563,10 @@ class BridgeDispatcher:
         rows = drb.load_handoff_rows(self.config["authority"], dir_fd=self.dir_fd)
         if isinstance(rows, str):
             raise BridgeHalt(rows if rows in BRIDGE_CODES else "ledger_unreadable", "select")
+        finished = self.done.task_ids()  # raises invalid_config; never read as empty (I1)
         matching = [r for r in rows if r.state == "acknowledged"
-                    and r.body.get("machine") == HOSTNAME and r.body.get("platform") == platform]
+                    and r.body.get("machine") == HOSTNAME and r.body.get("platform") == platform
+                    and r.task_id not in finished]
         if not matching:
             return None
         if len(matching) > 1:
@@ -2560,6 +2633,7 @@ class BridgeDispatcher:
     def run_round(self, platform: str, row, entry: dict) -> str:
         tid = row.task_id
         self.task_id = tid
+        self.issue = row.node
         body = row.body
         project = body["project"]
         agent_id = f"{platform}-{HOSTNAME}"
@@ -2801,6 +2875,11 @@ class BridgeDispatcher:
             payload["cost_usd"] = round(float(cost), 4)
         try:
             patch_task(payload)
+        except Exception:
+            raise BridgeHalt("claim_unknown", "result", task_id=tid) from None
+        try:
+            # I1: durably record the finished task before #211 clears the journal.
+            self.done.append(tid, self.issue)
         except Exception:
             raise BridgeHalt("claim_unknown", "result", task_id=tid) from None
         decision = ctl.confirm_cleanup_durable(stopctl.CleanupConfirmation("complete", "complete", True))
