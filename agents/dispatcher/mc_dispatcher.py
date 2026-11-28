@@ -2589,13 +2589,34 @@ class BridgeDispatcher:
         self.signals = BridgeSignalPort(self.children, table)
         self.halted: BridgeHalt | None = None
         self.held: dict | None = None
+        # Signal latch (PR #215): a plain flag plus a non-blocking self-pipe. The
+        # handler never takes a lock; the main loop sleeps in select() on the pipe.
+        self.signalled = False
+        self.wake_r, self.wake_w = os.pipe()
+        for fd in (self.wake_r, self.wake_w):
+            os.set_blocking(fd, False)
         self.task_id: int | None = None
         self.boundary = lambda name: None  # test hook at each named boundary
 
     # -- stop predicate (C12, D13) --------------------------------------------
 
+    def signal_received(self) -> bool:
+        return self.signalled or self.stop_event.is_set()
+
+    def sleep(self, timeout: float | None) -> None:
+        """Wait for the poll interval or a signal, whichever comes first. Drains the wake pipe."""
+        try:
+            ready, _w, _x = select.select([self.wake_r], [], [], timeout)
+        except InterruptedError:
+            return
+        if ready:
+            try:
+                os.read(self.wake_r, 4096)
+            except OSError:
+                pass
+
     def stop_requested(self) -> bool:
-        if self.stop_event.is_set():
+        if self.signal_received():
             return True
         stop_file = self.config.get("stop_file")
         if stop_file is None:
@@ -2649,8 +2670,8 @@ class BridgeDispatcher:
         """C4, D24, H6: the returned task is the requested id on the requested lane, frozen fields equal."""
         if not isinstance(task, dict):
             return False
-        task_id = task.get("id")
-        if type(task_id) is not int or task_id != row.task_id:
+        # Postgres returns the bigint id as "101": compare the canonical value (PR #215).
+        if drb.canonical_task_id(task.get("id")) != row.task_id:
             return False
         if task.get("project") != row.body["project"] or task.get("platform") != platform:
             return False
@@ -2730,7 +2751,7 @@ class BridgeDispatcher:
             resp = self.net(lambda: api(f"/api/tasks/{tid}", scrub(payload), "PATCH"))
             task = resp.get("task") if isinstance(resp, dict) else None
             if (not isinstance(resp, dict) or resp.get("ok") is not True or resp.get("demo") is True
-                    or not isinstance(task, dict) or task.get("id") != tid
+                    or not isinstance(task, dict) or drb.canonical_task_id(task.get("id")) != tid
                     or task.get("status") != payload["status"]):
                 raise RuntimeError("task update not recorded")
             return resp
@@ -3017,14 +3038,30 @@ def bridge_main(platforms: list[str]) -> int:
         print(bridge_halt_line(h), file=sys.stderr)
         return 2
     try:
-        lock_fd = bridge_lock_ledger(dir_fd)
-    except BridgeHalt as h:
-        print(bridge_halt_line(h), file=sys.stderr)
-        return 2
-    try:
-        return _bridge_run(parsed, dir_fd, platforms)
+        try:
+            lock_fd = bridge_lock_ledger(dir_fd)
+        except BridgeHalt as h:
+            print(bridge_halt_line(h), file=sys.stderr)
+            return 2
+        try:
+            return _bridge_run(parsed, dir_fd, platforms)
+        finally:
+            os.close(lock_fd)  # only at exit: the lock spans the journal check and any recovery
     finally:
-        os.close(lock_fd)  # only at exit: the lock spans the journal check and any recovery
+        os.close(dir_fd)
+
+
+def bridge_signal_handler(bridge: BridgeDispatcher):
+    """SIGTERM/SIGINT: set a plain flag and write one byte to the wake pipe. Takes no lock (D13)."""
+
+    def latch(_signum, _frame) -> None:
+        bridge.signalled = True
+        try:
+            os.write(bridge.wake_w, b"x")
+        except OSError:
+            pass  # the pipe is full: a wake is already pending
+
+    return latch
 
 
 def _bridge_run(parsed: dict, dir_fd: int, platforms: list[str]) -> int:
@@ -3039,15 +3076,13 @@ def _bridge_run(parsed: dict, dir_fd: int, platforms: list[str]) -> int:
         bridge.halt(h)
         return 2
 
-    def latch(_signum, _frame) -> None:
-        bridge.stop_event.set()  # latch and wake only; never a signal to a child (D13)
-
+    latch = bridge_signal_handler(bridge)  # latch and wake only; never a signal to a child (D13)
     signal.signal(signal.SIGTERM, latch)
     signal.signal(signal.SIGINT, latch)
     print(f"[mc] dispatcher on {HOSTNAME} serving: {', '.join(platforms)} (workdir {WORKDIR}, bridge mode)")
     heartbeat_at = 0.0
     outcome = "idle"
-    while not bridge.stop_event.is_set():
+    while not bridge.signal_received():
         now = time.time()
         if now - heartbeat_at > 300:
             for p in platforms:
@@ -3060,13 +3095,14 @@ def _bridge_run(parsed: dict, dir_fd: int, platforms: list[str]) -> int:
             outcome = bridge.poll_once(platform)
             if outcome in ("halt", "stop"):
                 break
-        if outcome == "stop" and bridge.stop_event.is_set():
+        if outcome == "stop" and bridge.signal_received():
             break
         if bridge.halted is not None:
             # Hold the halt (and any lock or unreaped child it keeps) until an operator stops us.
-            bridge.stop_event.wait()
+            while not bridge.signal_received():
+                bridge.sleep(None)
             return 3
-        bridge.stop_event.wait(POLL)
+        bridge.sleep(POLL)
     return 0
 
 

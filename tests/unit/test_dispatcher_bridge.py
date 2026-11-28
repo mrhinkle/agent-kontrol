@@ -136,8 +136,10 @@ class FakeServer:
         if split.path == "/api/ingest":
             return FakeResponse({"ok": True})
         if req.get_method() == "PATCH" and split.path.startswith("/api/tasks/"):
-            return FakeResponse({"ok": True, "task": {"id": int(split.path.rsplit("/", 1)[1]),
-                                                      "status": (body or {}).get("status")}})
+            task_id = split.path.rsplit("/", 1)[1]
+            return FakeResponse({"ok": True, "task": {
+                "id": task_id if getattr(self, "string_ids", False) else int(task_id),
+                "status": (body or {}).get("status")}})
         return FakeResponse({})
 
 
@@ -339,6 +341,7 @@ class QueueServer(FakeServer):
         self.queue = list(queue)
         self.claimed: list[int] = []
         self.lost = False
+        self.string_ids = False  # Postgres returns the bigint id as a decimal string
 
     def urlopen(self, req, timeout=None):
         split = md.urllib.parse.urlsplit(req.full_url)
@@ -356,6 +359,8 @@ class QueueServer(FakeServer):
             if task is not None:
                 self.queue.remove(task)
                 self.claimed.append(task["id"])
+                if self.string_ids:
+                    task = {**task, "id": str(task["id"])}
             return FakeResponse({"task": task})
         return super().urlopen(req, timeout)
 
@@ -934,6 +939,75 @@ class CodeRabbit215(BridgeHarness):
             observer.observe(identity)
 
 
+class CodeRabbit215Second(BridgeHarness):
+    """Second CodeRabbit pass on PR #215 at 81bea10."""
+
+    reviewer = "claude-code"
+
+    def test_postgres_string_ids_complete_round(self):
+        # Finding 1: tasks.id is a bigint; the real routes return "101".
+        self.server.string_ids = True
+        self.assertEqual(self.poll(), "done")
+        final = self.result_patches()
+        self.assertEqual([p["status"] for p in final], ["done"])
+        done = json.loads((self.ledger / md.BRIDGE_DONE).read_text())["done"]
+        self.assertEqual([d["task_id"] for d in done], [TID])
+        self.assertIsNone(self.journal())
+
+    def test_noncanonical_string_ids_rejected(self):
+        for bad in ("0101", " 101", "101 ", "+101", "101.0", "1e2", "", "9007199254740992", True, 101.0):
+            with self.subTest(task_id=bad):
+                if self._bridge is not None:
+                    held = self._bridge.held or {}
+                    if held.get("lock") is not None:
+                        held["lock"].release()
+                    if held.get("injection") is not None:
+                        ak_pointers.cleanup(held["injection"])
+                    os.close(self._bridge.dir_fd)
+                    self._bridge = None
+                    (self.ledger / md.BRIDGE_JOURNAL).unlink(missing_ok=True)
+                self.server.requests.clear()
+                task = {**server_task(TID, self.body), "id": bad}
+                real = self.server.urlopen
+
+                def urlopen(req, timeout=None, task=task):
+                    if md.urllib.parse.urlsplit(req.full_url).path == "/api/tasks/claim":
+                        self.server.requests.append({"method": "POST", "path": "/api/tasks/claim",
+                                                     "body": req.data.decode(), "headers": {}})
+                        return FakeResponse({"task": task})
+                    return real(req, timeout)
+
+                with mock.patch.object(md.urllib.request, "urlopen", side_effect=urlopen):
+                    self.assertEqual(self.poll(), "halt")
+                self.assert_halt("claim_mismatch", phase="claim")
+                self.assert_no_child()
+
+    def test_canonical_task_id(self):
+        self.assertEqual(drb.canonical_task_id("101"), 101)
+        self.assertEqual(drb.canonical_task_id(101), 101)
+        self.assertEqual(drb.canonical_task_id("9007199254740991"), 9007199254740991)
+        for bad in ("0101", " 101", "+101", "-1", "0", 0, -1, True, None, 1.0, "١٠١", "9007199254740992"):
+            self.assertIsNone(drb.canonical_task_id(bad), bad)
+        # The handoff's recovery listing and identity match see Postgres rows too.
+        self.assertTrue(drb._identity_matches({**server_task(TID, self.body), "id": "101"}, self.body))
+        self.assertFalse(drb._identity_matches({**server_task(TID, self.body), "id": "0101"}, self.body))
+
+    def test_signal_handler_takes_no_lock(self):
+        # Finding 3: the handler must never touch the Event (its lock) or block.
+        bridge = self.bridge()
+        bridge.stop_event = mock.Mock(**{"set.side_effect": AssertionError("took the Event lock"),
+                                         "is_set.return_value": False})
+        md.bridge_signal_handler(bridge)(signal.SIGTERM, None)
+        self.assertTrue(bridge.signalled)
+        self.assertTrue(bridge.stop_requested())
+        started = time.monotonic()
+        bridge.sleep(30)  # the pending wake byte ends the sleep at once
+        self.assertLess(time.monotonic() - started, 5)
+        bridge.stop_event.set.assert_not_called()
+        for _ in range(100000):  # a full pipe must not block or raise in the handler
+            md.bridge_signal_handler(bridge)(signal.SIGTERM, None)
+
+
 class BridgeStopTests(BridgeHarness):
     def test_stop_before_claim(self):
         bridge = self.bridge()
@@ -1382,6 +1456,34 @@ class CodeRabbit215Startup(BridgeStartupTests):
         self.assertEqual(refused(lambda: drb.load_handoff_rows(AUTHORITY, dir_fd=dir_fd)), "ledger_unreadable")
         os.mkfifo(self.ledger / md.BRIDGE_DONE)
         self.assertEqual(refused(lambda: md.BridgeDoneRecord(dir_fd).load()), "invalid_config")
+
+
+class CodeRabbit215SecondStartup(BridgeStartupTests):
+    def test_ledger_fd_closed_on_every_exit(self):
+        # Finding 2: the ledger dir fd is closed after a lock refusal and after a normal return.
+        opened: list[int] = []
+        real = md.bridge_read_config
+
+        def spy(environ):
+            parsed, fd = real(environ)
+            opened.append(fd)
+            return parsed, fd
+
+        dir_fd = os.open(str(self.ledger), os.O_RDONLY)
+        self.addCleanup(os.close, dir_fd)
+        held = md.bridge_lock_ledger(dir_fd)
+        with mock.patch.object(md, "bridge_read_config", side_effect=spy):
+            code, _err = self.start()
+        self.assertEqual(code, 2)
+        with self.assertRaises(OSError):
+            os.fstat(opened[-1])
+        os.close(held)
+        (self.ledger / md.BRIDGE_JOURNAL).write_text("{}\n")  # returns 3 through _bridge_run
+        with mock.patch.object(md, "bridge_read_config", side_effect=spy):
+            code, _err = self.start()
+        self.assertEqual(code, 3)
+        with self.assertRaises(OSError):
+            os.fstat(opened[-1])
 
 
 if __name__ == "__main__":

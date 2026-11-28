@@ -745,10 +745,16 @@ Rollback, in this order:
 
 1. Stop new claims: create the `stop_file`, then signal the bridge dispatcher.
    Do not start the legacy (non-bridge) dispatcher yet.
-2. Confirm that every process group named in `dispatcher-stop.json` is gone.
+2. Confirm the bridge dispatcher process has exited (it holds
+   `<ledger_dir>/dispatcher.lock` until then) before reading any recovery
+   state, then confirm that every process group named in
+   `dispatcher-stop.json` is gone.
 3. Reconcile the worktree (remove a left-over `ak-skills` block, check the
-   lock), the claimed task on the server, and every retained journal. Keep
-   `handoff.json`, `dispatcher-stop.json` and `dispatcher-done.json` until then.
+   lock), the claimed task on the server, every claim or status write that
+   timed out (a timed-out `claim`, `running`, `review` or result PATCH may
+   have landed after the halt: read the task's current status on the server),
+   and every retained journal. Keep `handoff.json`, `dispatcher-stop.json` and
+   `dispatcher-done.json` until then.
 4. Only then set `MC_BRIDGE_ENABLED=0` or unset it, and restart on the last
    known good revision. Legacy dispatch stays stopped until step 3 is done,
    because it would otherwise claim work in a worktree that is not reconciled.

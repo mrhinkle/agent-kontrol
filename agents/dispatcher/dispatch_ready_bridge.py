@@ -486,15 +486,16 @@ def _post(parsed, journal, record, tasks) -> dict:
             idempotency_key=key,
         )
     record["state"] = "acknowledged"
-    record["task_id"] = task["id"]
+    record["task_id"] = _canonical_task_id(task)  # an int, also when the server sent "101"
     record["bound_by"] = "post"
     record["halt_reason"] = None
     if not _save_journal(parsed["ledger_dir"], journal):
-        return _result("halted", posted=True, reason="ledger_unavailable", issue_node_id=node, idempotency_key=key, task_id=task["id"])
+        return _result("halted", posted=True, reason="ledger_unavailable", issue_node_id=node, idempotency_key=key,
+                       task_id=record["task_id"])
     return _result(
         "handed_off",
         posted=True,
-        task_id=task["id"],
+        task_id=record["task_id"],
         issue_node_id=node,
         idempotency_key=key,
     )
@@ -1117,14 +1118,30 @@ def _idempotency_key(authority: str, node: str) -> str:
     return f"drb1-{digest}"
 
 
+MAX_TASK_ID = 9007199254740991  # the claim route's safe-integer bound (#173)
+_TASK_ID_TEXT_RE = re.compile(r"[1-9][0-9]{0,15}")
+
+
+def canonical_task_id(value) -> int | None:
+    """A server task id as an int, or None (#212 CodeRabbit, PR #215).
+
+    ``tasks.id`` is a Postgres bigint and no int8 parser is registered, so the
+    real routes return it as a decimal string. Accept an int (not bool) or a
+    canonical decimal string (no sign, no leading zero, no space), within
+    1..MAX_TASK_ID. Anything else is not a task id.
+    """
+    if type(value) is int:
+        return value if 1 <= value <= MAX_TASK_ID else None
+    if isinstance(value, str) and _TASK_ID_TEXT_RE.fullmatch(value):
+        number = int(value)
+        return number if number <= MAX_TASK_ID else None
+    return None
+
+
 def _canonical_task_id(row):
     if not isinstance(row, Mapping):
         return None
-    task_id = row.get("id")
-    # bool subclasses int and compares equal to 1, so it is not a task id.
-    if type(task_id) is not int or isinstance(task_id, bool) or task_id < 1:
-        return None
-    return task_id
+    return canonical_task_id(row.get("id"))
 
 
 def _identity_matches(task, body: Mapping) -> bool:
